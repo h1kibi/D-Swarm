@@ -1,3 +1,0 @@
-FROM alpine:latest
-COPY ./runtime_agent /opt/runtime_agent
-RUN chmod +x /opt/runtime_agent && ls -la /opt/runtime_agent
