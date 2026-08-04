@@ -59,6 +59,35 @@ CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/muteki/control"  # bind-mounted; carries the per-run token
 _RUN_PREFIX = "muteki-run-"
 
+# Route A: per-category pi worker images (built from docker/worker-pi/). A single
+# explicit MUTEKI_WORKER_IMAGE keeps the historical one-image behavior; otherwise
+# the challenge category picks the image. Per-category env overrides win:
+#   MUTEKI_CATEGORY_IMAGE_WEB=my-web:tag
+_CATEGORY_IMAGES = {
+    "web": "ctf-swarm-pi-web:0.1.0",
+    "crypto": "ctf-swarm-pi-crypto:0.1.0",
+    "pwn": "ctf-swarm-pi-pwn:0.1.0",
+    "reverse": "ctf-swarm-pi-reverse:0.1.0",
+    "forensics": "ctf-swarm-pi-forensics:0.1.0",
+    "misc": "ctf-swarm-pi-misc:0.1.0",
+}
+
+
+def worker_image_for_category(category: str) -> str:
+    """The worker image for a challenge category.
+
+    Precedence: MUTEKI_WORKER_IMAGE (explicit single image) > per-category env
+    override > the per-category pi image > the default worker image.
+    """
+    explicit = os.environ.get("MUTEKI_WORKER_IMAGE", "").strip()
+    if explicit:
+        return explicit
+    cat = (category or "").strip().lower()
+    per_cat = os.environ.get(f"MUTEKI_CATEGORY_IMAGE_{cat.upper()}", "").strip()
+    if per_cat:
+        return per_cat
+    return _CATEGORY_IMAGES.get(cat, WORKER_IMAGE)
+
 # Backend selection. "container" (default) → rcp supervisor. "container_dockerexec"
 # → legacy host-side `docker exec` (emergency fallback). Anything else (incl unset)
 # with a container handle falls back to rcp. The swarm decides local-vs-container;
@@ -78,6 +107,8 @@ _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    # pi (route A): the pi images bake pi at /usr/local/bin/pi (on PATH)
+    "pi": "pi",
 }
 
 
@@ -586,7 +617,7 @@ def _await_supervisor(handle: ContainerHandle) -> None:
     if handle.mode != "rcp":
         return
     from muteki.solver.control_client import wait_supervisor_ready
-    if not wait_supervisor_ready(handle.run_id, deadline_s=40.0):
+    if not wait_supervisor_ready(handle.run_id):
         raise RuntimeError(
             f"runtime supervisor for run {handle.run_id} never dialed back "
             f"(container {handle.container} up but control plane unreachable)")

@@ -44,6 +44,7 @@ from muteki.solver.worker_profiles import (
     profile_names,
 )
 from muteki.solver.workspace import cleanup_worker_scratch, ensure_workspace
+from muteki.solver.container_exec import worker_image_for_category
 from muteki.swarm.insight_bus import InsightBus
 from muteki.swarm.stage_policy import StagePolicy
 from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph, canonicalize_lane
@@ -66,7 +67,35 @@ _BLACKBOARD_SKILL_LINKS = (
     ".codex/skills/muteki-blackboard",
     ".cursor/skills-cursor/muteki-blackboard",
     ".cursor/skills/muteki-blackboard",
+    # pi (route A): pi discovers skills under ~/.pi/agent/skills
+    ".pi/agent/skills/muteki-blackboard",
 )
+
+# pi's provider configuration (settings.json + models-store.json) is baked into
+# the image at /opt/muteki/pi-config; the worker HOME is ISOLATED per worker, so
+# the files must be linked into each isolated HOME for pi to find its provider.
+_CONTAINER_PI_CONFIG = "/opt/muteki/pi-config"
+_PI_CONFIG_LINKS = (
+    ".pi/agent/settings.json",
+    ".pi/agent/models-store.json",
+)
+
+
+def _ensure_pi_config_links(home: Path) -> None:
+    """Expose the image-baked pi provider config inside an isolated worker HOME."""
+    for rel in _PI_CONFIG_LINKS:
+        link = home / rel
+        try:
+            if link.is_symlink():
+                if os.readlink(link) == f"{_CONTAINER_PI_CONFIG}/{link.name}":
+                    continue
+                link.unlink()
+            elif link.exists():
+                continue
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(f"{_CONTAINER_PI_CONFIG}/{link.name}")
+        except OSError:
+            continue
 
 
 def _ensure_blackboard_skill_links(home: Path) -> None:
@@ -1892,6 +1921,7 @@ class Swarm:
             except OSError:
                 return env
             _ensure_blackboard_skill_links(home_host)
+            _ensure_pi_config_links(home_host)
             from muteki.solver.container_exec import _chown_tree_to_worker
             _chown_tree_to_worker(str(home_host))
             mapper = getattr(container, "to_container_path", None)
@@ -2075,9 +2105,11 @@ class Swarm:
             from muteki.solver.container_exec import ensure_container
             # Mount the whole run workspace, not only workspace/workers: the shared
             # graph lives in workspace/graph and the blackboard skill needs it.
+            # Route A: the image is picked per challenge category (worker_image_for_category).
             self._container_handle = ensure_container(
                 self.run_id,
                 str(self.workspace_root or self.worker_root),
+                image=worker_image_for_category(self.challenge.category),
                 network=str((self._runtime_for_engine(engine, profile) or {}).get("network") or "bridge"),
                 memory=str((self._runtime_for_engine(engine, profile) or {}).get("memory") or "") or None,
                 cpus=str((self._runtime_for_engine(engine, profile) or {}).get("cpus") or "") or None,

@@ -292,6 +292,13 @@ class ControlReceiver:
     _instance: "Optional[ControlReceiver]" = None
     _instance_lock = threading.Lock()
 
+    # How long to wait for a run's supervisor to dial back after its container is
+    # up. Default 40s (historical); Docker Desktop / cold-VM hosts can take ~60s
+    # (in-container workspace chown over the bind mount) — set
+    # MUTEKI_CONTROL_LINK_DEADLINE=120 there.
+    _CONTROL_LINK_DEADLINE = float(
+        os.environ.get("MUTEKI_CONTROL_LINK_DEADLINE", "40") or 40)
+
     def __init__(self, host: Optional[str] = None, port: int = DEFAULT_CONTROL_PORT):
         # host=None → env-driven default (MUTEKI_CONTROL_BIND, normally 127.0.0.1;
         # 0.0.0.0 in the compose layout). An explicit host always wins (tests).
@@ -378,9 +385,15 @@ class ControlReceiver:
         with self._lock:
             self._tokens[run_id] = token
 
-    def await_link(self, run_id: str, *, deadline_s: float = 40.0) -> _SupervisorLink:
+    def await_link(self, run_id: str, *, deadline_s: Optional[float] = None) -> _SupervisorLink:
         """Block until the run's supervisor has dialed in (and is alive). Raises
-        ControlError on timeout — surfaced as runtime_degraded, never a local fallback."""
+        ControlError on timeout — surfaced as runtime_degraded, never a local fallback.
+
+        Default is MUTEKI_CONTROL_LINK_DEADLINE (40s historical; raise to 120 on
+        Docker Desktop / cold-VM hosts where the supervisor's in-container chown
+        over the bind mount can take ~60s)."""
+        if deadline_s is None:
+            deadline_s = self._CONTROL_LINK_DEADLINE
         t0 = time.time()
         with self._lock:
             while True:

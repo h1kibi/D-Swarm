@@ -41,6 +41,8 @@ func applyTokenFiles(env map[string]string) {
 		{"CURSOR_API_KEY_FILE", "CURSOR_API_KEY"},
 		{"ANTHROPIC_API_KEY_FILE", "ANTHROPIC_API_KEY"},
 		{"OPENAI_API_KEY_FILE", "OPENAI_API_KEY"},
+		// pi (route A): the pi CLI reads DEEPSEEK_API_KEY for its deepseek provider
+		{"DEEPSEEK_API_KEY_FILE", "DEEPSEEK_API_KEY"},
 	}
 	for _, p := range pairs {
 		if _, already := env[p.valueVar]; already {

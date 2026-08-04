@@ -526,23 +526,46 @@ def runtime_env_for_engine(
             )
 
     # pi: the pi CLI reads standard provider env keys (ANTHROPIC_API_KEY /
-    # OPENAI_API_KEY / ...) — which provider it uses is decided by
+    # OPENAI_API_KEY / DEEPSEEK_API_KEY) — which provider it uses is decided by
     # MUTEKI_PI_PROVIDER / --provider on the driver. A custom-endpoint account
     # maps to the OpenAI-compatible path so pi's openai provider can consume it.
     elif e == "pi":
         if base is not None and (base / "API_KEY").exists():
             prov = str(source.get("MUTEKI_PI_PROVIDER", "")).strip().lower()
-            env_name = "OPENAI_API_KEY" if prov in ("openai", "deepseek", "custom") else "ANTHROPIC_API_KEY"
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name=env_name,
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="OPENAI_BASE_URL" if env_name == "OPENAI_API_KEY" else "ANTHROPIC_BASE_URL")
+            if prov == "deepseek":
+                # pi's deepseek provider (models-store.json) reads DEEPSEEK_API_KEY;
+                # the base URL is baked into the provider definition, not env.
+                _add_secret_file_or_env(
+                    out,
+                    base=base,
+                    filename="API_KEY",
+                    env_name="DEEPSEEK_API_KEY",
+                    container=container,
+                    container_path=_container_secret_path(account_id, "API_KEY"),
+                    source=source,
+                )
+            elif prov in ("openai", "custom"):
+                _add_secret_file_or_env(
+                    out,
+                    base=base,
+                    filename="API_KEY",
+                    env_name="OPENAI_API_KEY",
+                    container=container,
+                    container_path=_container_secret_path(account_id, "API_KEY"),
+                    source=source,
+                )
+                _add_base_url(out, base=base, env_name="OPENAI_BASE_URL")
+            else:
+                _add_secret_file_or_env(
+                    out,
+                    base=base,
+                    filename="API_KEY",
+                    env_name="ANTHROPIC_API_KEY",
+                    container=container,
+                    container_path=_container_secret_path(account_id, "API_KEY"),
+                    source=source,
+                )
+                _add_base_url(out, base=base, env_name="ANTHROPIC_BASE_URL")
 
     return RuntimeCredentialEnv(account_id=account_id, env=out)
 

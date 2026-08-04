@@ -34,7 +34,7 @@ __all__ = [
 # prelude): the engine credential vars + our own MUTEKI_* knobs. HOME is special-
 # cased below; everything else (host PATH etc.) is supplied by the supervisor's
 # baseEnv, so we don't leak the host's full environment into the container.
-_ENV_PREFIXES = ("MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_")
+_ENV_PREFIXES = ("MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_", "DEEPSEEK_")
 _CONTAINER_WORKSPACE = "/home/kali/workspace"
 
 
@@ -55,8 +55,11 @@ def _filter_env(env: Optional[dict]) -> dict[str, str]:
     return out
 
 
-def _resolve_link(run_id: str, *, deadline_s: float = 40.0) -> _SupervisorLink:
-    """Get the run's live supervisor link, waiting for the supervisor to dial in."""
+def _resolve_link(run_id: str, *, deadline_s: "Optional[float]" = None) -> _SupervisorLink:
+    """Get the run's live supervisor link, waiting for the supervisor to dial in.
+    Default: MUTEKI_CONTROL_LINK_DEADLINE (40s; raise to 120 on Docker Desktop)."""
+    if deadline_s is None:
+        deadline_s = ControlReceiver._CONTROL_LINK_DEADLINE
     return ControlReceiver.instance().await_link(run_id, deadline_s=deadline_s)
 
 
@@ -258,7 +261,7 @@ def run_cli_rcp(driver, argv: list[str], *, run_id: str, container_cwd: str,
 
 # ── lifecycle helpers used by container_exec ──────────────────────────────────
 
-def wait_supervisor_ready(run_id: str, *, deadline_s: float = 40.0) -> bool:
+def wait_supervisor_ready(run_id: str, *, deadline_s: "Optional[float]" = None) -> bool:
     """Block until the run's supervisor has dialed in AND answers Health. Returns
     False on timeout (caller surfaces runtime_degraded — never a local fallback)."""
     try:
