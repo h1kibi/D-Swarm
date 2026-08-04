@@ -28,7 +28,11 @@ def _board(tmp_path):
 
 
 def _run(db, *args, worker="cli-claude", intent_id=""):
-    env = {**os.environ, "MUTEKI_BLACKBOARD_DB": str(db), "MUTEKI_WORKER_ID": worker}
+    # PYTHONUTF8=1: the skill subprocess must emit UTF-8 on every host — the test
+    # parent runs in UTF-8 mode (pytest -X utf8) and would otherwise try to
+    # decode a GBK-cp936 console stream on a Chinese-locale Windows host.
+    env = {**os.environ, "PYTHONUTF8": "1",
+           "MUTEKI_BLACKBOARD_DB": str(db), "MUTEKI_WORKER_ID": worker}
     if intent_id:
         env["MUTEKI_INTENT_ID"] = intent_id
     r = subprocess.run([sys.executable, str(_SKILL), *args],

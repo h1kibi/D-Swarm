@@ -86,6 +86,9 @@ def test_probe_worker_model_allows_local_system_login_without_registered_account
 def test_probe_worker_model_does_not_default_local_codex_to_stale_account(
     tmp_path, monkeypatch
 ) -> None:
+    # a host-installed codex (CODEX_HOME in the environment) must not leak into a
+    # LOCAL probe that should use the run's own accounts — clear it for this test.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     codex_home = tmp_path / "_secrets" / "accounts" / "codex-main" / "codex-home"
     codex_home.mkdir(parents=True)
     (codex_home / "auth.json").write_text('{"stale": true}\n')

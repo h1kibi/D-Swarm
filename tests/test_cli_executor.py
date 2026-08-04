@@ -64,9 +64,10 @@ def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
 
 
 def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
+    import os as _os
     monkeypatch.setenv(
         "PATH",
-        "/Users/snowywar/.jenv/shims:/opt/homebrew/bin:/custom/bin",
+        _os.pathsep.join(["/Users/snowywar/.jenv/shims", "/opt/homebrew/bin", "/custom/bin"]),
     )
     ch = Challenge(
         id="env-path",
@@ -77,7 +78,7 @@ def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
     )
     solver = CliSolver(None, ch, engine="claude")
 
-    parts = solver._worker_env()["PATH"].split(":")
+    parts = solver._worker_env()["PATH"].split(_os.pathsep)
 
     assert parts[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     assert parts.index("/usr/bin") < parts.index("/Users/snowywar/.jenv/shims")
@@ -728,11 +729,12 @@ def test_claude_offline_and_kb_off_share_one_deny_flag():
 
 
 def test_registry():
-    assert set(DRIVERS) == {"claude", "codex", "cursor"}
+    assert set(DRIVERS) == {"claude", "codex", "cursor", "pi"}
     assert get_driver("claude").name == "claude"
     assert get_driver("cursor").name == "cursor"
 
 
+@pytest.mark.posix
 def test_kill_proc_tree_kills_setsid_escaped_orphan_and_reaps():
     """A worker child that setsid()'s out of the process group must STILL be
     killed (killpg alone misses it → orphan leaks a slot/CPU/port), and the
@@ -1008,7 +1010,10 @@ def test_resolve_known_good_location_wins_over_path(monkeypatch):
     monkeypatch.delenv("MUTEKI_CLAUDE_BIN", raising=False)
     good = "/blessed/claude"
     monkeypatch.setattr(mod, "_KNOWN_GOOD", {"claude": [good]})
-    monkeypatch.setattr(mod.Path, "exists", lambda self: str(self) == good)
+    # WindowsPath normalizes separators (str() renders `\blessed\claude`), so
+    # compare on the normalized form.
+    monkeypatch.setattr(mod.Path, "exists",
+                        lambda self: str(self).replace("\\", "/") == good)
     monkeypatch.setattr(mod, "_looks_bad", lambda p: False)
     monkeypatch.setattr(mod, "_runs_ok", lambda p: True)
     # PATH scan would return something else, but the known-good location is checked first
@@ -1987,6 +1992,7 @@ def test_claude_stream_parse_recovers_result_from_jsonl():
     assert r.session == "s9" and r.cost_usd == 0.5 and r.num_turns == 4
 
 
+@pytest.mark.posix
 def test_run_cli_streaming_fires_on_step_per_line(tmp_path):
     # end-to-end: a fake echo command emits two JSONL lines; on_step sees both,
     # and parse() builds the final result from the accumulated stdout.
@@ -2549,6 +2555,7 @@ def test_on_proc_kills_immediately_if_already_cancelled():
     assert p.killed is True
 
 
+@pytest.mark.posix
 def test_run_cli_streaming_cancel_event_kills_process(tmp_path):
     # bug #2 fix at the runner level: a long-running subprocess is killed promptly
     # when the cancel_event fires mid-run (not left running until timeout).
@@ -2592,6 +2599,7 @@ def test_run_cli_streaming_bare_timeout_kills_silent_process(tmp_path):
     assert elapsed < 8, f"timeout must fire promptly, took {elapsed:.1f}s"
 
 
+@pytest.mark.posix
 def test_run_cli_streaming_does_not_hang_on_orphaned_stderr(tmp_path):
     """A CLI may spawn a background sidecar that inherits stderr after the parent
     exits. The streaming runner must not block forever in proc.stderr.read(), or the
@@ -2702,6 +2710,7 @@ def test_m9_solved_winner_scratch_is_kept(tmp_path):
     assert scratch.exists(), "a solved worker's winner scratch must be preserved"
 
 
+@pytest.mark.posix
 def test_on_proc_freezes_subprocess_registered_while_paused():
     """M8: if the operator paused the worker before a subprocess registered (e.g. the
     pause landed in the gap before the conclude-fallback subprocess started), _on_proc
@@ -2725,6 +2734,7 @@ def test_on_proc_freezes_subprocess_registered_while_paused():
     assert _signal.SIGKILL not in sent, "must freeze, not kill, a paused worker's proc"
 
 
+@pytest.mark.posix
 def test_pause_resume_via_insight_bus_signals_process(monkeypatch):
     # bug #3 fix: a HITL pause GUIDANCE on the InsightBus reaches the live worker
     # and SIGSTOPs its subprocess; resume SIGCONTs it. We capture the signals.

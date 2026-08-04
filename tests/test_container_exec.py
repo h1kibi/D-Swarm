@@ -16,6 +16,8 @@ import os
 
 import signal
 
+import pytest
+
 import muteki.solver.container_exec as cx
 from muteki.solver.container_exec import (
     CONTAINER_WORKSPACE,
@@ -213,6 +215,7 @@ def _fake_docker_factory(calls):
     return fake_docker
 
 
+@pytest.mark.posix
 def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch, tmp_path):
     calls = []
     import muteki.solver.container_exec as ce
@@ -274,6 +277,7 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
 # bind-mounted into the kali worker, so worker writes hit sqlite "readonly db".
 # ensure_container must chown the workspace tree to the worker uid first.
 
+@pytest.mark.posix
 def test_chown_tree_to_worker_noop_when_not_root(monkeypatch, tmp_path):
     import muteki.solver.container_exec as ce
     f = tmp_path / "graph" / "shared_graph.db"
@@ -318,6 +322,7 @@ def test_worker_uid_gid_env_override_skips_image_probe(monkeypatch):
     assert ce._worker_uid_gid("worker:override-test") == (2000, 2001)
 
 
+@pytest.mark.posix
 def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
     import muteki.solver.container_exec as ce
     (tmp_path / "graph").mkdir()
@@ -338,6 +343,7 @@ def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
     assert os.path.abspath(str(tmp_path / "graph")) in chowned
 
 
+@pytest.mark.posix
 def test_chown_tree_to_worker_does_not_follow_skill_symlinks(monkeypatch, tmp_path):
     import muteki.solver.container_exec as ce
     target = tmp_path / "image-skill"
@@ -360,6 +366,7 @@ def test_chown_tree_to_worker_does_not_follow_skill_symlinks(monkeypatch, tmp_pa
     assert os.path.abspath(str(target)) not in chowned
 
 
+@pytest.mark.posix
 def test_ensure_container_chowns_workspace_to_worker(monkeypatch, tmp_path):
     # End to end through ensure_container: a pre-existing root-owned board DB under
     # the workspace gets chowned to the worker uid before the container comes up.
@@ -433,6 +440,7 @@ def _fake_popen():
     return _P()
 
 
+@pytest.mark.posix
 def test_legacy_container_signal_maps_to_pkill_actions(monkeypatch):
     calls = []
     import muteki.solver.container_exec as ce
@@ -452,6 +460,7 @@ def test_legacy_container_signal_maps_to_pkill_actions(monkeypatch):
         assert "muteki_wtag_tagX" in a
 
 
+@pytest.mark.posix
 def test_rcp_proc_signal_maps_to_control_ops():
     # the rcp proc routes STOP/CONT/KILL to the link's Signal op (worker-scoped).
     import muteki.solver.control_client as cc
@@ -467,6 +476,7 @@ def test_rcp_proc_signal_maps_to_control_ops():
     assert all(w == "w-1-abcd" for w, _ in sent)
 
 
+@pytest.mark.posix
 def test_signal_proc_prefers_container_routing():
     # the solver's _signal_proc must route through _container_signal when present
     # (so a container worker's pause/kill goes into the container, not the host).
@@ -546,6 +556,7 @@ def test_run_cli_container_dockerexec_dispatch(monkeypatch):
 
 # ── P2-v3 BLOCKER-c: host-path translation for sibling-container mounts ────────
 
+@pytest.mark.posix
 def test_mount_source_identity_on_bare_host(monkeypatch):
     # No MUTEKI_HOST_DATA_ROOT → identity (abspath), the historical behaviour.
     monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "")
@@ -553,6 +564,7 @@ def test_mount_source_identity_on_bare_host(monkeypatch):
     assert _mount_source("/some/abs/path") == "/some/abs/path"
 
 
+@pytest.mark.posix
 def test_mount_source_identity_mirror(monkeypatch):
     # host root == container root (path mirrored at the SAME path) → identity.
     monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
@@ -560,6 +572,7 @@ def test_mount_source_identity_mirror(monkeypatch):
     assert _mount_source("/opt/muteki/data/run-x/ws") == "/opt/muteki/data/run-x/ws"
 
 
+@pytest.mark.posix
 def test_mount_source_remaps_container_prefix_to_host(monkeypatch):
     # container data root differs from host root → remap the prefix so the HOST
     # daemon binds the real host path, not the (nonexistent) in-container path.
@@ -569,6 +582,7 @@ def test_mount_source_remaps_container_prefix_to_host(monkeypatch):
     assert _mount_source("/app/data") == "/opt/muteki/data"
 
 
+@pytest.mark.posix
 def test_mount_source_outside_root_passes_through(monkeypatch):
     monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
     monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/app/data")

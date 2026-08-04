@@ -79,8 +79,14 @@ _WORKER_PATH_PREFIX = (
 )
 
 
-def _stable_worker_path(current: str) -> str:
-    """Put system tool dirs before host shims without dropping the user's PATH."""
+def _stable_worker_path(current: str, *, sep: "Optional[str]" = None) -> str:
+    """Put system tool dirs before host shims without dropping the user's PATH.
+
+    `sep`: the PATH separator. Defaults to os.pathsep (host semantics). Container
+    workers must pass ":" — the env is handed to a LINUX container even when the
+    host is Windows (os.pathsep would be ';' there, and the POSIX prefix dirs
+    would collapse into one bogus entry)."""
+    sep = sep or os.pathsep
     parts: list[str] = []
     seen: set[str] = set()
     for item in [*_WORKER_PATH_PREFIX, *current.split(os.pathsep)]:
@@ -88,7 +94,7 @@ def _stable_worker_path(current: str) -> str:
             continue
         seen.add(item)
         parts.append(item)
-    return os.pathsep.join(parts)
+    return sep.join(parts)
 
 
 # The muteki-blackboard skill ships in the repo at <repo>/skills/muteki-blackboard/.
@@ -1023,7 +1029,11 @@ class CliSolver:
         it complements injection rather than replacing it. Without this var the skill
         exits non-zero (it can't find the DB) — a dangling failure we avoid."""
         env = dict(self._extra_worker_env)
-        env["PATH"] = _stable_worker_path(env.get("PATH") or os.environ.get("PATH", ""))
+        # container workers get a LINUX PATH even on a Windows host
+        env["PATH"] = _stable_worker_path(
+            env.get("PATH") or os.environ.get("PATH", ""),
+            sep=":" if self.container is not None else None,
+        )
         env["MUTEKI_WORKER_ID"] = self.solver_id
         intent_id = getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or ""
         if intent_id:
@@ -1075,8 +1085,11 @@ class CliSolver:
                 return
             except Exception:
                 pass
-        # last resort for SIGKILL: Popen.kill() (covers test fakes with no pid)
-        if sig == getattr(signal, "SIGKILL", -9):
+        # last resort for SIGKILL: Popen.kill() (covers test fakes with no pid).
+        # NOTE: Windows has no signal.SIGKILL — cancel() passes the fallback 9, so
+        # the fallback here MUST match (a -9 default would never equal 9 and the
+        # kill branch would silently die, leaking the subprocess).
+        if sig == getattr(signal, "SIGKILL", 9):
             try:
                 proc.kill()
             except Exception:

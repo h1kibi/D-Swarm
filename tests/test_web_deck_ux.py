@@ -1926,7 +1926,11 @@ def test_cli_solver_container_staging_shares_one_copy(tmp_path):
         assert link.is_symlink(), "container-mode staged input must be a symlink"
         # RELATIVE link (so host abs path != container abs path both resolve)
         assert not link.readlink().is_absolute()
-        assert "inputs/by-name/share.zip" in str(link.readlink())
+        # the link points INTO the shared CAS input store; separators are
+        # platform-specific (Windows relpath renders `..\..\inputs\...`)
+        rel = str(link.readlink())
+        assert not rel.startswith("\\") and not rel.startswith("/")
+        assert "inputs" in rel and rel.endswith("share.zip")
         assert link.read_bytes() == zip_in.read_bytes()  # read-through intact
         wds.append(wd)
 

@@ -293,9 +293,9 @@ class ContainerHandle:
                 if arel == ".":
                     return CONTAINER_ACCOUNTS_ROOT
                 if not arel.startswith(".."):
-                    return f"{CONTAINER_ACCOUNTS_ROOT}/{arel}"
+                    return f"{CONTAINER_ACCOUNTS_ROOT}/{arel.replace(os.sep, '/')}"
             return CONTAINER_WORKSPACE
-        return f"{CONTAINER_WORKSPACE}/{rel}"
+        return f"{CONTAINER_WORKSPACE}/{rel.replace(os.sep, '/')}"
 
 
 @dataclass

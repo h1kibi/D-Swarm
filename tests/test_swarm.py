@@ -3534,7 +3534,9 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
 
     class _FakeContainer:
         def to_container_path(self, path: str) -> str:
-            return path.replace(str(tmp_path / "workspace"), "/home/kali/workspace")
+            # separator-normalize: container paths are always POSIX
+            return (path.replace(str(tmp_path / "workspace"), "/home/kali/workspace")
+                    .replace("\\", "/"))
 
     env = sw._runtime_env_for("codex", "cli-codex", container=_FakeContainer())
 
@@ -3550,7 +3552,8 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     ):
         link = home / rel
         assert link.is_symlink()
-        assert str(link.readlink()) == "/opt/muteki/muteki-blackboard"
+        # WindowsPath normalizes separators; the target is a POSIX container path
+        assert str(link.readlink()).replace("\\", "/") == "/opt/muteki/muteki-blackboard"
 
 
 # ── review-policy sanitization ───────────────────────────────────────────────

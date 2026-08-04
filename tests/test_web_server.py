@@ -8,6 +8,7 @@ incrementally), then drives it with httpx.
 
 import asyncio
 import json
+import os
 import socket
 import threading
 import time
@@ -230,7 +231,8 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     assert seen["kb_access"] is False
     assert seen["env"]["MUTEKI_BTW_WORKER"] == "1"  # type: ignore[index]
     assert getattr(seen["driver"], "profile", {}).get("name") == "claude-sub-container"
-    assert "/workers/_btw/" in str(seen["cwd"])
+    # cwd is the _btw worker dir; separators are platform-specific
+    assert ("workers" + os.sep + "_btw") in str(seen["cwd"])
     assert run.worker_cmds.empty()
 
 
