@@ -78,6 +78,7 @@ _CONTAINER_PI_CONFIG = "/opt/muteki/pi-config"
 _PI_CONFIG_LINKS = (
     ".pi/agent/settings.json",
     ".pi/agent/models-store.json",
+    ".pi/agent/extensions",  # ctf-gateway provider extension (route A P3)
 )
 
 
@@ -93,7 +94,8 @@ def _ensure_pi_config_links(home: Path) -> None:
             elif link.exists():
                 continue
             link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(f"{_CONTAINER_PI_CONFIG}/{link.name}")
+            link.symlink_to(f"{_CONTAINER_PI_CONFIG}/{link.name}",
+                            target_is_directory=rel.endswith("extensions"))
         except OSError:
             continue
 
@@ -455,6 +457,10 @@ class Swarm:
         self._container_handle = None  # set lazily by _container() when backend=container
         self._container_runtime_id = ""  # runtime profile id the container was built with (#11)
         self._container_unavailable = False
+        # route A P3: per-run model-gateway task token (issued when the run container
+        # comes up; injected into worker env; revoked at teardown). None while the
+        # run has no container (local backend / before first spawn).
+        self._gateway_token: "Optional[str]" = None
         self._runtime_degraded: list[dict[str, Any]] = []
         # engines dropped from the roster by a dispatch-time health-check failure
         # (e.g. cursor headless auth lapsed). engine -> reason. Used to dedup the
@@ -1392,6 +1398,16 @@ class Swarm:
                     await asyncio.to_thread(teardown_container, self.run_id, remove=True)
                 except Exception:
                     pass
+            # route A P3: revoke the run's model-gateway task token — a revoked
+            # token makes every subsequent gateway call 401, even if a worker
+            # container outlives the run somehow.
+            if self._gateway_token:
+                try:
+                    from muteki.solver.modelgateway import ModelGateway
+                    ModelGateway.instance().revoke(self.run_id)
+                except Exception:
+                    pass
+                self._gateway_token = None
 
     @staticmethod
     def _cancel_solver(solver: Any) -> None:
@@ -1932,6 +1948,25 @@ class Swarm:
                     env["HOME"] = str(home_host)
             else:
                 env["HOME"] = str(home_host)
+        # route A P3: with a live task token the worker authenticates to the MODEL
+        # GATEWAY using the token as its key — the real upstream key stays in the
+        # host process. The worker image's models-store overrides the built-in
+        # deepseek provider's baseUrl to the gateway (host.docker.internal:9101/v1),
+        # so pi's DEFAULT provider already routes through the gateway; the explicit
+        # MUTEKI_PI_PROVIDER keeps it deterministic. Overrides the account FILE
+        # injection (the raw key must never cross into the container).
+        if container is not None and self._gateway_token:
+            env["DEEPSEEK_API_KEY"] = self._gateway_token
+            env.pop("DEEPSEEK_API_KEY_FILE", None)
+            env["MUTEKI_TASK_TOKEN"] = self._gateway_token
+            env["MUTEKI_PI_PROVIDER"] = "ctf-gateway"
+            # pi 0.81.x resolves the provider FROM the model: a bare `--provider
+            # ctf-gateway` (no --model) falls back to the settings default model's
+            # provider (models-store deepseek) and 401s with the task token as its
+            # key. The gateway provider registers deepseek-v4-flash/pro, so default
+            # to flash (a profile's explicit MUTEKI_WORKER_MODEL still wins).
+            if not env.get("MUTEKI_WORKER_MODEL"):
+                env["MUTEKI_WORKER_MODEL"] = "deepseek-v4-flash"
         return env
 
     def _backend_for_engine(self, engine: str, profile: "Optional[dict]" = None) -> str:
@@ -2121,6 +2156,16 @@ class Swarm:
             # from, so a later engine requesting a different runtime is flagged
             # degraded rather than silently inheriting these settings (#11).
             self._container_runtime_id = requested_rt_id
+            # route A P3: issue the per-run model-gateway task token. The worker
+            # container authenticates to the gateway with THIS token (baked into the
+            # env as DEEPSEEK_API_KEY); the REAL upstream key never leaves the host.
+            from muteki.solver.modelgateway import ModelGateway
+            gw = ModelGateway.instance()
+            gw.account_root = (str(self.credential_accounts_root)
+                               if self.credential_accounts_root is not None else None)
+            if self.workspace_root is not None:
+                gw.sessions_root = str(self.workspace_root.parent)
+            self._gateway_token = gw.issue(self.run_id)
         except Exception as exc:  # noqa: BLE001
             self._container_unavailable = True
             self._record_runtime_degraded(

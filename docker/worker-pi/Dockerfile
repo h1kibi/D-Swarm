@@ -41,6 +41,16 @@ RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
 # projection (DEEPSEEK_API_KEY_FILE -> DEEPSEEK_API_KEY in runtime_agent).
 COPY ./pi-config/settings.json /opt/muteki/pi-config/settings.json
 COPY ./pi-config/models-store.json /opt/muteki/pi-config/models-store.json
+# ctf-gateway provider extension (route A P3): registers a provider that points
+# pi at the HOST model gateway (per-run task token auth; real key stays host-side).
+COPY ./pi-config/extensions/ /opt/muteki/pi-config/extensions/
+# ALSO bake into the image default HOME (~/.pi/agent): the worker HOME is isolated
+# per worker (linked to /opt/muteki/pi-config), but bare `docker run` and manual
+# execs run with HOME=/home/ctf and must see the same providers.
+RUN cp /opt/muteki/pi-config/settings.json /home/ctf/.pi/agent/settings.json && \
+    cp /opt/muteki/pi-config/models-store.json /home/ctf/.pi/agent/models-store.json && \
+    mkdir -p /home/ctf/.pi/agent/extensions && \
+    cp /opt/muteki/pi-config/extensions/* /home/ctf/.pi/agent/extensions/
 
 # ── control plane + workspace layout (muteki conventions) ────────────────────
 # CONTAINER_WORKSPACE (container_exec) is /home/kali/workspace; the host
