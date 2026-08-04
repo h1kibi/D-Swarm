@@ -267,6 +267,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # Operator rail mutations: pin / archive / rename. Body carries any of
         # {"pinned": bool, "archived": bool, "name": str}. Each is persisted to
         # the meta side-table and reflected in subsequent /api/runs summaries.
+        # P4 also accepts queue actions: {"cancel": true} (drop a queued run, or
+        # gracefully stop a live one), {"pause": true}/{"resume": true} (hold /
+        # un-hold a queued run — live-run pause stays on the HITL path).
         body = await _require_dict_body(request)
         mgr = app.state.manager
         ok = True
@@ -280,6 +283,12 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             ok = mgr.set_folder(run_id, body.get("folder_id")) and ok
         if "order" in body:
             ok = mgr.set_order(run_id, body.get("order")) and ok
+        if body.get("cancel"):
+            ok = await mgr.cancel_run(run_id) and ok
+        if body.get("pause"):
+            ok = await mgr.pause_queued(run_id) and ok
+        if body.get("resume"):
+            ok = await mgr.resume_queued(run_id) and ok
         run = mgr.get(run_id)
         return {"ok": ok, "run": run.summary() if run else None}
 
@@ -311,6 +320,27 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # log, and the meta row. Irreversible — the UI confirms before calling.
         ok = await app.state.manager.delete(run_id)
         return {"ok": ok}
+
+    # ── P4 run scheduler (FIFO queue + global concurrency cap) ───────────────
+    # The queue is in-memory and transient: a server restart drops pending
+    # entries (their runs rehydrate as ghost-finished like any killed run).
+    @app.get("/api/scheduler")
+    async def get_scheduler() -> Any:
+        return app.state.manager.scheduler_snapshot()
+
+    @app.put("/api/scheduler")
+    async def put_scheduler(request: Request) -> Any:
+        body = await _require_dict_body(request)
+        mgr = app.state.manager
+        try:
+            n = int(body.get("max_concurrent_runs") or 0)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "max_concurrent_runs must be an integer"},
+                                status_code=400)
+        limit = mgr.set_scheduler_limit(n)
+        # a raised limit may free slots — dispatch immediately (clamped to 1..8).
+        await mgr.dispatch_pending()
+        return mgr.scheduler_snapshot()
 
     @app.post("/api/runs/{run_id}/open")
     async def open_run_workspace(run_id: str) -> Any:
@@ -970,8 +1000,15 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                                    model=title_model, base_url=title_base_url)
                 )
 
-        return {"run_id": run_id, "started": True, "kind": body.get("kind", "swarm")}
-
+        # P4: the scheduler may have queued this run (concurrency cap) — surface
+        # the position so the deck can render "queued (N)" instead of "running".
+        resp: dict[str, Any] = {
+            "run_id": run_id, "started": True, "kind": body.get("kind", "swarm"),
+        }
+        if run.queued:
+            resp["queued"] = True
+            resp["position"] = run.queue_position
+        return resp
     @app.post("/api/runs/{run_id}/uploads")
     async def upload_files(
         run_id: str, files: list[UploadFile] = File(...)

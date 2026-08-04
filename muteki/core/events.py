@@ -22,6 +22,12 @@ class EventType(str, Enum):
     RUN_FINISHED = "run.finished"
     RUN_REOPENED = "run.reopened"  # a terminal run was re-opened (continue solving
     #   or flag marked false-positive) — rail flips solved/finished→running
+    RUN_QUEUED = "run.queued"  # scheduler: run is waiting for a concurrency slot
+    #   (payload: position / active / limit) — the rail renders it as queued
+    RUN_DISPATCHED = "run.dispatched"  # scheduler: a QUEUED run got its slot and is
+    #   starting (payload: active / limit) — RUN_STARTED follows from the driver
+    RUN_CANCELLED = "run.cancelled"  # scheduler/operator: run cancelled while queued
+    #   (a live run's cancel is the existing graceful stop → RUN_FINISHED)
     WORKER_STATUS = "worker.status"  # a solver worker came online/offline
     WORKER_FINISHED = "worker.finished"  # ONE swarm sub-worker ended (worker-level,
     #   NOT the run). In coordinator mode many workers come and go while the run keeps

@@ -85,6 +85,13 @@ class Run:
     # M2: signature of the last HITL command (target, action, text, url) — an
     # identical back-to-back resend is dropped instead of re-queued/re-emitted.
     _last_hitl_sig: Optional[tuple] = None
+    # P4: scheduler state — True while the run waits for a concurrency slot
+    # (started but not dispatched); queue_position is the 1-based FIFO position.
+    # cancelled marks an operator-cancelled run (queued-cancel, or a live run
+    # stopped via the cancel endpoint) — distinct from a plain finished run.
+    queued: bool = False
+    queue_position: Optional[int] = None
+    cancelled: bool = False
 
     def merge_flags(self, flags: Any) -> None:
         """Accumulate flags from an event payload (dedup, keep order); keep the
@@ -100,11 +107,17 @@ class Run:
     def status(self) -> str:
         """Single derived lifecycle status the rail renders an icon for.
 
-        draft → never started. running → started, not finished, not paused.
-        paused → operator paused a live run. solved/finished/failed are terminal.
+        draft → never started. queued → started but waiting for a scheduler
+        slot. running → started, not finished, not paused. paused → operator
+        paused a live run (or held a queued one). solved/finished/failed are
+        terminal; cancelled is a terminal operator abort.
         """
+        if self.cancelled:
+            return "cancelled"
         if not self.started:
             return "draft"
+        if self.queued:
+            return "paused" if self.paused else "queued"
         if not self.finished:
             return "paused" if self.paused else "running"
         if self.solved:
@@ -127,6 +140,9 @@ class Run:
             "awaiting_help": self.awaiting_help,
             "help_text": self.help_text,
             "status": self.status(),
+            "queued": self.queued,
+            "queue_position": self.queue_position,
+            "cancelled": self.cancelled,
             "flag": self.flag,
             "flags": list(self.flags),
             "expected_flags": self.expected_flags,
@@ -188,6 +204,10 @@ class RunManager:
         # default worker-roster config (which engines launch per challenge); the
         # dispatch path falls back to this when a request doesn't say otherwise.
         self.worker_config = WorkerConfigStore(root=self.sessions_root)
+        # P4: FIFO run queue + global concurrency cap (default 5, 1..8). Every
+        # manager start goes through it; the queue is in-memory (transient).
+        from apps.web.run_scheduler import RunScheduler
+        self.scheduler = RunScheduler(sessions_root=self.sessions_root)
         self._rehydrate()
 
     def _apply_meta(self, run: "Run") -> None:
@@ -360,6 +380,9 @@ class RunManager:
             # still scrub any orphaned on-disk artifacts / meta
             self._delete_artifacts(run_id)
             return False
+        # P4: a queued run has no task to cancel — drop it from the FIFO first
+        # (the queue entry's driver closure is released with it).
+        self.scheduler.cancel(run_id)
         # Cancel BOTH the swarm task and any live standby worker, then AWAIT them to
         # actually unwind before we close the bus / delete artifacts. Cancelling
         # without awaiting was a use-after-free race: the cancelled coroutine could
@@ -578,6 +601,23 @@ class RunManager:
                     run.expected_flags = int(ev.payload["expected_flags"])
                 if "multi_flag" in ev.payload:
                     run.multi_flag = bool(ev.payload["multi_flag"])
+                if ev.payload.get("reason") == "cancelled":
+                    run.cancelled = True
+            elif ev.event_type is EventType.RUN_QUEUED:
+                # P4: waiting for a scheduler slot — rail shows "queued (N)".
+                run.queued = True
+                run.queue_position = ev.payload.get("position")
+                run.cancelled = False
+            elif ev.event_type is EventType.RUN_DISPATCHED:
+                # P4: the slot freed — the driver launches (RUN_STARTED follows).
+                run.queued = False
+                run.queue_position = None
+            elif ev.event_type is EventType.RUN_CANCELLED:
+                # P4: operator cancelled a queued run (RUN_FINISHED follows with
+                # reason=cancelled — this is just the explicit marker).
+                run.queued = False
+                run.queue_position = None
+                run.cancelled = True
             else:
                 _apply_blackboard_meta(run, ev)
 
@@ -610,8 +650,37 @@ class RunManager:
         return self.create(run_id)
 
     async def start(self, run_id: str, driver: Driver) -> Run:
-        """Create the run and launch `driver` as a background task on its bus."""
+        """Dispatch a run through the P4 scheduler: below the concurrency cap it
+        launches immediately (today's behavior); at the cap it enters the FIFO
+        queue (RUN_QUEUED with its position) and starts when a slot frees.
+
+        A run that is ALREADY live (task pending) is not double-dispatched —
+        the existing handle is returned untouched.
+        """
         run = self.create(run_id)
+        if run.task is not None and not run.task.done():
+            return run  # already live — never stack a second driver on one run
+        run.started = True  # the operator dispatched it; rail shows queued/running
+        position = self.scheduler.submit(run_id, driver)
+        if position is None:
+            # slot was free and is now held by this run — launch right away.
+            self._launch(run, driver)
+            return run
+        run.queued = True
+        run.queue_position = position
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_QUEUED, run_id=run_id,
+            payload={"position": position,
+                     "active": self.scheduler.active_count,
+                     "limit": self.scheduler.max_concurrent_runs}))
+        return run
+
+    def _launch(self, run: "Run", driver: Driver) -> None:
+        """Create the run's driver task (slot already held by the scheduler).
+        The driver's finally frees the slot and fills the queue."""
+        run_id = run.run_id
+        run.queued = False
+        run.queue_position = None
 
         async def _go() -> None:
             failure_detail = ""
@@ -639,15 +708,135 @@ class RunManager:
                     except Exception:
                         pass
                 run.finished = True
+                # P4: the slot freed — hand the queue the chance to start the next
+                # run BEFORE closing this bus (launch is independent of it).
+                self.scheduler.release(run_id)
+                await self._fill_slots()
                 await run.bus.close()
 
         run.task = asyncio.create_task(_go())
-        return run
+
+    # ── P4 scheduler plumbing ─────────────────────────────────────────────────
+    async def _fill_slots(self) -> None:
+        """Launch every queued run a freed slot can hold, FIFO (held/paused
+        queued runs are skipped but keep their position). Called from a driver's
+        finally, a limit raise, and queued-run resume."""
+        while True:
+            # never over-subscribe: only pop while a slot is actually free.
+            if self.scheduler.active_count >= self.scheduler.max_concurrent_runs:
+                return
+            nxt = self.scheduler.next_to_dispatch()
+            if nxt is None:
+                return
+            rid, _driver = nxt
+            run = self.runs.get(rid)
+            if run is None:
+                self.scheduler.release(rid)  # vanished (deleted) while queued
+                continue
+            await run.bus.emit(Event(
+                event_type=EventType.RUN_DISPATCHED, run_id=rid,
+                payload={"active": self.scheduler.active_count,
+                         "limit": self.scheduler.max_concurrent_runs}))
+            # the emit above yields the loop — the operator may have DELETED this
+            # run in the meantime. Never launch a driver on a deleted handle.
+            if self.runs.get(rid) is not run:
+                self.scheduler.release(rid)
+                continue
+            self._launch(run, _driver)
+
+    async def cancel_queued(self, run_id: str) -> bool:
+        """Operator cancels a run that is STILL WAITING in the queue: drop it
+        from the FIFO, settle the run (cancelled + RUN_FINISHED so the rail and
+        the event stream get a terminal state). False when it wasn't queued."""
+        run = self.runs.get(run_id)
+        if run is None or not self.scheduler.cancel(run_id):
+            return False
+        run.queued = False
+        run.queue_position = None
+        run.cancelled = True
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_CANCELLED, run_id=run_id,
+            payload={"reason": "operator_cancelled_queued"}))
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_FINISHED, run_id=run_id,
+            payload={"flag": run.flag, "flags": list(run.flags),
+                     "expected_flags": run.expected_flags,
+                     "multi_flag": run.multi_flag,
+                     "solved": False, "reason": "cancelled"}))
+        await run.bus.close()
+        return True
+
+    async def cancel_run(self, run_id: str) -> bool:
+        """P4 'cancel': a queued run is dropped from the FIFO; a LIVE run gets
+        the existing graceful stop (operator_stop, workers killed, state kept).
+        False for an unknown/finished run."""
+        run = self.runs.get(run_id)
+        if run is None:
+            return False
+        if self.scheduler.is_queued(run_id):
+            return await self.cancel_queued(run_id)
+        if run.task is not None and not run.task.done():
+            return await self.post_hitl(run_id, "global", "stop")
+        return False
+
+    async def pause_queued(self, run_id: str) -> bool:
+        """Hold a queued run: it keeps its queue position but is skipped by
+        dispatch until resumed. Emits the same HITL_RESPONSE pause the live-run
+        path uses, so the rail's paused icon works unchanged."""
+        run = self.runs.get(run_id)
+        if run is None or not self.scheduler.pause(run_id):
+            return False
+        run.paused = True
+        await run.bus.emit(Event(
+            event_type=EventType.HITL_RESPONSE, run_id=run_id,
+            payload=hitl_response_payload("global", "pause")))
+        return True
+
+    async def resume_queued(self, run_id: str) -> bool:
+        """Un-hold a queued run and give the scheduler a chance to dispatch it."""
+        run = self.runs.get(run_id)
+        if run is None or not self.scheduler.resume(run_id):
+            return False
+        run.paused = False
+        await run.bus.emit(Event(
+            event_type=EventType.HITL_RESPONSE, run_id=run_id,
+            payload=hitl_response_payload("global", "resume")))
+        await self._fill_slots()
+        return True
+
+    def scheduler_snapshot(self) -> dict[str, Any]:
+        """BTFly-style SchedulerStatus: settings + active count + FIFO queue with
+        per-run title/category enriched from the live run handles."""
+        s = self.scheduler
+        queue = []
+        for rid, pos, at in s.queued_entries():
+            run = self.runs.get(rid)
+            queue.append({
+                "run_id": rid,
+                "title": (run.name or rid) if run is not None else rid,
+                "category": (run.category or "") if run is not None else "",
+                "position": pos,
+                "queued_at": at,
+            })
+        return {
+            "settings": {"max_concurrent_runs": s.max_concurrent_runs},
+            "active_count": s.active_count,
+            "queued_count": s.queued_count,
+            "queue": queue,
+        }
+
+    def set_scheduler_limit(self, n: int) -> int:
+        """Clamp (1..8) + persist the concurrency limit; returns the effective
+        value. A raise is dispatched by the caller via dispatch_pending()."""
+        return self.scheduler.set_limit(n)
+
+    async def dispatch_pending(self) -> None:
+        """Give the scheduler a chance to fill slots (limit raise / resume)."""
+        await self._fill_slots()
 
     # actions a standby (post-solve) worker can serve. pause/resume/submit only
     # make sense against a LIVE run, so they never trigger a standby.
     _STANDBY_ACTIONS = {"ask", "hint", "mark_false", "writeup", "redirect", "focus"}
-
     async def post_hitl(self, run_id: str, target: str, action: str, **fields: Any) -> bool:
         """Route a human command into the run + echo it on the event stream.
 
