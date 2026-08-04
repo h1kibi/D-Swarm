@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Muteki — Command Deck</title>
+  <!-- wails runtime + bindings (present in production builds) — lets the page
+       ask the Go side for the real UI port instead of assuming :3001. -->
+  <script src="/wailsjs/runtime/runtime.js"></script>
+  <script src="/wailsjs/go/main/App.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0b1220; color: #e6eef6; font-family: system-ui, sans-serif;
+           display: flex; align-items: center; justify-content: center; height: 100vh; }
+    .box { text-align: center; }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    p { color: #9aa4b2; font-size: 14px; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+           background: #ff6b6b; margin-right: 8px; animation: blink 1.2s infinite; }
+    @keyframes blink { 50% { opacity: .2; } }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1><span class="dot"></span>Starting the command deck…</h1>
+    <p>Loading <code>http://127.0.0.1:3001</code> — the backend (API :8000) and
+       the deck UI (Next.js :3001) are booting.</p>
+    <p id="status"></p>
+  </div>
+  <script>
+    // The deck URL: prefer the Wails binding (honors MUTEKI_UI_PORT), else :3001.
+    function deckUrl() {
+      try {
+        if (window.go && window.go.main && window.go.main.App) {
+          return window.go.main.App.UiPort().then(function (p) {
+            return "http://127.0.0.1:" + (p || 3001) + "/";
+          });
+        }
+      } catch (e) {}
+      return Promise.resolve("http://127.0.0.1:3001/");
+    }
+    // fallback if the meta-refresh is too fast for the UI server: keep
+    // retrying the deck until it answers, then jump to it.
+    (function poll() {
+      deckUrl().then(function (url) {
+        fetch(url, { method: "GET", cache: "no-store" })
+          .then(function (r) {
+            if (r.ok) { location.replace(url); return; }
+            setTimeout(poll, 1500);
+          })
+          .catch(function () { setTimeout(poll, 1500); });
+      });
+    })();
+  </script>
+</body>
+</html>

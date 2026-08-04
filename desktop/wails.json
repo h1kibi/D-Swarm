@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "muteki-desktop",
+  "outputfilename": "muteki-desktop",
+  "frontend:install": "node install.mjs",
+  "frontend:build": "node build.mjs",
+  "frontend:dir": "frontend",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "http://127.0.0.1:3001",
+  "author": {
+    "name": "ctf-swarm",
+    "email": ""
+  },
+  "info": {
+    "companyName": "ctf-swarm",
+    "productName": "Muteki Desktop",
+    "productVersion": "0.2.5",
+    "copyright": "AGPL-3.0"
+  }
+}
