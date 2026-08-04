@@ -101,7 +101,7 @@ def test_is_placeholder_flag_detects_templates():
               "flag{FLAG}", "flag{flag}", "flag{your_flag_here}", "flag{redacted}",
               "flag{xxxx}", "flag{TODO}", "flag{____}", "flag{....}", "flag{}",
               "flag{ }", "flag{placeholder}", "flag{16fc0d69-...}",
-              "flag{4b9581e7…}"]:
+              "flag{4b9581e7…}", "<the", "<flag", "<placeholder"]:
         assert gate.is_placeholder_flag(p) is True, p
 
 

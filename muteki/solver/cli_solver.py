@@ -1300,6 +1300,25 @@ class CliSolver:
         if model and "--model" not in out and "-m" not in out:
             out = insert_before_prompt(out, ["--model", model])
 
+        # route A P3: the per-worker env is the AUTHORITATIVE provider choice — it
+        # carries MUTEKI_PI_PROVIDER=ctf-gateway for container workers with a live
+        # task token (the real upstream key stays host-side). The argv was built
+        # earlier from the HOST env (which may say "deepseek" or nothing), so the
+        # two disagree whenever a gateway is active — and pi would then call the
+        # REAL deepseek endpoint with the TASK TOKEN as its key (instant 401, the
+        # worker echoes the prompt in its error stream). The env override wins here
+        # so the --provider flag always matches the worker's actual key material.
+        # This single chokepoint covers every path (bootstrap/explore/respond/
+        # review/resume) since all flow through _run_streaming.
+        prov = (env.get("MUTEKI_PI_PROVIDER") or "").strip()
+        if prov:
+            if "--provider" in out:
+                i = out.index("--provider")
+                if i + 1 < len(out):
+                    out[i + 1] = prov
+            else:
+                out = insert_before_prompt(out, ["--provider", prov])
+
         if self.driver.name == "cursor":
             endpoint = (env.get("CURSOR_ENDPOINT") or "").strip()
             if endpoint and "--endpoint" not in out:
@@ -2100,7 +2119,10 @@ class CliSolver:
                     head = ""
                 if sentinel.strip() not in head:
                     return False  # a non-board file holds this name — don't clobber
-            board_path.write_text(sentinel + body)
+            # explicit utf-8: on a non-UTF-8 host (GBK Windows locale) the default
+            # encoding would write a board the Linux worker containers read as
+            # UTF-8 — mojibake in every teammate's board. The whole repo is UTF-8.
+            board_path.write_text(sentinel + body, encoding="utf-8")
             relative_symlink(path, board_path)
             self._board_file_written = True
             return True

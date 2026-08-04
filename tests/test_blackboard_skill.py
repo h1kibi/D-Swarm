@@ -36,7 +36,11 @@ def _run(db, *args, worker="cli-claude", intent_id=""):
     if intent_id:
         env["MUTEKI_INTENT_ID"] = intent_id
     r = subprocess.run([sys.executable, str(_SKILL), *args],
-                       capture_output=True, text=True, env=env, timeout=30)
+                       capture_output=True, text=True, env=env, timeout=30,
+                       # explicit utf-8: the parent may run on a GBK-locale host
+                       # (pytest without -X utf8); the skill subprocess always
+                       # emits UTF-8 (PYTHONUTF8=1 above).
+                       encoding="utf-8", errors="replace")
     assert r.returncode == 0, f"blackboard.py {args} failed: {r.stderr}"
     return r.stdout
 

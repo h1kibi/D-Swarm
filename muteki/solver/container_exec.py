@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import secrets
 import shlex
+import shutil
 import signal as _signal
 import subprocess
 import threading
@@ -511,6 +512,17 @@ def ensure_container(run_id: str, host_workspace: str, *,
         # problem and the "supervisor as open network service" problem.)
         from muteki.solver.control_receiver import ControlReceiver
         control_dir = os.path.join(host_workspace, ".muteki_control")
+        # Recreate the dir from scratch on the creation path: a leftover container
+        # from a killed run may have been bind-mounting THIS path, and Docker
+        # Desktop's file-sharing daemon can serve stale file contents for a
+        # re-created path (the supervisor then Hello's with an OLD token and the
+        # receiver rejects it — "host rejected hello: unauthorized", the whole run
+        # degrading before any worker starts). A fresh dir on a fresh container
+        # gets a fresh read of the fresh token.
+        try:
+            shutil.rmtree(control_dir, ignore_errors=True)
+        except OSError:
+            pass
         os.makedirs(control_dir, exist_ok=True)
         token = secrets.token_hex(16)
         try:

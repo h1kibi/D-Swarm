@@ -82,6 +82,12 @@ async def main() -> int:
     root = Path(r"C:\Projects\Agent-projects\ctf-swarm\sessions\smoke-container")
     if root.exists():
         _sh.rmtree(root, ignore_errors=True)
+    # a killed smoke run (e.g. a hard-interrupted process) leaves the run container
+    # RUNNING — ensure_container would reuse it with a STALE token and the new
+    # supervisor Hello gets rejected. Remove any leftover run container first.
+    import subprocess as _cleanup_sp
+    _cleanup_sp.run(["docker", "rm", "-f", "muteki-run-smoke-pi-container"],
+                    capture_output=True, timeout=30)
     accounts = root / "accounts"
     acct = accounts / "pi-main"
     acct.mkdir(parents=True, exist_ok=True)
@@ -130,20 +136,50 @@ async def main() -> int:
         barren_limit=3,
     )
     print("swarm constructed; running (container backend, image=ctf-swarm-pi-web)...", flush=True)
+    # gateway request logging to the smoke stdout (it logs at INFO via logging)
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO, format="%(levelname)s %(name)s: %(message)s",
+                         stream=sys.stdout, force=True)
     import subprocess as _sp
     # spy on the rcp exec spec: what argv/env actually goes to the supervisor
     import muteki.solver.control_client as _cc
     _orig_rcp = _cc.run_cli_streaming_rcp
 
     def _spy_rcp(driver, argv, **kw):
-        print("RCP argv[0]:", argv[0], flush=True)
+        # the --provider flag is the WHOLE P3 question: it must say ctf-gateway,
+        # not deepseek (a deepseek flag + task-token key = instant 401 + echo).
+        prov = ""
+        try:
+            i = argv.index("--provider")
+            prov = argv[i + 1] if i + 1 < len(argv) else ""
+        except ValueError:
+            pass
+        print("RCP argv[0]:", argv[0], "provider:", prov or "(unset)", flush=True)
         print("RCP argv count:", len(argv), "prompt len:", len(argv[-1]) if argv else 0, flush=True)
         print("RCP cwd:", kw.get("container_cwd"), flush=True)
         print("RCP env:", json.dumps(kw.get("env") or {}, ensure_ascii=False)[:600], flush=True)
+        # dump the real worker prompts for offline diagnosis (one file per call)
+        try:
+            import pathlib as _pl
+            import time as _t
+            _spy_rcp._n = getattr(_spy_rcp, "_n", 0) + 1
+            _pl.Path(rf"C:\Projects\Agent-projects\ctf-swarm\sessions\smoke-container\worker{_spy_rcp._n}.prompt.txt") \
+                .write_text(argv[-1] if argv else "", encoding="utf-8")
+        except Exception:
+            pass
         try:
             res = _orig_rcp(driver, argv, **kw)
             print("RCP res status:", json.dumps(getattr(res, "runtime_status", {}) or {}, ensure_ascii=False),
                   "text:", repr((res.text or "")[:300]), flush=True)
+            # dump the worker's raw output (text + stderr) per call — the
+            # authoritative "what did the worker actually produce" record.
+            try:
+                import pathlib as _pl
+                _pl.Path(rf"C:\Projects\Agent-projects\ctf-swarm\sessions\smoke-container\worker{_spy_rcp._n}.result.txt") \
+                    .write_text(f"--- text ---\n{res.text or ''}\n--- stderr ---\n{res.raw_stderr or ''}\n",
+                                encoding="utf-8")
+            except Exception:
+                pass
             return res
         except Exception as e:
             import traceback as _tb
@@ -199,6 +235,15 @@ async def main() -> int:
                          capture_output=True, text=True, timeout=20)
             print("=== MID container ps ===", flush=True)
             print((r2.stdout or "")[-2000:], flush=True)
+            # container -> gateway reachability, right from inside the worker container
+            r3 = _sp.run(["docker", "exec", "muteki-run-smoke-pi-container",
+                          "sh", "-c",
+                          "curl -sS -m 8 http://host.docker.internal:9101/health 2>&1; "
+                          "echo; echo RC=$?; "
+                          "ls -la /home/kali/workspace/homes/cli-pi/.pi/agent/extensions/ 2>&1"],
+                         capture_output=True, text=True, timeout=25)
+            print("=== MID gateway probe (in-container) ===", flush=True)
+            print((r3.stdout or "")[-1500:], flush=True)
         except Exception as e:
             print("mid dump:", e, flush=True)
 

@@ -464,6 +464,66 @@ def test_cursor_endpoint_is_inserted_before_prompt():
     assert out[-3:] == ["--endpoint", "https://cursor-endpoint.example", "PROMPT"]
 
 
+def test_pi_provider_env_overrides_host_provider_in_argv():
+    """route A P3: the per-worker env (MUTEKI_PI_PROVIDER=ctf-gateway for gateway
+    workers) must REPLACE the host-built --provider flag — otherwise pi calls the
+    real deepseek endpoint with the task token as its key (instant 401)."""
+    ch = Challenge(
+        id="pi-provider",
+        name="pi-provider",
+        category="web",
+        description="pi provider",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="pi")
+    # argv built by PiDriver from the HOST env (which said "deepseek")
+    argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions",
+            "--provider", "deepseek", "PROMPT"]
+
+    out = solver._apply_runtime_argv(
+        argv, {"MUTEKI_PI_PROVIDER": "ctf-gateway", "DEEPSEEK_API_KEY": "tok"})
+
+    i = out.index("--provider")
+    assert out[i + 1] == "ctf-gateway"
+    assert out[-1] == "PROMPT"  # prompt stays last, nothing else shifted
+
+
+def test_pi_provider_env_inserts_provider_when_argv_has_none():
+    """When the host env never set a provider, the worker env still decides."""
+    ch = Challenge(
+        id="pi-provider-insert",
+        name="pi-provider-insert",
+        category="web",
+        description="pi provider insert",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="pi")
+    argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions", "PROMPT"]
+
+    out = solver._apply_runtime_argv(argv, {"MUTEKI_PI_PROVIDER": "ctf-gateway"})
+
+    assert out[-3:] == ["--provider", "ctf-gateway", "PROMPT"]
+
+
+def test_pi_provider_env_absent_keeps_host_argv_untouched():
+    """No worker-env provider → byte-identical argv (local workers keep their
+    host default; the P2 non-gateway path is unchanged)."""
+    ch = Challenge(
+        id="pi-provider-none",
+        name="pi-provider-none",
+        category="web",
+        description="pi provider none",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="pi")
+    argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions",
+            "--provider", "deepseek", "PROMPT"]
+
+    out = solver._apply_runtime_argv(argv, {"MUTEKI_WORKER_MODEL": ""})
+
+    assert out == argv
+
+
 def test_profile_model_is_inserted_before_prompt_for_cli_drivers():
     ch = Challenge(
         id="profile-model",
