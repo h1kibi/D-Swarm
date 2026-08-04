@@ -59,7 +59,7 @@ type NetworkMode = "bridge" | "host" | "none";
 type Tab = "roster" | "accounts" | "runtime" | "budget" | "advanced";
 type Severity = "ok" | "amber" | "red";
 
-const BASE_ENGINES = ["claude", "codex", "cursor"] as const;
+const BASE_ENGINES = ["claude", "codex", "cursor", "pi"] as const;
 const ORDINARY_PROFILE_ROLES = new Set(["race", "bootstrap", "explore", "respond"]);
 // env var + default that govern the container worker image (server-side:
 // muteki/solver/container_exec.py WORKER_IMAGE). Surfaced in the Runtime tab so
@@ -96,6 +96,7 @@ const ENGINE_DEFAULTS: Record<string, { transport: string; wire_api: string; rol
   claude: { transport: "claude_code", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
   codex: { transport: "codex_cli", wire_api: "responses", roles: ["race", "bootstrap", "explore", "review"] },
   cursor: { transport: "cursor_agent", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
+  pi: { transport: "pi_cli", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
 };
 
 // A unique profile id/name for a new instance of `engine` that won't collide with

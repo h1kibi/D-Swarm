@@ -16,8 +16,9 @@ from muteki.core.events import EventType
 from muteki.models.solve_graph import Challenge
 from muteki.solver import cli_solver
 from muteki.solver.cli_driver import (
-    ClaudeCodeDriver, CodexDriver, CursorDriver, DRIVERS, driver_for, get_driver,
-    _descendant_pids, _kill_proc_tree, _probe_health_with_creds,
+    ClaudeCodeDriver, CodexDriver, CursorDriver, PiDriver, StreamStep, DRIVERS,
+    driver_for, get_driver, _descendant_pids, _kill_proc_tree,
+    _probe_health_with_creds,
 )
 from muteki.solver.cli_solver import CliSolver
 from muteki.solver.container_exec import CONTAINER_WORKSPACE, ContainerHandle
@@ -534,6 +535,108 @@ def test_cursor_bare_name_fallback_is_cursor_agent(monkeypatch):
     monkeypatch.setattr(mod, "_KNOWN_GOOD", {"cursor": []})
     monkeypatch.setattr(mod, "_which_all", lambda name: [])
     assert mod.resolve_engine_bin("cursor") == "cursor-agent"
+
+
+# ── pi driver (the route-A engine) ───────────────────────────────────────────
+
+def test_pi_execute_argv_single_shot_json():
+    d = PiDriver()
+    assert d.new_session() is None  # pi assigns its own session
+    argv = d.build_execute("DO THE THING", None)
+    assert argv[0] == d.bin and "-p" in argv
+    assert "--mode" in argv and argv[argv.index("--mode") + 1] == "json"
+    # worker-scoped session storage (relative → resolves under the worker cwd)
+    assert "--session-dir" in argv
+    assert argv[argv.index("--session-dir") + 1] == ".pi-sessions"
+    assert argv[-1] == "DO THE THING"  # prompt is last, after --
+
+
+def test_pi_execute_provider_flag_from_env(monkeypatch):
+    d = PiDriver()
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "anthropic")
+    argv = d.build_execute("GO", None)
+    assert "--provider" in argv
+    assert argv[argv.index("--provider") + 1] == "anthropic"
+    monkeypatch.delenv("MUTEKI_PI_PROVIDER")
+    assert "--provider" not in d.build_execute("GO", None)
+
+
+def test_pi_offline_denies_web_tools():
+    d = PiDriver()
+    online = d.build_execute("GO", None, web_access=True)
+    assert "--exclude-tools" not in online  # web on by default
+    offline = d.build_execute("GO", None, web_access=False)
+    assert "--exclude-tools" in offline
+    denied = offline[offline.index("--exclude-tools") + 1]
+    assert "WebSearch" in denied and "WebFetch" in denied
+
+
+def test_pi_resume_uses_continue_flag():
+    d = PiDriver()
+    # pi's json events carry no session id, so resume reuses the worker's most
+    # recent session via -c/--continue (worker-scoped --session-dir).
+    argv = d.build_resume("CONCLUDE", "ignored")
+    assert argv[0] == d.bin and "-c" in argv
+    assert "--session-dir" in argv
+    assert argv[-1] == "CONCLUDE"
+
+
+def test_pi_parse_accumulates_assistant_text_and_usage():
+    d = PiDriver()
+    out = "\n".join([
+        '{"type":"turn_start"}',
+        '{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"ls -la"}}',
+        '{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"total 48\\nflag.txt"}]},"isError":false}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"found it"},{"type":"text","text":"FOUND_FLAG=flag{abc}"}]}}',
+        '{"type":"turn_end","message":{"role":"assistant","text":"wrapping up"},"toolResults":[]}',
+        '{"type":"agent_end","messages":[{"role":"assistant","text":"final answer FOUND_FLAG=flag{abc}"}]}',
+        '{"type":"agent_settled"}',
+    ])
+    res = d.parse(out, "")
+    assert "found it" in res.text
+    assert "final answer" in res.text
+    assert "FOUND_FLAG=flag{abc}" in res.text
+
+
+def test_pi_parse_recovers_usage_from_events():
+    d = PiDriver()
+    out = "\n".join([
+        '{"type":"message_end","message":{"role":"assistant","text":"hi"},"usage":{"input_tokens":11,"output_tokens":7}}',
+        '{"type":"agent_settled"}',
+    ])
+    res = d.parse(out, "")
+    assert res.input_tokens == 11 and res.output_tokens == 7
+
+
+def test_pi_parse_falls_back_to_raw_stdout():
+    d = PiDriver()
+    res = d.parse("pi: something weird happened\n", "stderr line")
+    assert "weird" in res.text and "stderr line" in res.raw_stderr
+
+
+def test_pi_parse_stream_steps_shapes():
+    d = PiDriver()
+    # tool start → tool step with the command
+    steps = d.parse_stream_steps('{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"nmap -p 80 x"}}')
+    assert steps == [StreamStep("tool", tool="bash", text="nmap -p 80 x")]
+    # tool end → tool_result step with raw = full output for the provenance gate
+    steps = d.parse_stream_steps('{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"PORT STATE\\n80 open"}]},"isError":false}')
+    assert len(steps) == 1 and steps[0].kind == "tool_result"
+    assert steps[0].raw == "PORT STATE\n80 open" and steps[0].text == "PORT STATE\n80 open"
+    # message_end → one reasoning step per complete message
+    steps = d.parse_stream_steps('{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"step one"}]}}')
+    assert steps == [StreamStep("reasoning", text="step one")]
+    # message_update deltas are NOT surfaced (would flood the deck)
+    assert d.parse_stream_steps('{"type":"message_update","message":{},"assistantMessageEvent":{"type":"text_delta","delta":"x"}}') == []
+    # non-JSON tolerated
+    assert d.parse_stream_steps("not json") == []
+
+
+def test_pi_hello_ok_accepts_completed_turn():
+    d = PiDriver()
+    assert d._hello_ok(_CP(0, '{"type":"agent_end","messages":[]}\n{"type":"agent_settled"}')) is True
+    assert d._hello_ok(_CP(0, '{"type":"agent_start"}')) is False  # started but never finished
+    assert d._hello_ok(_CP(0, "no events")) is False
 
 
 # ── offline / web-access toggle (clean eval hygiene) ─────────────────────────

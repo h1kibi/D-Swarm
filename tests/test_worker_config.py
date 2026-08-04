@@ -842,7 +842,7 @@ def test_set_runtime_environment_renames_builtin_profiles_for_backend(tmp_path):
 
     local = store.set_runtime_environment(backend="local", runtime_id="local")
     local_ids = [p["id"] for p in local["worker_profiles"]]
-    assert local_ids == ["claude-local", "codex-local", "cursor-api-local"]
+    assert local_ids == ["claude-local", "codex-local", "cursor-api-local", "pi-api-local"]
     assert local["engines"] == local_ids
     assert local["stage_policy"]["coordinator"]["review"]["engine"] == "claude-local"
     assert all(p["runtime"] == "local" for p in local["worker_profiles"])
@@ -854,6 +854,7 @@ def test_set_runtime_environment_renames_builtin_profiles_for_backend(tmp_path):
         "claude-sub-container",
         "codex-sub-container",
         "cursor-api-container",
+        "pi-api-container",
     ]
     assert container["engines"] == container_ids
     assert container["stage_policy"]["coordinator"]["review"]["engine"] == "claude-sub-container"

@@ -58,6 +58,7 @@ _ENV_OVERRIDE = {
     "claude": "MUTEKI_CLAUDE_BIN",
     "codex": "MUTEKI_CODEX_BIN",
     "cursor": "MUTEKI_CURSOR_BIN",
+    "pi": "MUTEKI_PI_BIN",
 }
 
 # The on-disk binary basename for an engine, when it differs from the engine
@@ -84,6 +85,14 @@ _KNOWN_GOOD = {
         "~/.local/bin/cursor-agent",
         "/opt/homebrew/bin/cursor-agent",
         "/usr/local/bin/cursor-agent",
+    ],
+    # pi ships as a self-contained binary; the official Windows install lives
+    # under Program Files and is on PATH (btfly images bake it at /usr/local/bin).
+    "pi": [
+        "~/.local/bin/pi",
+        "/opt/homebrew/bin/pi",
+        "/usr/local/bin/pi",
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "pi-windows-x64", "pi.exe"),
     ],
 }
 
@@ -943,10 +952,202 @@ class CursorDriver(CliDriver):
         return r.returncode == 0 and '"result"' in (r.stdout or "")
 
 
+class PiDriver(CliDriver):
+    """`pi -p --mode json` — pi's single-shot non-interactive mode emitting a JSONL
+    event stream on stdout (the same event shape as `--mode rpc`, see docs/json.md).
+
+    Sessions: each worker stores its sessions under a RELATIVE `--session-dir`
+    `.pi-sessions` — argv-relative, so it resolves inside the worker's own cwd and
+    parallel workers never share session files. A fresh worker creates a session
+    there; `build_resume` uses `-c/--continue` (most recent session in that dir —
+    the worker's only one), which gives the conclude-fallback turn real continuity
+    without the driver needing to learn the session file path from the event stream
+    (pi's json events carry no session id).
+
+    Provider/model: `--provider` comes from MUTEKI_PI_PROVIDER (default: unset →
+    pi's own resolution: env keys like ANTHROPIC_API_KEY / OPENAI_API_KEY, or
+    `pi /login` subscriptions); ProfileDriver injects `--model` via _with_model.
+    """
+
+    name = "pi"
+    # pi's built-in tools are read/bash/edit/write/grep/find/ls — no web. The
+    # WebSearch/WebFetch capability arrives as opt-in extensions, so denying by
+    # name keeps an offline eval clean (same contract as claude's _WEB_TOOLS).
+    _WEB_TOOLS = ["WebSearch", "WebFetch"]
+
+    def _denied(self, *, web_access: bool, kb_access: bool) -> list[str]:
+        # pi takes --exclude-tools as ONE comma-separated list argument
+        # (`--exclude-tools <list>`), unlike claude's repeatable --disallowed-tools.
+        deny: list[str] = []
+        if not web_access:
+            deny += self._WEB_TOOLS
+        if not kb_access and self.KB_TOOL_PREFIX:
+            deny.append(self.KB_TOOL_PREFIX)
+        return ["--exclude-tools", ",".join(deny)] if deny else []
+
+    def _provider(self) -> str:
+        return os.environ.get("MUTEKI_PI_PROVIDER", "").strip()
+
+    def build_execute(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+    ) -> list[str]:
+        # `--mode json` already emits one JSON event per step; stream is accepted
+        # for interface parity (no extra flag needed).
+        argv = [self.bin, "-p", "--mode", "json", "--session-dir", ".pi-sessions"]
+        prov = self._provider()
+        if prov:
+            argv += ["--provider", prov]
+        if session:
+            argv += ["--session", session]
+        argv += self._denied(web_access=web_access, kb_access=kb_access)
+        argv += ["--", prompt]
+        return argv
+
+    def build_resume(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+    ) -> list[str]:
+        # `--session` was not recoverable from the event stream, so resume reuses
+        # the worker's most recent session via -c/--continue (the worker's
+        # .pi-sessions dir holds exactly its own session(s)).
+        argv = [self.bin, "-p", "--mode", "json", "--session-dir", ".pi-sessions",
+                "-c"]
+        prov = self._provider()
+        if prov:
+            argv += ["--provider", prov]
+        argv += self._denied(web_access=web_access, kb_access=kb_access)
+        argv += ["--", prompt]
+        return argv
+
+    @staticmethod
+    def _message_text(message: Any) -> str:
+        """Best-effort text of a pi AgentMessage: either a `text` field or the
+        concatenation of its text content blocks."""
+        if not isinstance(message, dict):
+            return ""
+        txt = message.get("text")
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+        parts: list[str] = []
+        for b in message.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+        return "\n".join(parts)
+
+    @staticmethod
+    def _tool_result_text(result: Any) -> str:
+        """Best-effort full text of a tool result (for the provenance gate): the
+        joined text blocks of `result.content`, or the raw dict."""
+        if isinstance(result, dict):
+            content = result.get("content")
+            if isinstance(content, list):
+                parts = []
+                for b in content:
+                    if isinstance(b, dict) and isinstance(b.get("text"), str):
+                        parts.append(b["text"])
+                if parts:
+                    return "\n".join(parts)
+            return str(result)
+        return str(result or "")
+
+    def parse_stream_steps(self, line: str) -> list[StreamStep]:
+        # pi streams per-delta message_update events; emitting every text_delta as
+        # its own reasoning step would flood the deck, so only COMPLETE blocks are
+        # surfaced (message_end / tool_execution_* / turn_end) — same granularity
+        # as the other drivers.
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            return []
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return []
+        t = ev.get("type")
+        if t == "tool_execution_start":
+            args = ev.get("args") or {}
+            arg = str(args.get("command") or args.get("query") or args.get("file_path") or "")[:300]
+            return [StreamStep("tool", tool=str(ev.get("toolName") or "tool"), text=arg)]
+        if t == "tool_execution_end":
+            # text=truncated for the deck; raw=full for the provenance gate.
+            full = self._tool_result_text(ev.get("result"))
+            return [StreamStep("tool_result", text=full[:600], raw=full)]
+        if t == "message_end":
+            text = self._message_text(ev.get("message"))
+            if text:
+                return [StreamStep("reasoning", text=text)]
+        if t == "turn_end":
+            text = self._message_text(ev.get("message"))
+            if text:
+                return [StreamStep("reasoning", text=text)]
+        return []
+
+    def parse(self, stdout: str, stderr: str) -> CliResult:
+        """Accumulate assistant text across message_end/turn_end/agent_end events
+        (the final result of a `pi -p` run is the last assistant message), and
+        best-effort usage from any event carrying a `usage` block."""
+        parts: list[str] = []
+        in_tok = out_tok = 0
+        for raw in stdout.splitlines():
+            line = raw.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = ev.get("type")
+            if t in ("message_end", "turn_end", "agent_end"):
+                # agent_end carries an array of messages; message_end/turn_end a
+                # single message.
+                msgs = ev.get("messages")
+                if isinstance(msgs, list):
+                    for m in msgs:
+                        txt = self._message_text(m)
+                        if txt:
+                            parts.append(txt)
+                else:
+                    txt = self._message_text(ev.get("message"))
+                    if txt:
+                        parts.append(txt)
+            u = ev.get("usage") if isinstance(ev.get("usage"), dict) else None
+            if u:
+                in_tok = int(u.get("input_tokens") or in_tok)
+                out_tok = int(u.get("output_tokens") or out_tok)
+        text = "\n".join(parts).strip()
+        if text:
+            return CliResult(text=text[-8000:], session=None, cost_usd=None,
+                             input_tokens=(in_tok or None), output_tokens=(out_tok or None),
+                             raw_stderr=stderr[-2000:])
+        return CliResult(text=stdout[-8000:], session=None, raw_stderr=stderr[-2000:])
+
+    def _hello_argv(self) -> list[str]:
+        # a real one-turn json-mode probe — symmetric with the other engines.
+        return [self.bin, "-p", "--mode", "json", "--session-dir", ".pi-sessions",
+                "--", self.HELLO_PROMPT]
+
+    def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
+        # a completed model turn proves auth/quota and the backend round-trip.
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") in ("agent_end", "agent_settled", "turn_end", "message_end"):
+                return True
+        return False
+
+
 DRIVERS: dict[str, CliDriver] = {
     "claude": ClaudeCodeDriver(),
     "codex": CodexDriver(),
     "cursor": CursorDriver(),
+    "pi": PiDriver(),
 }
 
 

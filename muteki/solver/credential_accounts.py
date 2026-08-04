@@ -525,6 +525,25 @@ def runtime_env_for_engine(
                 source=source,
             )
 
+    # pi: the pi CLI reads standard provider env keys (ANTHROPIC_API_KEY /
+    # OPENAI_API_KEY / ...) — which provider it uses is decided by
+    # MUTEKI_PI_PROVIDER / --provider on the driver. A custom-endpoint account
+    # maps to the OpenAI-compatible path so pi's openai provider can consume it.
+    elif e == "pi":
+        if base is not None and (base / "API_KEY").exists():
+            prov = str(source.get("MUTEKI_PI_PROVIDER", "")).strip().lower()
+            env_name = "OPENAI_API_KEY" if prov in ("openai", "deepseek", "custom") else "ANTHROPIC_API_KEY"
+            _add_secret_file_or_env(
+                out,
+                base=base,
+                filename="API_KEY",
+                env_name=env_name,
+                container=container,
+                container_path=_container_secret_path(account_id, "API_KEY"),
+                source=source,
+            )
+            _add_base_url(out, base=base, env_name="OPENAI_BASE_URL" if env_name == "OPENAI_API_KEY" else "ANTHROPIC_BASE_URL")
+
     return RuntimeCredentialEnv(account_id=account_id, env=out)
 
 

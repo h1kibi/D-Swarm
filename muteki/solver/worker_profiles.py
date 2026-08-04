@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 
-VALID_BASE_ENGINES = ("claude", "codex", "cursor")
+VALID_BASE_ENGINES = ("claude", "codex", "cursor", "pi")
 TRANSPORT_TO_ENGINE = {
     "claude": "claude",
     "claude_code": "claude",
@@ -17,6 +17,8 @@ TRANSPORT_TO_ENGINE = {
     "codex_cli": "codex",
     "cursor": "cursor",
     "cursor_agent": "cursor",
+    "pi": "pi",
+    "pi_cli": "pi",
 }
 DEFAULT_ROLES = ["race", "bootstrap", "explore", "respond", "review"]
 

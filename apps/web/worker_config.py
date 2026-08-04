@@ -99,6 +99,17 @@ DEFAULT_WORKER_PROFILES = [
      "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
      "race": True, "max_running": 2, "max_review_running": 0, "priority": 30, "model": "",
      "enabled": True},
+    # route A: pi worker (pi -p --mode json). Credentials flow via the account
+    # (ANTHROPIC_API_KEY / OPENAI_API_KEY per MUTEKI_PI_PROVIDER); the P3 model
+    # gateway will replace direct key injection with a task token.
+    {"id": "pi-api-container", "name": "pi-api-container",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 40, "model": "",
+     "enabled": True},
 ]
 DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
 
