@@ -543,12 +543,14 @@ def test_pi_execute_argv_single_shot_json():
     d = PiDriver()
     assert d.new_session() is None  # pi assigns its own session
     argv = d.build_execute("DO THE THING", None)
-    assert argv[0] == d.bin and "-p" in argv
+    assert argv[0] == d.bin
     assert "--mode" in argv and argv[argv.index("--mode") + 1] == "json"
     # worker-scoped session storage (relative → resolves under the worker cwd)
     assert "--session-dir" in argv
     assert argv[argv.index("--session-dir") + 1] == ".pi-sessions"
-    assert argv[-1] == "DO THE THING"  # prompt is last, after --
+    # prompt is a positional arg, last (per docs/json.md: `pi --mode json "..."`)
+    assert argv[-1] == "DO THE THING"
+    assert "-p" not in argv
 
 
 def test_pi_execute_provider_flag_from_env(monkeypatch):
@@ -571,14 +573,31 @@ def test_pi_offline_denies_web_tools():
     assert "WebSearch" in denied and "WebFetch" in denied
 
 
-def test_pi_resume_uses_continue_flag():
+def test_pi_resume_uses_session_id_or_continue():
     d = PiDriver()
-    # pi's json events carry no session id, so resume reuses the worker's most
-    # recent session via -c/--continue (worker-scoped --session-dir).
-    argv = d.build_resume("CONCLUDE", "ignored")
-    assert argv[0] == d.bin and "-c" in argv
-    assert "--session-dir" in argv
+    # known session id → resume that session
+    argv = d.build_resume("CONCLUDE", "019fce1e-44b4-7201-bbe8-9d44d5f61a48")
+    assert argv[0] == d.bin and "--session" in argv
+    assert argv[argv.index("--session") + 1] == "019fce1e-44b4-7201-bbe8-9d44d5f61a48"
     assert argv[-1] == "CONCLUDE"
+    # unknown session → continue the worker's most recent session
+    argv2 = d.build_resume("CONCLUDE", "")
+    assert "-c" in argv2
+    assert "--session" not in argv2
+
+
+def test_pi_parse_recovers_session_id():
+    d = PiDriver()
+    out = "\n".join([
+        '{"type":"session","version":3,"id":"019fce1e-44b4-7201-bbe8-9d44d5f61a48","timestamp":"2026-08-04T18:51:58.004Z"}',
+        '{"type":"message_end","message":{"role":"assistant","text":"hi"}}',
+        '{"type":"agent_settled"}',
+    ])
+    res = d.parse(out, "")
+    assert res.session == "019fce1e-44b4-7201-bbe8-9d44d5f61a48"
+    # session event also surfaces as a live StreamStep (like claude/cursor)
+    steps = d.parse_stream_steps('{"type":"session","version":3,"id":"sess-abc"}')
+    assert steps == [StreamStep("session", session="sess-abc")]
 
 
 def test_pi_parse_accumulates_assistant_text_and_usage():

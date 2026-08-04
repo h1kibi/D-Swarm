@@ -265,6 +265,11 @@ class CliDriver(abc.ABC):
     # resolve_engine_bin). Override via MUTEKI_CLAUDE_BIN / MUTEKI_CODEX_BIN.
     _bin: Optional[str] = None
 
+    # Engines whose CLI blocks waiting on stdin (pi on Windows: `--mode json`
+    # idles until stdin EOF) must run with stdin closed — the runner passes
+    # DEVNULL instead of inheriting the parent's pipe. True for pi only.
+    close_stdin: bool = False
+
     @property
     def bin(self) -> str:
         override = os.environ.get(_ENV_OVERRIDE.get(self.name, ""), "").strip()
@@ -401,7 +406,8 @@ class CliDriver(abc.ABC):
         for attempt in range(self._HELLO_RETRIES + 1):
             try:
                 r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                   timeout=self._HELLO_TIMEOUT, env=env)
+                                   timeout=self._HELLO_TIMEOUT, env=env,
+                                   stdin=subprocess.DEVNULL if getattr(self, "close_stdin", False) else None)
             except FileNotFoundError:
                 return False, "binary not found on PATH"
             except subprocess.TimeoutExpired:
@@ -953,23 +959,28 @@ class CursorDriver(CliDriver):
 
 
 class PiDriver(CliDriver):
-    """`pi -p --mode json` — pi's single-shot non-interactive mode emitting a JSONL
-    event stream on stdout (the same event shape as `--mode rpc`, see docs/json.md).
+    """`pi --mode json` — pi's single-shot json-event-stream mode: prints every
+    session event as a JSON line to stdout and EXITS (docs/json.md). On Windows
+    the CLI idles until stdin EOF, so `close_stdin` is set and the runner passes
+    DEVNULL.
 
     Sessions: each worker stores its sessions under a RELATIVE `--session-dir`
     `.pi-sessions` — argv-relative, so it resolves inside the worker's own cwd and
-    parallel workers never share session files. A fresh worker creates a session
-    there; `build_resume` uses `-c/--continue` (most recent session in that dir —
-    the worker's only one), which gives the conclude-fallback turn real continuity
-    without the driver needing to learn the session file path from the event stream
-    (pi's json events carry no session id).
+    parallel workers never share session files. The first event is
+    `{"type":"session","id":...}` — parse() surfaces that id as the session, and
+    build_resume reuses it via `--session <id>` (falling back to `-c/--continue`
+    when the id is unknown).
 
     Provider/model: `--provider` comes from MUTEKI_PI_PROVIDER (default: unset →
-    pi's own resolution: env keys like ANTHROPIC_API_KEY / OPENAI_API_KEY, or
-    `pi /login` subscriptions); ProfileDriver injects `--model` via _with_model.
+    pi's own resolution: settings.json defaultProvider or env keys like
+    DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY, or `pi /login`
+    subscriptions); ProfileDriver injects `--model` via _with_model.
     """
 
     name = "pi"
+    # pi's --mode json waits for stdin EOF on Windows before executing; the
+    # runners must hand it DEVNULL, not the parent's (open) pipe.
+    close_stdin = True
     # pi's built-in tools are read/bash/edit/write/grep/find/ls — no web. The
     # WebSearch/WebFetch capability arrives as opt-in extensions, so denying by
     # name keeps an offline eval clean (same contract as claude's _WEB_TOOLS).
@@ -992,32 +1003,33 @@ class PiDriver(CliDriver):
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
-        # `--mode json` already emits one JSON event per step; stream is accepted
-        # for interface parity (no extra flag needed).
-        argv = [self.bin, "-p", "--mode", "json", "--session-dir", ".pi-sessions"]
+        # `--mode json` already emits one JSON event per step and EXITS after the
+        # run; stream is accepted for interface parity (no extra flag needed).
+        # The prompt is a positional arg per docs/json.md (`pi --mode json "..."`).
+        argv = [self.bin, "--mode", "json", "--session-dir", ".pi-sessions"]
         prov = self._provider()
         if prov:
             argv += ["--provider", prov]
         if session:
             argv += ["--session", session]
         argv += self._denied(web_access=web_access, kb_access=kb_access)
-        argv += ["--", prompt]
+        argv += [prompt]
         return argv
 
     def build_resume(
         self, prompt: str, session: str, *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
-        # `--session` was not recoverable from the event stream, so resume reuses
-        # the worker's most recent session via -c/--continue (the worker's
-        # .pi-sessions dir holds exactly its own session(s)).
-        argv = [self.bin, "-p", "--mode", "json", "--session-dir", ".pi-sessions",
-                "-c"]
+        # resume the SAME session when the id is known; fall back to
+        # -c/--continue (the worker's .pi-sessions dir holds only its own
+        # sessions, so "most recent" is the right one).
+        argv = [self.bin, "--mode", "json", "--session-dir", ".pi-sessions"]
         prov = self._provider()
         if prov:
             argv += ["--provider", prov]
+        argv += (["--session", session] if session else ["-c"])
         argv += self._denied(web_access=web_access, kb_access=kb_access)
-        argv += ["--", prompt]
+        argv += [prompt]
         return argv
 
     @staticmethod
@@ -1053,6 +1065,31 @@ class PiDriver(CliDriver):
             return str(result)
         return str(result or "")
 
+    @staticmethod
+    def _usage_tokens(ev: Any) -> "tuple[Optional[int], Optional[int]]":
+        """Best-effort (input, output) tokens from a pi event. pi nests usage
+        inside the message (`message.usage` with input/output/cacheRead fields);
+        tolerate a top-level `usage` with input_tokens/output_tokens too."""
+        u = None
+        if isinstance(ev, dict):
+            if isinstance(ev.get("usage"), dict):
+                u = ev["usage"]
+            msg = ev.get("message")
+            if u is None and isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
+                u = msg["usage"]
+        if not isinstance(u, dict):
+            return None, None
+        inp = int(u.get("input_tokens") or u.get("input") or 0) or None
+        out = int(u.get("output_tokens") or u.get("output") or 0) or None
+        return inp, out
+
+    @staticmethod
+    def _is_assistant(ev: Any) -> bool:
+        msg = ev.get("message") if isinstance(ev, dict) else None
+        if isinstance(msg, dict):
+            return str(msg.get("role") or "") == "assistant"
+        return False
+
     def parse_stream_steps(self, line: str) -> list[StreamStep]:
         # pi streams per-delta message_update events; emitting every text_delta as
         # its own reasoning step would flood the deck, so only COMPLETE blocks are
@@ -1066,6 +1103,9 @@ class PiDriver(CliDriver):
         except json.JSONDecodeError:
             return []
         t = ev.get("type")
+        if t == "session" and ev.get("id"):
+            # first event of a json-mode run: the session id (usable for resume)
+            return [StreamStep("session", session=str(ev["id"]))]
         if t == "tool_execution_start":
             args = ev.get("args") or {}
             arg = str(args.get("command") or args.get("query") or args.get("file_path") or "")[:300]
@@ -1075,21 +1115,30 @@ class PiDriver(CliDriver):
             full = self._tool_result_text(ev.get("result"))
             return [StreamStep("tool_result", text=full[:600], raw=full)]
         if t == "message_end":
-            text = self._message_text(ev.get("message"))
-            if text:
-                return [StreamStep("reasoning", text=text)]
+            # message_end fires for the USER message too — only surface assistant
+            # text as a reasoning step.
+            if self._is_assistant(ev):
+                text = self._message_text(ev.get("message"))
+                if text:
+                    return [StreamStep("reasoning", text=text)]
         if t == "turn_end":
-            text = self._message_text(ev.get("message"))
-            if text:
-                return [StreamStep("reasoning", text=text)]
+            if self._is_assistant(ev):
+                text = self._message_text(ev.get("message"))
+                if text:
+                    return [StreamStep("reasoning", text=text)]
         return []
 
     def parse(self, stdout: str, stderr: str) -> CliResult:
         """Accumulate assistant text across message_end/turn_end/agent_end events
-        (the final result of a `pi -p` run is the last assistant message), and
-        best-effort usage from any event carrying a `usage` block."""
+        (the final result of a `pi --mode json` run is the last assistant message),
+        best-effort usage from any event carrying a `usage` block (top-level or
+        nested in `message.usage`), and the session id from the leading
+        `{"type":"session"}` event. The same assistant message arrives in
+        message_end, turn_end AND agent_end.messages — dedupe by (role, text)."""
         parts: list[str] = []
+        seen: set[tuple[str, str]] = set()
         in_tok = out_tok = 0
+        session: Optional[str] = None
         for raw in stdout.splitlines():
             line = raw.strip()
             if not line or not line.startswith("{"):
@@ -1099,34 +1148,43 @@ class PiDriver(CliDriver):
             except json.JSONDecodeError:
                 continue
             t = ev.get("type")
+            if t == "session" and ev.get("id"):
+                session = str(ev["id"])
             if t in ("message_end", "turn_end", "agent_end"):
                 # agent_end carries an array of messages; message_end/turn_end a
                 # single message.
                 msgs = ev.get("messages")
                 if isinstance(msgs, list):
                     for m in msgs:
-                        txt = self._message_text(m)
-                        if txt:
-                            parts.append(txt)
+                        if isinstance(m, dict) and m.get("role") == "assistant":
+                            txt = self._message_text(m)
+                            key = ("assistant", txt)
+                            if txt and key not in seen:
+                                seen.add(key)
+                                parts.append(txt)
                 else:
-                    txt = self._message_text(ev.get("message"))
-                    if txt:
-                        parts.append(txt)
-            u = ev.get("usage") if isinstance(ev.get("usage"), dict) else None
-            if u:
-                in_tok = int(u.get("input_tokens") or in_tok)
-                out_tok = int(u.get("output_tokens") or out_tok)
+                    if self._is_assistant(ev):
+                        txt = self._message_text(ev.get("message"))
+                        key = ("assistant", txt)
+                        if txt and key not in seen:
+                            seen.add(key)
+                            parts.append(txt)
+            inp, outp = self._usage_tokens(ev)
+            if inp is not None:
+                in_tok = inp
+            if outp is not None:
+                out_tok = outp
         text = "\n".join(parts).strip()
         if text:
-            return CliResult(text=text[-8000:], session=None, cost_usd=None,
+            return CliResult(text=text[-8000:], session=session, cost_usd=None,
                              input_tokens=(in_tok or None), output_tokens=(out_tok or None),
                              raw_stderr=stderr[-2000:])
-        return CliResult(text=stdout[-8000:], session=None, raw_stderr=stderr[-2000:])
+        return CliResult(text=stdout[-8000:], session=session, raw_stderr=stderr[-2000:])
 
     def _hello_argv(self) -> list[str]:
         # a real one-turn json-mode probe — symmetric with the other engines.
-        return [self.bin, "-p", "--mode", "json", "--session-dir", ".pi-sessions",
-                "--", self.HELLO_PROMPT]
+        return [self.bin, "--mode", "json", "--session-dir", ".pi-sessions",
+                self.HELLO_PROMPT]
 
     def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
         # a completed model turn proves auth/quota and the backend round-trip.
@@ -1755,6 +1813,7 @@ _CONTAINER_ENGINE_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    "pi": "pi",
 }
 
 
@@ -1906,7 +1965,8 @@ def run_cli(driver: CliDriver, argv: list[str], *, cwd: str, timeout: int,
     run_env = {**os.environ, **env} if env else None
     try:
         proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=timeout, env=run_env)
+                              timeout=timeout, env=run_env,
+                              stdin=subprocess.DEVNULL if getattr(driver, "close_stdin", False) else None)
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else ""
         err = e.stderr if isinstance(e.stderr, str) else ""
@@ -1998,7 +2058,8 @@ def run_cli_streaming(
     # loop blocks until timeout (the deeper form of bug #2). We kill the whole GROUP.
     proc = _sp.Popen(argv, cwd=cwd, stdout=_sp.PIPE, stderr=_sp.PIPE,
                      text=True, encoding="utf-8", errors="replace", bufsize=1, env=run_env,
-                     start_new_session=True)  # line-buffered + own process group
+                     start_new_session=True,  # line-buffered + own process group
+                     stdin=_sp.DEVNULL if getattr(driver, "close_stdin", False) else None)
     try:
         proc_pgid: "Optional[int]" = os.getpgid(proc.pid)
     except Exception:
