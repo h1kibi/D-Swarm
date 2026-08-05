@@ -1,0 +1,7 @@
+{
+  "_comment": "Route-A bare-host worker config (copy to sessions/_worker_config.json). Engines: only pi — claude/codex/cursor need their own credential accounts + CLIs; a fresh host has neither, and the pre-dispatch health check hard-fails on missing accounts. Set MUTEKI_*_ACCOUNT_ID / install the CLIs if you add them back.",
+  "engines": ["pi-api-container"],
+  "worker_backend": "container",
+  "start_workers": 1,
+  "race_scout": false
+}
