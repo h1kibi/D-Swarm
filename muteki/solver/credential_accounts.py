@@ -98,48 +98,31 @@ class CredentialAccountStore:
         if not base.exists() or not base.is_dir():
             return None
         updated = self._updated_at(base)
-        if (base / "CLAUDE_CODE_OAUTH_TOKEN").exists():
-            return CredentialAccount(
-                account_id=account_id,
-                engine="claude",
-                mode="subscription_token",
-                present=True,
-                writable_state=False,
-                updated_at=updated,
-                details={"token_file": True, "secret_value": self._read_secret_value(base)},
-            )
-        if (base / "codex-home" / "auth.json").exists():
-            return CredentialAccount(
-                account_id=account_id,
-                engine="codex",
-                mode="chatgpt_auth_home",
-                present=True,
-                writable_state=True,
-                updated_at=updated,
-                details={
-                    "codex_home": True,
-                    "mutable_auth_home": True,
-                    "secret_value": self._read_secret_value(base),
-                },
-            )
-        if (base / "CURSOR_API_KEY").exists():
-            return CredentialAccount(
-                account_id=account_id,
-                engine="cursor",
-                mode="api_key",
-                present=True,
-                writable_state=False,
-                updated_at=updated,
-                details={"api_key_file": True, "secret_value": self._read_secret_value(base)},
-            )
         if (base / "API_KEY").exists():
             # A custom endpoint (API_KEY + BASE_URL) is engine-agnostic on disk —
             # runtime_env_for_engine keys off the ENGINE passed in, not the account.
-            # The optional ENGINE marker records which agent the operator registered
-            # it FOR, so the panel can bind/display it (claude/codex/cursor) instead
-            # of an orphan "api". No marker → legacy/programmatic "api".
+            # The optional ENGINE marker records which engine the operator
+            # registered it FOR, so the panel can bind/display it instead of an
+            # orphan "api". No marker → legacy/programmatic "api".
             target = self._read_target_engine(base)
             base_url = self._read_base_url(base)
+            if not base_url:
+                # A provider-key account (pi's DEEPSEEK/OPENAI/ANTHROPIC key) with
+                # no custom endpoint: probe/schedule it as a plain key account,
+                # NOT a custom endpoint (which would demand a base_url).
+                return CredentialAccount(
+                    account_id=account_id,
+                    engine=target or "api",
+                    mode="api_key",
+                    present=True,
+                    writable_state=False,
+                    updated_at=updated,
+                    details={
+                        "api_key_file": True,
+                        "secret_value": self._read_secret_value(base),
+                        "target_engine": target or None,
+                    },
+                )
             return CredentialAccount(
                 account_id=account_id,
                 engine=target or "api",
@@ -175,7 +158,6 @@ class CredentialAccountStore:
         account_id: str,
         engine: str,
         secret: str | None = None,
-        codex_auth_json: str | None = None,
         base_url: str | None = None,
         target_engine: str | None = None,
     ) -> dict[str, Any]:
@@ -183,8 +165,8 @@ class CredentialAccountStore:
         engine = engine.strip().lower()
         if not valid_account_id(account_id):
             raise ValueError("account_id must be 1-64 chars: letters, digits, _, ., -")
-        if engine not in {"claude", "codex", "cursor", "api"}:
-            raise ValueError("engine must be claude, codex, cursor, or api")
+        if engine not in {"pi", "api"}:
+            raise ValueError("engine must be pi or api")
 
         # EDIT support: secrets are never read back to the UI, so an operator who
         # only wants to change an endpoint's base_url / target_engine cannot
@@ -193,19 +175,7 @@ class CredentialAccountStore:
         # edit preserves it. _replace_account wipes the dir, so snapshot first.
         prior = self._snapshot_material(account_id)
 
-        if engine == "claude":
-            value = str(secret or "").strip() or prior.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-            if not value:
-                raise ValueError("CLAUDE_CODE_OAUTH_TOKEN is required")
-            base = self._replace_account(account_id)
-            self._atomic_write(base / "CLAUDE_CODE_OAUTH_TOKEN", value + "\n")
-        elif engine == "cursor":
-            value = str(secret or "").strip() or prior.get("CURSOR_API_KEY", "")
-            if not value:
-                raise ValueError("CURSOR_API_KEY is required")
-            base = self._replace_account(account_id)
-            self._atomic_write(base / "CURSOR_API_KEY", value + "\n")
-        elif engine == "api":
+        if engine == "api":
             value = str(secret or "").strip() or prior.get("API_KEY", "")
             if not value:
                 raise ValueError("API_KEY is required")
@@ -214,59 +184,33 @@ class CredentialAccountStore:
             # explicit clear isn't expressible here, and isn't needed by the panel.
             b = str(base_url or "").strip() or prior.get("BASE_URL", "")
             te = str(target_engine or "").strip().lower() or prior.get("ENGINE", "")
-            if te and te not in {"claude", "codex", "cursor"}:
-                raise ValueError("target_engine must be claude, codex, or cursor")
+            if te and te not in {"pi"}:
+                raise ValueError("target_engine must be pi")
             base = self._replace_account(account_id)
             self._atomic_write(base / "API_KEY", value + "\n")
             if b:
                 self._atomic_write(base / "BASE_URL", b + "\n")
-            # Record which agent this endpoint is FOR so the panel can bind/display
+            # Record which engine this endpoint is FOR so the panel can bind/display
             # it. The runtime injection stays engine-agnostic (it reads API_KEY/
             # BASE_URL regardless of this marker).
             if te:
                 self._atomic_write(base / "ENGINE", te + "\n")
         else:
-            value = str(codex_auth_json or secret or "").strip() or prior.get("codex_auth_json", "")
+            # pi: the account's key file is DEEPSEEK_API_KEY (the pi CLI's
+            # deepseek provider), written as API_KEY on disk and mapped to
+            # DEEPSEEK_API_KEY at runtime.
+            value = str(secret or "").strip() or prior.get("API_KEY", "")
             if not value:
-                raise ValueError("codex auth.json content is required")
-            # Ensure it is at least syntactically JSON before persisting.
-            import json
-            json.loads(value)
+                raise ValueError("API_KEY is required")
             base = self._replace_account(account_id)
-            codex_home = base / "codex-home"
-            codex_home.mkdir(parents=True, exist_ok=True)
-            self._chmod_private_dir(codex_home)
-            self._atomic_write(codex_home / "auth.json", value + "\n")
+            self._atomic_write(base / "API_KEY", value + "\n")
+            # ENGINE marker: this account belongs to the pi engine (not an
+            # orphan "api"), so the panel binds/displays it as pi.
+            self._atomic_write(base / "ENGINE", "pi\n")
 
         acct = self.inspect(account_id)
         assert acct is not None
         return self._public(acct)
-
-    def import_host_codex_auth(self, account_id: str) -> dict[str, Any]:
-        """Refresh a codex account from the HOST's ~/.codex/auth.json.
-
-        `codex login` refreshes the host's ~/.codex/auth.json, but container
-        workers mount the account-store COPY — so a fresh host login never reaches
-        the account until it's re-imported. This reads the host file and upserts it
-        (one click from the settings page). Only meaningful on a bare host where
-        ~/.codex belongs to the operator; the caller guards on is_web_container().
-
-        Raises ValueError with an actionable message if the host file is missing
-        or invalid (the route maps it to a 400/404).
-        """
-        host_auth = Path.home() / ".codex" / "auth.json"
-        if not host_auth.exists():
-            raise ValueError(
-                f"host ~/.codex/auth.json not found ({host_auth}) — run `codex login` first"
-            )
-        try:
-            content = host_auth.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ValueError(f"could not read {host_auth}: {exc}") from exc
-        # upsert_secret validates it's JSON and writes codex-home/auth.json.
-        return self.upsert_secret(
-            account_id=account_id, engine="codex", codex_auth_json=content
-        )
 
     def _replace_account(self, account_id: str) -> Path:
         base = self.root / account_id
@@ -306,7 +250,7 @@ class CredentialAccountStore:
             marker = mp.read_text(encoding="utf-8").strip().lower()
         except OSError:
             return ""
-        return marker if marker in {"claude", "codex", "cursor"} else ""
+        return marker if marker in {"pi"} else ""
 
     @staticmethod
     def _read_base_url(base: Path) -> str:
@@ -328,26 +272,18 @@ class CredentialAccountStore:
         """The account's stored SECRET in plaintext, or "" if absent/unreadable.
 
         ⚠️ SECURITY POSTURE: this deliberately returns the raw credential
-        (OAuth token / API key / codex auth.json) so the settings UI can ECHO it
+        (OAuth token / API key) so the settings UI can ECHO it
         into the edit form (operator request: "show it, let me edit it"). It is
         therefore included in the JSON of the (password-authenticated) credential
         endpoints and visible in the browser's Network tab. Callers that don't
         want the plaintext must strip details.secret_value before forwarding.
 
-        For codex the value is the auth.json contents (the form edits it as JSON);
-        for the other engines it's the single-line token/key.
+        it's the single-line token/key.
         """
-        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY"):
-            p = base / rel
-            if p.exists():
-                try:
-                    return p.read_text(encoding="utf-8").strip()
-                except OSError:
-                    return ""
-        codex_auth = base / "codex-home" / "auth.json"
-        if codex_auth.exists():
+        p = base / "API_KEY"
+        if p.exists():
             try:
-                return codex_auth.read_text(encoding="utf-8").strip()
+                return p.read_text(encoding="utf-8").strip()
             except OSError:
                 return ""
         return ""
@@ -390,39 +326,29 @@ class CredentialAccountStore:
     def _snapshot_material(self, account_id: str) -> dict[str, str]:
         """Read an existing account's stored secrets/markers before a rewrite.
 
-        Returns a dict keyed by the on-disk filename (plus the synthetic key
-        ``codex_auth_json``) holding the trimmed prior values, or empty strings
-        for anything absent. Used so a metadata-only edit (blank secret) can fall
-        back to the stored credential instead of erroring or wiping it. Never
-        raises — a fresh/unreadable account simply yields blanks.
+        Returns a dict keyed by the on-disk filename holding the trimmed prior
+        values, or empty strings for anything absent. Used so a metadata-only
+        edit (blank secret) can fall back to the stored credential instead of
+        erroring or wiping it. Never raises — a fresh/unreadable account simply
+        yields blanks.
         """
         base = self.root / account_id
         out: dict[str, str] = {}
-        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL", "ENGINE"):
+        for rel in ("API_KEY", "BASE_URL", "ENGINE"):
             p = base / rel
             try:
                 out[rel] = p.read_text(encoding="utf-8").strip() if p.exists() else ""
             except OSError:
                 out[rel] = ""
-        codex_auth = base / "codex-home" / "auth.json"
-        try:
-            out["codex_auth_json"] = (
-                codex_auth.read_text(encoding="utf-8").strip() if codex_auth.exists() else ""
-            )
-        except OSError:
-            out["codex_auth_json"] = ""
         return out
 
     @staticmethod
     def _clear_account_material(base: Path) -> None:
-        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL", "ENGINE"):
+        for rel in ("API_KEY", "BASE_URL", "ENGINE"):
             try:
                 (base / rel).unlink(missing_ok=True)
             except OSError:
                 pass
-        codex_home = base / "codex-home"
-        if codex_home.exists():
-            shutil.rmtree(codex_home, ignore_errors=True)
 
 
 def runtime_env_for_engine(
@@ -451,85 +377,11 @@ def runtime_env_for_engine(
     base = root / account_id if root is not None and account_id else None
     out: dict[str, str] = {}
 
-    if e == "claude":
-        if base is not None and (base / "API_KEY").exists():
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="ANTHROPIC_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="ANTHROPIC_AUTH_TOKEN",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="ANTHROPIC_BASE_URL")
-        else:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="CLAUDE_CODE_OAUTH_TOKEN",
-                env_name="CLAUDE_CODE_OAUTH_TOKEN",
-                container=container,
-                container_path=_container_secret_path(account_id, "CLAUDE_CODE_OAUTH_TOKEN"),
-                source=source,
-            )
-    elif e == "codex":
-        if base is not None and (base / "API_KEY").exists():
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="OPENAI_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="OPENAI_BASE_URL")
-        codex_home = base / "codex-home" if base is not None else None
-        if "OPENAI_API_KEY" not in out and "OPENAI_API_KEY_FILE" not in out and codex_home is not None and codex_home.exists():
-            out["CODEX_HOME"] = (
-                f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/codex-home"
-                if container else str(codex_home.resolve())
-            )
-        elif source.get("CODEX_HOME"):
-            out["CODEX_HOME"] = str(source["CODEX_HOME"])
-    elif e == "cursor":
-        if base is not None and (base / "API_KEY").exists():
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="CURSOR_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="CURSOR_ENDPOINT")
-        else:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="CURSOR_API_KEY",
-                env_name="CURSOR_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "CURSOR_API_KEY"),
-                source=source,
-            )
-
     # pi: the pi CLI reads standard provider env keys (ANTHROPIC_API_KEY /
     # OPENAI_API_KEY / DEEPSEEK_API_KEY) — which provider it uses is decided by
     # MUTEKI_PI_PROVIDER / --provider on the driver. A custom-endpoint account
     # maps to the OpenAI-compatible path so pi's openai provider can consume it.
-    elif e == "pi":
+    if e == "pi":
         if base is not None and (base / "API_KEY").exists():
             prov = str(source.get("MUTEKI_PI_PROVIDER", "")).strip().lower()
             if prov == "deepseek":
@@ -623,52 +475,23 @@ def detect_system_login(engine: str, env: Mapping[str, str] | None = None) -> st
     host HOME+env, so an unregistered account silently falls back to the host's
     existing CLI login. Container mode does NOT use this (host login isn't
     mounted) — there an account is mandatory.
-
-    We REUSE the existing quota-path login probes (cli_driver) so the detection
-    matches reality: claude's login lives in the macOS Keychain ("Claude
-    Code-credentials"), NOT a file — checking only ~/.claude/.credentials.json
-    would report a logged-in mac as absent.
     """
     e = (engine or "").strip().lower()
     source = env or os.environ
 
-    if e == "claude":
-        # env token wins (explicit), else the keychain/file probe.
-        if source.get("CLAUDE_CODE_OAUTH_TOKEN") or source.get("ANTHROPIC_API_KEY"):
+    if e == "pi":
+        # the pi CLI's deepseek provider reads DEEPSEEK_API_KEY; a present host
+        # key means a usable host-side login.
+        if source.get("DEEPSEEK_API_KEY"):
             return "present"
-        try:
-            from muteki.solver.cli_driver import _claude_oauth  # lazy: avoid cycle
-            return "present" if _claude_oauth() is not None else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "codex":
-        if source.get("OPENAI_API_KEY"):
-            return "present"
-        try:
-            # An explicit CODEX_HOME is authoritative — don't also fall back to
-            # ~/.codex (that would let a host login mask an empty CODEX_HOME).
-            codex_home = source.get("CODEX_HOME")
-            root = Path(codex_home) if codex_home else (Path.home() / ".codex")
-            return "present" if (root / "auth.json").exists() else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "cursor":
-        if source.get("CURSOR_API_KEY"):
-            return "present"
-        try:
-            from muteki.solver.cli_driver import _cursor_session_cookie  # lazy
-            return "present" if _cursor_session_cookie() is not None else "absent"
-        except Exception:
-            return "unknown"
+        return "absent"
 
     return "unknown"
 
 
 # Filenames whose containing dir must be WRITABLE inside the container so the CLI
-# can refresh state in place (codex ChatGPT-auth refreshes CODEX_HOME/auth.json).
-_WRITABLE_STATE_DIRS = ("codex-home",)
+# can refresh state in place. pi's key file is read-only for the worker.
+_WRITABLE_STATE_DIRS = ()
 
 
 def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:
@@ -676,16 +499,12 @@ def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:
 
     The host account store holds 0600 files owned by the host user; a container
     worker runs as a different uid ('kali') and cannot read them through a plain
-    read-only bind mount (#15), and codex needs CODEX_HOME/auth.json to be WRITABLE
-    so it can refresh its OAuth token in place (#14 — the raw store mount is
-    read-only and must stay so).
+    read-only bind mount (#15).
 
     This copies the store into `dest_root` (a per-run, gitignored, ephemeral dir
     under the run workspace) with permissions the container user can use:
-      - static secret files (API keys / OAuth tokens) → 0644 (readable, not writable
-        by the worker — the worker only reads them);
-      - writable-state dirs (codex-home) → dir 0777 + files 0666 so the CLI can
-        rewrite auth.json after a token refresh.
+      - static secret files (API keys) → 0644 (readable, not writable by the
+        worker — the worker only reads them).
     The HOST store is never modified and never made world-writable; this projection
     is the only thing the container sees. Returns dest_root.
     """

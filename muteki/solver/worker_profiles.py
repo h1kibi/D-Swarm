@@ -9,14 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 
-VALID_BASE_ENGINES = ("claude", "codex", "cursor", "pi")
+VALID_BASE_ENGINES = ("pi",)
 TRANSPORT_TO_ENGINE = {
-    "claude": "claude",
-    "claude_code": "claude",
-    "codex": "codex",
-    "codex_cli": "codex",
-    "cursor": "cursor",
-    "cursor_agent": "cursor",
     "pi": "pi",
     "pi_cli": "pi",
 }
@@ -40,10 +34,10 @@ def coerce_pos_int(value: Any, default: int) -> int:
 
 
 def base_engine_for_profile(profile_or_name: Any) -> str:
-    """Resolve a profile dict OR a bare string to a BASE engine (claude/codex/cursor).
+    """Resolve a profile dict OR a bare string to a BASE engine (pi).
 
-    A bare string may be a base engine ("codex"), a transport ("codex_cli"), or a
-    PROFILE ID ("codex-sub-container"). Profile ids are "<base>-<suffix>", so when a
+    A bare string may be a base engine ("pi"), a transport ("pi_cli"), or a
+    PROFILE ID ("pi-sub-container"). Profile ids are "<base>-<suffix>", so when a
     string is neither a known base nor transport we recover the base from its segments
     (the first segment that is a valid base engine). This is what keeps a profile id
     from being passed straight to DRIVERS[...] (→ KeyError) downstream. The original
@@ -125,7 +119,7 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "credential_account": credential_account,
         "api_key_ref": str(item.get("api_key_ref") or "").strip(),
         "base_url": str(item.get("base_url") or "").strip(),
-        "wire_api": str(item.get("wire_api") or ("responses" if engine == "codex" else "")).strip(),
+        "wire_api": str(item.get("wire_api") or "").strip(),
         "runtime": str(item.get("runtime") or "docker-web").strip(),
         "roles": roles,
         "race": bool(item.get("race", "race" in roles)),

@@ -62,11 +62,6 @@ _PENDING_HELP_MAX = 16
 
 _CONTAINER_BLACKBOARD_SKILL = "/opt/muteki/muteki-blackboard"
 _BLACKBOARD_SKILL_LINKS = (
-    ".claude/skills/muteki-blackboard",
-    ".agents/skills/muteki-blackboard",
-    ".codex/skills/muteki-blackboard",
-    ".cursor/skills-cursor/muteki-blackboard",
-    ".cursor/skills/muteki-blackboard",
     # pi (route A): pi discovers skills under ~/.pi/agent/skills
     ".pi/agent/skills/muteki-blackboard",
 )
@@ -220,12 +215,11 @@ class Swarm:
         # coordinator loop drains this each tick. None → no runtime worker control.
         worker_cmds: "Optional[asyncio.Queue]" = None,
         executor: str = "cli",
-        cli_engine: str = "claude",
+        cli_engine: str = "pi",
         cli_race: bool = False,
         # the engine roster this swarm may use (race + coordinator pick from it,
-        # filtered by healthcheck). Default keeps the historical claude+codex pair
-        # so existing tests/behavior are unchanged; the web driver passes the full
-        # ["cursor","claude","codex"] roster for a three-engine race.
+        # filtered by healthcheck). Defaults to the single pi engine; the web
+        # driver passes the configured profile roster for a multi-profile race.
         engines: "Optional[list[str]]" = None,
         web_access: bool = True,
         kb: bool = True,
@@ -388,7 +382,7 @@ class Swarm:
                      for p in self.worker_profiles}
             self.engines.sort(key=lambda e: _prio.get(e, (10**9, e)))
         else:
-            roster = engines if engines else ["claude", "codex"]
+            roster = engines if engines else ["pi"]
             seen: set[str] = set()
             self.engines = [e for e in roster if not (e in seen or seen.add(e))]
         self._profiles_by_name: dict[str, dict] = {p["name"]: p for p in self.worker_profiles}
@@ -721,13 +715,13 @@ class Swarm:
             # lineup specs only supply solver_id labels, cycled).
             engines = [e for e in self.engines if _healthy(e, "race")]
             if not engines and not self.worker_profiles:
-                engines = ["claude"]
+                engines = ["pi"]
         else:
-            # single engine; degrade to claude if the chosen one is unhealthy.
+            # single engine; degrade to pi if the chosen one is unhealthy.
             if _healthy(self.cli_engine, "bootstrap"):
                 engines = [self.cli_engine]
             elif not self.worker_profiles:
-                engines = ["claude"]
+                engines = ["pi"]
             else:
                 engines = []
 
@@ -1681,7 +1675,7 @@ class Swarm:
                 self._note_engine_degraded(e, detail or "health check failed", role=role)
         if engines:
             return engines
-        return ["claude"] if not self.worker_profiles else []
+        return ["pi"] if not self.worker_profiles else []
 
     async def _healthy_engines_async(self, *, role: str = "bootstrap") -> list[str]:
         """Run CLI health probes off the FastAPI/coordination event loop.

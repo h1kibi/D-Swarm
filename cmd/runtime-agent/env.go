@@ -7,19 +7,15 @@ import (
 
 // baseEnv is the minimal environment a worker starts with before the host's overlay.
 // We keep it small and deterministic; the host passes the engine-specific vars
-// (MUTEKI_*, ANTHROPIC_*, CLAUDE_*, CODEX_*, CURSOR_*, OPENAI_*, HOME) explicitly.
+// (MUTEKI_*, ANTHROPIC_*, OPENAI_*, DEEPSEEK_*, HOME) explicitly.
 func baseEnv() map[string]string {
 	env := map[string]string{
-		// cursor-agent installs to ~/.local/bin which is NOT on a non-login PATH —
-		// include it so `cursor-agent` resolves (the old container bug). claude/codex
-		// live in /usr/local/bin.
-		"PATH": "/home/kali/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME": "/home/kali",
-		"USER": "kali",
+		"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME":  "/home/kali",
+		"USER":  "kali",
 		"LOGNAME": "kali",
-		"LANG": "C.UTF-8",
+		"LANG":  "C.UTF-8",
 		"PYTHONUNBUFFERED": "1",
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
 	}
 	// Inherit a TERM/TZ if the supervisor has one.
 	for _, k := range []string{"TERM", "TZ"} {
@@ -37,8 +33,6 @@ func baseEnv() map[string]string {
 // the bare var).
 func applyTokenFiles(env map[string]string) {
 	pairs := []struct{ fileVar, valueVar string }{
-		{"CLAUDE_CODE_OAUTH_TOKEN_FILE", "CLAUDE_CODE_OAUTH_TOKEN"},
-		{"CURSOR_API_KEY_FILE", "CURSOR_API_KEY"},
 		{"ANTHROPIC_API_KEY_FILE", "ANTHROPIC_API_KEY"},
 		{"OPENAI_API_KEY_FILE", "OPENAI_API_KEY"},
 		// pi (route A): the pi CLI reads DEEPSEEK_API_KEY for its deepseek provider

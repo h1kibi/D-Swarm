@@ -125,11 +125,10 @@ def _repo_blackboard_script() -> Optional[str]:
         return None
 
 
-# The user-scope copies the worker CLIs auto-discover (Claude/Cursor: ~/.claude/skills;
-# Codex: ~/.agents/skills), installed once by scripts/install_blackboard_skill.sh.
+# The user-scope copy pi auto-discovers (~/.pi/agent/skills), installed once by
+# scripts/install_blackboard_skill.sh.
 _DEPLOYED_BLACKBOARD_SCRIPTS = (
-    "~/.claude/skills/muteki-blackboard/blackboard.py",
-    "~/.agents/skills/muteki-blackboard/blackboard.py",
+    "~/.pi/agent/skills/muteki-blackboard/blackboard.py",
 )
 
 
@@ -652,7 +651,7 @@ class CliSolver:
         knowledge: Optional[Any] = None,
         shared_graph: Optional[Any] = None,
         driver: Optional[CliDriver] = None,
-        engine: str = "claude",
+        engine: str = "pi",
         max_turns: int = 80,
         timeout: int = 2400,
         workdir: Optional[str] = None,
@@ -684,9 +683,9 @@ class CliSolver:
         self.run_id = run_id or challenge.id
         self.graph = SolveGraph(challenge=challenge)
         # solver_id: prefer an explicit label (the coordinator hands each spawned
-        # worker a UNIQUE one like "cli-claude#3" so the deck draws one lane per
-        # worker — without it every claude worker would collapse onto the single
-        # "cli-claude" lane and you couldn't tell parallel/re-bootstrapped workers
+        # worker a UNIQUE one like "cli-pi#3" so the deck draws one lane per
+        # worker — without it every pi worker would collapse onto the single
+        # "cli-pi" lane and you couldn't tell parallel/re-bootstrapped workers
         # apart). Then the spec's label; in race mode specs may be shared or None,
         # so fall back to the engine. The "cli-<engine>" prefix is preserved in all
         # cases so workerEngine() on the deck still detects the engine badge.
@@ -714,11 +713,11 @@ class CliSolver:
         # off by denying its mcp tools. kb_config is accepted for back-compat /
         # tests but is no longer used to mount the server.
         # KB is OFF unless a KB MCP is configured (MUTEKI_KB_MCP_NAME); there is no
-        # bundled KB service, so out of the box this is always off. When configured,
-        # only the claude engine inherits the user-scope KB (codex has its own config
-        # dir and doesn't see it), so KB is on iff a name is set AND requested AND
-        # this worker runs claude. (kb_config kept for back-compat; unused now.)
-        self.kb = bool(KB_MCP_NAME) and bool(kb) and self.driver.name == "claude"
+        # bundled KB service, so out of the box this is always off. The KB MCP was
+        # a claude user-scope mechanism; with the pi-only roster, KB lands with the
+        # pi extension work — until then the block stays empty (kb accepted for
+        # back-compat; unused now).
+        self.kb = False
         self.kb_config = kb_config
         # mode: "bootstrap" = whole-challenge rush (current behavior);
         # "explore" = claim one intent, explore that direction only,
@@ -1007,12 +1006,10 @@ class CliSolver:
         if repo is not None:
             return repo
         # Installed deployment (pip/wheel; skills/ not adjacent to the package):
-        # fall back to the engine-specific user-scope copy installed by
-        # scripts/install_blackboard_skill.sh. Claude/Cursor read ~/.claude/skills;
-        # Codex reads ~/.agents/skills.
-        skill_root = ".agents" if self.driver.name == "codex" else ".claude"
+        # fall back to pi's user-scope copy installed by
+        # scripts/install_blackboard_skill.sh (~/.pi/agent/skills).
         return os.path.expanduser(
-            f"~/{skill_root}/skills/muteki-blackboard/blackboard.py")
+            "~/.pi/agent/skills/muteki-blackboard/blackboard.py")
 
     def _worker_env(self) -> dict:
         """Env vars handed to the worker subprocess.
@@ -1318,11 +1315,6 @@ class CliSolver:
                     out[i + 1] = prov
             else:
                 out = insert_before_prompt(out, ["--provider", prov])
-
-        if self.driver.name == "cursor":
-            endpoint = (env.get("CURSOR_ENDPOINT") or "").strip()
-            if endpoint and "--endpoint" not in out:
-                out = insert_before_prompt(out, ["--endpoint", endpoint])
         return out
 
     async def _run_streaming(self, argv: list[str], *, cwd: str, timeout: int) -> CliResult:
@@ -1730,7 +1722,7 @@ class CliSolver:
     # signatures that the flag in `raw_output` was SCRAPED from local muteki /
     # agent storage (other runs' logs, the engine's own conversation history,
     # sibling process titles) rather than RECOVERED from the challenge target.
-    # run-11551: a codex worker ran `rg 'FOUND_FLAG=bl_…' ~/.codex/sessions
+    # run-11551: a worker ran `rg 'FOUND_FLAG=bl_…' ~/.pi/sessions
     # sessions/run-…` and found the L2 flag from a PRIOR run on disk, then
     # restated it as its own FOUND_FLAG — falsely "solving" L4 with the L2 flag.
     # A real recovered flag traces to the TARGET's verifier output, never to a
@@ -1757,14 +1749,13 @@ class CliSolver:
     # Part 1 — UNAMBIGUOUS launder signatures. These name muteki/agent INTERNAL
     # storage that no genuine target solve ever touches (the engine's own
     # conversation history dirs, another run's PERSISTED EVENT LOG — `run-NNNN.jsonl` /
-    # `rollout-*.jsonl` are muteki/codex internal filenames a CTF target would never
+    # `rollout-*.jsonl` are muteki internal filenames a CTF target would never
     # serve), or describe the "harvest from a sibling process" behavior in words. They
     # fire on their own, scanned over the WHOLE raw_output (a grep-from-disk launder
     # can restate the stolen flag arbitrarily far from the read, so localizing to the
     # FOUND_FLAG line would miss it — run-11551).
     _LAUNDER_RE = re.compile(
-        r"(?:\.codex/sessions|\.claude/projects|\.agents/skills|"
-        r"\.cursor/projects|agent-transcripts|"   # cursor's own conversation history
+        r"(?:\.pi/sessions|"                          # pi's own conversation history
         r"run-\d{3,}\.jsonl|rollout-[0-9a-f-]+\.jsonl|"  # other runs' persisted logs
         r"process title|process output so the token|live process output|"
         r"from (?:a |another |the )?(?:teammate|sibling).*process)",

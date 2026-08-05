@@ -37,17 +37,8 @@ class ModelPrice:
 PRICES: dict[str, ModelPrice] = {
     "deepseek-v4-pro": ModelPrice(input_per_m=0.55, output_per_m=2.19),
     "deepseek-v4-flash": ModelPrice(input_per_m=0.07, output_per_m=0.28),
-    # codex (GPT-5 class) — subscription CLIs no longer report total_cost_usd,
-    # so we re-derive an API-EQUIVALENT cost from the tokens it does report (the
-    # same "what would this have cost on the API" lens we keep for claude). GPT-5
-    # list price per 1M: input $1.25, output $10.00 (reasoning bills as output).
-    # Cached input ($0.125/M) is folded into input here; cli_driver discounts it.
-    "codex": ModelPrice(input_per_m=1.25, output_per_m=10.0),
     "gpt-5": ModelPrice(input_per_m=1.25, output_per_m=10.0),
 }
-# Cached-input rate for codex/GPT-5 (per 1M). cli_driver prices cached tokens at
-# this rate and fresh tokens at the full input rate when computing codex cost.
-CODEX_CACHED_INPUT_PER_M = 0.125
 # Fallback for unknown models so accounting never silently drops to zero.
 _DEFAULT_PRICE = ModelPrice(input_per_m=1.0, output_per_m=3.0)
 

@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from muteki.core.cost import PRICES, CODEX_CACHED_INPUT_PER_M, _DEFAULT_PRICE
 from muteki.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
 
 
@@ -49,43 +48,19 @@ from muteki.solver.worker_profiles import base_engine_for_profile, profile_uses_
 # runnable OFFICIAL binary and pin it.
 #
 # Precedence:
-#   1. explicit override  — env MUTEKI_CLAUDE_BIN / MUTEKI_CODEX_BIN (operator wins)
+#   1. explicit override  — env MUTEKI_PI_BIN (operator wins)
 #   2. known official install locations, in order
 #   3. every `name` on PATH, skipping ones whose realpath looks like a known
 #      bad repackage (cometix), taking the first that actually runs
 #   4. bare `name` as a last resort (preserves old behavior if nothing else found)
 _ENV_OVERRIDE = {
-    "claude": "MUTEKI_CLAUDE_BIN",
-    "codex": "MUTEKI_CODEX_BIN",
-    "cursor": "MUTEKI_CURSOR_BIN",
     "pi": "MUTEKI_PI_BIN",
 }
-
-# The on-disk binary basename for an engine, when it differs from the engine
-# `name` we use everywhere else. Cursor's headless CLI ships as `cursor-agent`
-# (the bare `cursor` launcher opens the GUI / is a different tool), so a PATH
-# scan for the engine "cursor" must actually look for `cursor-agent`.
-_BIN_NAME = {"cursor": "cursor-agent"}
 
 # Official / first-party install locations we trust, highest first. `~` expanded
 # at resolve time. The local native installer and Homebrew cask are the two
 # blessed macOS paths; /usr/local/bin covers a plain npm global on Linux.
 _KNOWN_GOOD = {
-    "claude": [
-        "~/.local/bin/claude",
-        "/opt/homebrew/bin/claude",
-        "/usr/local/bin/claude",
-    ],
-    "codex": [
-        "~/.local/bin/codex",
-        "/opt/homebrew/bin/codex",
-        "/usr/local/bin/codex",
-    ],
-    "cursor": [
-        "~/.local/bin/cursor-agent",
-        "/opt/homebrew/bin/cursor-agent",
-        "/usr/local/bin/cursor-agent",
-    ],
     # pi ships as a self-contained binary; the official Windows install lives
     # under Program Files and is on PATH (btfly images bake it at /usr/local/bin).
     "pi": [
@@ -142,9 +117,8 @@ def resolve_engine_bin(name: str) -> str:
         if Path(p).exists() and not _looks_bad(p) and _runs_ok(p):
             return p
 
-    # 3. PATH scan, skipping known-bad repackages, first that runs wins. The
-    #    on-disk basename may differ from the engine name (cursor → cursor-agent).
-    bin_basename = _BIN_NAME.get(name, name)
+    # 3. PATH scan, skipping known-bad repackages, first that runs wins.
+    bin_basename = name
     for p in _which_all(bin_basename):
         if not _looks_bad(p) and _runs_ok(p):
             return p
@@ -169,7 +143,7 @@ def resolve_engine_bin_source(name: str) -> str:
         p = os.path.expanduser(cand)
         if Path(p).exists() and not _looks_bad(p) and _runs_ok(p):
             return "known-good"
-    bin_basename = _BIN_NAME.get(name, name)
+    bin_basename = name
     for p in _which_all(bin_basename):
         if not _looks_bad(p) and _runs_ok(p):
             return "path"
@@ -447,517 +421,6 @@ class CliDriver(abc.ABC):
 _FLAG_LINE = re.compile(r"FOUND_FLAG=\s*(\S+)")
 
 
-class ClaudeCodeDriver(CliDriver):
-    """`claude -p` — pre-seeds a uuid session; resumes with `-r`. Bare host,
-    --dangerously-skip-permissions (full shell), JSON output for clean parsing."""
-    name = "claude"
-
-    def new_session(self) -> Optional[str]:
-        return str(uuid.uuid4())
-
-    # claude exposes WebSearch + WebFetch by default; deny them for a clean
-    # (offline) eval so the agent can't fetch a challenge writeup.
-    _WEB_TOOLS = ["WebSearch", "WebFetch"]
-
-    def _denied(self, *, web_access: bool, kb_access: bool) -> list[str]:
-        """The --disallowed-tools list for this run (empty → flag omitted)."""
-        deny: list[str] = []
-        if not web_access:
-            deny += self._WEB_TOOLS
-        if not kb_access and self.KB_TOOL_PREFIX:
-            # deny the whole inherited KB MCP by server prefix (only if one is
-            # configured — KB_TOOL_PREFIX is empty when MUTEKI_KB_MCP_NAME is unset)
-            deny.append(self.KB_TOOL_PREFIX)
-        return ["--disallowed-tools", *deny] if deny else []
-
-    def _fmt(self, stream: bool) -> list[str]:
-        # stream-json emits one event per step (needs --verbose); json is a single
-        # final doc. Both parse the same way via parse() on accumulated stdout.
-        return (["--output-format", "stream-json", "--verbose"] if stream
-                else ["--output-format", "json"])
-
-    def build_execute(
-        self, prompt: str, session: Optional[str], *,
-        web_access: bool = True, kb_access: bool = True, stream: bool = False,
-    ) -> list[str]:
-        argv = [self.bin, "-p", *self._fmt(stream),
-                "--dangerously-skip-permissions"]
-        if session:
-            argv += ["--session-id", session]
-        argv += self._denied(web_access=web_access, kb_access=kb_access)
-        argv += ["--", prompt]
-        return argv
-
-    def build_resume(
-        self, prompt: str, session: str, *,
-        web_access: bool = True, kb_access: bool = True, stream: bool = False,
-    ) -> list[str]:
-        return [self.bin, "-r", session, "-p", *self._fmt(stream),
-                "--dangerously-skip-permissions",
-                *self._denied(web_access=web_access, kb_access=kb_access),
-                "--", prompt]
-
-    @staticmethod
-    def _usage_tokens(usage: dict) -> tuple[Optional[int], Optional[int]]:
-        """claude's result `usage` block → (input, output) tokens for the deck's
-        token column. Input counts the fresh + both cache buckets (read/creation);
-        output is the completion. None when the block is absent."""
-        if not isinstance(usage, dict) or not usage:
-            return None, None
-        inp = (int(usage.get("input_tokens") or 0)
-               + int(usage.get("cache_read_input_tokens") or 0)
-               + int(usage.get("cache_creation_input_tokens") or 0))
-        outp = int(usage.get("output_tokens") or 0)
-        return (inp or None), (outp or None)
-
-    def parse(self, stdout: str, stderr: str) -> CliResult:
-        # Plain --output-format json: one JSON document.
-        try:
-            d = json.loads(stdout)
-            inp, outp = self._usage_tokens(d.get("usage") or {})
-            return CliResult(
-                text=str(d.get("result", "")),
-                session=d.get("session_id"),
-                cost_usd=d.get("total_cost_usd"),
-                input_tokens=inp,
-                output_tokens=outp,
-                num_turns=d.get("num_turns"),
-                raw_stderr=stderr[-2000:],
-            )
-        except json.JSONDecodeError:
-            pass
-        # stream-json: many JSONL lines — the final {"type":"result",...} is the
-        # outcome. Scan for it (and fall back to raw text if absent).
-        result_text, session, cost, turns, inp, outp = "", None, None, None, None, None
-        # fallback usage from the LAST intermediate assistant message — a worker
-        # KILLED mid-run (race loser / steer) never emits the final `result`, but
-        # each assistant event carries a cumulative `usage` block, so the latest
-        # one is the best estimate of what it burned. Without this, killed claude
-        # workers report 0 tokens and their spend silently vanishes from the ledger.
-        stream_in = stream_out = None
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "result":
-                result_text = str(ev.get("result", ""))
-                cost = ev.get("total_cost_usd")
-                turns = ev.get("num_turns")
-                inp, outp = self._usage_tokens(ev.get("usage") or {})
-            if ev.get("type") == "assistant":
-                u = (ev.get("message") or {}).get("usage")
-                si, so = self._usage_tokens(u or {})
-                if si is not None:
-                    stream_in = si
-                if so is not None:
-                    stream_out = so
-            if ev.get("session_id"):
-                session = ev["session_id"]
-        if inp is None and outp is None:  # no final result → use the streamed estimate
-            inp, outp = stream_in, stream_out
-        if result_text or session:
-            return CliResult(text=result_text, session=session, cost_usd=cost,
-                             input_tokens=inp, output_tokens=outp,
-                             num_turns=turns, raw_stderr=stderr[-2000:])
-        return CliResult(text=stdout[-8000:], raw_stderr=stderr[-2000:])
-
-    def parse_stream_line(self, line: str) -> Optional[StreamStep]:
-        # single-step view (first step of the line); see parse_stream_steps for the
-        # all-blocks version the streaming runner uses.
-        steps = self.parse_stream_steps(line)
-        return steps[0] if steps else None
-
-    def parse_stream_steps(self, line: str) -> list[StreamStep]:
-        # #18: a claude assistant message can carry MULTIPLE content blocks (text +
-        # tool_use + more text); emit a StreamStep for EVERY block so a FOUND_FLAG /
-        # VERIFIED_FACT in a later block propagates live, not only via final parse().
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            return []
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        t = ev.get("type")
-        if t == "system" and ev.get("session_id"):
-            return [StreamStep("session", session=ev["session_id"])]
-        steps: list[StreamStep] = []
-        if t == "assistant":
-            for b in (ev.get("message", {}) or {}).get("content", []) or []:
-                bt = b.get("type")
-                if bt == "text" and b.get("text", "").strip():
-                    steps.append(StreamStep("reasoning", text=b["text"].strip()))
-                elif bt == "tool_use":
-                    inp = b.get("input", {}) or {}
-                    arg = inp.get("command") or inp.get("query") or inp.get("file_path") or ""
-                    steps.append(StreamStep("tool", tool=str(b.get("name", "")), text=str(arg)[:300]))
-        elif t == "user":
-            for b in (ev.get("message", {}) or {}).get("content", []) or []:
-                if isinstance(b, dict) and b.get("type") == "tool_result":
-                    c = b.get("content")
-                    txt = c if isinstance(c, str) else json.dumps(c)
-                    full = txt or ""
-                    # text=truncated for the deck; raw=full for the provenance gate.
-                    steps.append(StreamStep("tool_result", text=full[:600], raw=full))
-        return steps
-
-    def _hello_argv(self) -> list[str]:
-        # one-turn JSON dry-run; _hello_ok asserts the result envelope came back.
-        return [self.bin, "-p", "--output-format", "json", "--max-turns", "1",
-                "--", self.HELLO_PROMPT]
-
-    def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
-        # exit 0 AND a result envelope — proves the turn round-tripped, not just
-        # that the process started (a quota/auth refusal still exits with no result).
-        return r.returncode == 0 and '"result"' in (r.stdout or "")
-
-
-class CodexDriver(CliDriver):
-    """`codex exec` — engine assigns the session (scraped from stderr 'session id:');
-    resumes with `codex exec resume <id>`. May be usage-limited (degrade to claude)."""
-    name = "codex"
-    # Codex CLI can burn ~100s on websocket retries before falling back to HTTPS.
-    # Keep the deep probe truthful: a completed fallback turn is healthy, not red.
-    _HELLO_TIMEOUT = 150
-    _SESSION_RE = re.compile(r"session id:\s*([0-9a-fA-F-]+)")
-
-    def _globals(self, *, web_access: bool) -> list[str]:
-        # `--search` is a GLOBAL codex flag (before the `exec` subcommand) that
-        # enables the native web_search tool. codex exec has NO web tool unless it
-        # is passed → offline is the default; we only opt IN when web_access is on.
-        # (The optional KB MCP lives in claude's user config, not codex's ~/.codex,
-        # so codex doesn't see it — claude is the KB consumer.)
-        return ["--search"] if web_access else []
-
-    def build_execute(
-        self, prompt: str, session: Optional[str], *,
-        web_access: bool = True, kb_access: bool = True, stream: bool = False,
-    ) -> list[str]:
-        # kb_access is a no-op for codex: the optional KB MCP is registered in
-        # claude's user config, not codex's ~/.codex — codex doesn't inherit it.
-        # `--json` already emits live per-step JSONL, so streaming needs no extra
-        # flag — stream is accepted for interface parity.
-        return [self.bin, *self._globals(web_access=web_access),
-                "exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
-                "--", prompt]
-
-    def build_resume(
-        self, prompt: str, session: str, *,
-        web_access: bool = True, kb_access: bool = True, stream: bool = False,
-    ) -> list[str]:
-        return [self.bin, *self._globals(web_access=web_access),
-                "exec", "resume", session, "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--", prompt]
-
-    def parse_stream_line(self, line: str) -> Optional[StreamStep]:
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            return None
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        t = ev.get("type")
-        if t == "thread.started" and ev.get("thread_id"):
-            return StreamStep("session", session=ev["thread_id"])
-        item = ev.get("item") or {}
-        it = item.get("type")
-        # a shell command the agent is about to / did run
-        if t == "item.started" and it == "command_execution":
-            return StreamStep("tool", tool="shell", text=str(item.get("command", ""))[:300])
-        if t == "item.completed":
-            if it == "command_execution":
-                # aggregated_output carries the command's FULL stdout/stderr — including
-                # a nested `ssh host '...'` whose remote stdout the outer ssh forwards
-                # here. text=truncated for the deck; raw=full for the provenance gate.
-                out = str(item.get("aggregated_output") or item.get("output") or "")
-                return StreamStep("tool_result", text=out[:600], raw=out)
-            if it == "agent_message":
-                txt = (item.get("text") or "").strip()
-                if txt:
-                    return StreamStep("reasoning", text=txt)
-        return None
-
-    def parse(self, stdout: str, stderr: str) -> CliResult:
-        # codex --json emits JSONL events. codex 0.133–0.137 shape:
-        #   {"type":"thread.started","thread_id":"<uuid>"}        ← session for resume
-        #   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
-        #   {"type":"turn.completed","usage":{"input_tokens":...,"cached_input_tokens":
-        #      ...,"output_tokens":...,"reasoning_output_tokens":...}}
-        # Subscription codex NO LONGER reports total_cost_usd, so we re-derive an
-        # API-EQUIVALENT cost from the per-turn token usage (sum across turns).
-        # Older shapes ({"msg":{...}}, total_cost_usd) are still tolerated.
-        text, cost, turns, session = "", None, 0, None
-        in_tok = cached_tok = out_tok = 0
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                text += line + "\n"      # tolerate non-JSON lines
-                continue
-            et = ev.get("type")
-            # session id (for a resume/conclude turn)
-            if et == "thread.started" and ev.get("thread_id"):
-                session = ev["thread_id"]
-            # assistant output: 0.133 wraps it in item.completed → item.agent_message
-            if et == "item.completed":
-                item = ev.get("item") or {}
-                if item.get("type") in ("agent_message", "assistant", "message"):
-                    text += str(item.get("text") or item.get("message") or "") + "\n"
-            if et == "turn.completed":
-                turns += 1
-                u = ev.get("usage") or {}
-                in_tok += int(u.get("input_tokens") or 0)
-                cached_tok += int(u.get("cached_input_tokens") or 0)
-                # reasoning tokens bill as output
-                out_tok += int(u.get("output_tokens") or 0) + int(
-                    u.get("reasoning_output_tokens") or 0)
-            # legacy / alternate shapes
-            msg = ev.get("msg") or ev
-            if isinstance(msg, dict):
-                if msg.get("type") in ("agent_message", "assistant", "message"):
-                    text += str(msg.get("message") or msg.get("text") or "") + "\n"
-                if "total_cost_usd" in msg:
-                    cost = msg["total_cost_usd"]
-        if session is None:
-            m = self._SESSION_RE.search(stderr)
-            if m:
-                session = m.group(1)
-        # Derive API-equivalent cost from tokens when codex didn't report a dollar
-        # figure (the subscription path). `input_tokens` from codex INCLUDES the
-        # cached portion, so split it: cached billed at the cheaper cached rate,
-        # the rest at the full input rate; reasoning already folded into out_tok.
-        if cost is None and (in_tok or out_tok):
-            price = PRICES.get("codex", _DEFAULT_PRICE)
-            fresh_in = max(0, in_tok - cached_tok)
-            cost = (
-                fresh_in / 1_000_000 * price.input_per_m
-                + cached_tok / 1_000_000 * CODEX_CACHED_INPUT_PER_M
-                + out_tok / 1_000_000 * price.output_per_m
-            )
-        if not text.strip() and not stdout.strip() and stderr.strip():
-            tail = "\n".join(stderr.strip().splitlines()[-12:])[-1800:]
-            text = f"[codex stderr]\n{tail}\n"
-        return CliResult(text=text[-8000:] or stdout[-8000:], session=session,
-                         cost_usd=cost, num_turns=turns or None,
-                         input_tokens=(in_tok or None), output_tokens=(out_tok or None),
-                         raw_stderr=stderr[-2000:])
-
-    def _hello_argv(self) -> list[str]:
-        # a real one-turn exec (offline, sandboxed) — symmetric with claude/cursor
-        # so the self-check actually exercises codex auth, not just `--version`.
-        return [self.bin, "exec", "--json",
-                "--dangerously-bypass-approvals-and-sandbox", "--", self.HELLO_PROMPT]
-
-    def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
-        # codex --json streams JSONL. A completed model turn proves auth/quota and
-        # the backend round-trip even when late MCP/plugin shutdown noise makes the
-        # process exit non-zero after stdout already contains the successful turn.
-        for line in (r.stdout or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "turn.completed":
-                return True
-            if ev.get("type") == "item.completed":
-                item = ev.get("item") or {}
-                if isinstance(item, dict) and item.get("type") == "agent_message":
-                    return True
-        return False
-
-
-class CursorDriver(CliDriver):
-    """`cursor-agent -p` — Cursor's headless terminal agent. The engine assigns the
-    session (captured from the stream's `system.init`/`result` `session_id`);
-    resumes with `--resume <chatId>`. Subscription-backed (no per-run cost), full
-    shell via `--force` + `--trust`. JSONL via `--output-format stream-json`.
-
-    Caveats (handled at the swarm/driver layer, not here):
-      - Cursor has NO `--disallowed-tools` equivalent, so `web_access=False` can't be
-        cleanly enforced — the swarm DROPS cursor from the engine list for offline
-        bench evals (protects the AGENTS.md offline rule). `web_access` is a no-op.
-      - Cursor does NOT inherit the user-scope KB MCP (that lives in
-        claude's config), so `kb_access` is a no-op too — claude stays the KB
-        consumer.
-    """
-    name = "cursor"
-    # optional pinned model (e.g. "sonnet-4.5-thinking"); unset → cursor's default.
-    _MODEL_ENV = "MUTEKI_CURSOR_MODEL"
-
-    def new_session(self) -> Optional[str]:
-        # cursor assigns the chat id itself; we scrape it from the stream so a
-        # resume/conclude turn can reconnect with --resume.
-        return None
-
-    def _model(self) -> list[str]:
-        m = os.environ.get(self._MODEL_ENV)
-        return ["--model", m] if m else []
-
-    def _fmt(self, stream: bool) -> list[str]:
-        # stream-json emits one NDJSON event per step; json is a single final doc.
-        # We do NOT pass --stream-partial-output, so each assistant event is one
-        # complete message (no per-delta de-duplication needed).
-        return (["--output-format", "stream-json"] if stream
-                else ["--output-format", "json"])
-
-    def build_execute(
-        self, prompt: str, session: Optional[str], *,
-        web_access: bool = True, kb_access: bool = True, stream: bool = False,
-    ) -> list[str]:
-        # -p (print/headless) + --force (run all commands) + --trust (skip the
-        # workspace-trust prompt in headless mode). Prompt is the trailing POSITIONAL
-        # arg (cursor has no `--` separator). cwd is the subprocess cwd, so no
-        # explicit --workspace is needed (matches the claude/codex drivers).
-        return [self.bin, "-p", *self._fmt(stream), "--force", "--trust",
-                *self._model(), prompt]
-
-    def build_resume(
-        self, prompt: str, session: str, *,
-        web_access: bool = True, kb_access: bool = True, stream: bool = False,
-    ) -> list[str]:
-        return [self.bin, "-p", *self._fmt(stream), "--force", "--trust",
-                "--resume", session, *self._model(), prompt]
-
-    @staticmethod
-    def _usage_tokens(usage: dict) -> tuple[Optional[int], Optional[int]]:
-        """cursor's result `usage` block → (input, output) tokens for the deck's
-        token column. cursor uses camelCase + separate cache buckets:
-        {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}. Input
-        counts the fresh + both cache buckets. None when the block is absent.
-        Cost stays $0 — cursor is subscription-backed and reports no dollar figure."""
-        if not isinstance(usage, dict) or not usage:
-            return None, None
-        inp = (int(usage.get("inputTokens") or 0)
-               + int(usage.get("cacheReadTokens") or 0)
-               + int(usage.get("cacheWriteTokens") or 0))
-        outp = int(usage.get("outputTokens") or 0)
-        return (inp or None), (outp or None)
-
-    @staticmethod
-    def _tool_summary(tc: dict) -> tuple[str, str]:
-        """(tool_name, arg_preview) from cursor's tool_call object. Shapes:
-        {"readToolCall": {"args": {...}}} | {"function": {"name","arguments"}}."""
-        if not isinstance(tc, dict) or not tc:
-            return ("", "")
-        key = next(iter(tc))
-        body = tc.get(key) or {}
-        if key == "function" and isinstance(body, dict):
-            return (str(body.get("name", "function")),
-                    str(body.get("arguments", ""))[:300])
-        name = key[:-8] if key.endswith("ToolCall") else key  # readToolCall → read
-        arg = ""
-        if isinstance(body, dict) and isinstance(body.get("args"), dict):
-            a = body["args"]
-            arg = str(a.get("path") or a.get("command") or a.get("query") or "")[:300]
-        return (name, arg)
-
-    def parse(self, stdout: str, stderr: str) -> CliResult:
-        # --output-format json: one JSON object {type:result, result, session_id, ...}
-        try:
-            d = json.loads(stdout)
-            if isinstance(d, dict) and (d.get("type") == "result" or "result" in d):
-                inp, outp = self._usage_tokens(d.get("usage") or {})
-                return CliResult(
-                    text=str(d.get("result", "")),
-                    session=d.get("session_id"),
-                    cost_usd=None,         # subscription-backed; no per-run cost
-                    input_tokens=inp,
-                    output_tokens=outp,
-                    num_turns=None,
-                    raw_stderr=stderr[-2000:],
-                )
-        except json.JSONDecodeError:
-            pass
-        # stream-json: NDJSON. The terminal {"type":"result",...} carries the full
-        # text + usage; any line may carry session_id (system.init or result).
-        result_text, session, inp, outp = "", None, None, None
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "result":
-                result_text = str(ev.get("result", ""))
-                inp, outp = self._usage_tokens(ev.get("usage") or {})
-            if ev.get("session_id"):
-                session = ev["session_id"]
-        if result_text or session:
-            return CliResult(text=result_text, session=session, cost_usd=None,
-                             input_tokens=inp, output_tokens=outp,
-                             num_turns=None, raw_stderr=stderr[-2000:])
-        return CliResult(text=stdout[-8000:], raw_stderr=stderr[-2000:])
-
-    def parse_stream_line(self, line: str) -> Optional[StreamStep]:
-        # single-step view (first step of the line); see parse_stream_steps for the
-        # all-blocks version the streaming runner uses.
-        steps = self.parse_stream_steps(line)
-        return steps[0] if steps else None
-
-    def parse_stream_steps(self, line: str) -> list[StreamStep]:
-        # #18: a cursor assistant message can carry MULTIPLE text blocks; emit one
-        # StreamStep per block so a FOUND_FLAG/VERIFIED_FACT in a later block isn't
-        # lost from live propagation (tool_call/system lines carry one step each).
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            return []
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        t = ev.get("type")
-        if t == "system" and ev.get("session_id"):
-            return [StreamStep("session", session=ev["session_id"])]
-        if t == "assistant":
-            steps: list[StreamStep] = []
-            for b in (ev.get("message", {}) or {}).get("content", []) or []:
-                if b.get("type") == "text" and (b.get("text") or "").strip():
-                    steps.append(StreamStep("reasoning", text=b["text"].strip()))
-            return steps
-        if t == "tool_call":
-            sub = ev.get("subtype")
-            tc = ev.get("tool_call") or {}
-            if sub == "started":
-                tool, arg = self._tool_summary(tc)
-                return [StreamStep("tool", tool=tool, text=arg)]
-            if sub == "completed":
-                # surface the tool's output (best-effort: success.content)
-                body = tc.get(next(iter(tc))) if isinstance(tc, dict) and tc else {}
-                res = (body or {}).get("result") if isinstance(body, dict) else None
-                content = ""
-                if isinstance(res, dict):
-                    succ = res.get("success")
-                    if isinstance(succ, dict):
-                        content = str(succ.get("content") or succ.get("path") or "")
-                # text=truncated for the deck; raw=full for the provenance gate.
-                return [StreamStep("tool_result", text=content[:600], raw=content)]
-        return []
-
-    def _hello_argv(self) -> list[str]:
-        # one headless turn, single-JSON envelope. --force/--trust skip the
-        # workspace-trust prompt so the probe doesn't hang waiting for input.
-        return [self.bin, "-p", "--output-format", "json", "--force", "--trust",
-                *self._model(), self.HELLO_PROMPT]
-
-    def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
-        # exit 0 AND a result field — cursor's json envelope is {type:result,result,...}.
-        return r.returncode == 0 and '"result"' in (r.stdout or "")
-
-
 class PiDriver(CliDriver):
     """`pi --mode json` — pi's single-shot json-event-stream mode: prints every
     session event as a JSON line to stdout and EXITS (docs/json.md). On Windows
@@ -1202,9 +665,6 @@ class PiDriver(CliDriver):
 
 
 DRIVERS: dict[str, CliDriver] = {
-    "claude": ClaudeCodeDriver(),
-    "codex": CodexDriver(),
-    "cursor": CursorDriver(),
     "pi": PiDriver(),
 }
 
@@ -1215,7 +675,7 @@ def get_driver(name: str) -> CliDriver:
     except KeyError:
         raise ValueError(
             f"unknown engine {name!r}: expected one of {sorted(DRIVERS)} "
-            f"(a profile id like 'codex-sub-container' should be resolved to its "
+            f"(a profile id like 'pi-sub-container' should be resolved to its "
             f"base engine via driver_for/base_engine_for_profile first)"
         ) from None
 
@@ -1310,52 +770,19 @@ class EndpointDriver(CliDriver):
     def new_session(self) -> Optional[str]:
         return self.base.new_session()
 
-    def _codex_config_flags(self) -> list[str]:
-        base_url = str(self.profile.get("base_url") or "").strip()
-        if self.name != "codex" or not base_url:
-            return []
-        wire_api = str(self.profile.get("wire_api") or "responses").strip() or "responses"
-        model = str(self.profile.get("model") or "").strip()
-        # `name` is REQUIRED by codex: a [model_providers.X] block with no `name`
-        # fails config load with "provider name must not be empty", so a custom
-        # endpoint never even reaches the request. `env_key` pins which env var
-        # holds the bearer token — OPENAI_API_KEY is exactly what the Credential
-        # Account injection populates for codex (see _api_key / runtime_env_for_engine),
-        # so codex reads the worker's endpoint key instead of silently sending none.
-        flags = [
-            "-c", "model_provider=muteki",
-            "-c", "model_providers.muteki.name=muteki",
-            "-c", f"model_providers.muteki.base_url={base_url}",
-            "-c", f"model_providers.muteki.wire_api={wire_api}",
-            "-c", "model_providers.muteki.env_key=OPENAI_API_KEY",
-        ]
-        if model:
-            flags += ["-c", f"model={model}"]
-        return flags
-
-    def _inject_before_exec(self, argv: list[str]) -> list[str]:
-        flags = self._codex_config_flags()
-        if not flags:
-            return argv
-        try:
-            idx = argv.index("exec")
-        except ValueError:
-            return [argv[0], *flags, *argv[1:]]
-        return [*argv[:idx], *flags, *argv[idx:]]
-
     def build_execute(
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
-        return self._inject_before_exec(self.base.build_execute(
-            prompt, session, web_access=web_access, kb_access=kb_access, stream=stream))
+        return self.base.build_execute(
+            prompt, session, web_access=web_access, kb_access=kb_access, stream=stream)
 
     def build_resume(
         self, prompt: str, session: str, *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
-        return self._inject_before_exec(self.base.build_resume(
-            prompt, session, web_access=web_access, kb_access=kb_access, stream=stream))
+        return self.base.build_resume(
+            prompt, session, web_access=web_access, kb_access=kb_access, stream=stream)
 
     def parse(self, stdout: str, stderr: str) -> CliResult:
         return self.base.parse(stdout, stderr)
@@ -1367,17 +794,11 @@ class EndpointDriver(CliDriver):
         return self.base.parse_stream_steps(line)
 
     def _endpoint_probe_url(self) -> str:
-        base_url = str(self.profile.get("base_url") or "").rstrip("/")
-        if self.name == "claude":
-            return f"{base_url}/v1/messages"
-        if self.name == "codex":
-            return f"{base_url}/responses"
-        return base_url
+        return str(self.profile.get("base_url") or "").rstrip("/")
 
     def _hello_argv(self) -> list[str]:
-        if self.name != "codex":
-            return []
-        return self._inject_before_exec(self.base._hello_argv())  # noqa: SLF001
+        # endpoint workers probe via curl in health_detail — no CLI hello probe.
+        return []
 
     def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
         return self.base._hello_ok(r)  # noqa: SLF001
@@ -1405,8 +826,9 @@ class EndpointDriver(CliDriver):
                 return ""
         # No explicit ref → fall back to the env the Credential Account injection
         # sets for this transport: <PROVIDER>_API_KEY_FILE (file-backed) or the
-        # bare <PROVIDER>_API_KEY (env-backed).
-        env_name = "ANTHROPIC_API_KEY" if self.name == "claude" else "OPENAI_API_KEY"
+        # bare <PROVIDER>_API_KEY (env-backed). pi's endpoint workers read the
+        # standard provider keys — OPENAI_API_KEY is what the injection populates.
+        env_name = "OPENAI_API_KEY"
         file_env = src.get(f"{env_name}_FILE", "").strip()
         if file_env:
             try:
@@ -1419,43 +841,29 @@ class EndpointDriver(CliDriver):
         base_url = str(self.profile.get("base_url") or "").strip()
         if not base_url:
             return self.base.health_detail(env=env)
-        if self.name == "codex":
-            # Codex custom endpoints are only ready if the actual CLI can complete
-            # a turn with its Responses tool schema. A bare HTTP /responses probe
-            # can pass while the real worker fails immediately, e.g. LiteLLM →
-            # DeepSeek rejects Codex's `tools[].type = "namespace"`.
-            probe_env = env
-            key = self._api_key(env)
-            if key and not (env or {}).get("OPENAI_API_KEY"):
-                probe_env = {**os.environ, **(env or {}), "OPENAI_API_KEY": key}
-            return CliDriver.health_detail(self, env=probe_env)
+        key = self._api_key(env)
+        # Mirror how the live worker authenticates (runtime_env_for_engine): give
+        # the probe ITS OWN credential env so parallel probes don't clobber each
+        # other's key material.
+        probe_env = env
+        if key and not (env or {}).get("OPENAI_API_KEY"):
+            probe_env = {**os.environ, **(env or {}), "OPENAI_API_KEY": key}
         argv = [
             "curl", "-fsS", "-X", "POST", "--max-time", "20",
             "-H", "Content-Type: application/json",
         ]
-        key = self._api_key(env)
         if key:
-            if self.name == "claude":
-                argv += ["-H", f"x-api-key: {key}", "-H", "anthropic-version: 2023-06-01"]
-            else:
-                argv += ["-H", f"Authorization: Bearer {key}"]
+            argv += ["-H", f"Authorization: Bearer {key}"]
         model = str(self.profile.get("model") or "").strip()
-        if self.name == "claude":
-            body = json.dumps({
-                "model": model or "claude-3-5-haiku-latest",
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "OK"}],
-            })
-        else:
-            body = json.dumps({
-                "model": model or "gpt-5-mini",
-                "input": "OK",
-                "max_output_tokens": 1,
-            })
+        body = json.dumps({
+            "model": model or "gpt-5-mini",
+            "input": "OK",
+            "max_output_tokens": 1,
+        })
         argv += ["--data", body, self._endpoint_probe_url()]
         try:
             r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
-                               env=env)
+                               env=probe_env)
         except FileNotFoundError:
             return False, "curl binary not found"
         except subprocess.TimeoutExpired:
@@ -1514,20 +922,15 @@ def _probe_health_with_creds(name: str, drv: "CliDriver",
                              account_root: "Optional[str]") -> "tuple[bool, str]":
     """Run a driver's health_detail() with the engine's DEFAULT-account credential
     env injected (when account_root is known) — so the global probe matches what a
-    live worker sees. Critical for cursor: its headless CLI authenticates ONLY via
-    CURSOR_API_KEY, so a bare probe falsely reports "Authentication required" and the
-    engine bar shows a healthy engine as down. account_root=None → bare probe
-    (no account store available, e.g. a TUI/test context)."""
+    live worker sees (pi's provider key comes from the account store, not the
+    host). account_root=None → bare probe (no account store available, e.g. a
+    TUI/test context)."""
     if account_root is None:
         return drv.health_detail()
     try:
         from muteki.solver.credential_accounts import runtime_env_for_engine
-        # Local Codex subscription auth is the host's default CODEX_HOME
-        # (~/.codex). A stale persisted codex-main account must not make the engine
-        # bar or dispatch preflight report Codex down when the host login works.
-        account_id = "" if name == "codex" else None
         env = runtime_env_for_engine(
-            name, account_root=account_root, account_id=account_id, container=False).env
+            name, account_root=account_root, account_id=None, container=False).env
     except Exception:
         env = {}
     if not env:
@@ -1559,73 +962,6 @@ def engine_liveness(account_root: "Optional[str]" = None) -> dict:
     _health_cache["data"] = out
     _health_cache["ts"] = now
     return out
-
-
-def _claude_oauth() -> "Optional[tuple[str, int]]":
-    """(access_token, expires_at_ms) from env / macOS Keychain / creds file.
-    Returns None when no credential is found. Used by credential_accounts for
-    login detection. Never raises."""
-    env_tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-               or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-               or os.environ.get("ANTHROPIC_API_KEY"))
-    if env_tok and env_tok.strip():
-        return env_tok.strip(), 0
-    raw: Optional[str] = None
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            raw = r.stdout.strip()
-    except Exception:
-        pass
-    if not raw:
-        try:
-            p = Path.home() / ".claude" / ".credentials.json"
-            if p.exists():
-                raw = p.read_text()
-        except Exception:
-            pass
-    if not raw:
-        return None
-    try:
-        d = json.loads(raw)
-        o = d.get("claudeAiOauth") or d
-        tok = o.get("accessToken")
-        exp = int(o.get("expiresAt") or 0)
-        if tok:
-            return tok, exp
-    except Exception:
-        pass
-    return None
-
-
-def _cursor_session_cookie() -> "Optional[str]":
-    """`WorkosCursorSessionToken=<userId>::<JWT>` from the macOS Keychain +
-    cli-config, or None. Never raises. (Linux Cursor stores the token elsewhere;
-    we only support the Keychain path today → None elsewhere.)"""
-    tok: Optional[str] = None
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-s", "cursor-access-token", "-w"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            tok = r.stdout.strip()
-    except Exception:
-        pass
-    if not tok:
-        return None
-    uid: Optional[str] = None
-    try:
-        cfg = Path.home() / ".cursor" / "cli-config.json"
-        if cfg.exists():
-            uid = str(json.loads(cfg.read_text()).get("authInfo", {}).get("userId") or "")
-    except Exception:
-        pass
-    if not uid:
-        return None
-    # cookie value is "<userId>::<JWT>", url-encoded (:: → %3A%3A)
-    return f"WorkosCursorSessionToken={uid}%3A%3A{tok}"
 
 
 def engine_status(account_root: "Optional[str]" = None,
@@ -1810,9 +1146,6 @@ def engine_health(backend: str = "local",
 
 # in-container worker binary per engine (mirrors container_exec._CONTAINER_BIN).
 _CONTAINER_ENGINE_BIN = {
-    "claude": "claude",
-    "codex": "codex",
-    "cursor": "/home/kali/.local/bin/cursor-agent",
     "pi": "pi",
 }
 

@@ -34,7 +34,7 @@ __all__ = [
 # prelude): the engine credential vars + our own MUTEKI_* knobs. HOME is special-
 # cased below; everything else (host PATH etc.) is supplied by the supervisor's
 # baseEnv, so we don't leak the host's full environment into the container.
-_ENV_PREFIXES = ("MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_", "DEEPSEEK_")
+_ENV_PREFIXES = ("MUTEKI_", "ANTHROPIC_", "OPENAI_", "DEEPSEEK_")
 _CONTAINER_WORKSPACE = "/home/kali/workspace"
 
 

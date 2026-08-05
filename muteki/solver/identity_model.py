@@ -408,7 +408,7 @@ def seat_to_legacy_profile(
         "credential_account": credential_account,
         "api_key_ref": "",
         "base_url": base_url,
-        "wire_api": wire_api or ("responses" if engine == "codex" and base_url else ""),
+        "wire_api": wire_api or "",
         "runtime": str(seat.get("environment_id") or environment.get("id") or "docker-web").strip(),
         "roles": roles,
         "race": bool(seat.get("race", "race" in roles)),

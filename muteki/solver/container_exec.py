@@ -97,18 +97,10 @@ _BACKEND = (os.environ.get("MUTEKI_WORKER_BACKEND") or "").strip().lower()
 _USE_DOCKEREXEC = _BACKEND == "container_dockerexec"
 
 # the worker binary INSIDE the container, keyed by engine. The driver resolves
-# argv[0] to a HOST absolute path (e.g. /Users/.../.local/bin/claude); inside the
-# container that path doesn't exist, so we replace argv[0] with the container path.
-# claude/codex live in /usr/local/bin (on the default PATH); cursor-agent installs
-# to ~/.local/bin, which is NOT on `docker exec`'s non-login-shell PATH — so it MUST
-# be an absolute path or `exec: "cursor-agent": not found in $PATH` (the bug that
-# made cursor workers instantly empty-exit in container mode). (The rcp supervisor's
-# baseEnv puts ~/.local/bin on PATH too, but we keep the absolute path for parity.)
+# argv[0] to a HOST absolute path; inside the container that path doesn't exist,
+# so we replace argv[0] with the container path. pi (route A): the pi images bake
+# pi at /usr/local/bin/pi (on PATH).
 _CONTAINER_BIN = {
-    "claude": "claude",
-    "codex": "codex",
-    "cursor": "/home/kali/.local/bin/cursor-agent",
-    # pi (route A): the pi images bake pi at /usr/local/bin/pi (on PATH)
     "pi": "pi",
 }
 
@@ -864,7 +856,7 @@ class _DockerExecBackend:
           keeps running orphaned (every worker turn looked like a 2-10s empty exit).
         - container-side `timeout -s KILL <N>s` is the authoritative wall-clock cap.
         - `< /dev/null`: docker exec without -i leaves the CLIs waiting on stdin
-          (codex hangs); /dev/null = instant EOF.
+          (a hang); /dev/null = instant EOF.
         - MUTEKI_WTAG env + the `muteki_wtag_<tag>` sentinel `$0` let `pkill -f <tag>`
           target ONLY this worker's tree for per-worker kill/pause.
         """
@@ -877,15 +869,11 @@ class _DockerExecBackend:
                         cmd += ["-e", f"{k}={v}"]
                     continue
                 if k.startswith((
-                    "MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_"
+                    "MUTEKI_", "ANTHROPIC_", "OPENAI_", "DEEPSEEK_"
                 )):
                     cmd += ["-e", f"{k}={v}"]
         cmd.append(handle.container)
         prelude = [
-            'if [ -r "$CLAUDE_CODE_OAUTH_TOKEN_FILE" ]; then '
-            'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_CODE_OAUTH_TOKEN_FILE")"; fi',
-            'if [ -r "$CURSOR_API_KEY_FILE" ]; then '
-            'export CURSOR_API_KEY="$(cat "$CURSOR_API_KEY_FILE")"; fi',
             'if [ -r "$ANTHROPIC_API_KEY_FILE" ]; then '
             'export ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_API_KEY_FILE")"; fi',
             'if [ -r "$OPENAI_API_KEY_FILE" ]; then '
