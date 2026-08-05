@@ -38,18 +38,16 @@
       } catch (e) {}
       return Promise.resolve("http://127.0.0.1:3001/");
     }
-    // fallback if the meta-refresh is too fast for the UI server: keep
-    // retrying the deck until it answers, then jump to it.
-    (function poll() {
-      deckUrl().then(function (url) {
-        fetch(url, { method: "GET", cache: "no-store" })
-          .then(function (r) {
-            if (r.ok) { location.replace(url); return; }
-            setTimeout(poll, 1500);
-          })
-          .catch(function () { setTimeout(poll, 1500); });
-      });
-    })();
+    // Navigate UNCONDITIONALLY once the port is known. A fetch() gate cannot
+    // work here: this page runs on the wails:// origin, so a cross-origin
+    // fetch to http://127.0.0.1:<port> is CORS-blocked (the Next dev server
+    // sends no Access-Control-Allow-Origin) and the "wait until ready" poll
+    // never fired — the window sat on this splash forever. The deck's root
+    // answers 200 immediately even while compiling, so a short delay is all
+    // that's needed.
+    deckUrl().then(function (url) {
+      setTimeout(function () { location.replace(url); }, 800);
+    });
   </script>
 </body>
 </html>

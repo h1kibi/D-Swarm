@@ -336,10 +336,13 @@ func BackendService(root string, python string, port int) *Service {
 
 // UiService builds the Next deck service; missing node_modules triggers a
 // one-time npm install (UI_MODE=prod builds then serves, default dev server).
-func UiService(root string, port int, mode string) *Service {
+// MUTEKI_BACKEND points the deck's /api proxy at OUR backend (default 8000 is
+// what next.config assumes, but the port override must reach the right one).
+func UiService(root string, port int, backendPort int, mode string) *Service {
 	uiDir := filepath.Join(root, "apps", "web", "ui")
 	argv := []string{"npm.cmd", "run", "dev", "--", "-p", fmt.Sprint(port)}
-	extra := []string{"MUTEKI_UI_PORT=" + fmt.Sprint(port)}
+	extra := []string{"MUTEKI_UI_PORT=" + fmt.Sprint(port),
+		"MUTEKI_BACKEND=http://127.0.0.1:" + fmt.Sprint(backendPort)}
 	if strings.EqualFold(strings.TrimSpace(mode), "prod") {
 		argv = []string{"npm.cmd", "run", "start"}
 		extra = append(extra, "PORT="+fmt.Sprint(port))

@@ -45,7 +45,7 @@ func main() {
 
 	sup := &Supervisor{
 		Backend: BackendService(root, os.Getenv("MUTEKI_PYTHON"), backendPort),
-		UI:      UiService(root, uiPort, uiMode),
+		UI:      UiService(root, uiPort, backendPort, uiMode),
 	}
 	app := &App{sup: sup, root: root}
 

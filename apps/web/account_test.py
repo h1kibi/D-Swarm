@@ -198,12 +198,26 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
     """
     from muteki.solver.container_exec import (
         WORKER_IMAGE,
+        _CATEGORY_IMAGES,
         CONTAINER_WORKSPACE,
         _HOST_DATA_ROOT,
         _mount_source,
     )
 
+    # Probe the image the workers will ACTUALLY run. Dispatch picks the worker
+    # image per challenge CATEGORY (worker_image_for_category → the route-A
+    # ctf-swarm-pi-<cat> images); the old hardcoded WORKER_IMAGE (upstream
+    # ghcr.io/fishcodetech/muteki-worker:latest) is NOT installed on route-A
+    # hosts, so the plumbing probe false-failed every profile before any worker
+    # spawned ("镜像缺失或不可用"). Prefer the first locally-present category
+    # image (any of them proves the same plumbing: supervisor image + account
+    # mount + engine CLI), fall back to the upstream default.
     image = WORKER_IMAGE
+    for cand in _CATEGORY_IMAGES.values():
+        r = _docker("image", "inspect", cand, timeout=20)
+        if r.returncode == 0:
+            image = cand
+            break
 
     # 1) docker reachable + image present.
     try:
