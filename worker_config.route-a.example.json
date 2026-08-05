@@ -1,25 +1,7 @@
 {
-  "_comment": "Route-A bare-host worker config (copy to sessions/_worker_config.json). Seven direction profiles, ALL still the plain pi engine for now — they are the specialization hooks (per-direction model / image / prompt later). Each challenge category dispatches its own profile via overrides; 'aisec' is the reserved new-direction category. claude/codex/cursor profiles were dropped (no CLIs/accounts on a fresh host; the pre-dispatch health check hard-fails on missing accounts).",
-  "engines": ["pi-web", "pi-pwn", "pi-rev", "pi-crypto", "pi-misc", "pi-forensics", "pi-AIsec"],
+  "_comment": "Route-A bare-host worker config (copy to sessions/_worker_config.json). pi is ONE engine profile (pi-api-container) at the same level as claude/codex/cursor — the default lineup's per-engine profiles are kept, only the roster selects what this host can actually run. Per-DIRECTION specialization is NOT a profile-multiplication problem: the worker image is already chosen per challenge category (worker_image_for_category → ctf-swarm-pi-<cat>), and future per-direction model/prompt hooks belong on the category machinery, not on the engine roster. Add claude/codex/cursor back to engines[] once their CLIs + credential accounts exist (sessions/_secrets/accounts/<engine>-main/API_KEY).",
+  "engines": ["pi-api-container"],
   "worker_backend": "container",
   "start_workers": 1,
-  "race_scout": false,
-  "worker_profiles": [
-    {"id": "pi-web", "name": "pi-web", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 10},
-    {"id": "pi-pwn", "name": "pi-pwn", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 20},
-    {"id": "pi-rev", "name": "pi-rev", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 30},
-    {"id": "pi-crypto", "name": "pi-crypto", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 40},
-    {"id": "pi-misc", "name": "pi-misc", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 50},
-    {"id": "pi-forensics", "name": "pi-forensics", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 60},
-    {"id": "pi-AIsec", "name": "pi-AIsec", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 70}
-  ],
-  "overrides": {
-    "web": {"engines": ["pi-web"]},
-    "crypto": {"engines": ["pi-crypto"]},
-    "pwn": {"engines": ["pi-pwn"]},
-    "reverse": {"engines": ["pi-rev"]},
-    "forensics": {"engines": ["pi-forensics"]},
-    "misc": {"engines": ["pi-misc"]},
-    "aisec": {"engines": ["pi-AIsec"]}
-  }
+  "race_scout": false
 }
