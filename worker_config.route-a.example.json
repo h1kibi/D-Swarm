@@ -1,7 +1,25 @@
 {
-  "_comment": "Route-A bare-host worker config (copy to sessions/_worker_config.json). Engines: only pi — claude/codex/cursor need their own credential accounts + CLIs; a fresh host has neither, and the pre-dispatch health check hard-fails on missing accounts. Set MUTEKI_*_ACCOUNT_ID / install the CLIs if you add them back.",
-  "engines": ["pi-api-container"],
+  "_comment": "Route-A bare-host worker config (copy to sessions/_worker_config.json). Seven direction profiles, ALL still the plain pi engine for now — they are the specialization hooks (per-direction model / image / prompt later). Each challenge category dispatches its own profile via overrides; 'aisec' is the reserved new-direction category. claude/codex/cursor profiles were dropped (no CLIs/accounts on a fresh host; the pre-dispatch health check hard-fails on missing accounts).",
+  "engines": ["pi-web", "pi-pwn", "pi-rev", "pi-crypto", "pi-misc", "pi-forensics", "pi-AIsec"],
   "worker_backend": "container",
   "start_workers": 1,
-  "race_scout": false
+  "race_scout": false,
+  "worker_profiles": [
+    {"id": "pi-web", "name": "pi-web", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 10},
+    {"id": "pi-pwn", "name": "pi-pwn", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 20},
+    {"id": "pi-rev", "name": "pi-rev", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 30},
+    {"id": "pi-crypto", "name": "pi-crypto", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 40},
+    {"id": "pi-misc", "name": "pi-misc", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 50},
+    {"id": "pi-forensics", "name": "pi-forensics", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 60},
+    {"id": "pi-AIsec", "name": "pi-AIsec", "engine": "pi", "credential_account": "pi-main", "roles": ["bootstrap", "explore", "respond", "review"], "priority": 70}
+  ],
+  "overrides": {
+    "web": {"engines": ["pi-web"]},
+    "crypto": {"engines": ["pi-crypto"]},
+    "pwn": {"engines": ["pi-pwn"]},
+    "reverse": {"engines": ["pi-rev"]},
+    "forensics": {"engines": ["pi-forensics"]},
+    "misc": {"engines": ["pi-misc"]},
+    "aisec": {"engines": ["pi-AIsec"]}
+  }
 }
