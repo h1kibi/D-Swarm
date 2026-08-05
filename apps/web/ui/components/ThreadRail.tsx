@@ -553,6 +553,9 @@ function RailRow({
             <span className="sub">
               {run.category && <span className="ct">{run.category}</span>}
               <span className="st">{t(`rail.status.${run.status}`)}</span>
+              {run.status === "queued" && run.queue_position != null && (
+                <span className="st" title={t("rail.status.queued")}>#{run.queue_position}</span>
+              )}
               {when && <span className="when" title={absTime(run.updated_at)}>{when}</span>}
             </span>
           </>
@@ -750,10 +753,12 @@ function StatusIcon({ status, t }: { status: RunStatus; t: (k: string) => string
   }
   const icon: Record<Exclude<RunStatus, "running">, IconName> = {
     draft: "dot",
+    queued: "clock",       // waiting for a scheduler slot (P4)
     paused: "pause",
     solved: "flag",
     finished: "check",
     failed: "alert",
+    cancelled: "x",
   };
   return (
     <span className={`tk st-${status}`} aria-label={t(`rail.status.${status}`)}>

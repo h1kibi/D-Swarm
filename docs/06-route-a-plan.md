@@ -73,15 +73,17 @@
 
 ## 4. 阶段计划（重排 02）
 
+> **执行状态（2026-08-05）：P0–P6 全部落地并提交。** P5 的 NYU-200 全量回归待有数据集+基线引擎的机器上执行（跑批器 `eval_nyu/` 已就绪，见 `eval_nyu/README.md`）；P3 镜像 pi 已对齐 0.83.0（`docker/worker-pi/build-base.sh`）。
+
 | 阶段 | 内容 | 验收标准 |
 | --- | --- | --- |
-| **P0 基线** | `git archive a141bb5` 恢复 BTFly 源码到 `references/btfly/`（只读参考）；muteki 在本机跑通测试套件 | BTFly 参考树完整可读；`uv run pytest`（或 `.venv` 直跑）通过；web 后端能起 |
-| **P1 内核闭环 + PiDriver** | 目录合并；新增 `PiDriver`（`pi --mode rpc` 子进程 JSONL 会话）；local 后端跑通一道简单题 | 一个 pi worker 解出一道 web 题；flag 过 gate 进 graph；事件流可见于 web UI |
-| **P2 分类镜像 + 知识库** | BTFly Dockerfile 搬入 `docker/`；`skills/` 知识库烤入镜像；runtime profile 按 category 选镜像；每 run 一个容器 | web/crypto/pwn 各解一道；容器内 worker 能读写共享图 |
-| **P3 模型网关** | task token 网关（Python 优先，Go 二进制兜底）；容器内无真实 key | 容器内只有 task token；错误 token 401；usage 落库；断 token 立即失效 |
-| **P4 任务队列** | task FSM（ready→queued→provisioning→running→paused→settled/failed/cancelled）+ FIFO + 并发上限（默认 5，1–8） | 多任务排队/暂停/恢复/中止；事件流完整 |
-| **P5 评测回归** | 复用 `eval_nyu`；pi 引擎加入引擎名册 | 200 题回归报告：pi vs claude/codex/cursor 的 winner 分布、solve rate、成本 |
-| **P6（可选）桌面壳** | Wails + React 壳包 FastAPI（或复用 Go 骨架） | 桌面端可管理 run |
+| **P0 基线** | `git archive a141bb5` 恢复 BTFly 源码到 `references/btfly/`（只读参考）；muteki 在本机跑通测试套件 | BTFly 参考树完整可读；`uv run pytest`（或 `.venv` 直跑）通过；web 后端能起 ✅ |
+| **P1 内核闭环 + PiDriver** | 目录合并；新增 `PiDriver`（`pi --mode json` 子进程 JSONL 会话）；local 后端跑通一道简单题 | 一个 pi worker 解出一道 web 题；flag 过 gate 进 graph；事件流可见于 web UI ✅ |
+| **P2 分类镜像 + 知识库** | BTFly Dockerfile 搬入 `docker/`；`skills/` 知识库烤入镜像；runtime profile 按 category 选镜像；每 run 一个容器 | web/crypto/pwn 各解一道；容器内 worker 能读写共享图 ✅（P2 冒烟 + P3 容器链路） |
+| **P3 模型网关** | task token 网关（Python）；容器内无真实 key | 容器内只有 task token；错误 token 401；usage 落库；断 token 立即失效 ✅（冒烟 PASS；pi 对齐 0.83.0） |
+| **P4 任务队列** | task FSM + FIFO + 并发上限（默认 5，1–8） | 多任务排队/暂停/恢复/中止；事件流完整 ✅（`RunScheduler` + API + deck 状态图标） |
+| **P5 评测回归** | 复用 `eval_nyu`；pi 引擎加入引擎名册 | 200 题回归报告：pi vs claude/codex/cursor 的 winner 分布、solve rate、成本 🔶（跑批器 + 基线入库 + 本地 pilot 2/2；NYU-200 待跑） |
+| **P6（可选）桌面壳** | Wails + React 壳包 FastAPI | 桌面端可管理 run ✅（`desktop/`，窗口 + 双服务监督） |
 
 ## 5. 风险与缓解（补充 05）
 

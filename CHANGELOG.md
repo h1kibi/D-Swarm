@@ -4,9 +4,35 @@ All notable public release changes are tracked here.
 
 ## Unreleased
 
+### Added
+
+- Route A P3: host-side model gateway (task-token reverse proxy) — worker
+  containers never see the real upstream key; per-run token issue/revoke,
+  per-run usage ledger, `ctf-gateway` pi provider extension (image pi aligned
+  to 0.83.0).
+- Route A P4: run scheduler — FIFO queue + global concurrency cap (default 5,
+  1–8), queued pause/resume/cancel, `/api/scheduler`, `run.queued` /
+  `run.dispatched` / `run.cancelled` events; the deck renders queued/cancelled
+  states with position.
+- Route A P5: `eval_nyu` benchmark harness (oracle / runner / report / CLI) —
+  NYU + local datasets, docker target lifecycle, engine roster with pi,
+  resume-safe results, historical baseline ingestion, pi-vs-baseline report.
+  Local pilot: pi 2/2 solved (cdut md5 + baby_rce), $0.008.
+- Route A P6: Wails desktop shell (`desktop/`) — native window over the
+  FastAPI backend + Next deck, supervised child processes, clean shutdown.
+
 ### Fixed
 
 - Fixed draft-run attachment upload returning 422 when using the file-picker button: the live `FileList` was cleared before the async upload finished on new solves.
+- Gateway worker relay: the per-worker env `MUTEKI_PI_PROVIDER` now wins over
+  the host-built `--provider` flag; pi 0.81+ resolves the provider from the
+  model, so gateway workers default `MUTEKI_WORKER_MODEL=deepseek-v4-flash`.
+- `ensure_container` recreates the control dir before writing the token —
+  Docker Desktop's bind-mount cache could serve a stale token and the
+  supervisor's Hello was rejected (`unauthorized`).
+- Rejected unclosed angle-bracket placeholder flags (`FOUND_FLAG=<the flag>`).
+- Windows host portability: board file + blackboard skill subprocess now
+  write/read explicit UTF-8 (GBK locale).
 
 ## 0.2.5 - 2026-06-30
 

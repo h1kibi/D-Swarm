@@ -111,7 +111,7 @@ export async function authTicket(): Promise<string> {
   }
 }
 
-export type RunStatus = "draft" | "running" | "paused" | "solved" | "finished" | "failed";
+export type RunStatus = "draft" | "queued" | "running" | "paused" | "solved" | "finished" | "failed" | "cancelled";
 
 export const isDraftRunId = (id: string) => id.startsWith("draft-");
 
@@ -125,6 +125,9 @@ export interface RunSummary {
   solved: boolean;
   paused: boolean;
   status: RunStatus;
+  queued?: boolean;
+  queue_position?: number | null;
+  cancelled?: boolean;
   flag?: string | null;
   pinned: boolean;
   pinned_at?: number | null;

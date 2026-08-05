@@ -57,11 +57,13 @@ const STRINGS: Dict = {
   "theme.toLight": { zh: "切换到亮色模式", en: "Switch to light mode" },
   // status labels (row subtitle)
   "rail.status.draft": { zh: "草稿", en: "draft" },
+  "rail.status.queued": { zh: "排队中", en: "queued" },
   "rail.status.running": { zh: "运行中", en: "running" },
   "rail.status.paused": { zh: "已暂停", en: "paused" },
   "rail.status.solved": { zh: "已解出", en: "solved" },
   "rail.status.finished": { zh: "已结束", en: "finished" },
   "rail.status.failed": { zh: "失败", en: "failed" },
+  "rail.status.cancelled": { zh: "已取消", en: "cancelled" },
   // row ... menu
   "rail.menu.share": { zh: "分享", en: "Share" },
   "rail.menu.collab": { zh: "打开协作视图", en: "Open collaboration" },
