@@ -2,10 +2,9 @@
 run's bus. Keeps the HTTP layer (server.py) ignorant of solving internals.
 
 Kinds:
-  - "swarm" (DEFAULT): races the REAL solver swarm (shelled claude+codex CLI
-    executor) against a challenge spec. Needs a live target (URL in the prompt /
-    challenge.target) and the claude (and optionally codex) CLI on PATH — no
-    DeepSeek key (the CLI executor doesn't use the code-driven kernel).
+  - "swarm" (DEFAULT): the REAL solver swarm (pi CLI executor) against a
+    challenge spec. Needs a live target (URL in the prompt /
+    challenge.target) and the pi CLI (host) + worker images (container).
   - "mock": scripts the canned event stream (no model, no target) — UI dev / e2e
     ONLY. Must be asked for explicitly (kind:"mock"); it is no longer the default.
 """
@@ -20,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from apps.web.run_manager import Run, RunManager
 from apps.web.worker_config import (
+    DEFAULT_ENGINES,
     DEFAULT_WORKER_BACKEND,
     backend_for_profile,
     resolve_worker_backend,
@@ -99,16 +99,6 @@ def _selected_profiles(engines: list[str], worker_profiles: list[dict]) -> list[
     names = normalize_profile_roster(engines, worker_profiles)
     by_name = {str(p.get("name") or p.get("id")): p for p in worker_profiles if isinstance(p, dict)}
     return [by_name[n] for n in names if n in by_name]
-
-
-def _drop_cursor_profiles(engines: list[str], worker_profiles: list[dict]) -> list[str]:
-    if not worker_profiles:
-        return [e for e in engines if e != "cursor"]
-    by_name = {str(p.get("name") or p.get("id")): p for p in worker_profiles if isinstance(p, dict)}
-    return [
-        name for name in normalize_profile_roster(engines, worker_profiles)
-        if base_engine_for_profile(by_name.get(name) or name) != "cursor"
-    ]
 
 
 def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
@@ -235,14 +225,14 @@ def _mock_driver(body: dict[str, Any]) -> Driver:
 
 
 def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
-    """The REAL solver: a shelled-CLI swarm (claude + codex race) against the
-    challenge. No DeepSeek key — CliSolver runs the subscription CLIs directly and
-    still gates every flag through the real provenance check.
+    """The REAL solver: a shelled-CLI swarm (pi) against the challenge. No DeepSeek
+    key — CliSolver runs the pi CLI and still gates every flag through the real
+    provenance check.
 
     Knobs from the request body (all optional):
       challenge.{name,category,target,description,flag_format}  (inferred from prompt)
-      cli_race: bool (default True)           — race claude + codex
-      cli_engine: "claude" | "codex"          — single engine when not racing
+      cli_race: bool (default True)           — race pi direction profiles
+      cli_engine: "pi"                        — single engine when not racing
       race_scout: bool (default True)         — one parallel single-shot recon round
                                                 in front of the main coordinator loop
                                                 (fast path on flag, else hands facts
@@ -253,8 +243,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                                                 also denies the KB unless `kb` is set
       kb: bool (default: True online / False offline) — let the worker query the KB
       n_solvers: int (default 2)              — bootstrap lineup size
-      engines: list[str] (default [cursor,claude,codex]) — engine roster; offline
-                                                drops cursor (can't go offline cleanly)
+      engines: list[str] (default = worker-config roster) — engine roster
       start_workers: int (default len(engines)) — bootstrap workers (one per engine)
     """
     async def drive(run: Run) -> None:
@@ -313,7 +302,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         )
         executor = body.get("executor", "cli")
         cli_race = bool(body.get("cli_race", False))
-        cli_engine = body.get("cli_engine", "claude")
+        cli_engine = body.get("cli_engine", "pi")
         offline = bool(body.get("offline", False))
         web_access = not offline
         # offline implies NO KB (a clean black-box eval denies every external
@@ -322,24 +311,14 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         kb = bool(body.get("kb", not offline))
         n = int(body.get("n_solvers", 2))
         coordinator = bool(body.get("coordinator", True))
-        # engine roster: three-engine race by default (cursor + claude + codex).
-        # Resolution order: explicit body.engines > the operator's per-category
-        # worker-config default (apps/web/worker_config.py) > the hardcoded roster.
-        # OFFLINE drops cursor — Cursor's headless CLI has no --disallowed-tools to
-        # deny web tools and doesn't inherit the optional KB MCP, so it can't run a
-        # clean offline bench eval (protects the AGENTS.md offline rule).
+        # engine roster: the pi direction profiles (pi-web/pwn/rev/crypto/misc/
+        # forensics/AIsec). Resolution order: explicit body.engines > the
+        # operator's per-category worker-config default (apps/web/worker_config.py)
+        # > the hardcoded pi roster.
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
-        engines = body.get("engines") or wc.get("engines") or ["cursor", "claude", "codex"]
+        engines = body.get("engines") or wc.get("engines") or DEFAULT_ENGINES
         runtime_profiles = body.get("runtime_profiles") or wc.get("runtime_profiles") or []
         worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
-        # OFFLINE normally drops cursor (no --disallowed-tools to deny web tools →
-        # can't guarantee a clean black-box). `allow_cursor_offline:true` overrides
-        # that — the operator accepts that cursor MIGHT web-search a writeup, and the
-        # anti-cheat audit (scripts/audit_retest.py) is relied on to flag any case
-        # where a flag comes from a fetched writeup rather than a real exploit.
-        allow_cursor_offline = bool(body.get("allow_cursor_offline", False))
-        if offline and not allow_cursor_offline:
-            engines = _drop_cursor_profiles(engines, worker_profiles) or ["claude", "codex"]
         if offline:
             runtime_profiles = [
                 {**r, "network": "none"} if isinstance(r, dict)
@@ -408,8 +387,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         #   race_timeout (int, default 720s) — short per-worker recon timeout
         race_scout = bool(body["race_scout"]) if "race_scout" in body else bool(wc.get("race_scout", True))
         race_engines = body.get("race_engines") or wc.get("race_engines") or None  # None → defaults to the roster
-        if offline and not allow_cursor_offline and race_engines:
-            race_engines = _drop_cursor_profiles(race_engines, worker_profiles) or None
+        # (the cursor-offline carve-out was removed with the cursor engine — with
+        #  the pi-only roster there is no race engine to special-case offline)
         race_timeout = int(body.get("race_timeout", wc.get("race_timeout", 720)))
         # cold_start (run-75379 BUG④): "继续做题"/standby relaunch sets this False so the
         # coordinator skips the race-scout warmup and continues on the existing graph.
@@ -706,7 +685,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
         runtime_profiles = wc.get("runtime_profiles") or []
         worker_profiles = wc.get("worker_profiles") or []
-        winner_engine = str(winner.get("engine") or "claude")
+        winner_engine = str(winner.get("engine") or "pi")
         profile = _standby_profile_for(winner_engine, worker_profiles)
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(

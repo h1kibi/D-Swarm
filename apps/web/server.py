@@ -468,7 +468,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                     if "respond" in roles or "review" in roles:
                         candidates.append(str(p.get("name") or p.get("id") or ""))
             candidates.extend(str(e) for e in (wc.get("engines") or []))
-            candidates.extend(["claude", "codex"])
             for cand in candidates:
                 if not cand:
                     continue
@@ -476,9 +475,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 if profile is not None:
                     return profile, cand
                 base = base_engine_for_profile(cand)
-                if base in ("claude", "codex", "cursor"):
+                if base in ("pi",):
                     return None, base
-            return None, "claude"
+            return None, "pi"
 
         async def stream():
             # Register this generation as the run's active btw; cancel any prior.
@@ -849,10 +848,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 account_id=account_id,
                 engine=str(body.get("engine") or ""),
                 secret=(body.get("secret") if body.get("secret") is not None else None),
-                codex_auth_json=(
-                    body.get("codex_auth_json")
-                    if body.get("codex_auth_json") is not None else None
-                ),
                 base_url=(body.get("base_url") if body.get("base_url") is not None else None),
                 target_engine=(
                     body.get("target_engine") if body.get("target_engine") is not None else None
@@ -866,28 +861,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def delete_credential_account(account_id: str) -> Any:
         store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
         return {"ok": store.delete(account_id)}
-
-    @app.post("/api/settings/credential-accounts/{account_id}/import-host-codex")
-    async def import_host_codex(account_id: str) -> Any:
-        # One-click refresh of a codex account from the HOST's ~/.codex/auth.json.
-        # `codex login` writes the host file; container workers mount the account
-        # COPY, so a fresh login must be re-imported. Only valid on a bare host —
-        # inside the web container ~/.codex is the container's, not the operator's.
-        from muteki.core.runtime_env import is_web_container
-
-        if is_web_container():
-            raise HTTPException(
-                status_code=409,
-                detail="import-from-host is unavailable when the web control plane "
-                       "runs in a container (~/.codex is not the operator's). Paste "
-                       "or upload the auth.json instead.",
-            )
-        store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
-        try:
-            account = await asyncio.to_thread(store.import_host_codex_auth, account_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        return {"ok": True, "account": account}
 
     @app.post("/api/settings/credential-accounts/{account_id}/test")
     async def test_credential_account(account_id: str, request: Request) -> Any:
@@ -917,7 +890,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         from muteki.solver.credential_accounts import detect_system_login
 
         logins = await asyncio.to_thread(
-            lambda: {e: detect_system_login(e) for e in ("claude", "codex", "cursor")}
+            lambda: {e: detect_system_login(e) for e in ("pi",)}
         )
         return {"logins": logins}
 

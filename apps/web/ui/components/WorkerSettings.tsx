@@ -24,7 +24,6 @@ import {
   testWorkerProfileModel,
   fetchProfilesHealth,
   testProfileHealth,
-  importHostCodexAuth,
   type ProfileHealth,
 } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
@@ -53,13 +52,13 @@ import { Icon, IconName } from "@/components/Icon";
  */
 
 type WorkerProfile = WS["worker_profiles"][number];
-type AccountType = "claude" | "codex" | "cursor" | "api";
+type AccountType = "pi" | "api";
 type Backend = "local" | "container";
 type NetworkMode = "bridge" | "host" | "none";
 type Tab = "roster" | "accounts" | "runtime" | "budget" | "advanced";
 type Severity = "ok" | "amber" | "red";
 
-const BASE_ENGINES = ["claude", "codex", "cursor", "pi"] as const;
+const BASE_ENGINES = ["pi"] as const;
 const ORDINARY_PROFILE_ROLES = new Set(["race", "bootstrap", "explore", "respond"]);
 // env var + default that govern the container worker image (server-side:
 // muteki/solver/container_exec.py WORKER_IMAGE). Surfaced in the Runtime tab so
@@ -91,16 +90,13 @@ const profileCapacity = (profiles: WorkerProfile[]): number =>
 // Mirrors apps/web/worker_config.py DEFAULT_WORKER_PROFILES so a new instance is
 // valid the moment it's created (the backend re-normalizes, but we want sensible
 // fields immediately and a stable credential_account that shares the engine's one
-// subscription — three codex instances all authenticate as "codex-main").
+// provider key — multiple pi instances all authenticate as "pi-main").
 const ENGINE_DEFAULTS: Record<string, { transport: string; wire_api: string; roles: string[] }> = {
-  claude: { transport: "claude_code", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
-  codex: { transport: "codex_cli", wire_api: "responses", roles: ["race", "bootstrap", "explore", "review"] },
-  cursor: { transport: "cursor_agent", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
   pi: { transport: "pi_cli", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
 };
 
 // A unique profile id/name for a new instance of `engine` that won't collide with
-// existing profiles (the backend dedupes by id, so "codex" + "codex-2" + "codex-3"
+// existing profiles (the backend dedupes by id, so "pi" + "pi-2" + "pi-3"
 // stay distinct). First instance of an engine gets the bare base name when free.
 const nextInstanceId = (engine: string, existing: WorkerProfile[]): string => {
   const taken = new Set(existing.map((p) => p.name || p.id));
@@ -113,7 +109,7 @@ const nextInstanceId = (engine: string, existing: WorkerProfile[]): string => {
 };
 
 const makeInstance = (engine: string, existing: WorkerProfile[], runtime: string): WorkerProfile => {
-  const d = ENGINE_DEFAULTS[engine] ?? ENGINE_DEFAULTS.claude;
+  const d = ENGINE_DEFAULTS[engine] ?? ENGINE_DEFAULTS.pi;
   const id = nextInstanceId(engine, existing);
   const maxPrio = existing.reduce((m, p) => Math.max(m, Number(p.priority ?? 100)), 0);
   return {
@@ -160,7 +156,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   const [raceScout, setRaceScout] = useState(true);
   const [raceTimeout, setRaceTimeout] = useState(720);
   const [reviewEnabled, setReviewEnabled] = useState(true);
-  const [reviewEngine, setReviewEngine] = useState("claude-sub-container");
+  const [reviewEngine, setReviewEngine] = useState("pi-web");
   const [reviewTimeout, setReviewTimeout] = useState(420);
   const [reviewMaxConcurrent, setReviewMaxConcurrent] = useState(1);
   const [reviewCandidateThreshold, setReviewCandidateThreshold] = useState(5);
@@ -176,12 +172,12 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   const [llmTesting, setLlmTesting] = useState(false);
   const [accounts, setAccounts] = useState<CredentialAccount[]>([]);
   const [sysLogin, setSysLogin] = useState<Record<string, SystemLoginStatus>>({});
-  const [accountId, setAccountId] = useState("claude-main");
-  const [accountType, setAccountType] = useState<AccountType>("claude");
+  const [accountId, setAccountId] = useState("pi-main");
+  const [accountType, setAccountType] = useState<AccountType>("pi");
   // For a custom endpoint (type "api") this names WHICH agent the base_url+key
   // overrides — persisted as the account's ENGINE marker so the panel can bind &
   // display it instead of an orphan "api".
-  const [accountApiEngine, setAccountApiEngine] = useState<"claude" | "codex" | "cursor">("claude");
+  const [accountApiEngine, setAccountApiEngine] = useState<"pi">("pi");
   const [accountSecret, setAccountSecret] = useState("");
   const [accountBaseUrl, setAccountBaseUrl] = useState("");
   const [accountStatus, setAccountStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -206,8 +202,6 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   // account_id) busts the stale verdict rather than showing a phantom pass/fail.
   const [profileHealth, setProfileHealth] = useState<Record<string, ProfileHealth>>({});
   const [profileAuth, setProfileAuth] = useState<Record<string, ProfileHealth & { testing?: boolean }>>({});
-  // account_id currently being re-imported from the host ~/.codex (button spinner).
-  const [importingCodex, setImportingCodex] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [customModelOpen, setCustomModelOpen] = useState<Record<string, boolean>>({});
   // composer drag state: index of the card being dragged, and the index it's
@@ -242,7 +236,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
       const rv = c.stage_policy?.coordinator?.review ?? {};
       setReviewPolicy(rv);
       setReviewEnabled(rv.enabled ?? true);
-      setReviewEngine(rv.engine ?? "claude-sub-container");
+      setReviewEngine(rv.engine ?? "pi-web");
       setReviewTimeout(rv.timeout ?? 420);
       setReviewMaxConcurrent(rv.max_concurrent ?? 1);
       setReviewCandidateThreshold(rv.candidate_spike_threshold ?? 5);
@@ -363,7 +357,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   const engineOptions = useMemo(
     () => workerProfiles.length > 0
       ? workerProfiles.map((p) => p.name || p.id)
-      : ["claude", "codex", "cursor"],
+      : ["pi"],
     [workerProfiles]
   );
   const reviewOptions = useMemo(() => {
@@ -626,7 +620,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   };
 
   const isDefaultLikeAccountId = (id: string) =>
-    id.trim() === "" || /^(claude|codex|cursor)-main$/.test(id.trim());
+    id.trim() === "" || /^pi-main$/.test(id.trim());
 
   const onAccountTypeChange = (next: AccountType) => {
     setAccountType(next);
@@ -634,14 +628,14 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     if (isDefaultLikeAccountId(accountId)) setAccountId(`${targetEngine}-main`);
   };
 
-  const onAccountApiEngineChange = (next: "claude" | "codex" | "cursor") => {
+  const onAccountApiEngineChange = (next: "pi") => {
     setAccountApiEngine(next);
     if (isDefaultLikeAccountId(accountId)) setAccountId(`${next}-main`);
   };
 
   // Pre-fill the account form for a specific engine and bring it into view (used
   // by the per-card "configure account →" deep-link and the Accounts blocker).
-  const prefillAccount = (engine: "claude" | "codex" | "cursor") => {
+  const prefillAccount = (engine: "pi") => {
     setTab("accounts");
     setEditingAccount(null);
     setAccountType(engine);
@@ -657,9 +651,9 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   // Reset the form back to a clean "add new" state (also used to cancel an edit).
   const resetAccountForm = () => {
     setEditingAccount(null);
-    setAccountType("claude");
-    setAccountApiEngine("claude");
-    setAccountId("claude-main");
+    setAccountType("pi");
+    setAccountApiEngine("pi");
+    setAccountId("pi-main");
     setAccountSecret("");
     setAccountBaseUrl("");
     setShowSecret(false);
@@ -685,14 +679,14 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     if (isEndpoint) {
       setAccountType("api");
       // a.engine carries the target_engine for a marked endpoint; fall back to
-      // the explicit detail, else default to claude.
+      // the explicit detail, else default to pi.
       setAccountApiEngine(
-        (target || (a.engine !== "api" ? a.engine : "claude")) as "claude" | "codex" | "cursor",
+        (target || (a.engine !== "api" ? a.engine : "pi")) as "pi",
       );
     } else {
       setAccountType(a.engine as AccountType);
-      if (a.engine === "claude" || a.engine === "codex" || a.engine === "cursor") {
-        setAccountApiEngine(a.engine);
+      if (a.engine === "pi") {
+        setAccountApiEngine("pi");
       }
     }
     // Pre-fill the real values so the operator sees and edits them in place. The
@@ -722,11 +716,9 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     const secret = accountSecret.trim();   // "" on edit = keep existing
     const saved = await putCredentialAccount(
       accountId.trim(),
-      engine === "codex"
-        ? { engine, codex_auth_json: secret }
-        : engine === "api"
-          ? { engine, secret, base_url: accountBaseUrl, target_engine: accountApiEngine }
-          : { engine, secret }
+      engine === "api"
+        ? { engine, secret, base_url: accountBaseUrl, target_engine: accountApiEngine }
+        : { engine, secret }
     );
     if (saved) {
       setAccountStatus("saved");
@@ -777,24 +769,6 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     // since the modal opened) — re-pull the cheap batch.
     fetchProfilesHealth().then((hs) =>
       setProfileHealth(Object.fromEntries(hs.map((h) => [h.profile_id, h]))));
-  };
-
-  // One-click: re-import a codex account from the host's ~/.codex/auth.json after
-  // `codex login`. `codex login` refreshes the host file but container workers
-  // mount the account COPY, so a fresh login must be re-imported to take effect.
-  const importCodexFromHost = async (accountId: string) => {
-    setImportingCodex(accountId);
-    const r = await importHostCodexAuth(accountId);
-    setImportingCodex(null);
-    if (r.ok) {
-      await refreshAccounts();   // busts cached auth verdicts + re-pulls binding health
-      setStatus("saved");
-    } else {
-      setStatus("error");
-      // surface the server's reason (host file missing / container) inline
-      setProfileAuth((s) => ({ ...s }));
-      window.alert(r.detail || "import failed");
-    }
   };
 
   const runLlmTest = async () => {
@@ -1100,7 +1074,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                           <div className="ws2-blocker">
                             <Icon name="alert" size={12} />
                             <span>{t("settings.blockerAccount", { engine: blocker })}</span>
-                            <button type="button" className="ws-jump" onClick={() => prefillAccount(blocker as "claude" | "codex" | "cursor")}>
+                            <button type="button" className="ws-jump" onClick={() => prefillAccount("pi")}>
                               {t("settings.blockerGoAccount")}
                             </button>
                           </div>
@@ -1221,19 +1195,8 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                               <Icon name="plug" size={12} /> {auth?.testing ? t("settings.testing") : t("settings.testConn")}
                             </button>
                           ) : (
-                            <button className="ws-save sm" type="button" onClick={() => prefillAccount(p.engine as "claude" | "codex" | "cursor")}>
+                            <button className="ws-save sm" type="button" onClick={() => prefillAccount(p.engine as "pi")}>
                               <Icon name="plug" size={12} /> {t("settings.acctAdd")}
-                            </button>
-                          )}
-                          {/* codex re-auth: after `codex login`, one click re-imports the
-                              fresh host ~/.codex/auth.json into the bound account (the host
-                              file and the mounted account copy drift otherwise). */}
-                          {bindKind !== "missing" && effCred && p.engine === "codex" && (
-                            <button className="ws-mini-btn" type="button"
-                              disabled={importingCodex === effCred}
-                              onClick={() => importCodexFromHost(effCred)}
-                              title={t("settings.importHostCodexHint")}>
-                              <Icon name="refresh" size={12} /> {importingCodex === effCred ? t("settings.importing") : t("settings.importHostCodex")}
                             </button>
                           )}
                         </span>
@@ -1304,9 +1267,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                     <div className="ws-field">
                       <label>{t("settings.accountType")}</label>
                       <select value={accountType} onChange={(e) => onAccountTypeChange(e.target.value as AccountType)}>
-                        <option value="claude">{t("settings.typeClaudeToken")}</option>
-                        <option value="codex">{t("settings.typeCodexAuth")}</option>
-                        <option value="cursor">{t("settings.typeCursorKey")}</option>
+                        <option value="pi">{t("settings.typePiKey")}</option>
                         <option value="api">{t("settings.typeCustomEndpoint")}</option>
                       </select>
                     </div>
@@ -1315,25 +1276,13 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                         <div className="ws-field">
                           <label>{t("settings.accountTargetEngine")}</label>
                           <select value={accountApiEngine}
-                            onChange={(e) => onAccountApiEngineChange(e.target.value as "claude" | "codex" | "cursor")}>
-                            <option value="claude">claude</option>
-                            <option value="codex">codex</option>
-                            <option value="cursor">cursor</option>
+                            onChange={(e) => onAccountApiEngineChange(e.target.value as "pi")}>
+                            <option value="pi">pi</option>
                           </select>
                         </div>
-                        {accountApiEngine === "codex" && (
-                          <p className="ws-field ws-span-all ws-warn-note">
-                            <Icon name="x" size={12} /> {t("settings.endpointCodexWarn")}
-                          </p>
-                        )}
-                        {accountApiEngine === "cursor" && (
-                          <p className="ws-field ws-span-all ws-warn-note">
-                            <Icon name="x" size={12} /> {t("settings.endpointCursorWarn")}
-                          </p>
-                        )}
-                        {accountApiEngine === "claude" && (
+                        {accountApiEngine === "pi" && (
                           <p className="ws-field ws-span-all ws-muted-note">
-                            {t("settings.endpointClaudeHint")}
+                            {t("settings.endpointPiHint")}
                           </p>
                         )}
                         <div className="ws-field">
@@ -1348,30 +1297,20 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                     )}
                     <div className="ws-field ws-span-all">
                       <label>
-                        {accountType === "codex" ? t("settings.codexAuthJson") : t("settings.secret")}
+                        {t("settings.secret")}
                         {editingAccount && <span className="ws-label-hint"> · {t("settings.secretEditHint")}</span>}
                       </label>
                       {/* The stored secret is echoed into this field (operator opted
                           into edit-in-place). It's masked by default; the eye toggle
                           reveals plaintext. Reset to masked whenever the form reloads. */}
                       <div className="ws-secret-wrap">
-                        {accountType === "codex" ? (
-                          <textarea
-                            className={showSecret ? "" : "ws-secret-masked"}
-                            value={accountSecret}
-                            onChange={(e) => setAccountSecret(e.target.value)}
-                            rows={3} spellCheck={false}
-                            placeholder={editingAccount ? t("settings.keepCurrentSecret") : '{"OPENAI_API_KEY":"..."}'}
-                          />
-                        ) : (
-                          <input
-                            type={showSecret ? "text" : "password"}
-                            value={accountSecret}
-                            onChange={(e) => setAccountSecret(e.target.value)}
-                            spellCheck={false}
-                            placeholder={editingAccount ? t("settings.keepCurrentSecret") : undefined}
-                          />
-                        )}
+                        <input
+                          type={showSecret ? "text" : "password"}
+                          value={accountSecret}
+                          onChange={(e) => setAccountSecret(e.target.value)}
+                          spellCheck={false}
+                          placeholder={editingAccount ? t("settings.keepCurrentSecret") : undefined}
+                        />
                         {accountSecret && (
                           <button
                             type="button"

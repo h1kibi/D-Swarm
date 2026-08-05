@@ -802,7 +802,7 @@ export async function listCredentialAccounts(): Promise<CredentialAccount[]> {
 
 export async function putCredentialAccount(
   accountId: string,
-  body: { engine: string; secret?: string; codex_auth_json?: string; base_url?: string; target_engine?: string }
+  body: { engine: string; secret?: string; base_url?: string; target_engine?: string }
 ): Promise<CredentialAccount | null> {
   try {
     const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
@@ -828,24 +828,6 @@ export async function deleteCredentialAccount(accountId: string): Promise<boolea
     return Boolean(j.ok);
   } catch {
     return false;
-  }
-}
-
-/** One-click refresh of a codex account from the HOST's ~/.codex/auth.json (after
- *  `codex login`). Returns {ok, detail} — detail carries the server's error (e.g.
- *  host file missing, or unavailable when web runs in a container). */
-export async function importHostCodexAuth(
-  accountId: string
-): Promise<{ ok: boolean; detail: string }> {
-  try {
-    const r = await apiFetch(
-      `/api/settings/credential-accounts/${encodeURIComponent(accountId)}/import-host-codex`,
-      { method: "POST" }
-    );
-    const j = await r.json().catch(() => ({}));
-    return { ok: r.ok && Boolean(j.ok), detail: String(j.detail ?? (r.ok ? "" : "import failed")) };
-  } catch (e) {
-    return { ok: false, detail: String(e) };
   }
 }
 

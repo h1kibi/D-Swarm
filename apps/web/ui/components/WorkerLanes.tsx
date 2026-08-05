@@ -18,7 +18,7 @@ import { ChipFilterBar } from "@/components/ChipFilterBar";
  * lines — plus spawn/kill controls so the operator drives the swarm from here.
  */
 
-const SPAWN_ENGINES = ["cursor", "claude", "codex"];
+const SPAWN_ENGINES = ["pi"];
 
 function runtimeLabel(lane: SolverLane): string {
   const runtime = lane.runtime;

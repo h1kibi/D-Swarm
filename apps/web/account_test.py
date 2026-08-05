@@ -33,9 +33,7 @@ from muteki.solver.credential_accounts import (
 
 # in-container worker binary per engine — mirrors container_exec._CONTAINER_BIN.
 _CONTAINER_BIN = {
-    "claude": "claude",
-    "codex": "codex",
-    "cursor": "/home/kali/.local/bin/cursor-agent",
+    "pi": "pi",
 }
 
 
@@ -120,10 +118,9 @@ def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[s
     """Model-agnostic auth probe for a custom-endpoint credential.
 
     Reads the account's API_KEY + BASE_URL + target engine and sends ONE minimal
-    request (max_tokens=1) in the wire format the target engine speaks:
-      - claude target → Anthropic Messages  ({base}/v1/messages, x-api-key)
-      - codex/cursor/other → OpenAI Chat Completions ({base}/chat/completions, Bearer)
-    Never shells a CLI, never needs a pinned model, returns fast. NEVER raises.
+    request (max_tokens=1) in the OpenAI Chat Completions wire format
+    ({base}/chat/completions, Bearer). Never shells a CLI, never needs a pinned
+    model, returns fast. NEVER raises.
     """
     base = root / account_id
     try:
@@ -142,18 +139,11 @@ def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[s
         return _result(False, "自定义端点缺少 API key", layer="auth")
 
     target = (acct.details or {}).get("target_engine") or acct.engine or ""
-    # build the right wire request for the target engine.
-    if target == "claude":
-        url = f"{base_url}/v1/messages"
-        headers = ["-H", f"x-api-key: {api_key}", "-H", "anthropic-version: 2023-06-01",
-                   "-H", "Content-Type: application/json"]
-        body = json.dumps({"model": "probe", "max_tokens": 1,
-                           "messages": [{"role": "user", "content": "ok"}]})
-    else:
-        url = f"{base_url}/chat/completions"
-        headers = ["-H", f"Authorization: Bearer {api_key}", "-H", "Content-Type: application/json"]
-        body = json.dumps({"model": "probe", "max_tokens": 1,
-                           "messages": [{"role": "user", "content": "ok"}]})
+    # the pi/openai wire format: OpenAI Chat Completions with a Bearer key.
+    url = f"{base_url}/chat/completions"
+    headers = ["-H", f"Authorization: Bearer {api_key}", "-H", "Content-Type: application/json"]
+    body = json.dumps({"model": "probe", "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "ok"}]})
 
     # -w writes the HTTP status on its own line so we can classify auth vs other.
     argv = ["curl", "-sS", "-m", "20", "-o", "/dev/null", "-w", "%{http_code}",
@@ -213,11 +203,15 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
     # image (any of them proves the same plumbing: supervisor image + account
     # mount + engine CLI), fall back to the upstream default.
     image = WORKER_IMAGE
-    for cand in _CATEGORY_IMAGES.values():
-        r = _docker("image", "inspect", cand, timeout=20)
-        if r.returncode == 0:
-            image = cand
-            break
+    try:
+        for cand in _CATEGORY_IMAGES.values():
+            r = _docker("image", "inspect", cand, timeout=20)
+            if r.returncode == 0:
+                image = cand
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # docker missing/busy — the explicit probe below reports the layer.
+        pass
 
     # 1) docker reachable + image present.
     try:

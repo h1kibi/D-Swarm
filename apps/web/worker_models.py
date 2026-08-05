@@ -30,50 +30,23 @@ from muteki.solver.worker_profiles import base_engine_for_profile, profile_uses_
 ModelOption = dict[str, str]
 
 WORKER_MODEL_OPTIONS: dict[str, list[ModelOption]] = {
-    "claude": [
-        {"id": "sonnet", "label": "Sonnet (alias)"},
-        {"id": "opus", "label": "Opus (alias)"},
-        {"id": "fable", "label": "Fable (alias)"},
-        {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
-        {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
-        {"id": "claude-fable-5", "label": "Claude Fable 5"},
-        {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5"},
-    ],
-    "codex": [
-        {"id": "gpt-5.5", "label": "GPT-5.5"},
-        {"id": "gpt-5.4", "label": "GPT-5.4"},
-        {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
-        {"id": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark"},
-        {"id": "gpt-5.2", "label": "GPT-5.2"},
-        {"id": "gpt-5.1", "label": "GPT-5.1"},
-        {"id": "gpt-5-mini", "label": "GPT-5 Mini"},
-    ],
-    "cursor": [
-        {"id": "auto", "label": "Auto"},
-        {"id": "composer-2.5-fast", "label": "Composer 2.5 Fast"},
-        {"id": "composer-2.5", "label": "Composer 2.5"},
-        {"id": "gpt-5.3-codex", "label": "Codex 5.3"},
-        {"id": "gpt-5.3-codex-high", "label": "Codex 5.3 High"},
-        {"id": "gpt-5.2", "label": "GPT-5.2"},
-        {"id": "claude-4.5-sonnet", "label": "Sonnet 4.5"},
-        {"id": "claude-4.5-sonnet-thinking", "label": "Sonnet 4.5 Thinking"},
+    "pi": [
+        {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
+        {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
     ],
 }
 
 _CONTAINER_BIN = {
-    "claude": "claude",
-    "codex": "codex",
-    "cursor": "/home/kali/.local/bin/cursor-agent",
+    "pi": "pi",
 }
 
 _CONTAINER_BASE_ENV = {
-    "PATH": "/home/kali/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "HOME": "/home/kali",
     "USER": "kali",
     "LOGNAME": "kali",
     "LANG": "C.UTF-8",
     "PYTHONUNBUFFERED": "1",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
 }
 
 
@@ -135,8 +108,7 @@ def _containerize_argv(engine: str, argv: list[str]) -> list[str]:
 def _probe_ok(profile: dict[str, Any], r: subprocess.CompletedProcess) -> bool:
     drv = driver_for(profile)
     # EndpointDriver's build_execute output is still the base engine's envelope.
-    # Use the base checker when present so codex keeps its tolerant JSONL success
-    # predicate instead of the generic "rc 0 + non-empty stdout" fallback.
+    # Use the base checker so the driver's own success predicate applies.
     checker = getattr(drv, "base", drv)
     return bool(checker._hello_ok(r))  # noqa: SLF001
 
@@ -149,9 +121,9 @@ def _probe_argv_for_profile(profile: dict[str, Any], engine: str, model: str) ->
         argv = drv.build_execute(
             prompt, None, web_access=False, kb_access=False, stream=False
         )
-        # EndpointDriver injects codex's provider/model config itself, but claude
-        # endpoint profiles still need the regular --model flag on the CLI argv.
-        if not (profile_uses_endpoint(profile) and engine == "codex"):
+        # pi's CLI takes --model directly even for a custom endpoint (the endpoint
+        # is just base_url/key env), so the probe must still pin the selected model.
+        if not profile_uses_endpoint(profile) or engine == "pi":
             argv = _insert_model(argv, model)
     return _containerize_argv(engine, argv)
 
@@ -258,15 +230,6 @@ def _worker_container_model_probe(
 
         env = {**_CONTAINER_BASE_ENV, **resolved.env}
         prelude = [
-            'if [ -n "$MUTEKI_CODEX_HOME_SEED" ] && [ -d "$MUTEKI_CODEX_HOME_SEED" ]; then '
-            'export CODEX_HOME="${CODEX_HOME:-$HOME/.codex-muteki-model-test}"; '
-            'rm -rf "$CODEX_HOME"; mkdir -p "$CODEX_HOME"; '
-            'cp -R "$MUTEKI_CODEX_HOME_SEED"/. "$CODEX_HOME"/; '
-            'chmod -R u+rwX "$CODEX_HOME"; fi',
-            'if [ -r "$CLAUDE_CODE_OAUTH_TOKEN_FILE" ]; then '
-            'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_CODE_OAUTH_TOKEN_FILE")"; fi',
-            'if [ -r "$CURSOR_API_KEY_FILE" ]; then '
-            'export CURSOR_API_KEY="$(cat "$CURSOR_API_KEY_FILE")"; fi',
             'if [ -r "$ANTHROPIC_API_KEY_FILE" ]; then '
             'export ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_API_KEY_FILE")"; fi',
             'if [ -r "$OPENAI_API_KEY_FILE" ]; then '
@@ -365,10 +328,9 @@ def probe_worker_model(
         )
 
     account_id = str(profile.get("credential_account") or "").strip()
-    # In local mode an empty credential_account means "use the host CLI login"
-    # (e.g. ~/.codex), matching the live swarm worker path. Passing None here
-    # would silently fall back to the default <engine>-main account and can pick
-    # up a stale registered Codex home.
+    # In local mode an empty credential_account means "use the host CLI login",
+    # matching the live swarm worker path. Passing None here would silently fall
+    # back to the default <engine>-main account.
     resolved_account_id = account_id if account_id else ("" if backend == "local" else None)
     root = account_store_root(sessions_root)
     env = runtime_env_for_engine(
@@ -422,21 +384,6 @@ def probe_worker_model(
             "model": model,
             "backend": backend if backend in ("local", "container") else "local",
         }
-
-
-def parse_cursor_models(text: str) -> list[ModelOption]:
-    """Small parser kept for future refresh tooling and tests."""
-
-    out: list[ModelOption] = []
-    for line in text.splitlines():
-        if " - " not in line or line.lower().startswith("available models"):
-            continue
-        mid, label = line.split(" - ", 1)
-        mid = mid.strip()
-        label = label.strip()
-        if mid:
-            out.append({"id": mid, "label": label or mid})
-    return out
 
 
 def parse_openai_models(text: str) -> list[ModelOption]:

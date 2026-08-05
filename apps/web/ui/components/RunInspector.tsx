@@ -25,7 +25,7 @@ import type { ArtifactView } from "@/components/ArtifactPanel";
  * coordinator conversation being drowned out.
  */
 
-const SPAWN_ENGINES = ["cursor", "claude", "codex"];
+const SPAWN_ENGINES = ["pi"];
 
 function runtimeLabel(lane: SolverLane): string {
   const runtime = lane.runtime;

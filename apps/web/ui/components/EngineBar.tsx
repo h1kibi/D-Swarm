@@ -4,9 +4,7 @@ import { useEngines, EngineStatus } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
 
 const LABELS: Record<string, string> = {
-  cursor: "Cursor",
-  claude: "Claude",
-  codex: "Codex",
+  pi: "Pi",
 };
 
 /** Why an engine is degraded, or "" when it's fine. Two independent signals:

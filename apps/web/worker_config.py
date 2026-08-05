@@ -42,7 +42,7 @@ DEFAULT_MAX_TOTAL_WORKERS = 0
 DEFAULT_COST_BUDGET_USD = 0.0
 DEFAULT_REVIEW_POLICY = {
     "enabled": True,
-    "engine": "claude-sub-container",
+    "engine": "pi-web",
     "after_race": True,
     "after_fruitless_workers": 3,
     "after_duplicate_intents": 2,
@@ -74,44 +74,82 @@ DEFAULT_RUNTIME_PROFILES = [
     {"id": "docker-pwn-heavy", "backend": "container", "label": "Docker pwn heavy",
      "network": "bridge", "memory": "24g", "cpus": "8", "pids_limit": 4096},
 ]
+# Pi-only roster (route A): one engine (pi), seven DIRECTION profiles. All are
+# plain pi for now — they are the specialization hooks (per-profile model /
+# runtime image / prompt later). The per-category override map routes each
+# challenge to its direction profile.
 DEFAULT_WORKER_PROFILES = [
-    {"id": "claude-sub-container", "name": "claude-sub-container",
-     "engine": "claude", "transport": "claude_code",
-     "auth": "subscription", "credential_mode": "subscription",
-     "credential_account": "claude-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 2, "max_review_running": 0, "priority": 10, "model": "",
-     "enabled": True},
-    {"id": "codex-sub-container", "name": "codex-sub-container",
-     "engine": "codex", "transport": "codex_cli",
-     "auth": "subscription", "credential_mode": "subscription",
-     "credential_account": "codex-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "responses",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 20, "model": "",
-     "enabled": True},
-    {"id": "cursor-api-container", "name": "cursor-api-container",
-     "engine": "cursor", "transport": "cursor_agent",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "cursor-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
-     "race": True, "max_running": 2, "max_review_running": 0, "priority": 30, "model": "",
-     "enabled": True},
-    # route A: pi worker (pi -p --mode json). Credentials flow via the account
-    # (ANTHROPIC_API_KEY / OPENAI_API_KEY per MUTEKI_PI_PROVIDER); the P3 model
-    # gateway will replace direct key injection with a task token.
-    {"id": "pi-api-container", "name": "pi-api-container",
+    {"id": "pi-web", "name": "pi-web",
      "engine": "pi", "transport": "pi_cli",
      "auth": "api_key", "credential_mode": "api_key",
      "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
      "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 10, "model": "",
+     "enabled": True},
+    {"id": "pi-pwn", "name": "pi-pwn",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 20, "model": "",
+     "enabled": True},
+    {"id": "pi-rev", "name": "pi-rev",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 30, "model": "",
+     "enabled": True},
+    {"id": "pi-crypto", "name": "pi-crypto",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
      "race": True, "max_running": 1, "max_review_running": 0, "priority": 40, "model": "",
+     "enabled": True},
+    {"id": "pi-misc", "name": "pi-misc",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 50, "model": "",
+     "enabled": True},
+    {"id": "pi-forensics", "name": "pi-forensics",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 60, "model": "",
+     "enabled": True},
+    {"id": "pi-AIsec", "name": "pi-AIsec",
+     "engine": "pi", "transport": "pi_cli",
+     "auth": "api_key", "credential_mode": "api_key",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 70, "model": "",
      "enabled": True},
 ]
 DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
+
+# Per-category dispatch routing: each challenge category uses its direction
+# profile (all plain pi today). A category without an entry falls back to the
+# full DEFAULT_ENGINES roster.
+DEFAULT_CATEGORY_OVERRIDES = {
+    "web": ["pi-web"],
+    "pwn": ["pi-pwn"],
+    "reverse": ["pi-rev"],
+    "crypto": ["pi-crypto"],
+    "misc": ["pi-misc"],
+    "forensics": ["pi-forensics"],
+    "aisec": ["pi-AIsec"],
+}
 
 
 def resolve_worker_backend(
@@ -426,8 +464,6 @@ class WorkerConfigStore:
                 p["credential_account"] = account_id
                 p["credential_mode"] = "api_key"
                 p["auth"] = "api_key"
-                if engine == "codex" and not str(p.get("wire_api") or "").strip():
-                    p["wire_api"] = "responses"
                 break
             out.append(p)
         return out
@@ -512,8 +548,15 @@ class WorkerConfigStore:
         review["engine"] = review_engine
         overrides: dict[str, Any] = {}
         raw_ov = d.get("overrides")
+        if not isinstance(raw_ov, dict):
+            # route A default: each category dispatches its direction profile.
+            raw_ov = DEFAULT_CATEGORY_OVERRIDES
         if isinstance(raw_ov, dict):
             for cat, ov in raw_ov.items():
+                # DEFAULT_CATEGORY_OVERRIDES are bare name lists; stored overrides
+                # are {"engines": [...]} dicts — accept both shapes.
+                if isinstance(ov, list):
+                    ov = {"engines": ov}
                 if not isinstance(ov, dict):
                     continue
                 cat_engines = _clean_engines_for_backend(

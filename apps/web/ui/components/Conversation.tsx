@@ -456,7 +456,7 @@ function QuietMeta({ digest, t }: { digest: SwarmDigest; t: (k: string) => strin
 }
 
 const ENGINE_LABELS: Record<string, string> = {
-  claude: "Claude", codex: "Codex", cursor: "Cursor", deepseek: "DeepSeek",
+  pi: "Pi", deepseek: "DeepSeek",
 };
 
 /** A friendly agent name from a solverId + engine. solverIds look like
