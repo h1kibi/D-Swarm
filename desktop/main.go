@@ -53,8 +53,8 @@ func main() {
 	// OnShutdown stops BOTH child services (backend + UI), so no orphans.
 	err := wails.Run(&options.App{
 		Title:     "Muteki — Command Deck",
-		Width:     1024,
-		Height:    768,
+		Width:     1440,
+		Height:    900,
 		MinWidth:  960,
 		MinHeight: 640,
 		AssetServer: &assetserver.Options{Assets: assets},
