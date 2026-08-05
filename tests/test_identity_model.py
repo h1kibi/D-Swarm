@@ -25,19 +25,19 @@ from muteki.solver.worker_profiles import resolve_seat_ref
 # ── deterministic ids ────────────────────────────────────────────────────────
 
 def test_seat_and_credential_ids_are_deterministic_and_prefixed():
-    a = seat_id_for("claude", legacy_name="claude-local")
-    b = seat_id_for("claude", legacy_name="claude-local")
+    a = seat_id_for("pi", legacy_name="pi-local")
+    b = seat_id_for("pi", legacy_name="pi-local")
     assert a == b
-    assert a.startswith("seat_claude_") and len(a) == len("seat_claude_") + 6
-    c = credential_id_for("codex", legacy_account_id="codex-main")
-    assert c == credential_id_for("codex", legacy_account_id="codex-main")
-    assert c.startswith("cred_codex_")
+    assert a.startswith("seat_pi_") and len(a) == len("seat_pi_") + 6
+    c = credential_id_for("pi", legacy_account_id="pi-main")
+    assert c == credential_id_for("pi", legacy_account_id="pi-main")
+    assert c.startswith("cred_pi_")
 
 
 def test_distinct_inputs_yield_distinct_ids():
-    assert seat_id_for("claude", legacy_name="a") != seat_id_for("claude", legacy_name="b")
-    assert credential_id_for("claude", legacy_account_id="x") != credential_id_for(
-        "cursor", legacy_account_id="x"
+    assert seat_id_for("pi", legacy_name="a") != seat_id_for("pi", legacy_name="b")
+    assert credential_id_for("pi", legacy_account_id="x") != credential_id_for(
+        "pi", legacy_account_id="y"
     )
 
 
@@ -64,30 +64,30 @@ def test_container_forbids_system_inherit():
 # ── migration: empty binding + present default account → engine_key ──────────
 
 def test_empty_binding_with_present_default_account_becomes_engine_key():
-    """The codex-local case: credential_account='' but codex-main exists on disk
-    → bind to codex-main as engine_key (mirrors backend fallback), NOT inherit."""
+    """The pi-local case: credential_account='' but pi-main exists on disk
+    → bind to pi-main as engine_key (mirrors backend fallback), NOT inherit."""
     res = migrate_legacy_config(
         worker_profiles=[{
-            "id": "codex-local", "name": "codex-local", "engine": "codex",
+            "id": "pi-pwn-local", "name": "pi-pwn-local", "engine": "pi",
             "credential_mode": "subscription", "credential_account": "",
-            "runtime": "docker-web", "model": "gpt-5.4", "enabled": True,
+            "runtime": "docker-web", "model": "deepseek-v4-flash", "enabled": True,
         }],
         runtime_profiles=[{"id": "docker-web", "backend": "container"}],
-        account_modes={"codex-main": "chatgpt_auth_home"},
+        account_modes={"pi-main": "api_key"},
     )
     assert len(res.credentials) == 1
     cred = res.credentials[0]
     assert cred.kind == "engine_key"
-    assert cred.secret_ref == "codex-main"
+    assert cred.secret_ref == "pi-main"
     # the bare-engine default account id is aliased to the new credential id
-    assert res.credential_alias.get("codex-main") == cred.id
+    assert res.credential_alias.get("pi-main") == cred.id
 
 
 def test_empty_binding_with_no_default_account_becomes_system_inherit():
     """No bound account AND no default on disk → host login inherit."""
     res = migrate_legacy_config(
         worker_profiles=[{
-            "id": "claude-local", "name": "claude-local", "engine": "claude",
+            "id": "pi-local", "name": "pi-local", "engine": "pi",
             "credential_mode": "subscription", "credential_account": "",
             "runtime": "local", "enabled": True,
         }],
@@ -101,18 +101,18 @@ def test_empty_binding_with_no_default_account_becomes_system_inherit():
 def test_base_url_profile_becomes_custom_endpoint():
     res = migrate_legacy_config(
         worker_profiles=[{
-            "id": "claude-ds", "name": "claude-ds", "engine": "claude",
-            "credential_mode": "api_key", "credential_account": "claude-ds",
+            "id": "pi-ds", "name": "pi-ds", "engine": "pi",
+            "credential_mode": "api_key", "credential_account": "pi-ds",
             "base_url": "https://api.deepseek.com/anthropic", "wire_api": "",
             "runtime": "local", "model": "deepseek-v4-pro", "enabled": True,
         }],
         runtime_profiles=[{"id": "local", "backend": "local"}],
-        account_modes={"claude-ds": "custom_endpoint"},
+        account_modes={"pi-ds": "custom_endpoint"},
     )
     cred = res.credentials[0]
     assert cred.kind == "custom_endpoint"
     assert cred.base_url == "https://api.deepseek.com/anthropic"
-    assert cred.target_engine == "claude"
+    assert cred.target_engine == "pi"
 
 
 # ── migration preserves model, race, roles, priority ─────────────────────────
@@ -120,21 +120,21 @@ def test_base_url_profile_becomes_custom_endpoint():
 def test_migration_preserves_seat_fields():
     res = migrate_legacy_config(
         worker_profiles=[{
-            "id": "claude-local", "name": "claude-local", "engine": "claude",
-            "credential_account": "claude-main", "runtime": "docker-web",
-            "model": "claude-opus-4-8", "roles": ["race", "review"], "race": False,
+            "id": "pi-local", "name": "pi-local", "engine": "pi",
+            "credential_account": "pi-main", "runtime": "docker-web",
+            "model": "deepseek-v4-pro", "roles": ["race", "review"], "race": False,
             "max_running": 3, "priority": 10, "enabled": True,
         }],
         runtime_profiles=[{"id": "docker-web", "backend": "container"}],
-        account_modes={"claude-main": "subscription_token"},
+        account_modes={"pi-main": "api_key"},
     )
     seat = res.seats[0]
-    assert seat.model == "claude-opus-4-8"
+    assert seat.model == "deepseek-v4-pro"
     assert seat.race is False           # explicit race-opt-out survives
     assert seat.roles == ["race", "review"]
     assert seat.max_running == 3
     assert seat.priority == 10
-    assert res.seat_alias["claude-local"] == seat.id
+    assert res.seat_alias["pi-local"] == seat.id
 
 
 def test_environments_mapped_from_runtime_profiles():
@@ -159,25 +159,25 @@ def test_environments_mapped_from_runtime_profiles():
 def test_adapter_round_trip_preserves_scheduler_fields():
     """legacy → migrate → adapt back must preserve the fields the swarm/drivers read."""
     legacy = {
-        "id": "claude-local", "name": "claude-local", "engine": "claude",
-        "credential_mode": "subscription", "credential_account": "claude-main",
-        "runtime": "docker-web", "model": "claude-opus-4-8",
+        "id": "pi-local", "name": "pi-local", "engine": "pi",
+        "credential_mode": "subscription", "credential_account": "pi-main",
+        "runtime": "docker-web", "model": "deepseek-v4-pro",
         "roles": ["race", "review"], "race": True,
         "max_running": 3, "max_review_running": 0, "priority": 10, "enabled": True,
     }
     res = migrate_legacy_config(
         worker_profiles=[legacy],
         runtime_profiles=[{"id": "docker-web", "backend": "container"}],
-        account_modes={"claude-main": "subscription_token"},
+        account_modes={"pi-main": "api_key"},
     )
     back = seats_to_legacy_profiles(
         [s.to_dict() for s in res.seats],
         [c.to_dict() for c in res.credentials],
         [e.to_dict() for e in res.environments],
     )[0]
-    assert back["engine"] == "claude"
-    assert back["model"] == "claude-opus-4-8"
-    assert back["credential_account"] == "claude-main"
+    assert back["engine"] == "pi"
+    assert back["model"] == "deepseek-v4-pro"
+    assert back["credential_account"] == "pi-main"
     assert back["runtime"] == "docker-web"
     assert back["roles"] == ["race", "review"]
     assert back["max_running"] == 3
@@ -187,10 +187,10 @@ def test_adapter_round_trip_preserves_scheduler_fields():
 def test_adapter_system_inherit_clears_credential_account():
     """A host-inherit credential must adapt to an EMPTY credential_account so the
     driver inherits the host login (no *_FILE injection)."""
-    cred = Credential(id="cred_claude_x", label="claude 系统登录", engine="claude",
+    cred = Credential(id="cred_pi_x", label="pi 系统登录", engine="pi",
                       kind="system_inherit", secret_ref="").to_dict()
-    seat = Seat(id="seat_claude_x", label="c", engine="claude",
-                credential_id="cred_claude_x", environment_id="local").to_dict()
+    seat = Seat(id="seat_pi_x", label="c", engine="pi",
+                credential_id="cred_pi_x", environment_id="local").to_dict()
     env = {"id": "local", "backend": "local"}
     prof = seat_to_legacy_profile(seat, cred, env)
     assert prof["credential_account"] == ""
@@ -198,52 +198,52 @@ def test_adapter_system_inherit_clears_credential_account():
 
 
 def test_adapter_custom_endpoint_wires_base_url():
-    cred = Credential(id="cred_claude_ds", label="ds", engine="claude",
-                      kind="custom_endpoint", secret_ref="claude-ds",
-                      target_engine="claude",
+    cred = Credential(id="cred_pi_ds", label="ds", engine="pi",
+                      kind="custom_endpoint", secret_ref="pi-ds",
+                      target_engine="pi",
                       base_url="https://api.deepseek.com/anthropic", wire_api="").to_dict()
-    seat = Seat(id="seat_claude_ds", label="ds", engine="claude",
-                credential_id="cred_claude_ds", environment_id="local",
+    seat = Seat(id="seat_pi_ds", label="ds", engine="pi",
+                credential_id="cred_pi_ds", environment_id="local",
                 model="deepseek-v4-pro").to_dict()
     prof = seat_to_legacy_profile(seat, cred, {"id": "local", "backend": "local"})
     assert prof["base_url"] == "https://api.deepseek.com/anthropic"
-    assert prof["credential_account"] == "claude-ds"
+    assert prof["credential_account"] == "pi-ds"
     assert prof["model"] == "deepseek-v4-pro"
 
 
 # ── resolve_seat_ref: old name / hyphen alias / new id / bare engine ─────────
 
 def test_resolve_seat_ref_all_forms():
-    seats = [{"id": "seat_claude_ab12cd", "label": "claude-local", "engine": "claude"}]
-    alias = {"claude-local": "seat_claude_ab12cd", "claude-sub-container": "seat_claude_ab12cd"}
+    seats = [{"id": "seat_pi_ab12cd", "label": "pi-local", "engine": "pi"}]
+    alias = {"pi-local": "seat_pi_ab12cd", "pi-api-container": "seat_pi_ab12cd"}
     # new id
-    assert resolve_seat_ref("seat_claude_ab12cd", seats=seats, alias_table=alias) == "seat_claude_ab12cd"
+    assert resolve_seat_ref("seat_pi_ab12cd", seats=seats, alias_table=alias) == "seat_pi_ab12cd"
     # legacy name (via label)
-    assert resolve_seat_ref("claude-local", seats=seats, alias_table=alias) == "seat_claude_ab12cd"
+    assert resolve_seat_ref("pi-local", seats=seats, alias_table=alias) == "seat_pi_ab12cd"
     # legacy hyphen canonical alias (via alias table)
-    assert resolve_seat_ref("claude-sub-container", seats=seats, alias_table=alias) == "seat_claude_ab12cd"
+    assert resolve_seat_ref("pi-api-container", seats=seats, alias_table=alias) == "seat_pi_ab12cd"
     # bare engine with exactly one seat
-    assert resolve_seat_ref("claude", seats=seats, alias_table=alias) == "seat_claude_ab12cd"
+    assert resolve_seat_ref("pi", seats=seats, alias_table=alias) == "seat_pi_ab12cd"
     # unknown → None (never silently swallowed)
     assert resolve_seat_ref("nope", seats=seats, alias_table=alias) is None
 
 
 def test_resolve_seat_ref_bare_engine_ambiguous_returns_none():
     seats = [
-        {"id": "seat_claude_1", "label": "a", "engine": "claude"},
-        {"id": "seat_claude_2", "label": "b", "engine": "claude"},
+        {"id": "seat_pi_1", "label": "a", "engine": "pi"},
+        {"id": "seat_pi_2", "label": "b", "engine": "pi"},
     ]
-    # two claude seats → bare "claude" is ambiguous → None (caller fans out)
-    assert resolve_seat_ref("claude", seats=seats) is None
+    # two pi seats → bare "pi" is ambiguous → None (caller fans out)
+    assert resolve_seat_ref("pi", seats=seats) is None
 
 
 def test_migration_never_raises_on_malformed_entries():
     res = migrate_legacy_config(
         worker_profiles=[None, {}, {"engine": "bogus"}, 42,
-                         {"id": "ok", "name": "ok", "engine": "claude",
-                          "credential_account": "claude-main", "runtime": "local"}],
+                         {"id": "ok", "name": "ok", "engine": "pi",
+                          "credential_account": "pi-main", "runtime": "local"}],
         runtime_profiles=[None, {"no_id": True}, {"id": "local", "backend": "local"}],
-        account_modes={"claude-main": "subscription_token"},
+        account_modes={"pi-main": "api_key"},
     )
     # only the one valid profile survives
     assert len(res.seats) == 1

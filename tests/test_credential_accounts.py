@@ -20,115 +20,94 @@ def test_account_store_root_is_sessions_secret_side_table(tmp_path):
     assert account_store_root(tmp_path) == tmp_path / "_secrets" / "accounts"
 
 
-def test_claude_container_prefers_token_file_without_reading_secret(tmp_path, monkeypatch):
+def test_pi_container_prefers_key_file_without_reading_secret(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    acct = root / "claude-main"
+    acct = root / "pi-main"
     acct.mkdir(parents=True)
-    (acct / "CLAUDE_CODE_OAUTH_TOKEN").write_text("fake-claude-token\n")
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    (acct / "API_KEY").write_text("fake-key\n")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
 
-    resolved = runtime_env_for_engine("claude", account_root=root, container=True)
+    resolved = runtime_env_for_engine("pi", account_root=root, container=True)
 
-    assert resolved.account_id == "claude-main"
+    assert resolved.account_id == "pi-main"
     assert resolved.env == {
-        "CLAUDE_CODE_OAUTH_TOKEN_FILE": (
-            f"{CONTAINER_ACCOUNTS_ROOT}/claude-main/CLAUDE_CODE_OAUTH_TOKEN"
+        "DEEPSEEK_API_KEY_FILE": (
+            f"{CONTAINER_ACCOUNTS_ROOT}/pi-main/API_KEY"
         )
     }
 
 
-def test_claude_local_reads_account_token_for_subprocess_env(tmp_path, monkeypatch):
+def test_pi_local_reads_account_key_for_subprocess_env(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    acct = root / "claude-main"
+    acct = root / "pi-main"
     acct.mkdir(parents=True)
-    (acct / "CLAUDE_CODE_OAUTH_TOKEN").write_text("local-token\n")
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    (acct / "API_KEY").write_text("local-key\n")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
 
-    resolved = runtime_env_for_engine("claude", account_root=root, container=False)
+    resolved = runtime_env_for_engine("pi", account_root=root, container=False)
 
-    assert resolved.env == {"CLAUDE_CODE_OAUTH_TOKEN": "local-token"}
+    assert resolved.env == {"DEEPSEEK_API_KEY": "local-key"}
 
 
-def test_codex_uses_account_scoped_codex_home(tmp_path):
+def test_pi_blank_account_id_skips_default_account(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    codex_home = root / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text("{}\n")
-
-    local = runtime_env_for_engine("codex", account_root=root, container=False)
-    container = runtime_env_for_engine("codex", account_root=root, container=True)
-
-    assert local.env == {"CODEX_HOME": str(codex_home)}
-    assert container.env == {"CODEX_HOME": f"{CONTAINER_ACCOUNTS_ROOT}/codex-main/codex-home"}
-
-
-def test_codex_blank_account_id_skips_default_account_codex_home(tmp_path, monkeypatch):
-    root = tmp_path / "_secrets" / "accounts"
-    codex_home = root / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text("{}\n")
-    monkeypatch.delenv("CODEX_HOME", raising=False)
+    acct = root / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("k\n")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
     resolved = runtime_env_for_engine(
-        "codex", account_root=root, account_id="", container=False)
+        "pi", account_root=root, account_id="", container=False)
 
     assert resolved.account_id == ""
     assert resolved.env == {}
 
 
-def test_codex_local_codex_home_is_absolute_when_account_root_is_relative(tmp_path, monkeypatch):
-    root = Path("sessions") / "_secrets" / "accounts"
-    codex_home = tmp_path / root / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text("{}\n")
-    monkeypatch.chdir(tmp_path)
-
-    resolved = runtime_env_for_engine("codex", account_root=root, container=False)
-
-    assert resolved.env["CODEX_HOME"] == str(codex_home.resolve())
-    assert Path(resolved.env["CODEX_HOME"]).is_absolute()
-
-
-def test_cursor_api_key_file_and_env_fallback(tmp_path, monkeypatch):
+def test_pi_api_key_file_and_env_fallback(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    acct = root / "cursor-main"
+    acct = root / "pi-main"
     acct.mkdir(parents=True)
-    (acct / "CURSOR_API_KEY").write_text("cursor-secret\n")
-    monkeypatch.setenv("CURSOR_API_KEY", "env-secret")
+    (acct / "API_KEY").write_text("key-secret\n")
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-secret")
 
-    resolved = runtime_env_for_engine("cursor", account_root=root, container=True)
+    resolved = runtime_env_for_engine("pi", account_root=root, container=True)
 
     assert resolved.env == {
-        "CURSOR_API_KEY_FILE": f"{CONTAINER_ACCOUNTS_ROOT}/cursor-main/CURSOR_API_KEY"
+        "DEEPSEEK_API_KEY_FILE": f"{CONTAINER_ACCOUNTS_ROOT}/pi-main/API_KEY"
     }
 
 
 def test_engine_account_id_can_be_overridden(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    acct = root / "team-claude"
+    acct = root / "team-pi"
     acct.mkdir(parents=True)
-    (acct / "CLAUDE_CODE_OAUTH_TOKEN").write_text("token\n")
-    monkeypatch.setenv("MUTEKI_CLAUDE_ACCOUNT_ID", "team-claude")
+    (acct / "API_KEY").write_text("token\n")
+    monkeypatch.setenv("MUTEKI_PI_ACCOUNT_ID", "team-pi")
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
 
-    resolved = runtime_env_for_engine("claude", account_root=root, container=True)
+    resolved = runtime_env_for_engine("pi", account_root=root, container=True)
 
-    assert resolved.account_id == "team-claude"
-    assert "team-claude" in resolved.env["CLAUDE_CODE_OAUTH_TOKEN_FILE"]
+    assert resolved.account_id == "team-pi"
+    assert "team-pi" in resolved.env["DEEPSEEK_API_KEY_FILE"]
 
 
-def test_runtime_env_accepts_explicit_profile_account_id(tmp_path):
+def test_runtime_env_accepts_explicit_profile_account_id(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    acct = root / "claude-team"
+    acct = root / "pi-team"
     acct.mkdir(parents=True)
-    (acct / "CLAUDE_CODE_OAUTH_TOKEN").write_text("token\n")
+    (acct / "API_KEY").write_text("token\n")
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
 
     resolved = runtime_env_for_engine(
-        "claude", account_root=root, account_id="claude-team", container=True)
+        "pi", account_root=root, account_id="pi-team", container=True)
 
-    assert resolved.account_id == "claude-team"
+    assert resolved.account_id == "pi-team"
     assert resolved.env == {
-        "CLAUDE_CODE_OAUTH_TOKEN_FILE": (
-            f"{CONTAINER_ACCOUNTS_ROOT}/claude-team/CLAUDE_CODE_OAUTH_TOKEN"
+        "DEEPSEEK_API_KEY_FILE": (
+            f"{CONTAINER_ACCOUNTS_ROOT}/pi-team/API_KEY"
         )
     }
 
@@ -136,49 +115,36 @@ def test_runtime_env_accepts_explicit_profile_account_id(tmp_path):
 def test_credential_account_store_masks_and_replaces_material(tmp_path):
     store = CredentialAccountStore(account_store_root(tmp_path))
 
-    claude = store.upsert_secret(
-        account_id="shared-main", engine="claude", secret="claude-secret")
-    assert claude["account_id"] == "shared-main"
-    assert claude["engine"] == "claude"
-    # Secrets are now ECHOED (operator opted into edit-in-place); the token is
+    pi_acct = store.upsert_secret(
+        account_id="shared-main", engine="pi", secret="pi-secret")
+    assert pi_acct["account_id"] == "shared-main"
+    assert pi_acct["engine"] == "pi"
+    # Secrets are now ECHOED (operator opted into edit-in-place); the key is
     # surfaced as details.secret_value so the UI can show/edit it.
-    assert claude["details"]["secret_value"] == "claude-secret"
+    assert pi_acct["details"]["secret_value"] == "pi-secret"
 
-    cursor = store.upsert_secret(
-        account_id="shared-main", engine="cursor", secret="cursor-secret")
-    assert cursor["engine"] == "cursor"
+    # a custom-endpoint re-save replaces the key material in place.
+    api = store.upsert_secret(
+        account_id="shared-main", engine="api", secret="api-secret",
+        base_url="https://api.deepseek.example/v1", target_engine="pi")
+    assert api["engine"] == "pi"
+    assert api["mode"] == "custom_endpoint"
     base = account_store_root(tmp_path) / "shared-main"
-    assert not (base / "CLAUDE_CODE_OAUTH_TOKEN").exists()
-    assert (base / "CURSOR_API_KEY").read_text(encoding="utf-8").strip() == "cursor-secret"
-    assert store.list()[0]["mode"] == "api_key"
-
-
-def test_credential_account_store_validates_codex_json(tmp_path):
-    store = CredentialAccountStore(account_store_root(tmp_path))
-    with pytest.raises(ValueError):
-        store.upsert_secret(account_id="codex-main", engine="codex", secret="{bad")
-
-    acct = store.upsert_secret(account_id="codex-main", engine="codex", secret='{"token":"x"}')
-    assert acct["engine"] == "codex"
-    assert acct["writable_state"] is True
-    assert acct["details"]["codex_home"] is True
-    assert acct["details"]["mutable_auth_home"] is True
-    assert "lease" not in acct["details"]
-    # codex echoes the auth.json contents so the UI can show/edit it
-    assert '"token":"x"' in acct["details"]["secret_value"]
+    assert (base / "API_KEY").read_text(encoding="utf-8").strip() == "api-secret"
+    assert store.list()[0]["mode"] == "custom_endpoint"
 
 
 def test_invalid_update_does_not_destroy_existing_account(tmp_path):
     store = CredentialAccountStore(account_store_root(tmp_path))
-    store.upsert_secret(account_id="codex-main", engine="codex", secret='{"token":"old"}')
+    store.upsert_secret(account_id="pi-main", engine="pi", secret="old-key")
     with pytest.raises(ValueError):
-        store.upsert_secret(account_id="codex-main", engine="codex", secret="{bad")
+        store.upsert_secret(account_id="pi-main", engine="bogus", secret="x")
 
-    auth = account_store_root(tmp_path) / "codex-main" / "codex-home" / "auth.json"
-    assert '"old"' in auth.read_text(encoding="utf-8")
+    key = account_store_root(tmp_path) / "pi-main" / "API_KEY"
+    assert "old-key" in key.read_text(encoding="utf-8")
 
 
-def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path):
+def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path, monkeypatch):
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     acct = store.upsert_secret(
@@ -186,47 +152,44 @@ def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path):
         engine="api",
         secret="deepseek-key",
         base_url="https://api.deepseek.example/v1",
+        target_engine="pi",
     )
-    assert acct["engine"] == "api"
+    assert acct["engine"] == "pi"
     assert acct["details"]["secret_value"] == "deepseek-key"   # echoed for edit
 
-    codex = runtime_env_for_engine(
-        "codex", account_root=root, account_id="deepseek-main", container=True)
-    assert codex.env["OPENAI_API_KEY_FILE"].endswith("/deepseek-main/API_KEY")
-    assert codex.env["OPENAI_BASE_URL"] == "https://api.deepseek.example/v1"
-
-    claude = runtime_env_for_engine(
-        "claude", account_root=root, account_id="deepseek-main", container=False)
-    assert claude.env["ANTHROPIC_API_KEY"] == "deepseek-key"
-    assert claude.env["ANTHROPIC_AUTH_TOKEN"] == "deepseek-key"
-    assert claude.env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.example/v1"
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "custom")
+    pi_env = runtime_env_for_engine(
+        "pi", account_root=root, account_id="deepseek-main", container=False)
+    assert pi_env.env["OPENAI_API_KEY"] == "deepseek-key"
+    assert pi_env.env["OPENAI_BASE_URL"] == "https://api.deepseek.example/v1"
 
 
-def test_custom_endpoint_records_target_engine_for_binding(tmp_path):
-    """A custom endpoint registered FOR an agent reports that agent (not "api") so
-    the panel can bind/display it — while runtime injection stays engine-agnostic."""
+def test_custom_endpoint_records_target_engine_for_binding(tmp_path, monkeypatch):
+    """A custom endpoint registered FOR pi reports pi (not "api") so the panel can
+    bind/display it — while runtime injection stays engine-agnostic."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     acct = store.upsert_secret(
-        account_id="claude-main",
+        account_id="pi-main",
         engine="api",
         secret="endpoint-key",
-        base_url="https://anthropic.example/v1",
-        target_engine="claude",
+        base_url="https://openai.example/v1",
+        target_engine="pi",
     )
-    assert acct["engine"] == "claude"
+    assert acct["engine"] == "pi"
     assert acct["mode"] == "custom_endpoint"
-    assert acct["details"]["target_engine"] == "claude"
+    assert acct["details"]["target_engine"] == "pi"
     assert acct["details"]["custom_endpoint"] is True
-    # inspect() agrees, and accountForEngine-style lookup now matches claude.
-    assert store.inspect("claude-main").engine == "claude"
-    assert [a for a in store.list() if a["account_id"] == "claude-main"][0]["engine"] == "claude"
+    # inspect() agrees, and accountForEngine-style lookup now matches pi.
+    assert store.inspect("pi-main").engine == "pi"
+    assert [a for a in store.list() if a["account_id"] == "pi-main"][0]["engine"] == "pi"
 
-    # Engine-agnostic injection is preserved: the same dir still drives claude's env.
+    # Engine-agnostic injection is preserved: the same dir still drives pi's env.
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "custom")
     env = runtime_env_for_engine(
-        "claude", account_root=root, account_id="claude-main", container=False).env
-    assert env["ANTHROPIC_BASE_URL"] == "https://anthropic.example/v1"
-    assert env["ANTHROPIC_API_KEY"] == "endpoint-key"
+        "pi", account_root=root, account_id="pi-main", container=False).env
+    assert env["OPENAI_BASE_URL"] == "https://openai.example/v1"
+    assert env["OPENAI_API_KEY"] == "endpoint-key"
 
 
 def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
@@ -237,7 +200,7 @@ def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
     store = CredentialAccountStore(root)
     acct = store.upsert_secret(
         account_id="deepseek-main", engine="api", secret="sk-super-secret",
-        base_url="https://api.deepseek.com/v1", target_engine="claude")
+        base_url="https://api.deepseek.com/v1", target_engine="pi")
 
     assert acct["details"]["base_url_value"] == "https://api.deepseek.com/v1"
     assert acct["details"]["base_url"] is True
@@ -249,26 +212,25 @@ def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
     assert listed["details"]["secret_value"] == "sk-super-secret"
 
 
-def test_custom_endpoint_without_base_url_reports_empty_value(tmp_path):
-    """No BASE_URL on disk → empty value + false boolean (not a crash)."""
+def test_custom_endpoint_without_base_url_reports_api_key_mode(tmp_path):
+    """No BASE_URL on disk → a plain api_key account (not custom_endpoint), with
+    no endpoint fields to mislead the panel."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     acct = store.upsert_secret(account_id="bare-main", engine="api", secret="k")
-    assert acct["details"]["base_url_value"] == ""
-    assert acct["details"]["base_url"] is False
+    assert acct["mode"] == "api_key"
+    assert "base_url" not in acct["details"]
+    assert "base_url_value" not in acct["details"]
 
 
-def test_secret_value_echoed_for_claude_and_cursor(tmp_path):
-    """Subscription token & cursor key are echoed as details.secret_value so the
-    UI can show/edit them. An empty/absent account exposes no secret_value."""
+def test_secret_value_echoed_for_pi_accounts(tmp_path):
+    """A pi key account's key is echoed as details.secret_value so the UI can
+    show/edit it. An empty/absent account exposes no secret_value."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
 
-    claude = store.upsert_secret(account_id="claude-main", engine="claude", secret="oauth-tok")
-    assert claude["details"]["secret_value"] == "oauth-tok"
-
-    cursor = store.upsert_secret(account_id="cursor-main", engine="cursor", secret="cur-key")
-    assert cursor["details"]["secret_value"] == "cur-key"
+    pi_acct = store.upsert_secret(account_id="pi-main", engine="pi", secret="pi-key")
+    assert pi_acct["details"]["secret_value"] == "pi-key"
 
     # an empty account (no material) has no secret_value key at all
     (root / "ghost").mkdir()
@@ -295,19 +257,20 @@ def test_custom_endpoint_invalid_target_engine_rejected(tmp_path):
             account_id="x-main", engine="api", secret="k", target_engine="gpt")
 
 
-def test_resaving_account_clears_stale_engine_marker(tmp_path):
-    """Switching a marked custom-endpoint account back to a subscription token must
-    not leave a stale ENGINE marker that mislabels it."""
+def test_resaving_account_as_pi_keeps_pi_marker_and_drops_endpoint(tmp_path):
+    """Switching a custom-endpoint account back to a plain pi key account must
+    drop the endpoint material (BASE_URL) while the pi ENGINE marker stays."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     store.upsert_secret(
-        account_id="claude-main", engine="api", secret="k",
-        base_url="https://x/v1", target_engine="claude")
-    assert (root / "claude-main" / "ENGINE").exists()
+        account_id="pi-main", engine="api", secret="k",
+        base_url="https://x/v1", target_engine="pi")
+    assert (root / "pi-main" / "ENGINE").exists()
     again = store.upsert_secret(
-        account_id="claude-main", engine="claude", secret="oauth-token")
-    assert not (root / "claude-main" / "ENGINE").exists()
-    assert again["mode"] == "subscription_token"
+        account_id="pi-main", engine="pi", secret="pi-token")
+    assert not (root / "pi-main" / "BASE_URL").exists()
+    assert again["mode"] == "api_key"
+    assert again["engine"] == "pi"
 
 
 def test_blank_secret_edit_preserves_custom_endpoint_key(tmp_path):
@@ -318,7 +281,7 @@ def test_blank_secret_edit_preserves_custom_endpoint_key(tmp_path):
     store = CredentialAccountStore(root)
     store.upsert_secret(
         account_id="deepseek-main", engine="api", secret="kept-key",
-        base_url="https://old.example/v1", target_engine="claude")
+        base_url="https://old.example/v1", target_engine="pi")
 
     edited = store.upsert_secret(
         account_id="deepseek-main", engine="api", secret="",
@@ -328,53 +291,45 @@ def test_blank_secret_edit_preserves_custom_endpoint_key(tmp_path):
     assert (base / "API_KEY").read_text(encoding="utf-8").strip() == "kept-key"
     assert (base / "BASE_URL").read_text(encoding="utf-8").strip() == "https://new.example/v1"
     # target_engine left blank on edit → preserved from the prior save.
-    assert edited["details"]["target_engine"] == "claude"
-    assert (base / "ENGINE").read_text(encoding="utf-8").strip() == "claude"
+    assert edited["details"]["target_engine"] == "pi"
+    assert (base / "ENGINE").read_text(encoding="utf-8").strip() == "pi"
 
 
 def test_blank_secret_edit_preserves_target_engine_when_base_url_unchanged(tmp_path):
-    """Re-pointing only the target engine (claude→codex) with a blank secret and
-    blank base_url keeps both the key and the base_url."""
+    """Re-saving with a blank secret and blank base_url keeps both the key and
+    the base_url, and the stored pi target survives."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     store.upsert_secret(
         account_id="ep-main", engine="api", secret="kept",
-        base_url="https://x/v1", target_engine="claude")
+        base_url="https://x/v1", target_engine="pi")
 
     edited = store.upsert_secret(
-        account_id="ep-main", engine="api", secret="", target_engine="codex")
+        account_id="ep-main", engine="api", secret="", target_engine="pi")
 
     base = root / "ep-main"
     assert (base / "API_KEY").read_text(encoding="utf-8").strip() == "kept"
     assert (base / "BASE_URL").read_text(encoding="utf-8").strip() == "https://x/v1"
-    assert edited["details"]["target_engine"] == "codex"
+    assert edited["details"]["target_engine"] == "pi"
 
 
-def test_blank_secret_edit_preserves_claude_and_cursor_tokens(tmp_path):
-    """Blank-secret re-save of a subscription/cursor account keeps the token rather
-    than erroring on the required-secret guard."""
+def test_blank_secret_edit_preserves_pi_and_api_keys(tmp_path):
+    """Blank-secret re-save of a pi/api account keeps the key rather than erroring
+    on the required-secret guard."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
 
-    store.upsert_secret(account_id="claude-main", engine="claude", secret="oauth-x")
-    store.upsert_secret(account_id="claude-main", engine="claude", secret="")
-    assert (root / "claude-main" / "CLAUDE_CODE_OAUTH_TOKEN").read_text(
-        encoding="utf-8").strip() == "oauth-x"
+    store.upsert_secret(account_id="pi-main", engine="pi", secret="pi-x")
+    store.upsert_secret(account_id="pi-main", engine="pi", secret="")
+    assert (root / "pi-main" / "API_KEY").read_text(
+        encoding="utf-8").strip() == "pi-x"
 
-    store.upsert_secret(account_id="cursor-main", engine="cursor", secret="cur-x")
-    store.upsert_secret(account_id="cursor-main", engine="cursor", secret="")
-    assert (root / "cursor-main" / "CURSOR_API_KEY").read_text(
-        encoding="utf-8").strip() == "cur-x"
-
-
-def test_blank_secret_edit_preserves_codex_auth_json(tmp_path):
-    """Blank-secret re-save of a codex account keeps the stored auth.json."""
-    root = account_store_root(tmp_path)
-    store = CredentialAccountStore(root)
-    store.upsert_secret(account_id="codex-main", engine="codex", secret='{"token":"keep"}')
-    store.upsert_secret(account_id="codex-main", engine="codex", secret="")
-    auth = root / "codex-main" / "codex-home" / "auth.json"
-    assert '"keep"' in auth.read_text(encoding="utf-8")
+    store.upsert_secret(account_id="api-main", engine="api", secret="api-x",
+                        base_url="https://x/v1", target_engine="pi")
+    store.upsert_secret(account_id="api-main", engine="api", secret="",
+                        target_engine="pi")
+    assert (root / "api-main" / "API_KEY").read_text(
+        encoding="utf-8").strip() == "api-x"
 
 
 def test_blank_secret_on_new_account_still_errors(tmp_path):
@@ -382,7 +337,7 @@ def test_blank_secret_on_new_account_still_errors(tmp_path):
     prior account on disk still raises the required-secret error."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
-    for engine in ("claude", "cursor", "api", "codex"):
+    for engine in ("pi", "api"):
         with pytest.raises(ValueError):
             store.upsert_secret(account_id=f"fresh-{engine}", engine=engine, secret="")
 
@@ -397,16 +352,16 @@ def test_local_runtime_does_not_override_host_home(tmp_path):
     )
     swarm = Swarm(ch, [], llm=None, sandbox=None, worker_root=tmp_path / "workers")
 
-    env = swarm._runtime_env_for("claude", "cli-claude", container=None)
+    env = swarm._runtime_env_for("pi", "cli-pi", container=None)
 
     assert "HOME" not in env
 
 
 def test_swarm_worker_profile_selects_credential_account_and_runtime(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts"
-    acct = root / "claude-team"
+    acct = root / "pi-team"
     acct.mkdir(parents=True)
-    (acct / "CLAUDE_CODE_OAUTH_TOKEN").write_text("token\n")
+    (acct / "API_KEY").write_text("token\n")
     ch = Challenge(
         id="profile-runtime",
         name="profile-runtime",
@@ -424,10 +379,10 @@ def test_swarm_worker_profile_selects_credential_account_and_runtime(tmp_path, m
             {"id": "docker-web", "backend": "container"},
         ],
         worker_profiles=[{
-            "id": "claude-sub-container",
-            "engine": "claude",
+            "id": "pi-sub-container",
+            "engine": "pi",
             "runtime": "docker-web",
-            "credential_account": "claude-team",
+            "credential_account": "pi-team",
             "enabled": True,
         }],
     )
@@ -436,32 +391,15 @@ def test_swarm_worker_profile_selects_credential_account_and_runtime(tmp_path, m
         def to_container_path(self, path: str) -> str:
             return "/home/kali/workspace/" + path.rsplit("/", 1)[-1]
 
-    profile = swarm._profile_for_engine("claude")
-    assert profile["credential_account"] == "claude-team"
-    assert swarm._backend_for_engine("claude", profile) == "container"
-    env = swarm._runtime_env_for("claude", "cli-claude", container=FakeHandle(), profile=profile)
-    assert env["CLAUDE_CODE_OAUTH_TOKEN_FILE"].endswith(
-        "/claude-team/CLAUDE_CODE_OAUTH_TOKEN")
-    assert env["MUTEKI_WORKER_PROFILE_ID"] == "claude-sub-container"
-    assert env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] == "claude-team"
+    profile = swarm._profile_for_engine("pi")
+    assert profile["credential_account"] == "pi-team"
+    assert swarm._backend_for_engine("pi", profile) == "container"
+    env = swarm._runtime_env_for("pi", "cli-pi", container=FakeHandle(), profile=profile)
+    assert env["ANTHROPIC_API_KEY_FILE"].endswith(
+        "/pi-team/API_KEY")
+    assert env["MUTEKI_WORKER_PROFILE_ID"] == "pi-sub-container"
+    assert env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] == "pi-team"
     assert env["HOME"].startswith("/home/kali/workspace/")
-
-
-def test_cursor_endpoint_is_inserted_before_prompt():
-    ch = Challenge(
-        id="cursor-endpoint",
-        name="cursor-endpoint",
-        category="misc",
-        description="cursor endpoint",
-        flag_format="flag{...}",
-    )
-    solver = CliSolver(None, ch, engine="cursor")
-    argv = ["/usr/bin/cursor-agent", "-p", "--output-format", "json", "--force", "PROMPT"]
-
-    out = solver._apply_runtime_argv(
-        argv, {"CURSOR_ENDPOINT": "https://cursor-endpoint.example"})
-
-    assert out[-3:] == ["--endpoint", "https://cursor-endpoint.example", "PROMPT"]
 
 
 def test_pi_provider_env_overrides_host_provider_in_argv():
@@ -532,8 +470,8 @@ def test_profile_model_is_inserted_before_prompt_for_cli_drivers():
         description="profile model",
         flag_format="flag{...}",
     )
-    solver = CliSolver(None, ch, engine="codex")
-    argv = ["/usr/bin/codex", "exec", "--json", "--skip-git-repo-check", "PROMPT"]
+    solver = CliSolver(None, ch, engine="pi")
+    argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions", "PROMPT"]
 
     out = solver._apply_runtime_argv(argv, {"MUTEKI_WORKER_MODEL": "deepseek-reasoner"})
 
@@ -553,10 +491,10 @@ def test_swarm_profile_roles_and_capacity_are_hard_limits(tmp_path):
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "codex-main",
-                "engine": "codex",
+                "id": "pi-main",
+                "engine": "pi",
                 "runtime": "local",
-                "credential_account": "codex-main",
+                "credential_account": "pi-main",
                 "auth": "subscription",
                 "roles": ["bootstrap", "explore"],
                 "race": False,
@@ -566,21 +504,21 @@ def test_swarm_profile_roles_and_capacity_are_hard_limits(tmp_path):
         ],
     )
 
-    assert swarm._profile_for_engine("codex", role="race", advance=False) is None
-    profile = swarm._profile_for_engine("codex", role="bootstrap")
+    assert swarm._profile_for_engine("pi", role="race", advance=False) is None
+    profile = swarm._profile_for_engine("pi", role="bootstrap")
     assert profile is not None
-    swarm._claim_worker_account("cli-codex", "codex", profile)
+    swarm._claim_worker_account("cli-pi", "pi", profile)
 
-    assert swarm._profile_for_engine("codex", role="bootstrap", advance=False) is None
-    assert swarm._engine_available_for_role("codex", "bootstrap") is False
+    assert swarm._profile_for_engine("pi", role="bootstrap", advance=False) is None
+    assert swarm._engine_available_for_role("pi", "bootstrap") is False
     with pytest.raises(RuntimeError):
-        swarm._make_cli_worker("codex", mode="bootstrap")
+        swarm._make_cli_worker("pi", mode="bootstrap")
 
     class Done:
-        solver_id = "cli-codex"
+        solver_id = "cli-pi"
 
     swarm._release_worker_account(Done())
-    assert swarm._engine_available_for_role("codex", "bootstrap") is True
+    assert swarm._engine_available_for_role("pi", "bootstrap") is True
 
 
 def test_review_profile_capacity_is_isolated_from_explore_capacity(tmp_path):
@@ -596,10 +534,10 @@ def test_review_profile_capacity_is_isolated_from_explore_capacity(tmp_path):
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "claude-main",
-                "engine": "claude",
+                "id": "pi-main",
+                "engine": "pi",
                 "runtime": "local",
-                "credential_account": "claude-main",
+                "credential_account": "pi-main",
                 "auth": "subscription",
                 "roles": ["bootstrap", "explore", "review"],
                 "race": False,
@@ -610,14 +548,14 @@ def test_review_profile_capacity_is_isolated_from_explore_capacity(tmp_path):
         stage_policy={"coordinator": {"review": {"enabled": True, "max_concurrent": 1}}},
     )
 
-    review_profile = swarm._profile_for_engine("claude", role="review")
+    review_profile = swarm._profile_for_engine("pi", role="review")
     assert review_profile is not None
     swarm._claim_worker_account(
-        "cli-claude-review", "claude", review_profile, role="review")
+        "cli-pi-review", "pi", review_profile, role="review")
 
-    assert swarm._profile_for_engine("claude", role="explore", advance=False) is not None
-    assert swarm._engine_available_for_role("claude", "explore") is True
-    assert swarm._profile_for_engine("claude", role="review", advance=False) is None
+    assert swarm._profile_for_engine("pi", role="explore", advance=False) is not None
+    assert swarm._engine_available_for_role("pi", "explore") is True
+    assert swarm._profile_for_engine("pi", role="review", advance=False) is None
 
 
 @pytest.mark.asyncio
@@ -634,10 +572,10 @@ async def test_done_review_task_keeps_slot_until_profile_release(tmp_path):
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "claude-main",
-                "engine": "claude",
+                "id": "pi-main",
+                "engine": "pi",
                 "runtime": "local",
-                "credential_account": "claude-main",
+                "credential_account": "pi-main",
                 "roles": ["review"],
                 "enabled": True,
             }
@@ -646,17 +584,17 @@ async def test_done_review_task_keeps_slot_until_profile_release(tmp_path):
             "coordinator": {
                 "review": {
                     "enabled": True,
-                    "engine": "claude-main",
+                    "engine": "pi-main",
                     "max_concurrent": 1,
                     "allow_review_fallback": False,
                 }
             }
         },
     )
-    profile = swarm._profile_for_engine("claude-main", role="review")
+    profile = swarm._profile_for_engine("pi-main", role="review")
     assert profile is not None
     swarm._claim_worker_account(
-        "cli-claude-review", "claude", profile, role="review")
+        "cli-pi-review", "pi", profile, role="review")
 
     async def finished_review():
         return None
@@ -670,12 +608,12 @@ async def test_done_review_task_keeps_slot_until_profile_release(tmp_path):
     assert task in swarm._active_review_tasks
 
     class Done:
-        solver_id = "cli-claude-review"
+        solver_id = "cli-pi-review"
 
     swarm._release_worker_account(Done())
     swarm._active_review_tasks.discard(task)
     assert swarm._review_capacity_available() is True
-    assert swarm._select_review_engine(["claude"]) == "claude-main"
+    assert swarm._select_review_engine(["pi"]) == "pi-main"
 
 
 def test_review_engine_profile_id_uses_base_engine_health(tmp_path):
@@ -691,10 +629,10 @@ def test_review_engine_profile_id_uses_base_engine_health(tmp_path):
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "claude-sub-container",
-                "engine": "claude",
+                "id": "pi-sub-container",
+                "engine": "pi",
                 "runtime": "docker-web",
-                "credential_account": "claude-main",
+                "credential_account": "pi-main",
                 "auth": "subscription",
                 "roles": ["review"],
                 "race": False,
@@ -706,7 +644,7 @@ def test_review_engine_profile_id_uses_base_engine_health(tmp_path):
             "coordinator": {
                 "review": {
                     "enabled": True,
-                    "engine": "claude-sub-container",
+                    "engine": "pi-sub-container",
                     "max_concurrent": 1,
                     "allow_review_fallback": False,
                 }
@@ -714,10 +652,10 @@ def test_review_engine_profile_id_uses_base_engine_health(tmp_path):
         },
     )
 
-    assert swarm._healthy_matches("claude-sub-container", ["claude"]) is True
-    assert swarm._healthy_matches("claude-sub-container", ["claude-sub-container"]) is True
-    assert swarm._select_review_engine(["claude"]) == "claude-sub-container"
-    assert swarm._select_review_engine(["claude-sub-container"]) == "claude-sub-container"
+    assert swarm._healthy_matches("pi-sub-container", ["pi"]) is True
+    assert swarm._healthy_matches("pi-sub-container", ["pi-sub-container"]) is True
+    assert swarm._select_review_engine(["pi"]) == "pi-sub-container"
+    assert swarm._select_review_engine(["pi-sub-container"]) == "pi-sub-container"
 
 
 def test_pick_engine_uses_configured_profile_roster_with_base_health(tmp_path):
@@ -733,15 +671,15 @@ def test_pick_engine_uses_configured_profile_roster_with_base_health(tmp_path):
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "claude-sub-container",
-                "engine": "claude",
+                "id": "pi-web-sub",
+                "engine": "pi",
                 "runtime": "docker-web",
                 "roles": ["bootstrap", "explore", "review"],
                 "enabled": True,
             },
             {
-                "id": "codex-sub-container",
-                "engine": "codex",
+                "id": "pi-pwn-sub",
+                "engine": "pi",
                 "runtime": "docker-web",
                 "roles": ["bootstrap", "explore", "review"],
                 "enabled": True,
@@ -749,13 +687,17 @@ def test_pick_engine_uses_configured_profile_roster_with_base_health(tmp_path):
         ],
     )
 
-    assert swarm.engines == ["claude-sub-container", "codex-sub-container"]
-    assert swarm._healthy_role_candidates(["claude", "codex"], role="bootstrap") == [
-        "claude-sub-container",
-        "codex-sub-container",
+    assert swarm.engines == ["pi-pwn-sub", "pi-web-sub"]  # sorted by profile name
+    # healthy-role candidates come back sorted by profile name
+    assert swarm._healthy_role_candidates(["pi"], role="bootstrap") == [
+        "pi-pwn-sub",
+        "pi-web-sub",
     ]
-    assert swarm._pick_engine([], ["claude", "codex"], role="bootstrap") == "claude-sub-container"
-    assert swarm._pick_engine(["claude-sub-container"], ["claude", "codex"], role="bootstrap") == "codex-sub-container"
+    assert swarm._pick_engine([], ["pi"], role="bootstrap") == "pi-pwn-sub"
+    # pi-only: a running pi worker marks every pi profile as running (the running
+    # match falls back to the base engine), so the least-loaded fallback returns
+    # the first candidate — still a valid pi profile, never a dead engine.
+    assert swarm._pick_engine(["pi-pwn-sub"], ["pi"], role="bootstrap") == "pi-pwn-sub"
 
 
 @pytest.mark.asyncio
@@ -775,8 +717,8 @@ async def test_worker_cmd_spawn_base_engine_resolves_to_configured_profile(
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "claude-sub-container",
-                "engine": "claude",
+                "id": "pi-sub-container",
+                "engine": "pi",
                 "runtime": "docker-web",
                 "roles": ["bootstrap", "explore", "review"],
                 "enabled": True,
@@ -788,7 +730,7 @@ async def test_worker_cmd_spawn_base_engine_resolves_to_configured_profile(
     emitted: list[tuple[str, dict]] = []
 
     class FakeWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
 
         async def run(self):
             await asyncio.sleep(3600)
@@ -801,7 +743,7 @@ async def test_worker_cmd_spawn_base_engine_resolves_to_configured_profile(
         emitted.append((kind, fields))
 
     monkeypatch.setattr(swarm, "_make_cli_worker", fake_make)
-    await queue.put({"action": "spawn", "engine": "claude"})
+    await queue.put({"action": "spawn", "engine": "pi"})
     tasks: dict[asyncio.Task, str] = {}
     task_solvers: dict[asyncio.Task, FakeWorker] = {}
 
@@ -809,12 +751,12 @@ async def test_worker_cmd_spawn_base_engine_resolves_to_configured_profile(
         await swarm._apply_worker_cmds(
             tasks=tasks,
             task_solvers=task_solvers,
-            healthy=["claude"],
+            healthy=["pi"],
             running_engines_fn=lambda: [],
             emit_bb=emit_bb,
         )
-        assert spawned == ["claude-sub-container"]
-        assert list(tasks.values()) == ["claude-sub-container"]
+        assert spawned == ["pi-sub-container"]
+        assert list(tasks.values()) == ["pi-sub-container"]
         assert emitted[-1][0] == "worker_spawned"
     finally:
         for task in tasks:
@@ -836,10 +778,10 @@ def test_ordinary_profile_capacity_is_isolated_from_review_capacity(tmp_path):
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
-                "id": "claude-main",
-                "engine": "claude",
+                "id": "pi-main",
+                "engine": "pi",
                 "runtime": "local",
-                "credential_account": "claude-main",
+                "credential_account": "pi-main",
                 "auth": "subscription",
                 "roles": ["bootstrap", "explore", "review"],
                 "race": False,
@@ -851,21 +793,21 @@ def test_ordinary_profile_capacity_is_isolated_from_review_capacity(tmp_path):
         stage_policy={"coordinator": {"review": {"enabled": True, "max_concurrent": 1}}},
     )
 
-    ordinary_profile = swarm._profile_for_engine("claude", role="explore")
+    ordinary_profile = swarm._profile_for_engine("pi", role="explore")
     assert ordinary_profile is not None
     swarm._claim_worker_account(
-        "cli-claude-explore", "claude", ordinary_profile, role="explore")
+        "cli-pi-explore", "pi", ordinary_profile, role="explore")
 
-    assert swarm._profile_for_engine("claude", role="explore", advance=False) is None
-    first_review = swarm._profile_for_engine("claude", role="review", advance=False)
+    assert swarm._profile_for_engine("pi", role="explore", advance=False) is None
+    first_review = swarm._profile_for_engine("pi", role="review", advance=False)
     assert first_review is not None
     swarm._claim_worker_account(
-        "cli-claude-review-1", "claude", first_review, role="review")
-    second_review = swarm._profile_for_engine("claude", role="review", advance=False)
+        "cli-pi-review-1", "pi", first_review, role="review")
+    second_review = swarm._profile_for_engine("pi", role="review", advance=False)
     assert second_review is not None
     swarm._claim_worker_account(
-        "cli-claude-review-2", "claude", second_review, role="review")
-    assert swarm._profile_for_engine("claude", role="review", advance=False) is None
+        "cli-pi-review-2", "pi", second_review, role="review")
+    assert swarm._profile_for_engine("pi", role="review", advance=False) is None
 
 
 def test_swarm_runtime_profile_options_reach_container_create(tmp_path, monkeypatch):
@@ -902,15 +844,15 @@ def test_swarm_runtime_profile_options_reach_container_create(tmp_path, monkeypa
             "pids_limit": 1024,
         }],
         worker_profiles=[{
-            "id": "codex-api",
-            "engine": "codex",
+            "id": "pi-api",
+            "engine": "pi",
             "runtime": "docker-web",
-            "credential_account": "deepseek-main",
+            "credential_account": "pi-main",
             "enabled": True,
         }],
     )
-    profile = swarm._profile_for_engine("codex")
-    swarm._container_for_engine("codex", profile)
+    profile = swarm._profile_for_engine("pi")
+    swarm._container_for_engine("pi", profile)
 
     assert seen["network"] == "bridge"
     assert seen["memory"] == "10g"
@@ -940,11 +882,11 @@ def test_swarm_container_failure_emits_runtime_degraded_and_falls_back(tmp_path,
     )
 
     async def go():
-        assert swarm._container_for_engine("claude") is None
+        assert swarm._container_for_engine("pi") is None
         await asyncio.sleep(0)
 
     asyncio.run(go())
-    assert swarm._backend_for_engine("claude") == "local"
+    assert swarm._backend_for_engine("pi") == "local"
     assert swarm._runtime_degraded[0]["status"] == "degraded"
     assert events[0].payload["kind"] == "runtime_degraded"
     assert "docker unavailable" in events[0].payload["reason"]
@@ -952,95 +894,32 @@ def test_swarm_container_failure_emits_runtime_degraded_and_falls_back(tmp_path,
 
 # ── detect_system_login (DESIGN §2.3 補強B) ──────────────────────────────────
 
-def test_detect_system_login_claude_uses_keychain_not_file(monkeypatch):
-    """claude login lives in the macOS Keychain, NOT a file. Detection must go
-    through _claude_oauth (keychain+file) — a file-only check would report a
-    logged-in mac as absent (reviewer P2). With NO ~/.claude file but a keychain
-    token present, this must be 'present'."""
+def test_detect_system_login_pi_key_env(monkeypatch):
+    """pi's host-side login is a present provider key (DEEPSEEK_API_KEY etc.),
+    checked directly — no keychain/file probing."""
     from muteki.solver import credential_accounts as ca
-    import muteki.solver.cli_driver as cli_driver
-
-    # no env token → forces the _claude_oauth probe path
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    # keychain has a token (no file involved)
-    monkeypatch.setattr(cli_driver, "_claude_oauth", lambda: ("kc-token", 0))
-    assert ca.detect_system_login("claude", env={}) == "present"
-
-    # keychain empty AND no file → absent
-    monkeypatch.setattr(cli_driver, "_claude_oauth", lambda: None)
-    assert ca.detect_system_login("claude", env={}) == "absent"
+    assert ca.detect_system_login("pi", env={"DEEPSEEK_API_KEY": "x"}) == "present"
+    # a truthy env WITHOUT the provider key reads as absent (env={} would fall
+    # back to the process environment, which may legitimately have a key)
+    assert ca.detect_system_login("pi", env={"PATH": "/usr/bin"}) == "absent"
 
 
-def test_detect_system_login_claude_env_token_wins(monkeypatch):
+def test_detect_system_login_pi_provider_env_key_wins(monkeypatch):
     from muteki.solver import credential_accounts as ca
+    # pi's provider env keys decide the login: deepseek key present → present
     assert ca.detect_system_login(
-        "claude", env={"CLAUDE_CODE_OAUTH_TOKEN": "x"}) == "present"
-
-
-def test_detect_system_login_codex_checks_auth_json(monkeypatch, tmp_path):
-    from muteki.solver import credential_accounts as ca
-    codex_home = tmp_path / "codex"
-    codex_home.mkdir()
+        "pi", env={"DEEPSEEK_API_KEY": "x"}) == "present"
+    # an unrelated key does not count
     assert ca.detect_system_login(
-        "codex", env={"CODEX_HOME": str(codex_home)}) == "absent"
-    (codex_home / "auth.json").write_text("{}")
-    assert ca.detect_system_login(
-        "codex", env={"CODEX_HOME": str(codex_home)}) == "present"
-    # env key also counts as present
-    assert ca.detect_system_login(
-        "codex", env={"OPENAI_API_KEY": "sk-x"}) == "present"
-
-
-def test_detect_system_login_cursor_uses_session_probe(monkeypatch):
-    from muteki.solver import credential_accounts as ca
-    import muteki.solver.cli_driver as cli_driver
-    monkeypatch.setattr(cli_driver, "_cursor_session_cookie", lambda: "WorkosCursorSessionToken=u%3A%3At")
-    assert ca.detect_system_login("cursor", env={}) == "present"
-    monkeypatch.setattr(cli_driver, "_cursor_session_cookie", lambda: None)
-    assert ca.detect_system_login("cursor", env={}) == "absent"
-    assert ca.detect_system_login("cursor", env={"CURSOR_API_KEY": "k"}) == "present"
+        "pi", env={"OPENAI_API_KEY": "x"}) == "absent"
 
 
 def test_detect_system_login_never_raises_on_probe_failure(monkeypatch):
     from muteki.solver import credential_accounts as ca
-    import muteki.solver.cli_driver as cli_driver
-
-    def _boom():
-        raise RuntimeError("keychain exploded")
-
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    monkeypatch.setattr(cli_driver, "_claude_oauth", _boom)
-    assert ca.detect_system_login("claude", env={}) == "unknown"
+    # unknown engines are reported as "unknown", never raised
     assert ca.detect_system_login("bogus-engine", env={}) == "unknown"
+    # a bad env mapping still never raises
+    assert ca.detect_system_login("pi", env=None) in ("present", "absent")
 
 
-# ── import-from-host codex auth (one-click re-auth after `codex login`) ───────
 
-def test_import_host_codex_auth_reads_host_file(tmp_path, monkeypatch):
-    """import_host_codex_auth reads the HOST ~/.codex/auth.json and upserts it into
-    the account store (the fix for: codex login refreshes the host file but the
-    container mounts the account COPY)."""
-    fake_home = tmp_path / "home"
-    (fake_home / ".codex").mkdir(parents=True)
-    (fake_home / ".codex" / "auth.json").write_text(
-        '{"tokens": {"access_token": "fresh-xyz"}, "last_refresh": "2026-06-26T14:11:00Z"}'
-    )
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
-
-    store = CredentialAccountStore(account_store_root(tmp_path))
-    acct = store.import_host_codex_auth("codex-main")
-    assert acct["account_id"] == "codex-main"
-    assert acct["present"] is True
-    # the account-store copy now holds the fresh host content
-    written = (account_store_root(tmp_path) / "codex-main" / "codex-home" / "auth.json").read_text()
-    assert "fresh-xyz" in written
-
-
-def test_import_host_codex_auth_missing_host_file_raises(tmp_path, monkeypatch):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
-    store = CredentialAccountStore(account_store_root(tmp_path))
-    with pytest.raises(ValueError, match="not found"):
-        store.import_host_codex_auth("codex-main")

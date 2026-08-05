@@ -29,13 +29,13 @@ def _graph(tmp_path) -> SQLiteSharedGraph:
     return SQLiteSharedGraph(str(tmp_path / "g.db"), ch)
 
 
-def _worker(bus, *, insight=None, shared_graph=None, workdir=None, sid="cli-claude-1"):
+def _worker(bus, *, insight=None, shared_graph=None, workdir=None, sid="cli-pi-1"):
     return CliSolver(
         spec=None,
         challenge=Challenge(id="run-kp", name="rivulet", category="pwn",
                             flag_format=r"flag\d?\{[^}]+\}", multi_flag=True,
                             expected_flags=4),
-        engine="claude", bus=bus, run_id="run-kp", solver_label=sid,
+        engine="pi", bus=bus, run_id="run-kp", solver_label=sid,
         insight=insight, shared_graph=shared_graph, workdir=workdir)
 
 
@@ -50,8 +50,8 @@ def test_p1a_board_shows_attempted_directions_to_workers(tmp_path):
     g = _graph(tmp_path)
     g.propose_intent(actor="reason", intent_id="intent:i1",
                      goal="brute-force the Shiro AES key with a public key list")
-    g.claim_intent(worker="cli-codex-9", intent_id="intent:i1")
-    g.conclude_intent(actor="cli-codex-9", intent_id="intent:i1",
+    g.claim_intent(worker="cli-pi-9", intent_id="intent:i1")
+    g.conclude_intent(actor="cli-pi-9", intent_id="intent:i1",
                       result="dead_end: random Shiro key, 1107-key list all miss")
 
     board = g.to_board_markdown()
@@ -66,8 +66,8 @@ def test_p1b_bootstrap_intent_lands_in_db_so_board_sees_it(tmp_path):
     This is the MAJORITY of "重走老路" workers — each new bootstrap re-running recon."""
     g = _graph(tmp_path)
     bus = EventBus()
-    sv = _worker(bus, shared_graph=g, sid="cli-claude-boot1")
-    sv._intent_id = "intent:cli-claude-boot1"
+    sv = _worker(bus, shared_graph=g, sid="cli-pi-boot1")
+    sv._intent_id = "intent:cli-pi-boot1"
 
     # the new helpers the bootstrap path calls
     sv._record_intent_db("Solve rivulet [pwn]")        # propose+claim, like turn start
@@ -129,12 +129,12 @@ def test_p5_gist_fallback_never_cuts_a_flag_in_half():
     """P5: fallback_summary must keep a flag/credential WHOLE even past the char cap
     — operator saw 'flag2{9f23aa1' (cut). A half-flag label is worse than a long one."""
     from muteki.solver.summarizer import fallback_summary
-    raw = ("[claude] the secret table holds "
+    raw = ("[pi] the secret table holds "
            "flag2{9f23aa16-33e7-11f1-9508-7e92a294591d} on host 192.168.1.123")
     out = fallback_summary(raw, max_chars=40)
     assert "flag2{9f23aa16-33e7-11f1-9508-7e92a294591d}" in out, \
         "the full flag must survive truncation, not be cut mid-token"
-    assert "[claude]" not in out  # worker tag still stripped
+    assert "[pi]" not in out  # worker tag still stripped
 
 
 def test_p5_gist_is_label_only_worker_reads_raw_fact(tmp_path):
@@ -144,7 +144,7 @@ def test_p5_gist_is_label_only_worker_reads_raw_fact(tmp_path):
     g = _graph(tmp_path)
     long_fact = ("DCSync recovered Administrator NTLM hash "
                  ":015f5d04d14d053508d14ac11d6496bb on DC01 192.168.1.83")
-    g.add_evidence(actor="cli-codex", source="codex", fact=long_fact, verified=True)
+    g.add_evidence(actor="cli-pi", source="pi", fact=long_fact, verified=True)
     g.record_fact_summary(fact_seq=1, summary="拿到域管hash")   # a short gist stored
 
     board = g.to_board_markdown()
@@ -189,7 +189,7 @@ def test_p2_multi_flag_sibling_flag_does_not_interrupt_current_turn():
 
     # a sibling's NEW flag arrives mid-turn
     sv._insight_inbox.put_nowait(
-        Insight(InsightKind.FLAG, "cli-codex-2", "flag1{aaaa-bbbb}"))
+        Insight(InsightKind.FLAG, "cli-pi-2", "flag1{aaaa-bbbb}"))
     sv._drain_control()
     assert "flag1{aaaa-bbbb}" in sv._already_found, "the flag is noted"
     assert not sv._steer_event.is_set(), \
@@ -205,14 +205,14 @@ def test_p2_single_flag_sibling_flag_still_interrupts_current_turn():
         spec=None,
         challenge=Challenge(id="run-single", name="single", category="web",
                             flag_format=r"flag\{[^}]+\}"),
-        engine="claude", bus=bus, run_id="run-single", solver_label="cli-claude-1",
+        engine="pi", bus=bus, run_id="run-single", solver_label="cli-pi-1",
         insight=insight,
     )
     sv._insight_inbox = insight.subscribe(sv.solver_id)
     sv._turn_active = True
 
     sv._insight_inbox.put_nowait(
-        Insight(InsightKind.FLAG, "cli-codex-2", "flag{one-and-done}"))
+        Insight(InsightKind.FLAG, "cli-pi-2", "flag{one-and-done}"))
     sv._drain_control()
 
     assert "flag{one-and-done}" in sv._already_found
@@ -229,7 +229,7 @@ def test_p2_backlog_replay_does_not_steerkill_fresh_worker():
     bus = EventBus()
     insight = InsightBus("run-kp")
     # a prior FLAG + standing hint already in history (the backlog a new worker gets)
-    asyncio.run(insight.flag_found("cli-codex-1", "flag1{already-found}"))
+    asyncio.run(insight.flag_found("cli-pi-9", "flag1{already-found}"))
     asyncio.run(insight.guidance("use the VPS 1.2.3.4", action="hint",
                                  target="global", standing=True))
     sv = _worker(bus, insight=insight)          # fresh worker, _turn_active=False
@@ -258,25 +258,26 @@ def test_p2_duplicate_flag_does_not_thrash_steer():
 
 
 def test_resume_falls_back_to_execute_when_session_not_established():
-    """run-42598 regression: a `build_resume` (claude `-r <sid>`) against a session
-    the engine never actually seated returns "No conversation found" → 0 tokens →
-    "(no output)" → instant dead_end, and never-give-up re-spawns into the same trap
-    (claude-5..33 each lived ~1.7s). Until a turn really produces output, a resume
-    turn must fall back to a FRESH execute, not `-r` a ghost session."""
+    """run-42598 regression: a `build_resume` (pi `--session <sid>`) against a
+    session the engine never actually seated returns "No conversation found" → 0
+    tokens → "(no output)" → instant dead_end, and never-give-up re-spawns into the
+    same trap (pi-5..33 each lived ~1.7s). Until a turn really produces output, a
+    resume turn must fall back to a FRESH execute, not `--session` a ghost session."""
     bus = EventBus()
     sv = _worker(bus)
     assert not sv._session_established, "a fresh worker has no established session"
 
-    # session NOT established → must NOT emit a resume (-r) argv; falls back to execute
+    # session NOT established → must NOT emit a resume (--session) argv; falls back to execute
     argv = sv._resume_or_execute_argv("CONTINUE", "ghost-uuid-never-seated")
-    assert "-r" not in argv, "resume of an unseated session must fall back to execute"
+    assert "--session" not in argv, "resume of an unseated session must fall back to execute"
     assert "ghost-uuid-never-seated" not in argv, "the ghost session id is not reused"
-    assert "-p" in argv, "the fallback is a fresh execute"
+    assert "--mode" in argv, "the fallback is a fresh execute"
 
 
 def test_resume_used_once_session_is_established():
     """The flip side: once a turn really produced output, _mark_session_if_live flips
-    the guard and a later resume turn legitimately uses `-r <sid>` (keeps context)."""
+    the guard and a later resume turn legitimately uses `--session <sid>` (keeps
+    context)."""
     from muteki.solver.cli_driver import CliResult
     bus = EventBus()
     sv = _worker(bus)
@@ -286,8 +287,8 @@ def test_resume_used_once_session_is_established():
     assert sv._session_established
 
     argv = sv._resume_or_execute_argv("CONTINUE", "real-sess-123")
-    assert "-r" in argv and "real-sess-123" in argv, \
-        "an established session resumes with -r to keep its memory"
+    assert "--session" in argv and "real-sess-123" in argv, \
+        "an established session resumes with --session to keep its memory"
 
 
 def test_zero_token_turn_does_not_establish_session():
@@ -325,7 +326,7 @@ def test_p3_peer_fact_propagates_via_shared_board(tmp_path):
     (The old InsightBus FACT/DEAD_END prompt-buffer was redundant dead code and is
     gone; this pins the channel that actually works.)"""
     g = _graph(tmp_path)
-    g.add_evidence(actor="cli-codex-3", source="codex",
+    g.add_evidence(actor="cli-pi-3", source="pi",
                    fact="admin/admin works on /doLogin", verified=True,
                    artifact_id="a1")
     board = g.to_board_markdown()
@@ -341,9 +342,9 @@ def test_p3_drain_control_does_not_crash_on_peer_fact_events():
     sv = _worker(bus, insight=insight)
     sv._insight_inbox = insight.subscribe(sv.solver_id)
     sv._insight_inbox.put_nowait(
-        Insight(InsightKind.FACT, "cli-codex-3", "admin/admin works"))
+        Insight(InsightKind.FACT, "cli-pi-3", "admin/admin works"))
     sv._insight_inbox.put_nowait(
-        Insight(InsightKind.DEAD_END, "cli-codex-3", "Shiro key brute is futile"))
+        Insight(InsightKind.DEAD_END, "cli-pi-3", "Shiro key brute is futile"))
     sv._drain_control()  # must not raise
     assert not sv._steer_event.is_set(), "a peer fact must not interrupt the turn"
 

@@ -33,11 +33,11 @@ def test_persist_winner_writes_session_handle(tmp_path):
         graph_dir=graph_dir, run_id="run-x",
     )
     out = SolveOutcome(True, "csawctf{x}", 1, None, "solved",
-                       session="sess-abc", engine="claude", workdir="/tmp/w")
+                       session="sess-abc", engine="pi", workdir="/tmp/w")
     sw._persist_winner(out, "csawctf{x}")
     winner = json.loads((graph_dir.parent / "winner.json").read_text())
     assert winner["session"] == "sess-abc"
-    assert winner["engine"] == "claude"
+    assert winner["engine"] == "pi"
     assert winner["backend"] == "local"
     assert "runtime_degraded" in winner
     assert winner["flag"] == "csawctf{x}"
@@ -59,7 +59,7 @@ def test_persist_winner_carries_all_flags(tmp_path):
     )
     sw._found_flags = ["flag{a}", "flag{b}", "flag{c}"]  # run collected three
     out = SolveOutcome(True, "flag{a}", 1, None, "solved",
-                       session="sess-1", engine="claude", workdir="/tmp/w",
+                       session="sess-1", engine="pi", workdir="/tmp/w",
                        flags=["flag{c}"])  # this worker only found the last one
     sw._persist_winner(out, "flag{a}")
     winner = json.loads((graph_dir.parent / "winner.json").read_text())
@@ -85,17 +85,17 @@ def test_persist_winner_skips_without_session(tmp_path):
 # ── D2: false-positive state machine ────────────────────────────────────────
 def test_reopen_after_false_positive(tmp_path):
     g = SQLiteSharedGraph(str(tmp_path / "g.db"), _challenge())
-    fs = g.add_evidence(actor="cli-claude", source="claude", fact="real", verified=True)
-    g.propose_intent(actor="reason", intent_id="intent:cli-claude", goal="solve")
-    g.conclude_intent(actor="cli-claude", intent_id="intent:cli-claude",
+    fs = g.add_evidence(actor="cli-pi", source="pi", fact="real", verified=True)
+    g.propose_intent(actor="reason", intent_id="intent:cli-pi", goal="solve")
+    g.conclude_intent(actor="cli-pi", intent_id="intent:cli-pi",
                       result="solved", to_fact_seq=fs)
     info = g.reopen_after_false_positive(actor="operator", flag="csawctf{fake}")
-    assert info["reopened"] == ["intent:cli-claude"]
+    assert info["reopened"] == ["intent:cli-pi"]
     assert "false positive" in info["dead_end_reason"]
     # intent flipped back to open, fact link cleared
     row = g._conn.execute(
         "SELECT status, to_fact_seq FROM intents WHERE intent_id=?",
-        ("intent:cli-claude",)).fetchone()
+        ("intent:cli-pi",)).fetchone()
     assert row == ("open", None)
     # the false flag is now a dead-end (so nobody retries it)
     assert any(e["kind"] == "dead_end" and "csawctf{fake}" in e["payload"].get("reason", "")
@@ -457,7 +457,7 @@ def test_mark_false_standby_uses_operator_selected_flag(tmp_path, monkeypatch):
         run.flags = ["flag{a}", "flag{b}", "flag{c}"]
         wp = mgr.workspace_dir("run-x") / "winner.json"
         wp.write_text(json.dumps({
-            "engine": "claude",
+            "engine": "pi",
             "session": "sess-1",
             "workdir": str(tmp_path),
             "flag": "flag{a}",
@@ -527,7 +527,7 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
 
         async def run(self):
             return SolveOutcome(False, None, 1, None, "writeup",
-                                engine="codex", reply="# Writeup")
+                                engine="pi", reply="# Writeup")
 
     monkeypatch.setattr(container_exec, "ensure_container", fake_ensure_container)
     monkeypatch.setattr(container_exec, "teardown_container", fake_teardown)
@@ -543,12 +543,12 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
             ],
             "worker_profiles": [
                 {
-                    "id": "seat-codex",
-                    "name": "seat-codex",
-                    "engine": "codex",
+                    "id": "seat-pi",
+                    "name": "seat-pi",
+                    "engine": "pi",
                     "runtime": "docker-web",
-                    "credential_account": "codex-main",
-                    "model": "gpt-5.4",
+                    "credential_account": "pi-main",
+                    "model": "deepseek-v4-pro",
                     "enabled": True,
                     "roles": ["bootstrap", "explore", "worker"],
                 },
@@ -558,14 +558,14 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
         run.started = True
         run.finished = True
         run.solved = True
-        home = mgr.workspace_dir("run-x") / "homes" / "cli-codex"
+        home = mgr.workspace_dir("run-x") / "homes" / "cli-pi"
         home.mkdir(parents=True, exist_ok=True)
         (home / "session.txt").write_text("thread-1")
         wp = mgr.workspace_dir("run-x") / "winner.json"
         wp.write_text(json.dumps({
-            "engine": "codex",
+            "engine": "pi",
             "session": "thread-1",
-            "workdir": str(mgr.workspace_dir("run-x") / "workers" / "cli-codex-1"),
+            "workdir": str(mgr.workspace_dir("run-x") / "workers" / "cli-pi-1"),
             "flag": "flag{ok}",
             "flags": ["flag{ok}"],
             "challenge": {
@@ -586,11 +586,11 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
     assert captured["ensure"]["run_id"] == "run-x"
     assert captured["ensure"]["network"] == "bridge"
     assert captured["solver_kwargs"]["container"].container == "muteki-run-run-x"
-    assert captured["solver_kwargs"]["engine"] == "codex"
+    assert captured["solver_kwargs"]["engine"] == "pi"
     assert captured["solver_kwargs"]["resume_session"] == "thread-1"
-    assert captured["solver_kwargs"]["worker_env"]["MUTEKI_WORKER_MODEL"] == "gpt-5.4"
-    assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-codex")
-    assert captured["chown"] == ["standby-codex", "cli-codex"]
+    assert captured["solver_kwargs"]["worker_env"]["MUTEKI_WORKER_MODEL"] == "deepseek-v4-pro"
+    assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-pi")
+    assert captured["chown"] == ["standby-pi", "cli-pi"]
     assert captured["teardown"] == {"run_id": "run-x", "remove": True}
 
 
@@ -611,7 +611,7 @@ def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, mo
 
         async def run(self):
             return SolveOutcome(False, None, 1, None, "reply",
-                                engine="claude", reply="ok")
+                                engine="pi", reply="ok")
 
     monkeypatch.setattr(cli_solver, "CliSolver", FakeCliSolver)
 

@@ -95,57 +95,59 @@ def _cli_swarm(challenge, tmp_path, *, cli_race, healthy, **kw):
             drv.health_detail = orig_hd[n]  # type: ignore[method-assign]
 
 
-def test_cli_race_builds_both_engines(challenge, tmp_path: Path) -> None:
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=True,
-                         healthy={"claude", "codex"})
+def test_cli_race_builds_two_profiles(challenge, tmp_path: Path) -> None:
+    solvers = _build_profile_race(
+        challenge, tmp_path,
+        [{"id": "pi-web", "name": "pi-web", "engine": "pi", "runtime": "local",
+          "credential_account": "pi-main", "auth": "subscription",
+          "roles": ["race", "bootstrap", "explore", "review"],
+          "race": True, "max_running": 1, "priority": 10, "model": "deepseek-v4-flash",
+          "enabled": True},
+         {"id": "pi-pwn", "name": "pi-pwn", "engine": "pi", "runtime": "local",
+          "credential_account": "pi-main", "auth": "subscription",
+          "roles": ["race", "bootstrap", "explore", "review"],
+          "race": True, "max_running": 1, "priority": 20, "model": "deepseek-v4-pro",
+          "enabled": True}],
+        healthy_base={"pi"})
     engines = sorted(s.driver.name for s in solvers)
-    assert engines == ["claude", "codex"]
+    assert engines == ["pi", "pi"]
     # distinct ids so the swarm's winner bookkeeping + deck can tell them apart
     assert len({s.solver_id for s in solvers}) == 2
 
 
-def test_cli_race_degrades_when_codex_unhealthy(challenge, tmp_path: Path) -> None:
-    # codex usage-limited → race collapses to claude alone, swarm still runs.
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=True, healthy={"claude"})
-    assert [s.driver.name for s in solvers] == ["claude"]
+def test_cli_race_degrades_when_pi_unhealthy(challenge, tmp_path: Path) -> None:
+    # pi usage-limited → race collapses to the pi fallback, swarm still runs.
+    solvers = _cli_swarm(challenge, tmp_path, cli_race=True, healthy=set())
+    assert [s.driver.name for s in solvers] == ["pi"]
 
 
-def test_cli_single_engine_degrades_to_claude(challenge, tmp_path: Path) -> None:
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"claude"},
-                         cli_engine="codex")  # asked for codex, but it's down
-    assert [s.driver.name for s in solvers] == ["claude"]
+def test_cli_single_engine_degrades_to_pi(challenge, tmp_path: Path) -> None:
+    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy=set(),
+                         cli_engine="pi")  # asked for pi, but it's down
+    assert [s.driver.name for s in solvers] == ["pi"]
 
 
 def test_cli_offline_and_no_kb_propagate(challenge, tmp_path: Path) -> None:
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"claude"},
+    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"pi"},
                          web_access=False, kb=False)
     s = solvers[0]
     assert s.web_access is False and s.kb is False
 
 
-def test_cli_race_three_engines(challenge, tmp_path: Path) -> None:
-    # the full roster races: cursor + claude + codex, one worker each.
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=True,
-                         healthy={"cursor", "claude", "codex"},
-                         engines=["cursor", "claude", "codex"])
+def test_cli_race_three_profiles(challenge, tmp_path: Path) -> None:
+    # three direction profiles race, one worker each.
+    solvers = _build_profile_race(challenge, tmp_path,
+                                  _pi_trio_profiles(), healthy_base={"pi"})
     engines = sorted(s.driver.name for s in solvers)
-    assert engines == ["claude", "codex", "cursor"]
+    assert engines == ["pi", "pi", "pi"]
     assert len({s.solver_id for s in solvers}) == 3
 
 
-def test_cli_race_drops_unhealthy_cursor(challenge, tmp_path: Path) -> None:
-    # cursor down (e.g. not logged in) → race runs claude + codex only.
+def test_engines_default_preserves_pi_roster(challenge, tmp_path: Path) -> None:
+    # no engines passed → the default pi roster.
     solvers = _cli_swarm(challenge, tmp_path, cli_race=True,
-                         healthy={"claude", "codex"},
-                         engines=["cursor", "claude", "codex"])
-    assert sorted(s.driver.name for s in solvers) == ["claude", "codex"]
-
-
-def test_engines_default_preserves_claude_codex(challenge, tmp_path: Path) -> None:
-    # no engines passed → historical claude+codex roster (back-compat).
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=True,
-                         healthy={"cursor", "claude", "codex"})
-    assert sorted(s.driver.name for s in solvers) == ["claude", "codex"]
+                         healthy={"pi"})
+    assert sorted(s.driver.name for s in solvers) == ["pi"]
 
 
 def test_engines_roster_deduped(challenge, tmp_path: Path) -> None:
@@ -153,30 +155,30 @@ def test_engines_roster_deduped(challenge, tmp_path: Path) -> None:
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               engines=["cursor", "claude", "cursor", "codex", "claude"])
-    assert sw.engines == ["cursor", "claude", "codex"]
+               engines=["pi", "pi", "pi", "pi", "pi"])
+    assert sw.engines == ["pi"]
 
 
 # ── single-engine multi-instance: N same-engine profiles, distinct models ─────
 # (P1 §10: "drag out 3 codex, each pinned to a different model; race them
 # concurrently; dispatch later phases by priority".)
 
-def _codex_trio_profiles():
-    """Three codex profiles (same base engine), each a distinct model, with
+def _pi_trio_profiles():
+    """Three pi profiles (same base engine), each a distinct model, with
     priorities deliberately OUT of declaration order so an order-preserving
     roster would NOT be priority-sorted. id == name (normalize copies one to the
     other)."""
     mk = lambda pid, model, prio: {
-        "id": pid, "name": pid, "engine": "codex", "runtime": "local",
-        "credential_account": "codex-main", "auth": "subscription",
+        "id": pid, "name": pid, "engine": "pi", "runtime": "local",
+        "credential_account": "pi-main", "auth": "subscription",
         "roles": ["race", "bootstrap", "explore", "review"],
         "race": True, "max_running": 1, "priority": prio, "model": model,
         "enabled": True,
     }
     # declaration order a,b,c but priorities 30,10,20 → priority order is b,c,a
-    return [mk("codex-a", "gpt-5.3", 30),
-            mk("codex-b", "gpt-5.5", 10),
-            mk("codex-c", "gpt-5.4", 20)]
+    return [mk("pi-a", "deepseek-reasoner", 30),
+            mk("pi-b", "deepseek-v4-pro", 10),
+            mk("pi-c", "deepseek-v4-flash", 20)]
 
 
 def _build_profile_race(challenge, tmp_path, profiles, *, healthy_base):
@@ -210,21 +212,21 @@ def _build_profile_race(challenge, tmp_path, profiles, *, healthy_base):
 def test_cli_race_same_engine_trio_distinct_solver_ids(challenge, tmp_path: Path) -> None:
     # THE BUG FIX (§10.8 Step 2): the classic cli_race path (_build_solvers,
     # which bypasses _make_cli_worker) used to give every same-base-engine racer
-    # the same solver_id "cli-codex" → event lanes / account maps overwrite each
+    # the same solver_id "cli-pi" → event lanes / account maps overwrite each
     # other. Now each gets a unique id via the _label_seq scheme.
     solvers = _build_profile_race(challenge, tmp_path,
-                                  _codex_trio_profiles(), healthy_base={"codex"})
+                                  _pi_trio_profiles(), healthy_base={"pi"})
     # all three actually spawned, one worker per profile
     assert len(solvers) == 3
-    assert all(s.driver.name == "codex" for s in solvers)
+    assert all(s.driver.name == "pi" for s in solvers)
     # distinct solver_ids — no collapse
     ids = [s.solver_id for s in solvers]
     assert len(set(ids)) == 3, ids
     # first keeps the bare id (winner bookkeeping / back-compat), rest get -2/-3
-    assert set(ids) == {"cli-codex", "cli-codex-2", "cli-codex-3"}, ids
+    assert set(ids) == {"cli-pi", "cli-pi-2", "cli-pi-3"}, ids
     # each worker carries its profile's distinct model down to the driver
     models = sorted(s.driver._model() for s in solvers)
-    assert models == ["gpt-5.3", "gpt-5.4", "gpt-5.5"], models
+    assert models == ["deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"], models
 
 
 def test_engines_roster_sorted_by_priority(challenge, tmp_path: Path) -> None:
@@ -236,11 +238,11 @@ def test_engines_roster_sorted_by_priority(challenge, tmp_path: Path) -> None:
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               worker_profiles=_codex_trio_profiles())
-    assert sw.engines == ["codex-b", "codex-c", "codex-a"], sw.engines
+               worker_profiles=_pi_trio_profiles())
+    assert sw.engines == ["pi-b", "pi-c", "pi-a"], sw.engines
     # race_engines (derived from self.engines when not given explicitly) inherits
     # the priority order too.
-    assert sw.race_engines == ["codex-b", "codex-c", "codex-a"], sw.race_engines
+    assert sw.race_engines == ["pi-b", "pi-c", "pi-a"], sw.race_engines
 
 
 def test_pick_engine_honors_priority_order(challenge, tmp_path: Path) -> None:
@@ -256,13 +258,13 @@ def test_pick_engine_honors_priority_order(challenge, tmp_path: Path) -> None:
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               worker_profiles=_codex_trio_profiles())
-    healthy = ["codex-a", "codex-b", "codex-c"]
+               worker_profiles=_pi_trio_profiles())
+    healthy = ["pi-a", "pi-b", "pi-c"]
     # _pick_engine(running_engines, healthy, *, role)
-    # all idle → top priority (codex-b, prio 10) picked first
-    assert sw._pick_engine([], healthy, role="bootstrap") == "codex-b"
+    # all idle → top priority (pi-b, prio 10) picked first
+    assert sw._pick_engine([], healthy, role="bootstrap") == "pi-b"
     # all-idle pick is deterministic regardless of declaration order: priority wins
-    assert sw._pick_engine([], list(reversed(healthy)), role="bootstrap") == "codex-b"
+    assert sw._pick_engine([], list(reversed(healthy)), role="bootstrap") == "pi-b"
 
 
 def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None:
@@ -271,8 +273,8 @@ def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None
     # coerce_nonneg_int keeps 0) into 100, sinking the top-priority profile. The
     # fix uses coerce_nonneg_int so 0 stays 0 and sorts FIRST.
     mk = lambda pid, prio: {
-        "id": pid, "name": pid, "engine": "codex", "runtime": "local",
-        "credential_account": "codex-main", "auth": "subscription",
+        "id": pid, "name": pid, "engine": "pi", "runtime": "local",
+        "credential_account": "pi-main", "auth": "subscription",
         "roles": ["race", "bootstrap"], "race": True, "max_running": 1,
         "priority": prio, "model": "gpt-5.5", "enabled": True,
     }
@@ -281,8 +283,8 @@ def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None
     # zero-prio declared LAST; must still sort first (not demoted to 100).
     sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               worker_profiles=[mk("codex-ten", 10), mk("codex-zero", 0)])
-    assert sw.engines == ["codex-zero", "codex-ten"], sw.engines
+               worker_profiles=[mk("pi-ten", 10), mk("pi-zero", 0)])
+    assert sw.engines == ["pi-zero", "pi-ten"], sw.engines
 
 
 def test_container_unavailable_falls_back_local_on_host(challenge, tmp_path: Path) -> None:
@@ -299,7 +301,7 @@ def test_container_unavailable_falls_back_local_on_host(challenge, tmp_path: Pat
     monkey = pytest.MonkeyPatch()
     monkey.setattr(swmod, "is_web_container", lambda: False)
     try:
-        assert sw._backend_for_engine("codex") == "local"  # degrades, no raise
+        assert sw._backend_for_engine("pi") == "local"  # degrades, no raise
     finally:
         monkey.undo()
 
@@ -318,7 +320,7 @@ def test_container_unavailable_hard_fails_in_web_container(challenge, tmp_path: 
     monkey.setattr(swmod, "is_web_container", lambda: True)
     try:
         with pytest.raises(RuntimeError, match="refusing to fall back"):
-            sw._backend_for_engine("codex")
+            sw._backend_for_engine("pi")
     finally:
         monkey.undo()
 
@@ -332,16 +334,16 @@ def test_engines_priority_sort_only_when_profiles(challenge, tmp_path: Path) -> 
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               engines=["cursor", "claude", "codex"])
-    assert sw.engines == ["cursor", "claude", "codex"]
+               engines=["pi", "pi"])
+    assert sw.engines == ["pi"]
 
 
 def test_cli_single_mode_preserves_lineup_label(challenge, tmp_path: Path) -> None:
     # GUARD: the §10.8 Step 2 fix is race-mode-only. Single mode must still take
     # its solver_id from the lineup spec (solver_label stays None), not get
     # overridden to "cli-<engine>".
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"claude"},
-                         cli_engine="claude")
+    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"pi"},
+                         cli_engine="pi")
     assert len(solvers) == 1
     # the lineup ModelSpec passed by _cli_swarm has solver_id="seat"
     assert solvers[0].solver_id == "seat", solvers[0].solver_id
@@ -365,7 +367,7 @@ def _bus_health_swarm(challenge, tmp_path, *, healthy: dict[str, bool]):
         challenge, [ModelSpec(solver_id="seat", model="mock")],
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         coordinator=True, race_scout=False, bus=bus,
-        engines=["cursor", "claude", "codex"],
+        engines=["pi"],
     )
     # these tests exercise probe → state-change → RE-PROBE semantics (degrade then
     # recover when a stubbed driver flips health). Disable the health-probe cache so
@@ -396,25 +398,23 @@ def _degrade_events(events):
 
 
 async def test_healthy_engines_emits_degrade_with_reason(challenge, tmp_path: Path) -> None:
-    sw, events = _bus_health_swarm(challenge, tmp_path,
-                                   healthy={"cursor": False, "claude": True, "codex": True})
+    sw, events = _bus_health_swarm(challenge, tmp_path, healthy={"pi": False})
     try:
         roster = sw._healthy_engines()
         await asyncio.sleep(0)  # let the fire-and-forget emit tasks run
     finally:
         sw._restore_health()
-    # cursor dropped from the roster; claude + codex remain
-    assert sorted(roster) == ["claude", "codex"]
+    # pi dropped from the roster (the fallback keeps the swarm running)
+    assert roster == ["pi"]
     degr = _degrade_events(events)
     assert len(degr) == 1
     p = degr[0].payload
-    assert p["engine"] == "cursor" and p["status"] == "degraded"
+    assert p["engine"] == "pi" and p["status"] == "degraded"
     assert "Authentication required" in p["reason"]
 
 
 async def test_healthy_engines_degrade_deduped(challenge, tmp_path: Path) -> None:
-    sw, events = _bus_health_swarm(challenge, tmp_path,
-                                   healthy={"cursor": False, "claude": True, "codex": True})
+    sw, events = _bus_health_swarm(challenge, tmp_path, healthy={"pi": False})
     try:
         sw._healthy_engines()
         sw._healthy_engines()  # same failure twice → still ONE event (no spam)
@@ -425,19 +425,18 @@ async def test_healthy_engines_degrade_deduped(challenge, tmp_path: Path) -> Non
 
 
 async def test_healthy_engines_recovery_event(challenge, tmp_path: Path) -> None:
-    sw, events = _bus_health_swarm(challenge, tmp_path,
-                                   healthy={"cursor": False, "claude": True, "codex": True})
+    sw, events = _bus_health_swarm(challenge, tmp_path, healthy={"pi": False})
     try:
-        sw._healthy_engines()              # cursor down → degraded
+        sw._healthy_engines()              # pi down → degraded
         await asyncio.sleep(0)
-        # cursor logs back in
+        # pi logs back in
         import muteki.solver.cli_driver as cd
-        cd.DRIVERS["cursor"].health_detail = lambda *a, **k: (True, "")  # type: ignore[method-assign]
-        roster = sw._healthy_engines()     # cursor back → recovered event
+        cd.DRIVERS["pi"].health_detail = lambda *a, **k: (True, "")  # type: ignore[method-assign]
+        roster = sw._healthy_engines()     # pi back → recovered event
         await asyncio.sleep(0)
     finally:
         sw._restore_health()
-    assert "cursor" in roster
+    assert "pi" in roster
     degr = _degrade_events(events)
     statuses = [e.payload["status"] for e in degr]
     assert statuses == ["degraded", "recovered"]
@@ -450,12 +449,12 @@ async def test_healthy_engines_async_does_not_block_event_loop(
     sw = Swarm(
         challenge, [ModelSpec(solver_id="seat", model="mock")],
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-        coordinator=True, race_scout=False, engines=["claude"],
+        coordinator=True, race_scout=False, engines=["pi"],
     )
 
     def slow_probe():
         time.sleep(0.15)
-        return ["claude"]
+        return ["pi"]
 
     monkeypatch.setattr(sw, "_healthy_engines", slow_probe)
     ticks = 0
@@ -469,7 +468,7 @@ async def test_healthy_engines_async_does_not_block_event_loop(
 
     task = asyncio.create_task(ticker())
     try:
-        assert await sw._healthy_engines_async() == ["claude"]
+        assert await sw._healthy_engines_async() == ["pi"]
     finally:
         done = True
         await task
@@ -494,8 +493,13 @@ def _probe_swarm(challenge, tmp_path, engines):
 
 def test_healthy_engines_probes_run_in_parallel(challenge, tmp_path: Path,
                                                  monkeypatch) -> None:
-    # three engines, each probe sleeps 0.3s. SERIAL → ~0.9s; PARALLEL → ~0.3s.
-    sw = _probe_swarm(challenge, tmp_path, ["cursor", "claude", "codex"])
+    # three profiles, each probe sleeps 0.3s. SERIAL → ~0.9s; PARALLEL → ~0.3s.
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               coordinator=True, race_scout=False,
+               worker_profiles=_pi_trio_profiles())
 
     def slow_probe(name, role):
         time.sleep(0.3)
@@ -505,7 +509,7 @@ def test_healthy_engines_probes_run_in_parallel(challenge, tmp_path: Path,
     t0 = time.monotonic()
     roster = sw._healthy_engines()
     elapsed = time.monotonic() - t0
-    assert sorted(roster) == ["claude", "codex", "cursor"]
+    assert sorted(roster) == ["pi-a", "pi-b", "pi-c"]
     # generous bound: parallel must finish well under the 0.9s serial cost.
     assert elapsed < 0.7, f"probes look serial: {elapsed:.2f}s for 3×0.3s"
 
@@ -513,7 +517,7 @@ def test_healthy_engines_probes_run_in_parallel(challenge, tmp_path: Path,
 def test_healthy_engines_caches_verdicts_within_ttl(challenge, tmp_path: Path,
                                                     monkeypatch) -> None:
     # a SECOND dispatch within the TTL must reuse verdicts, not re-probe.
-    sw = _probe_swarm(challenge, tmp_path, ["claude", "codex"])
+    sw = _probe_swarm(challenge, tmp_path, ["pi"])
     calls: list[str] = []
 
     def counting_probe(name, role):
@@ -521,16 +525,16 @@ def test_healthy_engines_caches_verdicts_within_ttl(challenge, tmp_path: Path,
         return True, ""
 
     monkeypatch.setattr(sw, "_probe_engine_health", counting_probe)
-    assert sorted(sw._healthy_engines()) == ["claude", "codex"]
-    assert sorted(calls) == ["claude", "codex"]  # first sweep probes both
+    assert sorted(sw._healthy_engines()) == ["pi"]
+    assert sorted(calls) == ["pi"]  # first sweep probes it
     calls.clear()
-    assert sorted(sw._healthy_engines()) == ["claude", "codex"]
+    assert sorted(sw._healthy_engines()) == ["pi"]
     assert calls == []  # second sweep served entirely from cache
 
 
 def test_healthy_engines_ttl_zero_disables_cache(challenge, tmp_path: Path,
                                                  monkeypatch) -> None:
-    sw = _probe_swarm(challenge, tmp_path, ["claude"])
+    sw = _probe_swarm(challenge, tmp_path, ["pi"])
     sw._health_probe_ttl = 0
     n = {"count": 0}
 
@@ -548,7 +552,7 @@ def test_healthy_engines_failure_cached_shorter(challenge, tmp_path: Path,
                                                 monkeypatch) -> None:
     # a FAILED verdict expires at a fraction of the TTL so a recovered engine
     # rejoins quickly. With a tiny TTL the failure window lapses between sweeps.
-    sw = _probe_swarm(challenge, tmp_path, ["claude"])
+    sw = _probe_swarm(challenge, tmp_path, ["pi"])
     sw._health_probe_ttl = 0.4  # failure horizon = 0.4 * 0.25 = 0.1s
     state = {"ok": False, "calls": 0}
 
@@ -557,13 +561,13 @@ def test_healthy_engines_failure_cached_shorter(challenge, tmp_path: Path,
         return state["ok"], "" if state["ok"] else "down"
 
     monkeypatch.setattr(sw, "_probe_engine_health", flip_probe)
-    sw._healthy_engines()              # claude down → cached fail (short horizon)
+    sw._healthy_engines()              # pi down → cached fail (short horizon)
     assert state["calls"] == 1
     state["ok"] = True
     time.sleep(0.15)                   # past the failure horizon, within the TTL
     roster = sw._healthy_engines()     # must RE-probe and see recovery
     assert state["calls"] == 2
-    assert roster == ["claude"]
+    assert roster == ["pi"]
 
 
 # ── launch-time deployed-skill reconciliation (run-75378 drift gap) ──────────
@@ -628,12 +632,12 @@ def _coordinator_swarm(challenge, tmp_path, **kw):
 
 
 def test_pick_engine_prefers_unrunning():
-    # heterogeneity-aware: prefer an engine not currently running
+    # pi-only: the single engine is the pick whether or not it is running
+    # (there is no second engine to prefer when idle).
     sw = Swarm.__new__(Swarm)
-    healthy = ["claude", "codex"]
-    assert sw._pick_engine([], healthy) == "claude"          # none running
-    assert sw._pick_engine(["claude"], healthy) == "codex"    # claude busy
-    assert sw._pick_engine(["claude", "codex"], healthy) == "claude"  # both → least-loaded
+    healthy = ["pi"]
+    assert sw._pick_engine([], healthy) == "pi"          # none running
+    assert sw._pick_engine(["pi"], healthy) == "pi"     # busy → least-loaded fallback
 
 
 def test_reason_backpressure_trips_on_large_ordinary_queue(challenge, tmp_path: Path):
@@ -741,7 +745,7 @@ async def _run_coordinator_briefly(sw, monkeypatch):
     monkeypatch.setattr(sw, "_run_reason", fake_reason)
 
     class FakeWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         async def run(self):
             await asyncio.sleep(0)
             return SolveOutcome(False, None, 1, None, "miss")
@@ -769,7 +773,7 @@ async def test_coordinator_skips_race_scout_on_populated_graph(
     sw = _coordinator_swarm(
         challenge, tmp_path, race_scout=True, start_workers=1, wall_clock_budget=0.3)
     sw.shared_graph.add_evidence(
-        actor="cli-claude", source="recon", fact="admin panel at /admin")
+        actor="cli-pi", source="recon", fact="admin panel at /admin")
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I-prior", goal="probe /admin",
         payload={"worker_class": "code"})
@@ -971,7 +975,7 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
     sw = _coordinator_swarm(
         challenge, tmp_path, max_workers=1,
         stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "claude", "max_concurrent": 1,
+            "enabled": True, "engine": "pi", "max_concurrent": 1,
             "cooldown_events": 0, "max_review_workers": 3,
         }}},
     )
@@ -985,12 +989,12 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
     emitted: list[tuple[str, dict]] = []
 
     class FakeReviewWorker:
-        solver_id = "cli-claude-review"
+        solver_id = "cli-pi-review"
 
         async def run(self):
             await asyncio.sleep(3600)
 
-    monkeypatch.setattr(sw, "_select_review_engine", lambda healthy: "claude")
+    monkeypatch.setattr(sw, "_select_review_engine", lambda healthy: "pi")
     monkeypatch.setattr(sw, "_make_cli_worker",
                         lambda engine, **kw: FakeReviewWorker())
 
@@ -1001,7 +1005,7 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
         started = await sw._maybe_start_review(
             trigger="operator_hint",
             directive="audit duplicated candidates",
-            healthy=["claude", "codex"],
+            healthy=["pi", "codex"],
             tasks=tasks,
             task_solvers=task_solvers,
             emit_bb=emit_bb,
@@ -1106,7 +1110,7 @@ async def test_run_reason_persists_model_selected_fact_pins(
 async def test_coordinator_applies_tier1_review_proposal(challenge, tmp_path: Path):
     sw = _coordinator_swarm(challenge, tmp_path)
     fact_seq = sw.shared_graph.add_evidence(
-        actor="cli-a", source="claude", fact="JWT alg is HS256",
+        actor="cli-a", source="pi", fact="JWT alg is HS256",
         verified=True, artifact_id="a1")
     sw.shared_graph.add_review_proposal(
         actor="cli-review", marker="FACT_CHALLENGE",
@@ -1311,22 +1315,23 @@ def test_open_intents_backfills_structured_lane_from_existing_goal_text(
 
 def test_pick_engine_least_loaded_when_all_running():
     sw = Swarm.__new__(Swarm)
-    healthy = ["claude", "codex"]
-    # claude running twice, codex once → pick codex
-    assert sw._pick_engine(["claude", "claude", "codex"], healthy) == "codex"
+    healthy = ["pi"]
+    # the one pi entry running → least-loaded returns it
+    assert sw._pick_engine(["pi"], healthy) == "pi"
 
 
-def test_pick_engine_three_engines_heterogeneity():
-    # with cursor in the roster, _pick_engine still prefers an unrunning engine,
-    # walking the roster order, then falls back to least-loaded.
-    sw = Swarm.__new__(Swarm)
-    healthy = ["cursor", "claude", "codex"]
-    assert sw._pick_engine([], healthy) == "cursor"            # none running
-    assert sw._pick_engine(["cursor"], healthy) == "claude"     # cursor busy
-    assert sw._pick_engine(["cursor", "claude"], healthy) == "codex"
-    # all three running → least-loaded (codex once vs cursor/claude twice)
-    assert sw._pick_engine(
-        ["cursor", "cursor", "claude", "claude", "codex"], healthy) == "codex"
+def test_pick_engine_three_profiles_no_heterogeneity(challenge, tmp_path: Path):
+    # with a pi-only profile roster there is no second engine to prefer: a running
+    # pi worker marks EVERY pi profile as running (base-engine match), so the pick
+    # falls back to the priority-ordered least-loaded candidate.
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               worker_profiles=_pi_trio_profiles())
+    healthy = ["pi-a", "pi-b", "pi-c"]
+    assert sw._pick_engine([], healthy) == "pi-b"            # idle → top priority
+    assert sw._pick_engine(["pi-b"], healthy) == "pi-b"     # running → least-loaded
 
 
 # ── operator runtime worker control (spawn/kill a specific engine) ───────────
@@ -1345,7 +1350,7 @@ class _FakeWorker:
 
 @pytest.mark.asyncio
 async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatch):
-    sw = _coordinator_swarm(challenge, tmp_path, engines=["claude", "codex"])
+    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi", "codex"])
     sw.worker_cmds = asyncio.Queue()
     monkeypatch.setattr(sw, "_make_cli_worker",
                         lambda engine, **kw: _FakeWorker(engine))
@@ -1358,19 +1363,19 @@ async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatc
         emitted.append((kind, f))
 
     # spawn a claude worker on demand
-    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "claude"})
+    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "pi"})
     await sw._apply_worker_cmds(
-        tasks=tasks, task_solvers=task_solvers, healthy=["claude", "codex"],
+        tasks=tasks, task_solvers=task_solvers, healthy=["pi", "codex"],
         running_engines_fn=lambda: list(tasks.values()), emit_bb=emit_bb)
     assert len(tasks) == 1
     w = next(iter(task_solvers.values()))
-    assert w.solver_id == "cli-claude-op"
+    assert w.solver_id == "cli-pi-op"
     assert any(k == "worker_spawned" for k, _ in emitted)
 
     # kill it by solver_id → solver cancelled + worker_killed emitted
-    sw.worker_cmds.put_nowait({"action": "kill", "solver_id": "cli-claude-op"})
+    sw.worker_cmds.put_nowait({"action": "kill", "solver_id": "cli-pi-op"})
     await sw._apply_worker_cmds(
-        tasks=tasks, task_solvers=task_solvers, healthy=["claude", "codex"],
+        tasks=tasks, task_solvers=task_solvers, healthy=["pi", "codex"],
         running_engines_fn=lambda: list(tasks.values()), emit_bb=emit_bb)
     assert w.cancelled is True
     assert any(k == "worker_killed" for k, _ in emitted)
@@ -1381,7 +1386,7 @@ async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_apply_worker_cmds_rejects_unknown_engine_and_max(challenge, tmp_path, monkeypatch):
-    sw = _coordinator_swarm(challenge, tmp_path, engines=["claude", "codex"])
+    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi"])
     sw.worker_cmds = asyncio.Queue()
     monkeypatch.setattr(sw, "_make_cli_worker",
                         lambda engine, **kw: _FakeWorker(engine))
@@ -1392,10 +1397,10 @@ async def test_apply_worker_cmds_rejects_unknown_engine_and_max(challenge, tmp_p
     async def emit_bb(kind, **f):
         emitted.append((kind, f))
 
-    # cursor is NOT in this swarm's roster (e.g. offline) → spawn rejected
-    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "cursor"})
+    # a bogus engine is NOT in this swarm's roster → spawn rejected
+    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "bogus"})
     await sw._apply_worker_cmds(
-        tasks=tasks, task_solvers=task_solvers, healthy=["claude", "codex"],
+        tasks=tasks, task_solvers=task_solvers, healthy=["pi"],
         running_engines_fn=lambda: list(tasks.values()), emit_bb=emit_bb)
     assert len(tasks) == 0
     assert any(k == "worker_spawn_rejected" and f.get("reason") == "unknown_engine"
@@ -1404,9 +1409,9 @@ async def test_apply_worker_cmds_rejects_unknown_engine_and_max(challenge, tmp_p
     # at max_workers → spawn rejected
     emitted.clear()
     sw.max_workers = 0
-    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "claude"})
+    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "pi"})
     await sw._apply_worker_cmds(
-        tasks=tasks, task_solvers=task_solvers, healthy=["claude", "codex"],
+        tasks=tasks, task_solvers=task_solvers, healthy=["pi"],
         running_engines_fn=lambda: list(tasks.values()), emit_bb=emit_bb)
     assert len(tasks) == 0
     assert any(k == "worker_spawn_rejected" and f.get("reason") == "max_workers"
@@ -1418,7 +1423,7 @@ async def test_coordinator_bootstrap_then_flag(challenge, tmp_path: Path, monkey
     from muteki.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
 
     class FakeWorker:
         def __init__(self, engine, solved):
@@ -1432,13 +1437,13 @@ async def test_coordinator_bootstrap_then_flag(challenge, tmp_path: Path, monkey
 
     # claude solves, codex misses
     def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        return FakeWorker(engine, solved=(engine == "claude"))
+        return FakeWorker(engine, solved=(engine == "pi"))
     monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
 
     out = await sw.run()
     assert out.solved is True
     assert out.flag == "flag{win}"
-    assert out.winner == "cli-claude"
+    assert out.winner == "cli-pi"
 
 
 async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, monkeypatch):
@@ -1448,15 +1453,20 @@ async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, mo
 
     challenge.expected_flags = 2
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
 
     # each engine returns a DIFFERENT single flag; neither alone completes the run.
-    flags = {"claude": "flag{a}", "codex": "flag{b}"}
+    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
+
+    flag_pool = ["flag{a}", "flag{b}"]
+    spawn = {"n": 0}
 
     class FakeWorker:
         def __init__(self, engine):
             self.solver_id = f"cli-{engine}"
-            self._f = flags[engine]
+            self._f = flag_pool[spawn["n"] % len(flag_pool)]
+            spawn["n"] += 1
         async def run(self):
             await asyncio.sleep(0)
             return SolveOutcome(True, self._f, 1, None, "solved", flags=[self._f])
@@ -1477,7 +1487,7 @@ async def test_coordinator_singleflag_stops_on_first(challenge, tmp_path: Path, 
     from muteki.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
 
     class FakeWorker:
         def __init__(self, engine):
@@ -1507,13 +1517,13 @@ async def test_coordinator_ctf_complete_reason_stops_dispatching(
     sw = _coordinator_swarm(
         challenge, tmp_path, start_workers=1, max_workers=2, wall_clock_budget=0.3)
     sw._found_flags = ["flag{a}", "flag{b}", "flag{c}", "flag{d}"]
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
     monkeypatch.setattr(sw, "_verified_fact_count", lambda: 1)
 
     makes: list[tuple[str, str]] = []
 
     class FakeWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         async def run(self):
             await asyncio.sleep(0)
             return SolveOutcome(False, None, 1, None, "miss")
@@ -1534,7 +1544,7 @@ async def test_coordinator_ctf_complete_reason_stops_dispatching(
     out = await asyncio.wait_for(sw.run(), timeout=5)
 
     assert out.solved is True
-    assert makes == [("claude", "bootstrap")]
+    assert makes == [("pi", "bootstrap")]
 
 
 async def test_coordinator_reason_then_explore(challenge, tmp_path: Path, monkeypatch):
@@ -1638,11 +1648,11 @@ async def test_course_correct_runs_review_before_rebootstrap(challenge, tmp_path
         challenge, tmp_path, start_workers=1, stall_seconds=0.01,
         wall_clock_budget=0.4,
         stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "codex", "timeout": 120,
+            "enabled": True, "engine": "pi", "timeout": 120,
             "on_course_correct": True, "cooldown_events": 0,
         }}},
     )
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
 
     spawned: list[tuple[str, str, str]] = []
 
@@ -1686,7 +1696,7 @@ async def test_course_correct_runs_review_before_rebootstrap(challenge, tmp_path
 
     await asyncio.wait_for(sw.run(), timeout=5)
 
-    assert ("codex", "review", "raw drift: stop brute force") in spawned
+    assert ("pi", "review", "raw drift: stop brute force") in spawned
     assert any(mode == "bootstrap" and "decode the signed cookie" in goal
                for _engine, mode, goal in spawned), spawned
 
@@ -1716,14 +1726,14 @@ async def test_completed_worker_threshold_starts_review(challenge, tmp_path: Pat
         challenge, tmp_path, start_workers=1, max_workers=2,
         wall_clock_budget=0.2,
         stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "codex",
+            "enabled": True, "engine": "pi",
             "every_completed_workers": 1,
             "on_candidate_spike": False,
             "on_reason_dry": False,
             "cooldown_events": 0,
         }}},
     )
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
 
     spawned: list[tuple[str, str]] = []
@@ -1745,7 +1755,7 @@ async def test_completed_worker_threshold_starts_review(challenge, tmp_path: Pat
 
     out = await asyncio.wait_for(sw.run(), timeout=5)
     assert out.solved is False
-    assert ("codex", "review") in spawned
+    assert ("pi", "review") in spawned
 
 
 async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypatch):
@@ -1755,7 +1765,7 @@ async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypa
         challenge, tmp_path, start_workers=1, max_workers=2,
         wall_clock_budget=0.2,
         stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "codex",
+            "enabled": True, "engine": "pi",
             "every_completed_workers": 0,
             "on_candidate_spike": True,
             "candidate_spike_threshold": 2,
@@ -1763,7 +1773,7 @@ async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypa
             "cooldown_events": 0,
         }}},
     )
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
     candidates = {"n": 0}
     monkeypatch.setattr(sw, "_candidate_fact_count", lambda: candidates["n"])
@@ -1789,7 +1799,7 @@ async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypa
 
     out = await asyncio.wait_for(sw.run(), timeout=5)
     assert out.solved is False
-    assert ("codex", "review") in spawned
+    assert ("pi", "review") in spawned
 
 
 async def test_coordinator_respects_wall_clock_budget(challenge, tmp_path: Path, monkeypatch):
@@ -1802,7 +1812,7 @@ async def test_coordinator_respects_wall_clock_budget(challenge, tmp_path: Path,
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
 
     class HangWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         async def run(self):
             await asyncio.sleep(100)  # never finishes
             return SolveOutcome(False, None, 1, None, "x")
@@ -1825,9 +1835,10 @@ async def test_coordinator_winner_cancels_loser_solver(challenge, tmp_path: Path
     from muteki.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
 
     cancelled = []
+    spawn = {"n": 0}
 
     class FakeWorker:
         def __init__(self, engine, solved):
@@ -1843,13 +1854,14 @@ async def test_coordinator_winner_cancels_loser_solver(challenge, tmp_path: Path
             return SolveOutcome(False, None, 1, None, "miss")
 
     def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        return FakeWorker(engine, solved=(engine == "claude"))
+        spawn["n"] += 1
+        return FakeWorker(engine, solved=(spawn["n"] == 1))
     monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
 
     out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is True and out.winner == "cli-claude"
+    assert out.solved is True and out.winner == "cli-pi"
     # the LOSER's solver.cancel() was invoked (so its subprocess dies)
-    assert "cli-codex" in cancelled
+    assert "cli-pi" in cancelled
 
 
 async def test_cancel_solver_is_noop_without_cancel_method():
@@ -1871,7 +1883,7 @@ async def test_coordinator_never_gives_up_rebootstraps_when_reason_dry(challenge
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
                             wall_clock_budget=0.4)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
 
     spawned_modes = []
 
@@ -1904,7 +1916,7 @@ def test_retry_goal_lists_dead_ends(challenge, tmp_path):
     after a few probes (run-7349)."""
     sw = _coordinator_swarm(challenge, tmp_path)
     try:
-        sw.shared_graph.add_dead_end(actor="cli-claude", reason="SQLi on /login is sanitized")
+        sw.shared_graph.add_dead_end(actor="cli-pi", reason="SQLi on /login is sanitized")
     except Exception:
         pass
     goal = sw._retry_goal()
@@ -1921,19 +1933,19 @@ def test_make_cli_worker_assigns_unique_labels(challenge, tmp_path):
     worker), keeping the cli-<engine> prefix (so the engine badge still resolves).
     The first worker of an engine keeps the bare cli-<engine> for back-compat."""
     sw = _coordinator_swarm(challenge, tmp_path)
-    a = sw._make_cli_worker("claude", mode="bootstrap")
-    b = sw._make_cli_worker("claude", mode="explore")
-    c = sw._make_cli_worker("codex", mode="bootstrap")
-    d = sw._make_cli_worker("codex", mode="explore")
-    assert a.solver_id == "cli-claude"      # 1st claude → bare prefix
-    assert b.solver_id == "cli-claude-2"    # 2nd claude → distinct
-    assert c.solver_id == "cli-codex"       # 1st codex → bare prefix
-    assert d.solver_id == "cli-codex-2"
+    a = sw._make_cli_worker("pi", mode="bootstrap")
+    b = sw._make_cli_worker("pi", mode="explore")
+    c = sw._make_cli_worker("pi", mode="bootstrap")
+    d = sw._make_cli_worker("pi", mode="explore")
+    assert a.solver_id == "cli-pi"      # 1st pi → bare prefix
+    assert b.solver_id == "cli-pi-2"    # 2nd pi → distinct
+    assert c.solver_id == "cli-pi-3"    # 3rd pi → distinct
+    assert d.solver_id == "cli-pi-4"
     # all distinct → distinct lanes on the deck
     assert len({a.solver_id, b.solver_id, c.solver_id, d.solver_id}) == 4
     # prefix preserved so workerEngine() detects the engine from the id alone
-    assert all("claude" in s for s in (a.solver_id, b.solver_id))
-    assert all("codex" in s for s in (c.solver_id, d.solver_id))
+    assert all("pi" in s for s in (a.solver_id, b.solver_id))
+    assert all("pi" in s for s in (c.solver_id, d.solver_id))
     # swarm sub-workers are worker-scoped: their end is WORKER_FINISHED, not the run.
     assert all(w.lifecycle_scope == "worker" for w in (a, b, c, d))
 
@@ -1954,7 +1966,7 @@ async def test_coordinator_emits_single_run_level_finished(challenge, tmp_path, 
     bus.add_sink(_sink)
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2, bus=bus)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
 
     class FakeWorker:
         """Mimics a real CliSolver's lifecycle emits: each worker fires its OWN
@@ -1973,7 +1985,7 @@ async def test_coordinator_emits_single_run_level_finished(challenge, tmp_path, 
                                 "solved" if self._solved else "miss")
 
     def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        return FakeWorker(engine, solved=(engine == "claude"))
+        return FakeWorker(engine, solved=(engine == "pi"))
     monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
 
     out = await sw.run()
@@ -2093,7 +2105,7 @@ async def test_coordinator_does_not_steer_kill_on_global_fact_stall(
     steered = {"n": 0}
 
     class SlowNoFactWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         def request_steer(self):           # coordinator must NEVER call this for reclaim
             steered["n"] += 1
         async def run(self):
@@ -2130,7 +2142,7 @@ async def test_REDLINE_no_global_signal_kills_a_progressless_worker(
     events = {"steered": 0, "cancelled": 0, "ran_to_completion": False}
 
     class SlowNoFactWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         def request_steer(self):       # global logic must NEVER steer for reclaim
             events["steered"] += 1
         def cancel(self):              # global logic must NEVER cancel for reclaim
@@ -2163,8 +2175,8 @@ def test_make_cli_worker_explore_gets_short_timeout(challenge, tmp_path):
     is its SHORT per-turn timeout. explore must get explore_timeout; bootstrap keeps
     the long default (whole-challenge rush)."""
     sw = _coordinator_swarm(challenge, tmp_path, explore_timeout=720)
-    boot = sw._make_cli_worker("claude", mode="bootstrap")
-    expl = sw._make_cli_worker("claude", mode="explore",
+    boot = sw._make_cli_worker("pi", mode="bootstrap")
+    expl = sw._make_cli_worker("pi", mode="explore",
                                intent_goal="probe", intent_id="I1-abc")
     assert expl.timeout == 720, "explore worker must get the short explore_timeout"
     assert boot.timeout == 2400, "bootstrap worker keeps the long default timeout"
@@ -2270,9 +2282,9 @@ def test_reopen_false_positive_does_not_revive_superseded_intent(challenge, tmp_
     sw = _coordinator_swarm(challenge, tmp_path)
     g = sw.shared_graph
     # a real solve
-    fs = g.add_evidence(actor="cli-claude", source="claude", fact="real", verified=True)
+    fs = g.add_evidence(actor="cli-pi", source="pi", fact="real", verified=True)
     g.propose_intent(actor="reason", intent_id="I-solve", goal="exploit /login")
-    g.conclude_intent(actor="cli-claude", intent_id="I-solve",
+    g.conclude_intent(actor="cli-pi", intent_id="I-solve",
                       result="solved", to_fact_seq=fs)
     # an ask-operator intent that the operator obsoleted → superseded (status='done')
     g.propose_intent(actor="reason", intent_id="I-ask",
@@ -2281,7 +2293,7 @@ def test_reopen_false_positive_does_not_revive_superseded_intent(challenge, tmp_
     assert "I-ask" in superseded
     # a barren explored intent (also 'done', result not solved)
     g.propose_intent(actor="reason", intent_id="I-barren", goal="brute /admin")
-    g.conclude_intent(actor="cli-claude", intent_id="I-barren", result="explored")
+    g.conclude_intent(actor="cli-pi", intent_id="I-barren", result="explored")
 
     info = g.reopen_after_false_positive(actor="operator", flag="flag{fake}")
     assert info["reopened"] == ["I-solve"], \
@@ -2371,8 +2383,8 @@ async def test_drain_hitl_directive_classification_recorded(challenge, tmp_path)
     bus.add_sink(_help_sink)
     await bus.emit(Event(
         event_type=EventType.HITL_REQUEST, run_id=sw.run_id,
-        challenge_id=challenge.id, solver_id="cli-claude",
-        payload=hitl_request_payload("cli-claude", "need a VPS with 4444 open",
+        challenge_id=challenge.id, solver_id="cli-pi",
+        payload=hitl_request_payload("cli-pi", "need a VPS with 4444 open",
                                      kind="need_input")))
     # the classification persisted with awaiting_operator status
     rows = sw.shared_graph.events()
@@ -2464,14 +2476,14 @@ async def test_m5_solver_scoped_command_only_clears_that_workers_help(challenge,
     sw = _coordinator_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     sw._pending_help = [
-        {"worker": "cli-codex-1", "need": "need a VPS"},
-        {"worker": "cli-codex-2", "need": "need the dashboard token"},
+        {"worker": "cli-pi-1", "need": "need a VPS"},
+        {"worker": "cli-pi-2", "need": "need the dashboard token"},
     ]
     await _drain_one(sw, {"action": "hint", "text": "use http on 8080",
-                          "target": "solver:cli-codex-2"})
+                          "target": "solver:cli-pi-2"})
     workers = {h["worker"] for h in sw._pending_help}
-    assert "cli-codex-1" in workers, "worker A's unmet blocker must survive a B-scoped hint"
-    assert "cli-codex-2" not in workers, "the targeted worker's ask is cleared"
+    assert "cli-pi-1" in workers, "worker A's unmet blocker must survive a B-scoped hint"
+    assert "cli-pi-2" not in workers, "the targeted worker's ask is cleared"
 
 
 async def test_dismiss_clears_help_unfreezes_and_deadends(challenge, tmp_path):
@@ -2483,8 +2495,8 @@ async def test_dismiss_clears_help_unfreezes_and_deadends(challenge, tmp_path):
     sw._operator_event = asyncio.Event()
     sw._operator_paused = True
     sw._pending_help = [
-        {"worker": "cli-codex-1", "need": "need a public VPS for reverse shell"},
-        {"worker": "cli-claude-2", "need": "target seems expired"},
+        {"worker": "cli-pi-1", "need": "need a public VPS for reverse shell"},
+        {"worker": "cli-pi-2", "need": "target seems expired"},
     ]
     deadends = []
     if sw.insight is not None:
@@ -2507,12 +2519,12 @@ async def test_dismiss_scoped_only_clears_that_worker(challenge, tmp_path):
     sw.hitl_inbox = asyncio.Queue()
     sw._operator_event = asyncio.Event()
     sw._pending_help = [
-        {"worker": "cli-codex-1", "need": "need a VPS"},
-        {"worker": "cli-claude-2", "need": "need a token"},
+        {"worker": "cli-pi-1", "need": "need a VPS"},
+        {"worker": "cli-pi-2", "need": "need a token"},
     ]
-    await _drain_one(sw, {"action": "dismiss", "target": "solver:cli-codex-1"})
+    await _drain_one(sw, {"action": "dismiss", "target": "solver:cli-pi-1"})
     workers = {h["worker"] for h in sw._pending_help}
-    assert workers == {"cli-claude-2"}, "only the scoped worker's ask is dismissed"
+    assert workers == {"cli-pi-2"}, "only the scoped worker's ask is dismissed"
 
 
 def test_m6_help_sink_dedups_same_blocker_and_caps(challenge, tmp_path):
@@ -2539,7 +2551,7 @@ def test_m6_help_sink_dedups_same_blocker_and_caps(challenge, tmp_path):
         # same blocker from 5 distinct workers but identical (worker,need) repeats
         for _ in range(5):
             await _help_sink(Event(event_type=EventType.HITL_REQUEST, run_id="r",
-                payload=hitl_request_payload("cli-codex-1", "need a VPS")))
+                payload=hitl_request_payload("cli-pi-1", "need a VPS")))
         assert len(sw._pending_help) == 1, "an identical (worker,need) ask dedups to one"
         # many DISTINCT blockers → capped
         for i in range(_PENDING_HELP_MAX + 10):
@@ -2607,7 +2619,7 @@ def test_defect4_standing_block_char_budget(challenge, tmp_path):
     """defect-4: even within the count cap, the per-worker injected block is bounded
     by a char budget (most-recent hints win)."""
     from muteki.solver.cli_solver import CliSolver
-    s = CliSolver(None, challenge, driver=None, engine="claude", kb=False)
+    s = CliSolver(None, challenge, driver=None, engine="pi", kb=False)
     s._standing_guidance = ["x" * 3000, "y" * 3000, "z-newest"]  # 6KB+ > 4KB budget
     block = s._standing_block()
     assert "z-newest" in block                       # newest always kept
@@ -2640,7 +2652,7 @@ async def test_m3_redirect_reaches_next_spawned_worker(challenge, tmp_path, monk
 
     # the next spawned worker gets BOTH: the redirect url as its target override and
     # the text folded into its guidance.
-    w = sw._make_cli_worker("claude", mode="bootstrap")
+    w = sw._make_cli_worker("pi", mode="bootstrap")
     assert w._target_override == "http://new-target:9000"
     assert "decode the cookie, not brute force" in w._standing_guidance
     # one-shot: the coordinator's pending guidance is consumed after the spawn.
@@ -2654,7 +2666,7 @@ async def test_race_scout_fast_path_flag_wins(challenge, tmp_path, monkeypatch):
     from muteki.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             wall_clock_budget=2.0)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex", "cursor"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
     reason_calls = {"n": 0}
     async def fake_reason():
         reason_calls["n"] += 1
@@ -2667,7 +2679,7 @@ async def test_race_scout_fast_path_flag_wins(challenge, tmp_path, monkeypatch):
             self.timeout = 720
         async def run(self):
             await asyncio.sleep(0)
-            solved = self.solver_id == "cli-codex"
+            solved = self.solver_id == "cli-pi"
             return SolveOutcome(solved, "flag{won}" if solved else None, 1, None,
                                 "race", flags=["flag{won}"] if solved else None)
     monkeypatch.setattr(sw, "_make_cli_worker",
@@ -2675,7 +2687,7 @@ async def test_race_scout_fast_path_flag_wins(challenge, tmp_path, monkeypatch):
 
     out = await asyncio.wait_for(sw.run(), timeout=5)
     assert out.solved is True and out.flag == "flag{won}"
-    assert out.winner == "cli-codex"
+    assert out.winner == "cli-pi"
     assert reason_calls["n"] == 0, "fast path must skip the coordinator loop entirely"
 
 
@@ -2685,7 +2697,7 @@ async def test_race_scout_slow_path_hands_off_to_coordinator(challenge, tmp_path
     from muteki.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             wall_clock_budget=0.5)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex", "cursor"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
     reason_calls = {"n": 0}
     async def fake_reason():
         reason_calls["n"] += 1
@@ -2713,7 +2725,7 @@ async def test_race_scout_disabled_does_not_race(challenge, tmp_path, monkeypatc
     from muteki.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=False,
                             wall_clock_budget=0.3)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex", "cursor"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
     phases = []
     class FakeWorker:
@@ -2736,11 +2748,11 @@ def test_race_engines_subset_and_timeout(challenge, tmp_path):
     """config: race_engines restricts which engines race; race_timeout is the short
     per-worker timeout the race spawns use."""
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            race_engines=["claude"], race_timeout=300,
-                            engines=["claude", "codex", "cursor"])
-    assert sw.race_engines == ["claude"]          # cursor/codex dropped
+                            race_engines=["pi"], race_timeout=300,
+                            engines=["pi"])
+    assert sw.race_engines == ["pi"]          # the roster's only engine
     assert sw.race_timeout == 300
-    w = sw._make_cli_worker("claude", mode="bootstrap", timeout_override=sw.race_timeout)
+    w = sw._make_cli_worker("pi", mode="bootstrap", timeout_override=sw.race_timeout)
     assert w.timeout == 300                       # short race timeout applied
 
 
@@ -2748,16 +2760,16 @@ def test_stage_policy_overrides_race_budget_and_planner(challenge, tmp_path):
     sw = _coordinator_swarm(
         challenge, tmp_path,
         stage_policy={
-            "race": {"enabled": True, "timeout": 123, "engines": ["claude"]},
+            "race": {"enabled": True, "timeout": 123, "engines": ["pi"]},
             "coordinator": {"wall_clock_budget": 9},
             "budgets": {"max_total_workers": 7, "cost_budget_usd": 0.5},
         },
         llm_profiles={"planner": {"provider": "deepseek", "model": "planner-x"}},
-        engines=["claude", "codex"],
+        engines=["pi"],
     )
     assert sw.race_scout is True
     assert sw.race_timeout == 123
-    assert sw.race_engines == ["claude"]
+    assert sw.race_engines == ["pi"]
     assert sw.wall_clock_budget == 9
     assert sw.max_total_workers == 7
     assert sw.cost_budget_usd == 0.5
@@ -2776,8 +2788,8 @@ def test_stage_policy_reads_coordinator_key():
 
 async def test_race_scout_empty_healthy_subset_returns_three_tuple(challenge, tmp_path):
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            race_engines=["codex"], engines=["claude", "codex"])
-    got = await sw._run_race_scout(["claude"])
+                            race_engines=["pi"], engines=["pi"])
+    got = await sw._run_race_scout([])
     assert got == (None, None, {})
 
 
@@ -2793,11 +2805,11 @@ async def test_race_scout_slow_path_emits_phase_transition(challenge, tmp_path, 
 
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             wall_clock_budget=0.2, bus=Bus())
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
 
     class FakeWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         async def run(self):
             await asyncio.sleep(0)
             return SolveOutcome(False, None, 1, None, "no flag")
@@ -2820,10 +2832,10 @@ async def test_worker_budget_hard_gate_finishes_budget_exhausted(challenge, tmp_
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2,
                             max_total_workers=1, wall_clock_budget=0.2,
                             bus=Bus())
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
 
     class FakeWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         async def run(self):
             await asyncio.sleep(0.01)
             return SolveOutcome(False, None, 1, None, "done")
@@ -2865,7 +2877,7 @@ async def test_operator_stop_interrupts_race_scout_wait(challenge, tmp_path, mon
     cancelled = {"n": 0}
 
     class FakeWorker:
-        solver_id = "cli-claude"
+        solver_id = "cli-pi"
         async def run(self):
             await asyncio.sleep(10)
         def cancel(self):
@@ -2891,7 +2903,7 @@ async def test_race_scout_no_global_signal_kills_worker(challenge, tmp_path, mon
     from muteki.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             stall_seconds=0.01, wall_clock_budget=0.5)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex", "cursor"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
     cancelled = {"n": 0}
     class FakeWorker:
@@ -2944,7 +2956,7 @@ def test_standing_guidance_injected_into_new_worker_turn1(challenge, tmp_path):
     # operator gave standing guidance earlier in the run (coordinator persisted it)
     sw._standing_guidance.append("reverse shell: ssh root@38.247.145.244 (VPS relay)")
     # a worker spawned NOW must inherit it
-    w = sw._make_cli_worker("claude", mode="explore",
+    w = sw._make_cli_worker("pi", mode="explore",
                             intent_goal="probe", intent_id="I1-x")
     block = w._standing_block()
     assert "38.247.145.244" in block, "new worker's turn-1 standing block must carry the VPS hint"
@@ -3438,49 +3450,49 @@ def test_missing_profile_does_not_leak_budget(challenge, tmp_path):
     from muteki.swarm.swarm import WorkerSpawnRejected
     sw = _coordinator_swarm(
         challenge, tmp_path,
-        worker_profiles=[{"id": "claude-sub", "engine": "claude",
-                          "roles": ["bootstrap"], "runtime": "local"}],
+        worker_profiles=[{"id": "pi-sub", "engine": "pi",
+                          "roles": ["review"], "runtime": "local"}],
     )
     before = sw._spawned_total
-    # request an engine that has NO profile → rejected, not budget-charged
+    # request a role the profile can't serve → rejected, not budget-charged
     with pytest.raises(WorkerSpawnRejected):
-        sw._make_cli_worker("codex", mode="bootstrap")
+        sw._make_cli_worker("pi", mode="bootstrap")
     assert sw._spawned_total == before, "a rejected spawn must not charge the budget"
     # and it must NOT be a plain RuntimeError that spawn sites don't catch
     assert issubclass(WorkerSpawnRejected, RuntimeError)
 
 
-def test_codex_subscription_uses_profile_capacity_not_account_mutex(challenge, tmp_path):
-    """Codex subscription profiles are not account-mutexed. They obey the profile's
-    ordinary worker capacity just like claude/cursor profiles."""
+def test_pi_subscription_uses_profile_capacity_not_account_mutex(challenge, tmp_path):
+    """pi subscription profiles are not account-mutexed. They obey the profile's
+    ordinary worker capacity just like any other profile."""
     sw = _coordinator_swarm(
         challenge, tmp_path,
         worker_profiles=[{
-            "id": "codex-sub",
-            "engine": "codex",
+            "id": "pi-sub",
+            "engine": "pi",
             "credential_mode": "subscription",
-            "credential_account": "codex-main",
+            "credential_account": "pi-main",
             "roles": ["bootstrap", "explore"],
             "runtime": "local",
             "max_running": 2,
             "enabled": True,
         }],
-        engines=["codex-sub"],
+        engines=["pi-sub"],
     )
-    first = sw._profile_for_engine("codex", role="bootstrap")
+    first = sw._profile_for_engine("pi", role="bootstrap")
     assert first is not None
-    sw._claim_worker_account("cli-codex-1", "codex", first, role="bootstrap")
+    sw._claim_worker_account("cli-pi-1", "pi", first, role="bootstrap")
 
-    second = sw._profile_for_engine("codex", role="explore", advance=False)
+    second = sw._profile_for_engine("pi", role="explore", advance=False)
     assert second is not None
-    sw._claim_worker_account("cli-codex-2", "codex", second, role="explore")
-    assert sw._profile_for_engine("codex", role="bootstrap", advance=False) is None
+    sw._claim_worker_account("cli-pi-2", "pi", second, role="explore")
+    assert sw._profile_for_engine("pi", role="bootstrap", advance=False) is None
 
     class _S:
         def __init__(self, sid): self.solver_id = sid
 
-    sw._release_worker_account(_S("cli-codex-1"))
-    assert sw._profile_for_engine("codex", role="bootstrap", advance=False) is not None
+    sw._release_worker_account(_S("cli-pi-1"))
+    assert sw._profile_for_engine("pi", role="bootstrap", advance=False) is not None
 
 
 def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkeypatch):
@@ -3500,20 +3512,20 @@ def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkey
     sw = _coordinator_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=wroot,
         worker_profiles=[
-            {"id": "web", "engine": "claude", "roles": ["bootstrap"], "runtime": "docker-web"},
-            {"id": "off", "engine": "codex", "roles": ["bootstrap"], "runtime": "docker-offline"},
+            {"id": "web", "engine": "pi", "roles": ["bootstrap"], "runtime": "docker-web"},
+            {"id": "off", "engine": "pi", "roles": ["bootstrap"], "runtime": "docker-offline"},
         ],
         runtime_profiles=[
             {"id": "docker-web", "backend": "container", "network": "bridge"},
             {"id": "docker-offline", "backend": "container", "network": "none"},
         ],
     )
-    web_profile = sw._profile_for_engine("claude", role="bootstrap")
-    sw._container_for_engine("claude", web_profile)
+    web_profile = sw._profile_for_engine("web", role="bootstrap")
+    sw._container_for_engine("web", web_profile)
     assert sw._container_runtime_id == "docker-web"
     degraded_before = list(sw._runtime_degraded)
-    off_profile = sw._profile_for_engine("codex", role="bootstrap")
-    sw._container_for_engine("codex", off_profile)
+    off_profile = sw._profile_for_engine("off", role="bootstrap")
+    sw._container_for_engine("off", off_profile)
     assert len(sw._runtime_degraded) > len(degraded_before), \
         "#11: a different requested runtime on the cached container must record degraded"
 
@@ -3538,17 +3550,13 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
             return (path.replace(str(tmp_path / "workspace"), "/home/kali/workspace")
                     .replace("\\", "/"))
 
-    env = sw._runtime_env_for("codex", "cli-codex", container=_FakeContainer())
+    env = sw._runtime_env_for("pi", "cli-pi", container=_FakeContainer())
 
-    assert env["HOME"] == "/home/kali/workspace/homes/cli-codex"
-    home = tmp_path / "workspace" / "homes" / "cli-codex"
+    assert env["HOME"] == "/home/kali/workspace/homes/cli-pi"
+    home = tmp_path / "workspace" / "homes" / "cli-pi"
     assert chowned == [home]
     for rel in (
-        ".claude/skills/muteki-blackboard",
-        ".agents/skills/muteki-blackboard",
-        ".codex/skills/muteki-blackboard",
-        ".cursor/skills-cursor/muteki-blackboard",
-        ".cursor/skills/muteki-blackboard",
+        ".pi/agent/skills/muteki-blackboard",
     ):
         link = home / rel
         assert link.is_symlink()
@@ -3708,9 +3716,10 @@ async def test_coordinator_finalizes_when_flag_only_on_graph(challenge, tmp_path
     challenge.expected_flags = 2
     challenge.multi_flag = True
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude", "codex"])
+    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
 
-    flags = {"claude": "flag{a}", "codex": "flag{b}"}
+    flag_pool = ["flag{a}", "flag{b}"]
+    spawn = {"n": 0}
 
     class GraphOnlyWorker:
         """Accepts a flag onto the shared graph but never returns it in the
@@ -3718,7 +3727,8 @@ async def test_coordinator_finalizes_when_flag_only_on_graph(challenge, tmp_path
         live DB→bus bridge path."""
         def __init__(self, engine):
             self.solver_id = f"cli-{engine}"
-            self._f = flags[engine]
+            self._f = flag_pool[spawn["n"] % len(flag_pool)]
+            spawn["n"] += 1
         async def run(self):
             await asyncio.sleep(0)
             sw.shared_graph.flag_found(actor=self.solver_id, flag=self._f,

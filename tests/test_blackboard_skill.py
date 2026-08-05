@@ -27,7 +27,7 @@ def _board(tmp_path):
     return SQLiteSharedGraph.open(db_path=tmp_path / "shared_graph.db", challenge=ch)
 
 
-def _run(db, *args, worker="cli-claude", intent_id=""):
+def _run(db, *args, worker="cli-pi", intent_id=""):
     # PYTHONUTF8=1: the skill subprocess must emit UTF-8 on every host — the test
     # parent runs in UTF-8 mode (pytest -X utf8) and would otherwise try to
     # decode a GBK-cp936 console stream on a Chinese-locale Windows host.
@@ -100,9 +100,9 @@ def test_claim_intent_won_then_lost(tmp_path):
     g.propose_intent(actor="reason", intent_id="I1", goal="try default creds")
     g.close()
     # first worker wins
-    assert "WON" in _run(db, "claim", "I1", worker="cli-claude")
+    assert "WON" in _run(db, "claim", "I1", worker="cli-pi")
     # second worker loses (already claimed, lease valid)
-    assert "LOST" in _run(db, "claim", "I1", worker="cli-codex")
+    assert "LOST" in _run(db, "claim", "I1", worker="cli-pi")
 
 
 def test_list_intents(tmp_path):
@@ -177,7 +177,7 @@ def test_claim_succeeds_despite_empty_challenge_id_event(tmp_path):
                                challenge=Challenge(id="c1", name="t", category="web"))
     g.propose_intent(actor="reason", intent_id="I1", goal="enumerate redis")
     g.close()
-    assert "WON" in _run(db, "claim", "I1", worker="cli-claude")
+    assert "WON" in _run(db, "claim", "I1", worker="cli-pi")
 
 
 def test_fact_written_by_skill_is_visible_to_graph(tmp_path):
@@ -199,7 +199,7 @@ def test_skill_write_fact_links_product_to_current_intent(tmp_path):
     g = _board(tmp_path)
     db = g.db_path
     g.propose_intent(actor="reason", intent_id="I-skill", goal="enumerate /admin")
-    g.claim_intent(worker="cli-claude", intent_id="I-skill")
+    g.claim_intent(worker="cli-pi", intent_id="I-skill")
     g.close()
 
     _run(db, "write-fact", "admin panel exists", "--verified", intent_id="I-skill")
@@ -222,7 +222,7 @@ def test_skill_write_fact_links_product_to_current_intent(tmp_path):
 # assert the persisted dedupe_key equals what _normalize_fact_identity would
 # produce, across the echo-dedup battery (engine prefix, whitespace, case).
 
-def _dedupe_key_for(db, text, *, worker="cli-claude", script=None):
+def _dedupe_key_for(db, text, *, worker="cli-pi", script=None):
     """Write `text` via the skill and return the dedupe_key it persisted."""
     skill = str(script) if script is not None else None
     if skill is None:
@@ -245,8 +245,8 @@ def _dedupe_key_for(db, text, *, worker="cli-claude", script=None):
 
 @pytest.mark.parametrize("text", [
     "service is nginx 1.18.0",
-    "[claude] service is nginx 1.18.0",            # engine prefix stripped
-    "[Codex] service is nginx 1.18.0",             # case-insensitive prefix
+    "[pi] service is nginx 1.18.0",            # engine prefix stripped
+    "[Pi] service is nginx 1.18.0",             # case-insensitive prefix
     "service   is\tnginx\n1.18.0",                 # whitespace folded
     "SERVICE is NGINX 1.18.0",                      # lowercased
     "admin:admin works on /login",
@@ -258,8 +258,8 @@ def test_skill_dedupe_key_matches_normalize_fact_identity(tmp_path, text):
     g = _board(tmp_path)
     db = g.db_path
     g.close()
-    got = _dedupe_key_for(db, text, worker="cli-claude")
-    expected = f"fact::cli-claude::{_normalize_fact_identity(text)}"
+    got = _dedupe_key_for(db, text, worker="cli-pi")
+    expected = f"fact::cli-pi::{_normalize_fact_identity(text)}"
     assert got == expected
 
 
@@ -270,14 +270,14 @@ def test_skill_echo_dedupe_collides_engine_prefixed_marker(tmp_path):
     g = _board(tmp_path)
     db = g.db_path
     g.close()
-    k1 = _dedupe_key_for(db, "service is nginx 1.18.0", worker="cli-claude")
-    k2 = _dedupe_key_for(db, "[claude] service is nginx 1.18.0", worker="cli-claude")
+    k1 = _dedupe_key_for(db, "service is nginx 1.18.0", worker="cli-pi")
+    k2 = _dedupe_key_for(db, "[pi] service is nginx 1.18.0", worker="cli-pi")
     assert k1 == k2
     # and the board carries exactly one such fact, not two
     con = sqlite3.connect(str(db))
     try:
         n = con.execute(
-            "SELECT COUNT(*) FROM events WHERE kind='fact_added' AND actor='cli-claude'"
+            "SELECT COUNT(*) FROM events WHERE kind='fact_added' AND actor='cli-pi'"
         ).fetchone()[0]
     finally:
         con.close()
@@ -290,16 +290,16 @@ def test_resolved_blackboard_script_dedupe_matches_repo(tmp_path):
     swarm actually hands workers is never a drifted copy. (Source runs resolve to the
     repo skill; this guards the resolution wiring + the resolved file's logic.)"""
     ch = Challenge(id="resolve", name="t", category="web")
-    resolved = CliSolver(None, ch, engine="claude")._blackboard_script_path()
+    resolved = CliSolver(None, ch, engine="pi")._blackboard_script_path()
     assert resolved != "/usr/local/bin/blackboard.py"  # not the container path here
     assert Path(resolved).is_file()
 
     g = _board(tmp_path)
     db = g.db_path
     g.close()
-    text = "[claude]   ADMIN panel   at /admin"
-    got = _dedupe_key_for(db, text, worker="cli-codex", script=resolved)
-    expected = f"fact::cli-codex::{_normalize_fact_identity(text)}"
+    text = "[pi]   ADMIN panel   at /admin"
+    got = _dedupe_key_for(db, text, worker="cli-pi", script=resolved)
+    expected = f"fact::cli-pi::{_normalize_fact_identity(text)}"
     assert got == expected
 
 

@@ -172,7 +172,7 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     # without consuming a review/swarm slot.
     root = mgr.workspace_dir(run.run_id)
     (root / "winner.json").write_text(
-        json.dumps({"engine": "cursor-api-container"}),
+        json.dumps({"engine": "pi-web"}),
         encoding="utf-8",
     )
     seen: dict[str, object] = {}
@@ -230,7 +230,7 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     assert seen["web_access"] is False
     assert seen["kb_access"] is False
     assert seen["env"]["MUTEKI_BTW_WORKER"] == "1"  # type: ignore[index]
-    assert getattr(seen["driver"], "profile", {}).get("name") == "claude-sub-container"
+    assert getattr(seen["driver"], "profile", {}).get("name") == "pi-web"
     # cwd is the _btw worker dir; separators are platform-specific
     assert ("workers" + os.sep + "_btw") in str(seen["cwd"])
     assert run.worker_cmds.empty()
@@ -284,7 +284,7 @@ async def test_worker_model_options_and_probe_routes(server, monkeypatch) -> Non
 
     def fake_probe_worker_model(**kwargs):
         seen.update(kwargs)
-        return {"ok": True, "detail": "模型可用", "engine": "claude", "model": kwargs["model"]}
+        return {"ok": True, "detail": "模型可用", "engine": "pi", "model": kwargs["model"]}
 
     monkeypatch.setattr(worker_models, "probe_worker_model", fake_probe_worker_model)
 
@@ -292,17 +292,17 @@ async def test_worker_model_options_and_probe_routes(server, monkeypatch) -> Non
         opts = await client.get("/api/settings/worker-models")
         assert opts.status_code == 200
         assert opts.json()["allow_custom"] is True
-        assert "claude" in opts.json()["models"]
+        assert "pi" in opts.json()["models"]
 
         r = await client.post("/api/settings/worker-model/test", json={
-            "profile": {"id": "claude-sub", "engine": "claude", "credential_account": "claude-main"},
-            "model": "opus",
+            "profile": {"id": "pi-sub", "engine": "pi", "credential_account": "pi-main"},
+            "model": "deepseek-v4-pro",
             "backend": "local",
         })
         assert r.status_code == 200
         assert r.json()["ok"] is True
-        assert seen["model"] == "opus"
-        assert seen["profile"]["id"] == "claude-sub"
+        assert seen["model"] == "deepseek-v4-pro"
+        assert seen["profile"]["id"] == "pi-sub"
 
 
 async def test_engine_health_route_passes_enabled_worker_profiles(tmp_path, monkeypatch) -> None:
@@ -313,20 +313,20 @@ async def test_engine_health_route_passes_enabled_worker_profiles(tmp_path, monk
     def fake_engine_health(backend="local", account_root=None, profiles=None):
         seen["backend"] = backend
         seen["profiles"] = profiles
-        return [{"engine": "claude", "healthy": True, "backend": backend}]
+        return [{"engine": "pi", "healthy": True, "backend": backend}]
 
     monkeypatch.setattr(cli_driver, "engine_health", fake_engine_health)
     mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
     mgr.worker_config.set(
-        engines=["claude-main"],
+        engines=["pi-main"],
         worker_backend="local",
         worker_profiles=[
-            {"id": "claude-main", "name": "claude-main", "engine": "claude",
-             "transport": "claude_code", "credential_account": "",
-             "runtime": "local", "model": "sonnet"},
-            {"id": "codex-main", "name": "codex-main", "engine": "codex",
-             "transport": "codex_cli", "credential_account": "",
-             "runtime": "local", "model": "gpt-5.5"},
+            {"id": "pi-main", "name": "pi-main", "engine": "pi",
+             "transport": "pi_cli", "credential_account": "",
+             "runtime": "local", "model": "deepseek-v4-flash"},
+            {"id": "pi-aux", "name": "pi-aux", "engine": "pi",
+             "transport": "pi_cli", "credential_account": "",
+             "runtime": "local", "model": "deepseek-v4-pro"},
         ],
     )
     app = create_app(mgr)
@@ -335,8 +335,8 @@ async def test_engine_health_route_passes_enabled_worker_profiles(tmp_path, monk
             r = await client.get("/api/engines/health?backend=local")
     assert r.status_code == 200
     assert seen["backend"] == "local"
-    assert [p["id"] for p in seen["profiles"]] == ["claude-main"]
-    assert seen["profiles"][0]["model"] == "sonnet"
+    assert [p["id"] for p in seen["profiles"]] == ["pi-main"]
+    assert seen["profiles"][0]["model"] == "deepseek-v4-flash"
 
 
 async def test_worker_routes_accept_empty_body(server) -> None:
@@ -366,7 +366,7 @@ async def test_engines_endpoint_singleflights_slow_probe(tmp_path, monkeypatch) 
             calls += 1
         assert profiles is not None
         time.sleep(0.2)
-        return [{"engine": "codex", "available": True, "healthy": True}]
+        return [{"engine": "pi", "available": True, "healthy": True}]
 
     monkeypatch.setattr(cli_driver, "engine_status", fake_engine_status)
     app = create_app(RunManager(sessions_root=str(tmp_path / "sessions")))
@@ -392,20 +392,20 @@ async def test_engines_endpoint_passes_enabled_worker_profiles(tmp_path, monkeyp
     def fake_engine_status(account_root=None, backend="local", profiles=None):
         seen["backend"] = backend
         seen["profiles"] = profiles
-        return [{"engine": "claude", "available": True, "healthy": True}]
+        return [{"engine": "pi", "available": True, "healthy": True}]
 
     monkeypatch.setattr(cli_driver, "engine_status", fake_engine_status)
     mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
     mgr.worker_config.set(
-        engines=["claude-main"],
+        engines=["pi-main"],
         worker_backend="local",
         worker_profiles=[
-            {"id": "claude-main", "name": "claude-main", "engine": "claude",
-             "transport": "claude_code", "credential_account": "",
-             "runtime": "local", "model": "sonnet"},
-            {"id": "codex-main", "name": "codex-main", "engine": "codex",
-             "transport": "codex_cli", "credential_account": "",
-             "runtime": "local", "model": "gpt-5.5"},
+            {"id": "pi-main", "name": "pi-main", "engine": "pi",
+             "transport": "pi_cli", "credential_account": "",
+             "runtime": "local", "model": "deepseek-v4-flash"},
+            {"id": "pi-aux", "name": "pi-aux", "engine": "pi",
+             "transport": "pi_cli", "credential_account": "",
+             "runtime": "local", "model": "deepseek-v4-pro"},
         ],
     )
     app = create_app(mgr)
@@ -415,8 +415,8 @@ async def test_engines_endpoint_passes_enabled_worker_profiles(tmp_path, monkeyp
 
     assert r.status_code == 200
     assert seen["backend"] == "local"
-    assert [p["id"] for p in seen["profiles"]] == ["claude-main"]
-    assert seen["profiles"][0]["model"] == "sonnet"
+    assert [p["id"] for p in seen["profiles"]] == ["pi-main"]
+    assert seen["profiles"][0]["model"] == "deepseek-v4-flash"
 
 
 async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> None:
@@ -429,18 +429,18 @@ async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> No
     with _Server(app) as srv:
         async with httpx.AsyncClient(base_url=srv.base, timeout=15, trust_env=False) as client:
             r = await client.put(
-                "/api/settings/credential-accounts/claude-team",
-                json={"engine": "claude", "secret": "super-secret-token"},
+                "/api/settings/credential-accounts/pi-team",
+                json={"engine": "pi", "secret": "super-secret-token"},
             )
             assert r.status_code == 200
-            assert r.json()["account"]["engine"] == "claude"
+            assert r.json()["account"]["engine"] == "pi"
             # echoed for in-place editing, not masked
             assert r.json()["account"]["details"]["secret_value"] == "super-secret-token"
 
             listed = await client.get("/api/settings/credential-accounts")
             assert listed.status_code == 200
             accounts = listed.json()["accounts"]
-            assert accounts[0]["account_id"] == "claude-team"
+            assert accounts[0]["account_id"] == "pi-team"
             assert accounts[0]["present"] is True
             assert accounts[0]["details"]["secret_value"] == "super-secret-token"
 
@@ -463,7 +463,7 @@ async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> No
 
             bad = await client.put(
                 "/api/settings/credential-accounts/bad/cut",
-                json={"engine": "claude", "secret": "x"},
+                json={"engine": "pi", "secret": "x"},
             )
             assert bad.status_code == 404
 
@@ -479,7 +479,7 @@ async def test_settings_redesign_endpoints(tmp_path) -> None:
             sl = await client.get("/api/settings/system-login")
             assert sl.status_code == 200
             logins = sl.json()["logins"]
-            assert set(logins) == {"claude", "codex", "cursor"}
+            assert set(logins) == {"pi"}
             assert all(v in ("present", "absent", "unknown") for v in logins.values())
 
             # runtime-environment: flip to local, all profiles follow
@@ -497,7 +497,7 @@ async def test_settings_redesign_endpoints(tmp_path) -> None:
             # account test: unregistered account → ok:false, no host fallback
             at = await client.post(
                 "/api/settings/credential-accounts/ghost/test",
-                json={"engine": "claude", "backend": "local"})
+                json={"engine": "pi", "backend": "local"})
             assert at.status_code == 200
             assert at.json()["ok"] is False
 
@@ -812,7 +812,7 @@ def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
 
         async def driver(run) -> None:
             run.bus.add_sink(sink)
-            raise RuntimeError("profile_unhealthy missing credential account(s): cursor-api-local:cursor-main")
+            raise RuntimeError("profile_unhealthy missing credential account(s): pi-api-local:pi-main")
 
         run = await mgr.start("failed-run", driver)
         await run.task
@@ -821,4 +821,4 @@ def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
     asyncio.run(go())
     assert seen
     assert seen[-1]["reason"] == "runtime_failure"
-    assert "cursor-api-local:cursor-main" in seen[-1]["detail"]
+    assert "pi-api-local:pi-main" in seen[-1]["detail"]

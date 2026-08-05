@@ -16,12 +16,17 @@ from muteki.core.events import EventType
 from muteki.models.solve_graph import Challenge
 from muteki.solver import cli_solver
 from muteki.solver.cli_driver import (
-    ClaudeCodeDriver, CodexDriver, CursorDriver, PiDriver, StreamStep, DRIVERS,
+    PiDriver, StreamStep, DRIVERS,
     driver_for, get_driver, _descendant_pids, _kill_proc_tree,
     _probe_health_with_creds,
 )
 from muteki.solver.cli_solver import CliSolver
 from muteki.solver.container_exec import CONTAINER_WORKSPACE, ContainerHandle
+
+
+def _CP(rc: int, out: str = "", err: str = "") -> "subprocess.CompletedProcess":
+    """Canned CompletedProcess for mocked subprocess.run (no real CLI, no key)."""
+    return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
 
 
 # ── driver argv ───────────────────────────────────────────────────────────────
@@ -51,15 +56,15 @@ def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
     solver = CliSolver(
         None,
         ch,
-        engine="claude",
+        engine="pi",
         shared_graph=_Graph(),
         container=handle,
-        worker_env={"HOME": f"{CONTAINER_WORKSPACE}/workers/_homes/cli-claude"},
+        worker_env={"HOME": f"{CONTAINER_WORKSPACE}/workers/_homes/cli-pi"},
     )
 
     env = solver._worker_env()
 
-    assert env["HOME"] == f"{CONTAINER_WORKSPACE}/workers/_homes/cli-claude"
+    assert env["HOME"] == f"{CONTAINER_WORKSPACE}/workers/_homes/cli-pi"
     assert env["MUTEKI_BLACKBOARD_DB"] == f"{CONTAINER_WORKSPACE}/graph/shared_graph.db"
 
 
@@ -76,7 +81,7 @@ def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
         description="path stability",
         flag_format="flag{...}",
     )
-    solver = CliSolver(None, ch, engine="claude")
+    solver = CliSolver(None, ch, engine="pi")
 
     parts = solver._worker_env()["PATH"].split(_os.pathsep)
 
@@ -88,7 +93,7 @@ def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
 
 def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_path):
     """A source checkout (the test env) resolves the skill to the IN-REPO copy for
-    EVERY engine — no deployed ~/.claude or ~/.agents copy that can drift out of sync
+    EVERY engine — no deployed ~/.pi or ~/.agents copy that can drift out of sync
     (run-75378). The container path is still the image-baked one."""
     ch = Challenge(
         id="env-board",
@@ -104,7 +109,7 @@ def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_pa
     )
     assert repo_skill.is_file()  # sanity: we ARE running from a source checkout
 
-    for engine in ("claude", "cursor", "codex"):
+    for engine in ("pi",):
         env = CliSolver(None, ch, engine=engine)._worker_env()
         assert env["MUTEKI_BLACKBOARD_SCRIPT"] == str(repo_skill)
 
@@ -113,7 +118,7 @@ def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_pa
         host_workspace=str(tmp_path),
         container="muteki-run-env-board",
     )
-    cont_env = CliSolver(None, ch, engine="claude", container=handle)._worker_env()
+    cont_env = CliSolver(None, ch, engine="pi", container=handle)._worker_env()
     assert cont_env["MUTEKI_BLACKBOARD_SCRIPT"] == "/usr/local/bin/blackboard.py"
 
 
@@ -130,16 +135,9 @@ def test_worker_env_blackboard_script_falls_back_to_deployed_for_installs(monkey
     # Simulate "no in-repo skill" so the install fallback path is exercised.
     monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
 
-    claude_env = CliSolver(None, ch, engine="claude")._worker_env()
-    cursor_env = CliSolver(None, ch, engine="cursor")._worker_env()
-    codex_env = CliSolver(None, ch, engine="codex")._worker_env()
-
-    assert claude_env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.claude/skills/muteki-blackboard/blackboard.py")
-    assert cursor_env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.claude/skills/muteki-blackboard/blackboard.py")
-    assert codex_env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.agents/skills/muteki-blackboard/blackboard.py")
+    env = CliSolver(None, ch, engine="pi")._worker_env()
+    assert env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
+        "/.pi/agent/skills/muteki-blackboard/blackboard.py")
 
 
 def test_worker_env_exposes_current_intent_id():
@@ -153,7 +151,7 @@ def test_worker_env_exposes_current_intent_id():
     solver = CliSolver(
         None,
         ch,
-        engine="claude",
+        engine="pi",
         mode="explore",
         intent_goal="probe /admin",
         intent_id="I-admin",
@@ -164,137 +162,18 @@ def test_worker_env_exposes_current_intent_id():
 
 # argv[0] is the RESOLVED engine binary (a pinned official path), not the bare
 # name — so assert against d.bin, which is the contract these tests actually mean.
-def test_claude_execute_argv_has_session_and_skip_perms():
-    d = ClaudeCodeDriver()
-    sess = d.new_session()
-    assert sess  # claude pre-seeds a uuid session
-    argv = d.build_execute("DO THE THING", sess)
-    assert argv[0] == d.bin and "-p" in argv
-    assert "--dangerously-skip-permissions" in argv
-    assert "--session-id" in argv and sess in argv
-    assert argv[-1] == "DO THE THING"  # prompt is last, after --
-
-
-def test_claude_resume_uses_dash_r():
-    d = ClaudeCodeDriver()
-    argv = d.build_resume("CONCLUDE", "sess-123")
-    assert argv[:3] == [d.bin, "-r", "sess-123"]
-    assert "--dangerously-skip-permissions" in argv
-
-
-def test_codex_execute_and_resume():
-    d = CodexDriver()
-    # offline keeps the argv minimal: codex exec ... (no global --search)
-    ex = d.build_execute("GO", None, web_access=False)
-    assert ex[:2] == [d.bin, "exec"]
-    assert "--dangerously-bypass-approvals-and-sandbox" in ex
-    rs = d.build_resume("CONCLUDE", "abc", web_access=False)
-    assert rs[:4] == [d.bin, "exec", "resume", "abc"]
-
-
-def test_codex_search_is_a_global_flag_before_exec():
-    # --search must precede the `exec` subcommand (it's a global codex flag),
-    # otherwise codex errors on an unknown exec flag.
-    d = CodexDriver()
-    ex = d.build_execute("GO", None, web_access=True)
-    assert ex[0] == d.bin and "--search" in ex
-    assert ex.index("--search") < ex.index("exec")
-
-
-# ── cursor-agent driver (the third engine) ───────────────────────────────────
-
-def test_cursor_execute_argv_headless_print():
-    d = CursorDriver()
-    assert d.new_session() is None  # cursor assigns the chat id itself
-    argv = d.build_execute("DO THE THING", None, stream=True)
-    assert argv[0] == d.bin and "-p" in argv
-    assert "--force" in argv and "--trust" in argv
-    assert argv[argv.index("--output-format") + 1] == "stream-json"
-    assert argv[-1] == "DO THE THING"  # prompt is the trailing positional
-
-
-def test_cursor_execute_non_stream_uses_json():
-    d = CursorDriver()
-    argv = d.build_execute("GO", None, stream=False)
-    assert argv[argv.index("--output-format") + 1] == "json"
-
-
-def test_cursor_resume_uses_resume_flag():
-    d = CursorDriver()
-    argv = d.build_resume("CONCLUDE", "chat-abc", stream=True)
-    assert argv[0] == d.bin and "--resume" in argv
-    assert argv[argv.index("--resume") + 1] == "chat-abc"
-    assert argv[-1] == "CONCLUDE"
-
-
-# ── self-check / health probe (FE-healthcheck-page) ──────────────────────────
-# All three engines now send a REAL one-turn hello (symmetric), retry once on a
-# transient miss, and return a classified detail. These mock subprocess.run so
-# they stay pure (no real CLI, no key) — consistent with the rest of this file.
-
-import subprocess as _sp  # noqa: E402
-
-
-def _CP(rc: int, out: str = "", err: str = "") -> "_sp.CompletedProcess":
-    return _sp.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
-
-
-def test_all_engines_send_a_real_hello_probe():
-    # the symmetry fix: codex/cursor used to only check --version. Now every
-    # driver builds a non-empty one-turn argv carrying the hello prompt.
-    for drv in (ClaudeCodeDriver(), CodexDriver(), CursorDriver()):
-        argv = drv._hello_argv()
-        assert argv, f"{drv.name} has no hello probe"
-        assert drv.HELLO_PROMPT in argv, f"{drv.name} probe omits the hello prompt"
-
-
-def test_claude_hello_ok_requires_result_envelope():
-    d = ClaudeCodeDriver()
-    assert d._hello_ok(_CP(0, '{"result":"OK"}')) is True
-    assert d._hello_ok(_CP(0, "no envelope")) is False     # exit 0 but no turn
-    assert d._hello_ok(_CP(7, '{"result":"OK"}')) is False  # nonzero wins
-
-
-def test_codex_hello_ok_accepts_stream_markers():
-    d = CodexDriver()
-    assert d._hello_ok(_CP(0, '{"type":"item.completed","item":{"type":"agent_message"}}')) is True
-    assert d._hello_ok(_CP(0, '{"type":"turn.completed","usage":{}}')) is True
-    assert d._hello_ok(_CP(0, "nothing useful")) is False
-    assert d._hello_ok(_CP(1, "agent_message")) is False    # nonzero wins
-
-
-def test_codex_hello_ok_tolerates_post_turn_mcp_shutdown_error():
-    d = CodexDriver()
-    stdout = (
-        '{"type":"thread.started","thread_id":"t"}\n'
-        '{"type":"turn.started"}\n'
-        '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n'
-        '{"type":"turn.completed","usage":{}}\n'
-    )
-    stderr = "MCP startup failed: HTTP 401: {}, when send initialize request"
-
-    assert d._hello_ok(_CP(1, stdout, stderr)) is True
-
-
-def test_codex_hello_probe_allows_transport_fallback_window(monkeypatch):
-    d = CodexDriver()
-    _ = d.bin
-    seen = {}
-
-    def fake_run(argv, **kw):
-        seen["timeout"] = kw.get("timeout")
-        return _CP(0, '{"type":"turn.completed","usage":{}}')
-
-    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
-    ok, detail = d.health_detail()
-
-    assert ok is True and detail == ""
-    assert seen["timeout"] >= 120
+def test_pi_sends_a_real_hello_probe():
+    # pi builds a non-empty one-turn json-mode argv carrying the hello prompt
+    # (the codex/cursor symmetry fix retired with those engines).
+    drv = PiDriver()
+    argv = drv._hello_argv()
+    assert argv, f"{drv.name} has no hello probe"
+    assert drv.HELLO_PROMPT in argv, f"{drv.name} probe omits the hello prompt"
 
 
 def test_health_detail_retries_once_then_succeeds(monkeypatch):
     # a single transient miss must NOT report red — retry recovers it.
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     _ = d.bin  # resolve+cache the binary BEFORE we mock run (resolution probes too)
     calls = {"n": 0}
 
@@ -302,7 +181,7 @@ def test_health_detail_retries_once_then_succeeds(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             return _CP(1, "", "rate limit (overloaded)")  # transient
-        return _CP(0, '{"result":"OK"}')                   # recovered
+        return _CP(0, '{"type":"agent_settled"}')          # recovered
 
     monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
     monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
@@ -312,7 +191,7 @@ def test_health_detail_retries_once_then_succeeds(monkeypatch):
 
 
 def test_health_detail_classifies_persistent_failure(monkeypatch):
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     _ = d.bin  # cache the binary before mocking run
 
     def fake_run(argv, **kw):
@@ -327,11 +206,11 @@ def test_health_detail_classifies_persistent_failure(monkeypatch):
 
 
 def test_health_detail_classifies_timeout(monkeypatch):
-    d = CursorDriver()
+    d = PiDriver()
     _ = d.bin  # cache the binary before mocking run
 
     def fake_run(argv, **kw):
-        raise _sp.TimeoutExpired(cmd="x", timeout=60)
+        raise subprocess.TimeoutExpired(cmd="x", timeout=60)
 
     monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
     monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
@@ -342,63 +221,43 @@ def test_health_detail_classifies_timeout(monkeypatch):
 def test_healthcheck_bool_delegates_to_detail(monkeypatch):
     # back-compat: the swarm still calls the bool healthcheck(); it must mirror
     # health_detail()'s verdict.
-    d = CodexDriver()
+    d = PiDriver()
     monkeypatch.setattr(d, "health_detail", lambda: (True, ""))
     assert d.healthcheck() is True
     monkeypatch.setattr(d, "health_detail", lambda: (False, "nope"))
     assert d.healthcheck() is False
 
 
-def test_engine_bar_codex_health_uses_host_default_auth_not_stale_account(tmp_path, monkeypatch):
-    root = tmp_path / "_secrets" / "accounts"
-    codex_home = root / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text("{}\n")
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    seen = {}
-    d = CodexDriver()
-
-    def fake_health_detail():
-        import os
-        seen["CODEX_HOME"] = os.environ.get("CODEX_HOME")
-        return True, ""
-
-    monkeypatch.setattr(d, "health_detail", fake_health_detail)
-
-    assert _probe_health_with_creds("codex", d, str(root)) == (True, "")
-    assert seen["CODEX_HOME"] is None
-
-
 def test_engine_status_is_cheap_and_does_not_deep_probe(monkeypatch):
     import muteki.solver.cli_driver as cli_driver
 
-    monkeypatch.setenv("MUTEKI_CLAUDE_BIN", "/usr/bin/claude")
+    monkeypatch.setenv("MUTEKI_PI_BIN", "/usr/bin/pi")
     monkeypatch.setattr(cli_driver, "_runs_ok", lambda _path: True)
 
     def fail_deep_probe():
         raise AssertionError("/api/engines must not spend a model turn")
 
-    monkeypatch.setattr(cli_driver.DRIVERS["claude"], "health_detail", fail_deep_probe)
+    monkeypatch.setattr(cli_driver.DRIVERS["pi"], "health_detail", fail_deep_probe)
 
     rows = cli_driver.engine_status(
         profiles=[{
-            "id": "claude-main",
-            "name": "claude-main",
-            "engine": "claude",
-            "transport": "claude_code",
-            "model": "sonnet",
+            "id": "pi-main",
+            "name": "pi-main",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "model": "deepseek-v4-flash",
         }],
     )
 
     assert rows == [{
-        "engine": "claude",
-        "bin": "/usr/bin/claude",
+        "engine": "pi",
+        "bin": "/usr/bin/pi",
         "available": True,
         "healthy": None,
         "health_detail": "",
-        "profile_id": "claude-main",
-        "profile_name": "claude-main",
-        "model": "sonnet",
+        "profile_id": "pi-main",
+        "profile_name": "pi-main",
+        "model": "deepseek-v4-flash",
         "backend": "local",
     }]
 
@@ -406,139 +265,18 @@ def test_engine_status_is_cheap_and_does_not_deep_probe(monkeypatch):
 def test_health_detail_falls_back_to_version_when_no_hello(monkeypatch):
     # a hypothetical driver with no cheap dry-run (empty _hello_argv) degrades to
     # the --version liveness check rather than reporting red.
-    d = CodexDriver()
+    d = PiDriver()
     _ = d.bin  # cache the binary before mocking run
     monkeypatch.setattr(d, "_hello_argv", lambda: [])
 
     def fake_run(argv, **kw):
         assert "--version" in argv
-        return _CP(0, "codex-cli 0.137.0")
+        return _CP(0, "pi 0.81.1")
 
     monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
     ok, detail = d.health_detail()
     assert ok is True and detail == ""
 
-
-def test_cursor_model_env_adds_flag(monkeypatch):
-    monkeypatch.setenv("MUTEKI_CURSOR_MODEL", "sonnet-4.5-thinking")
-    d = CursorDriver()
-    argv = d.build_execute("GO", None)
-    assert argv[argv.index("--model") + 1] == "sonnet-4.5-thinking"
-    monkeypatch.delenv("MUTEKI_CURSOR_MODEL", raising=False)
-    assert "--model" not in d.build_execute("GO", None)
-
-
-def test_cursor_parse_single_json():
-    d = CursorDriver()
-    out = ('{"type":"result","subtype":"success","is_error":false,'
-           '"result":"FOUND_FLAG=flag{cursor}","session_id":"c1","duration_ms":1200,'
-           '"usage":{"inputTokens":21732,"outputTokens":30,'
-           '"cacheReadTokens":5408,"cacheWriteTokens":0}}')
-    r = d.parse(out, "")
-    assert r.text == "FOUND_FLAG=flag{cursor}"
-    assert r.session == "c1"
-    assert r.cost_usd is None  # subscription-backed
-    # tokens still recorded (fresh + cache buckets) for the deck's usage column
-    assert r.input_tokens == 21732 + 5408 + 0 and r.output_tokens == 30
-
-
-def test_cursor_parse_stream_jsonl_recovers_result():
-    d = CursorDriver()
-    dump = "\n".join([
-        '{"type":"system","subtype":"init","session_id":"c9","model":"x"}',
-        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]},"session_id":"c9"}',
-        '{"type":"result","subtype":"success","result":"FOUND_FLAG=flag{stream}","session_id":"c9","usage":{"inputTokens":100,"outputTokens":7}}',
-    ])
-    r = d.parse(dump, "")
-    assert "FOUND_FLAG=flag{stream}" in r.text
-    assert r.session == "c9" and r.cost_usd is None
-    assert r.input_tokens == 100 and r.output_tokens == 7
-
-
-def test_cursor_parse_stream_line_shapes():
-    d = CursorDriver()
-    # system init → session
-    s0 = d.parse_stream_line('{"type":"system","subtype":"init","session_id":"c1"}')
-    assert s0 and s0.kind == "session" and s0.session == "c1"
-    # assistant text → reasoning
-    s1 = d.parse_stream_line('{"type":"assistant","message":{"content":[{"type":"text","text":"reading README"}]}}')
-    assert s1 and s1.kind == "reasoning" and "reading" in s1.text
-    # tool_call started (readToolCall) → tool with the path
-    s2 = d.parse_stream_line('{"type":"tool_call","subtype":"started","call_id":"x","tool_call":{"readToolCall":{"args":{"path":"a.txt"}}}}')
-    assert s2 and s2.kind == "tool" and s2.tool == "read" and "a.txt" in s2.text
-    # tool_call started (function shape) → tool with the name
-    s3 = d.parse_stream_line('{"type":"tool_call","subtype":"started","tool_call":{"function":{"name":"shell","arguments":"curl x"}}}')
-    assert s3 and s3.kind == "tool" and s3.tool == "shell" and "curl" in s3.text
-    # tool_call completed → tool_result with the content
-    s4 = d.parse_stream_line('{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"a.txt"},"result":{"success":{"content":"hello"}}}}}')
-    assert s4 and s4.kind == "tool_result" and "hello" in s4.text
-    # noise → None
-    assert d.parse_stream_line("not json") is None
-
-
-def test_claude_parse_stream_steps_emits_all_blocks():
-    """#18 regression: a claude assistant message with MULTIPLE content blocks must
-    yield a StreamStep for EVERY block. The old parse_stream_line returned at the first
-    block, so a FOUND_FLAG/VERIFIED_FACT in a later block never propagated live (only
-    via the final parse()). The streaming runner now uses parse_stream_steps."""
-    d = ClaudeCodeDriver()
-    line = ('{"type":"assistant","message":{"content":['
-            '{"type":"text","text":"let me check the response"},'
-            '{"type":"tool_use","name":"Bash","input":{"command":"curl x"}},'
-            '{"type":"text","text":"FOUND_FLAG=flag{multi_block}"}]}}')
-    steps = d.parse_stream_steps(line)
-    assert len(steps) == 3, f"all 3 blocks must emit, got {len(steps)}"
-    assert steps[0].kind == "reasoning"
-    assert steps[1].kind == "tool" and steps[1].tool == "Bash"
-    # the LAST block (the one with the flag) must be present — this is the bug fix
-    assert any("FOUND_FLAG=flag{multi_block}" in s.text for s in steps)
-    # back-compat: parse_stream_line still returns the FIRST step
-    first = d.parse_stream_line(line)
-    assert first and first.kind == "reasoning"
-
-
-def test_cursor_parse_stream_steps_emits_all_text_blocks():
-    """#18 regression for cursor: multiple text blocks in one assistant message must
-    all emit (a later block's FOUND_FLAG was lost by the first-block return)."""
-    d = CursorDriver()
-    line = ('{"type":"assistant","message":{"content":['
-            '{"type":"text","text":"probing"},'
-            '{"type":"text","text":"VERIFIED_FACT=admin panel at /admin"},'
-            '{"type":"text","text":"FOUND_FLAG=flag{cursor_multi}"}]}}')
-    steps = d.parse_stream_steps(line)
-    assert len(steps) == 3
-    assert any("FOUND_FLAG=flag{cursor_multi}" in s.text for s in steps)
-    assert any("VERIFIED_FACT=" in s.text for s in steps)
-
-
-def test_cursor_resolves_cursor_agent_binary(monkeypatch):
-    # the engine "cursor" must resolve to the `cursor-agent` basename on PATH,
-    # not a bare `cursor` (which is the GUI launcher).
-    from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_CURSOR_BIN", raising=False)
-    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"cursor": []})
-    seen = {}
-
-    def _fake_which(name):
-        seen["name"] = name
-        return ["/x/cursor-agent"]
-
-    monkeypatch.setattr(mod, "_which_all", _fake_which)
-    monkeypatch.setattr(mod, "_looks_bad", lambda p: False)
-    monkeypatch.setattr(mod, "_runs_ok", lambda p: True)
-    assert mod.resolve_engine_bin("cursor") == "/x/cursor-agent"
-    assert seen["name"] == "cursor-agent"  # scanned for cursor-agent, not cursor
-
-
-def test_cursor_bare_name_fallback_is_cursor_agent(monkeypatch):
-    from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_CURSOR_BIN", raising=False)
-    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"cursor": []})
-    monkeypatch.setattr(mod, "_which_all", lambda name: [])
-    assert mod.resolve_engine_bin("cursor") == "cursor-agent"
-
-
-# ── pi driver (the route-A engine) ───────────────────────────────────────────
 
 def test_pi_execute_argv_single_shot_json():
     d = PiDriver()
@@ -596,7 +334,7 @@ def test_pi_parse_recovers_session_id():
     ])
     res = d.parse(out, "")
     assert res.session == "019fce1e-44b4-7201-bbe8-9d44d5f61a48"
-    # session event also surfaces as a live StreamStep (like claude/cursor)
+    # the session event also surfaces as a live StreamStep
     steps = d.parse_stream_steps('{"type":"session","version":3,"id":"sess-abc"}')
     assert steps == [StreamStep("session", session="sess-abc")]
 
@@ -661,77 +399,9 @@ def test_pi_hello_ok_accepts_completed_turn():
 
 # ── offline / web-access toggle (clean eval hygiene) ─────────────────────────
 
-def test_claude_offline_denies_web_tools():
-    d = ClaudeCodeDriver()
-    online = d.build_execute("GO", d.new_session(), web_access=True)
-    assert "--disallowed-tools" not in online  # web on by default
-    offline = d.build_execute("GO", d.new_session(), web_access=False)
-    assert "--disallowed-tools" in offline
-    i = offline.index("--disallowed-tools")
-    assert "WebSearch" in offline[i:i + 3] and "WebFetch" in offline[i:i + 3]
-    # the deny flags must come before the prompt sentinel, not after --
-    assert offline.index("--disallowed-tools") < offline.index("--")
-
-
-def test_claude_resume_respects_offline():
-    d = ClaudeCodeDriver()
-    rs = d.build_resume("CONCLUDE", "s1", web_access=False)
-    assert "--disallowed-tools" in rs
-
-
-def test_codex_web_is_opt_in():
-    # codex exec has NO web tool unless --search is passed → offline by default.
-    d = CodexDriver()
-    assert "--search" not in d.build_execute("GO", None, web_access=False)
-    assert "--search" in d.build_execute("GO", None, web_access=True)
-
-
-# ── KB access (optional user-scope MCP; off unless MUTEKI_KB_MCP_NAME is set) ──
-
-def test_claude_no_kb_configured_is_inert():
-    # No MUTEKI_KB_MCP_NAME → KB_TOOL_PREFIX is empty → nothing KB-related ever
-    # appears, even when kb_access is denied. This is the out-of-the-box default.
-    d = ClaudeCodeDriver()
-    assert d.KB_TOOL_PREFIX == ""  # no KB configured
-    argv = d.build_execute("GO", d.new_session(), kb_access=False)
-    assert "--mcp-config" not in argv
-    # denying a non-existent KB adds nothing (only web tools could be denied)
-    assert "mcp__" not in " ".join(argv)
-
-
-def test_claude_kb_inherited_when_configured():
-    # With a KB configured (prefix set), a default run leaves it enabled
-    # (never re-mounts — that would re-trigger the trust gate) and denies nothing.
-    d = ClaudeCodeDriver()
-    d.KB_TOOL_PREFIX = "mcp__my-kb"  # simulate MUTEKI_KB_MCP_NAME=my-kb
-    argv = d.build_execute("GO", d.new_session())
-    assert "--mcp-config" not in argv
-    assert d.KB_TOOL_PREFIX not in argv  # KB left enabled
-
-
-def test_claude_kb_off_denies_kb_tools_when_configured():
-    d = ClaudeCodeDriver()
-    d.KB_TOOL_PREFIX = "mcp__my-kb"  # simulate a configured KB
-    argv = d.build_execute("GO", d.new_session(), kb_access=False)
-    assert "--disallowed-tools" in argv
-    assert d.KB_TOOL_PREFIX in argv  # the whole configured KB server is denied
-
-
-def test_claude_offline_and_kb_off_share_one_deny_flag():
-    # both suppressions collapse into a single --disallowed-tools list
-    d = ClaudeCodeDriver()
-    d.KB_TOOL_PREFIX = "mcp__my-kb"  # simulate a configured KB
-    argv = d.build_execute("GO", d.new_session(), web_access=False, kb_access=False)
-    assert argv.count("--disallowed-tools") == 1
-    i = argv.index("--disallowed-tools")
-    tail = argv[i + 1:argv.index("--")]
-    assert "WebSearch" in tail and "WebFetch" in tail and d.KB_TOOL_PREFIX in tail
-
-
 def test_registry():
-    assert set(DRIVERS) == {"claude", "codex", "cursor", "pi"}
-    assert get_driver("claude").name == "claude"
-    assert get_driver("cursor").name == "cursor"
+    assert set(DRIVERS) == {"pi"}
+    assert get_driver("pi").name == "pi"
 
 
 @pytest.mark.posix
@@ -788,43 +458,42 @@ def test_kill_proc_tree_kills_setsid_escaped_orphan_and_reaps():
 
 
 def test_driver_for_resolves_profile_id_to_base_engine():
-    """A bare profile id string ("codex-sub-container") must resolve to its base
+    """A bare profile id string ("pi-sub-container") must resolve to its base
     engine driver, NOT KeyError on DRIVERS[id]. Regression: local runs crashed
     because the engine roster holds profile ids, and driver_for(<id-string>) used
     to index DRIVERS directly."""
-    assert driver_for("codex-sub-container").name == "codex"
-    assert driver_for("claude-sub-container").name == "claude"
-    assert driver_for("cursor-api-container").name == "cursor"
+    assert driver_for("pi-sub-container").name == "pi"
+    assert driver_for("pi-api-container").name == "pi"
     # base engine names and transports still resolve
-    assert driver_for("codex").name == "codex"
-    assert driver_for("codex_cli").name == "codex"
+    assert driver_for("pi").name == "pi"
+    assert driver_for("pi_cli").name == "pi"
     # a profile DICT still resolves via its transport/engine
-    assert driver_for({"id": "codex-sub-container", "engine": "codex",
-                       "transport": "codex_cli"}).name == "codex"
+    assert driver_for({"id": "pi-sub-container", "engine": "pi",
+                       "transport": "pi_cli"}).name == "pi"
 
 
 def test_driver_for_local_profile_injects_selected_model(monkeypatch):
     """A subscription/local worker profile is the scheduling unit. Its selected
     model must be used by the health probe and worker argv; otherwise an exhausted
-    default model (for example Opus) can falsely degrade Claude even when Sonnet is
-    available."""
-    monkeypatch.setenv("MUTEKI_CLAUDE_BIN", "/usr/bin/claude")
+    default model can falsely degrade the pi worker even when the profile's
+    selected model is available."""
+    monkeypatch.setenv("MUTEKI_PI_BIN", "/usr/bin/pi")
     drv = driver_for({
-        "id": "claude-sub-container",
-        "name": "claude-sub-container",
-        "engine": "claude",
-        "transport": "claude_code",
+        "id": "pi-sub-container",
+        "name": "pi-sub-container",
+        "engine": "pi",
+        "transport": "pi_cli",
         "credential_mode": "subscription",
         "credential_account": "",
         "runtime": "local",
-        "model": "sonnet",
+        "model": "deepseek-v4-flash",
     })
 
     hello = drv._hello_argv()
     execute = drv.build_execute("PROMPT", drv.new_session())
 
-    assert hello[hello.index("--model") + 1] == "sonnet"
-    assert execute[execute.index("--model") + 1] == "sonnet"
+    assert hello[hello.index("--model") + 1] == "deepseek-v4-flash"
+    assert execute[execute.index("--model") + 1] == "deepseek-v4-flash"
 
 
 def test_get_driver_unknown_name_raises_clear_error():
@@ -833,107 +502,6 @@ def test_get_driver_unknown_name_raises_clear_error():
     import pytest
     with pytest.raises(ValueError, match="unknown engine"):
         get_driver("totally-not-an-engine")
-
-
-def test_driver_for_codex_endpoint_injects_provider_before_exec(monkeypatch):
-    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
-    drv = driver_for({
-        "name": "deepseek-codex",
-        "engine": "codex",
-        "transport": "codex_cli",
-        "credential_mode": "api",
-        "base_url": "https://api.deepseek.example/v1",
-        "wire_api": "responses",
-        "model": "deepseek-chat",
-    })
-
-    argv = drv.build_execute("PROMPT", None, web_access=False)
-
-    exec_idx = argv.index("exec")
-    # `name` and `env_key` are mandatory: without `name` codex aborts config load
-    # ("provider name must not be empty") so the endpoint never works; `env_key`
-    # pins the bearer-token env var the Credential Account injection populates.
-    assert argv[1:exec_idx] == [
-        "-c", "model_provider=muteki",
-        "-c", "model_providers.muteki.name=muteki",
-        "-c", "model_providers.muteki.base_url=https://api.deepseek.example/v1",
-        "-c", "model_providers.muteki.wire_api=responses",
-        "-c", "model_providers.muteki.env_key=OPENAI_API_KEY",
-        "-c", "model=deepseek-chat",
-    ]
-    assert argv[exec_idx:exec_idx + 2] == ["exec", "--json"]
-
-
-def test_codex_endpoint_health_uses_real_cli_turn(monkeypatch):
-    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
-    drv = driver_for({
-        "name": "deepseek-codex",
-        "engine": "codex",
-        "transport": "codex_cli",
-        "credential_mode": "api",
-        "base_url": "https://api.deepseek.example/v1",
-        "wire_api": "responses",
-        "model": "deepseek-chat",
-    })
-    seen = {}
-
-    def fake_run(argv, **kw):
-        seen["argv"] = argv
-        return _CP(
-            1,
-            '{"type":"turn.failed","error":{"message":"tools[10].type: unknown variant `namespace`"}}',
-            "",
-        )
-
-    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
-    monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
-    ok, detail = drv.health_detail(env={"OPENAI_API_KEY": "secret"})
-
-    assert ok is False
-    exec_idx = seen["argv"].index("exec")
-    assert "model_provider=muteki" in seen["argv"][:exec_idx]
-    assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in seen["argv"][:exec_idx]
-    assert "namespace" in detail
-
-
-def test_driver_for_codex_keyed_profile_without_endpoint_still_injects_model(monkeypatch):
-    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
-    drv = driver_for({
-        "name": "codex-main",
-        "engine": "codex",
-        "transport": "codex_cli",
-        "credential_mode": "api_key",
-        "model": "gpt-5.4",
-    })
-
-    argv = drv.build_execute("PROMPT", None, web_access=False)
-
-    assert "-c" not in argv
-    assert "--model" in argv
-    assert argv[argv.index("--model") + 1] == "gpt-5.4"
-
-
-def test_driver_for_claude_endpoint_healthcheck_posts_messages(monkeypatch):
-    seen = {}
-
-    def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setenv("CLAUDE_ENDPOINT_TOKEN", "secret")
-    drv = driver_for({
-        "name": "claude-api",
-        "engine": "claude",
-        "transport": "claude_code",
-        "credential_mode": "api",
-        "base_url": "https://anthropic-proxy.example",
-        "api_key_ref": "env:CLAUDE_ENDPOINT_TOKEN",
-    })
-
-    assert drv.healthcheck() is True
-    assert "https://anthropic-proxy.example/v1/messages" in seen["argv"]
-    assert any(str(x).startswith("x-api-key: ") for x in seen["argv"])
 
 
 def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
@@ -957,25 +525,25 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
     keyfile = tmp_path / "API_KEY"
     keyfile.write_text("file-secret-123\n")
     drv = driver_for({
-        "name": "deepseek-codex-api", "engine": "codex", "transport": "codex_cli",
+        "name": "pi-api", "engine": "pi", "transport": "pi_cli",
         "credential_mode": "api", "base_url": "https://ds.example",
         "api_key_ref": f"file:{keyfile}",
     })
     assert drv.healthcheck() is True
     assert seen["env"]["OPENAI_API_KEY"] == "file-secret-123", \
-        "#5: file: api_key_ref must be read and injected for the Codex CLI"
+        "#5: file: api_key_ref must be read and injected for the pi endpoint probe"
 
     # (b) no ref, but the credential-injection *_API_KEY_FILE env is set (the
     # container path) → still resolved.
     seen.clear()
     monkeypatch.setenv("OPENAI_API_KEY_FILE", str(keyfile))
     drv2 = driver_for({
-        "name": "ds2", "engine": "codex", "transport": "codex_cli",
+        "name": "ds2", "engine": "pi", "transport": "pi_cli",
         "credential_mode": "api", "base_url": "https://ds.example",
     })
     assert drv2.healthcheck() is True
     assert seen["env"]["OPENAI_API_KEY"] == "file-secret-123", \
-        "#5: *_API_KEY_FILE env fallback must be read for the Codex CLI probe"
+        "#5: *_API_KEY_FILE env fallback must be read for the pi endpoint probe"
 
 
 # ── engine binary resolution (pin official, skip broken third-party) ──────────
@@ -986,55 +554,55 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
 
 def test_resolve_prefers_env_override(monkeypatch):
     from muteki.solver import cli_driver as mod
-    monkeypatch.setenv("MUTEKI_CLAUDE_BIN", "/custom/path/claude")
+    monkeypatch.setenv("MUTEKI_PI_BIN", "/custom/path/pi")
     # env override wins outright — no PATH scan, no run probe
-    assert mod.resolve_engine_bin("claude") == "/custom/path/claude"
+    assert mod.resolve_engine_bin("pi") == "/custom/path/pi"
 
 
 def test_resolve_skips_known_bad_repackage(monkeypatch):
     from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_CLAUDE_BIN", raising=False)
+    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
     # no known-good location exists in this fake world
-    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"claude": []})
-    # PATH has the broken cometix build first, then a good one
-    bad = "/n/node_modules/@cometix/claude-code/cli.js"
-    good = "/opt/official/claude"
+    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"pi": []})
+    # PATH has the broken repackage first, then a good one
+    bad = "/n/node_modules/@cometix/repackage/pi.js"
+    good = "/opt/official/pi"
     monkeypatch.setattr(mod, "_which_all", lambda name: [bad, good])
     # cometix realpath looks bad; the good one runs
     monkeypatch.setattr(mod, "_runs_ok", lambda p: p == good)
-    assert mod.resolve_engine_bin("claude") == good
+    assert mod.resolve_engine_bin("pi") == good
 
 
 def test_resolve_known_good_location_wins_over_path(monkeypatch):
     from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_CLAUDE_BIN", raising=False)
-    good = "/blessed/claude"
-    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"claude": [good]})
-    # WindowsPath normalizes separators (str() renders `\blessed\claude`), so
+    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
+    good = "/blessed/pi"
+    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"pi": [good]})
+    # WindowsPath normalizes separators (str() renders `\blessed\pi`), so
     # compare on the normalized form.
     monkeypatch.setattr(mod.Path, "exists",
                         lambda self: str(self).replace("\\", "/") == good)
     monkeypatch.setattr(mod, "_looks_bad", lambda p: False)
     monkeypatch.setattr(mod, "_runs_ok", lambda p: True)
     # PATH scan would return something else, but the known-good location is checked first
-    monkeypatch.setattr(mod, "_which_all", lambda name: ["/somewhere/else/claude"])
-    assert mod.resolve_engine_bin("claude") == good
+    monkeypatch.setattr(mod, "_which_all", lambda name: ["/somewhere/else/pi"])
+    assert mod.resolve_engine_bin("pi") == good
 
 
 def test_resolve_falls_back_to_bare_name_when_all_broken(monkeypatch):
     from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_CLAUDE_BIN", raising=False)
-    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"claude": []})
-    monkeypatch.setattr(mod, "_which_all", lambda name: ["/bad/claude"])
+    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
+    monkeypatch.setattr(mod, "_KNOWN_GOOD", {"pi": []})
+    monkeypatch.setattr(mod, "_which_all", lambda name: ["/bad/pi"])
     monkeypatch.setattr(mod, "_runs_ok", lambda p: False)  # nothing runs
     # last resort: the bare name (preserves old behavior, no worse than before)
-    assert mod.resolve_engine_bin("claude") == "claude"
+    assert mod.resolve_engine_bin("pi") == "pi"
 
 
 def test_looks_bad_flags_cometix():
     from muteki.solver.cli_driver import _looks_bad
-    assert _looks_bad("/x/node_modules/@cometix/claude-code/cli.js") is True
-    assert _looks_bad("/opt/homebrew/bin/claude") is False
+    assert _looks_bad("/x/node_modules/@cometix/repackage/cli.js") is True
+    assert _looks_bad("/opt/homebrew/bin/pi") is False
 
 
 def test_driver_bin_is_cached(monkeypatch):
@@ -1042,129 +610,14 @@ def test_driver_bin_is_cached(monkeypatch):
     calls = []
     monkeypatch.setattr(mod, "resolve_engine_bin",
                         lambda name: calls.append(name) or f"/resolved/{name}")
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     d._bin = None  # ensure a clean resolve
-    assert d.bin == "/resolved/claude"
-    assert d.bin == "/resolved/claude"  # second access
-    assert calls == ["claude"]  # resolved exactly once, then cached
+    assert d.bin == "/resolved/pi"
+    assert d.bin == "/resolved/pi"  # second access
+    assert calls == ["pi"]  # resolved exactly once, then cached
 
 
 # ── output parsing ───────────────────────────────────────────────────────────
-
-def test_claude_parse_json():
-    d = ClaudeCodeDriver()
-    out = ('{"result":"FOUND_FLAG=flag{x}","session_id":"s1",'
-           '"total_cost_usd":1.23,"num_turns":7,'
-           '"usage":{"input_tokens":4,"cache_read_input_tokens":1200,'
-           '"cache_creation_input_tokens":300,"output_tokens":5}}')
-    r = d.parse(out, "")
-    assert r.text == "FOUND_FLAG=flag{x}"
-    assert r.session == "s1" and r.cost_usd == 1.23 and r.num_turns == 7
-    # tokens captured for the deck's usage column: fresh + both cache buckets
-    assert r.input_tokens == 4 + 1200 + 300 and r.output_tokens == 5
-
-
-def test_codex_parse_real_0133_jsonl():
-    # codex 0.133.0 wraps the assistant message in item.completed → item.agent_message,
-    # and the session id arrives as thread.started.thread_id (not in stderr).
-    d = CodexDriver()
-    out = "\n".join([
-        '{"type":"thread.started","thread_id":"th-abc"}',
-        '{"type":"turn.started"}',
-        '{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"FOUND_FLAG=flag{codex}"}}',
-        '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}',
-    ])
-    r = d.parse(out, "")
-    assert "FOUND_FLAG=flag{codex}" in r.text
-    assert r.session == "th-abc"   # captured from thread.started
-    assert r.num_turns == 1
-
-
-def test_codex_subscription_derives_cost_from_tokens():
-    # Subscription codex (0.137) reports NO total_cost_usd — only per-turn token
-    # usage. The driver must re-derive an API-equivalent dollar cost so codex
-    # workers stop contributing $0 to the deck's cost figure.
-    from muteki.core.cost import PRICES, CODEX_CACHED_INPUT_PER_M
-    d = CodexDriver()
-    out = "\n".join([
-        '{"type":"thread.started","thread_id":"th-x"}',
-        '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}',
-        '{"type":"turn.completed","usage":{"input_tokens":26910,'
-        '"cached_input_tokens":3456,"output_tokens":24,"reasoning_output_tokens":17}}',
-    ])
-    r = d.parse(out, "")
-    assert r.input_tokens == 26910
-    assert r.output_tokens == 24 + 17          # reasoning folded into output
-    p = PRICES["codex"]
-    fresh_in = 26910 - 3456
-    expected = (fresh_in / 1_000_000 * p.input_per_m
-                + 3456 / 1_000_000 * CODEX_CACHED_INPUT_PER_M
-                + (24 + 17) / 1_000_000 * p.output_per_m)
-    assert r.cost_usd == pytest.approx(expected)
-    assert r.cost_usd > 0    # the whole point: codex is no longer free
-
-
-def test_codex_legacy_total_cost_usd_still_wins():
-    # When an (older) codex DOES report total_cost_usd, that authoritative dollar
-    # figure must win over the token-derived estimate.
-    d = CodexDriver()
-    out = '{"msg":{"type":"agent_message","message":"hi","total_cost_usd":0.5}}'
-    r = d.parse(out, "")
-    assert r.cost_usd == 0.5
-
-
-def test_claude_killed_loser_recovers_tokens_from_assistant_event():
-    # A race-loser claude worker is killpg'd mid-run → it NEVER emits the final
-    # {type:result}. Each assistant event carries a cumulative usage block, so the
-    # parser must fall back to the LAST one — otherwise the loser's real spend
-    # (it ran many tool turns) silently vanishes from the ledger.
-    d = ClaudeCodeDriver()
-    out = "\n".join([
-        '{"type":"system","subtype":"init","session_id":"s-killed"}',
-        '{"type":"assistant","message":{"usage":{"input_tokens":4646,"cache_creation_input_tokens":26944,"cache_read_input_tokens":0,"output_tokens":1}}}',
-        '{"type":"assistant","message":{"usage":{"input_tokens":5000,"cache_read_input_tokens":30000,"cache_creation_input_tokens":0,"output_tokens":820}}}',
-        # killpg here — no {"type":"result"}
-    ])
-    r = d.parse(out, "")
-    assert r.session == "s-killed"
-    # latest assistant usage wins: 5000 + 30000 cache_read + 0 cache_creation = 35000
-    assert r.input_tokens == 35000 and r.output_tokens == 820
-
-
-def test_claude_final_result_wins_over_intermediate_usage():
-    # When the run completes normally, the final result's usage is authoritative —
-    # the intermediate-assistant fallback must NOT override it.
-    d = ClaudeCodeDriver()
-    out = "\n".join([
-        '{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":5}}}',
-        '{"type":"result","result":"OK","session_id":"s1","total_cost_usd":0.19,"usage":{"input_tokens":999,"cache_read_input_tokens":1,"output_tokens":50}}',
-    ])
-    r = d.parse(out, "")
-    assert r.input_tokens == 1000 and r.output_tokens == 50 and r.cost_usd == 0.19
-
-
-def test_codex_killed_preserves_completed_turns():
-    # A codex worker killed mid-3rd-turn keeps the usage of the 2 turns that DID
-    # complete (each turn.completed is its own line, already summed). Only the
-    # in-progress turn is lost (unavoidable — codex reports usage per finished turn).
-    d = CodexDriver()
-    out = "\n".join([
-        '{"type":"thread.started","thread_id":"t1"}',
-        '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100}}',
-        '{"type":"turn.completed","usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":200}}',
-        # killed mid 3rd turn — no more turn.completed
-    ])
-    r = d.parse(out, "")
-    assert r.input_tokens == 3000 and r.output_tokens == 300 and r.cost_usd > 0
-
-
-def test_claude_parse_non_json_tolerant():
-    d = ClaudeCodeDriver()
-    r = d.parse("not json at all", "stderr tail")
-    assert "not json" in r.text  # falls back to raw text, never crashes
-
-
-# ── flag extraction + provenance gate (the moat is preserved) ────────────────
 
 def _cli_solver(challenge, **kw):
     spec = type("S", (), {"solver_id": "cli-1"})()
@@ -1179,14 +632,15 @@ def test_cli_solver_offline_flag_threads_through():
     assert s.web_access is False
     argv = s.driver.build_execute(s._build_prompt(), s.driver.new_session(),
                                   web_access=s.web_access, kb_access=s.kb)
-    assert "--disallowed-tools" in argv
+    assert "--exclude-tools" in argv
+    assert argv[argv.index("--exclude-tools") + 1] == "WebSearch,WebFetch"
 
 
 def test_cli_solver_kb_off_by_default_when_no_kb_configured():
     # Out of the box (no MUTEKI_KB_MCP_NAME) the KB is inert regardless of kb=...:
     # self.kb is False and the prompt teaches no KB tool.
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
-    s = _cli_solver(ch, kb=True, engine="claude")
+    s = _cli_solver(ch, kb=True, engine="pi")
     assert s.kb is False  # no KB configured → off even though kb=True was requested
     assert "knowledge-base tool" not in s._build_prompt()
 
@@ -1194,27 +648,6 @@ def test_cli_solver_kb_off_by_default_when_no_kb_configured():
 def test_cli_solver_kb_disabled_keeps_prompt_clean():
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch, kb=False)
-    assert s.kb is False
-    assert "knowledge-base tool" not in s._build_prompt()
-
-
-def test_cli_solver_kb_on_for_claude_teaches_dispatch_when_configured(monkeypatch):
-    # With a KB configured (MUTEKI_KB_MCP_NAME) the claude worker inherits it →
-    # kb stays on and the prompt teaches dispatch, naming the configured server.
-    import muteki.solver.cli_solver as cs
-    monkeypatch.setattr(cs, "KB_MCP_NAME", "my-kb")
-    monkeypatch.setattr(cs, "_KB_PROMPT",
-                        "\nYou ALSO have a `my-kb` knowledge-base tool ...\n")
-    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
-    s = _cli_solver(ch, kb=True, engine="claude")
-    assert s.kb is True
-    assert "my-kb" in s._build_prompt()
-
-
-def test_cli_solver_kb_off_for_codex():
-    # codex doesn't inherit claude's user-scope KB → kb forced off even if asked.
-    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
-    s = _cli_solver(ch, kb=True, engine="codex")
     assert s.kb is False
     assert "knowledge-base tool" not in s._build_prompt()
 
@@ -1275,7 +708,7 @@ def test_launder_still_rejects_grep_from_disk_steal():
              "I recovered the flag: flag{stolen}\n")
     assert s._flag_ok("flag{stolen}", steal) is False
     # the engine's own history dir is an unambiguous tell on its own (no read verb needed)
-    assert s._flag_ok("flag{x}", "found it in ~/.codex/sessions/abc flag{x}") is False
+    assert s._flag_ok("flag{x}", "found it in ~/.pi/sessions/abc flag{x}") is False
     # a sibling-process harvest phrasing
     assert s._flag_ok("flag{y}", "pulled flag{y} from a teammate process title") is False
 
@@ -1370,8 +803,8 @@ def test_tool_result_flag_in_real_output_is_accepted_run75379():
 
 
 def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
-    """(b) Codex's hidden killer: the stream driver truncates the live tool_result
-    chunk to 600 chars. A flag that appears PAST char 600 of a command's output is
+    """(b) the stream driver's hidden killer: the live tool_result chunk is
+    truncated to 600 chars. A flag that appears PAST char 600 of a command's output is
     absent from the truncated `text`, but the gate must see the full `raw`. Without the
     raw-output gate this real flag would be silently dropped."""
     from muteki.solver.cli_driver import StreamStep
@@ -1472,40 +905,6 @@ def test_persist_raw_tool_output_ring_trims_to_cap():
 
 # ── driver-level: tool_result carries untruncated raw (run-75379) ─────────────
 
-def test_claude_driver_tool_result_raw_is_untruncated():
-    flag = "flag{deep-in-claude-output}"
-    body = ("B" * 900) + f" FOUND_FLAG={flag}"
-    line = json.dumps({"type": "user", "message": {
-        "content": [{"type": "tool_result", "content": body}]}})
-    steps = ClaudeCodeDriver().parse_stream_steps(line)
-    tr = [s for s in steps if s.kind == "tool_result"][0]
-    assert len(tr.text) == 600 and flag not in tr.text   # deck chunk truncated
-    assert flag in tr.raw                                  # gate sees full output
-
-
-def test_codex_driver_tool_result_raw_is_untruncated():
-    flag = "flag{deep-in-codex-output}"
-    body = ("C" * 900) + f" FOUND_FLAG={flag}"
-    line = json.dumps({"type": "item.completed", "item": {
-        "type": "command_execution", "aggregated_output": body}})
-    step = CodexDriver().parse_stream_line(line)
-    assert step.kind == "tool_result"
-    assert len(step.text) == 600 and flag not in step.text
-    assert flag in step.raw
-
-
-def test_cursor_driver_tool_result_raw_is_untruncated():
-    flag = "flag{deep-in-cursor-output}"
-    body = ("D" * 900) + f" FOUND_FLAG={flag}"
-    tc = {"shell": {"result": {"success": {"content": body}}}}
-    line = json.dumps(
-        {"type": "tool_call", "subtype": "completed", "tool_call": tc})
-    steps = CursorDriver().parse_stream_steps(line)
-    tr = [s for s in steps if s.kind == "tool_result"][0]
-    assert len(tr.text) == 600 and flag not in tr.text
-    assert flag in tr.raw
-
-
 def test_single_flag_prompt_has_no_multiflag_block():
     # expected_flags=1 (default) → the prompt must NOT carry the multi-flag block,
     # keeping single-flag runs byte-identical.
@@ -1562,7 +961,7 @@ def test_add_external_usd_feeds_budget_breaker():
 
 
 def test_add_external_usd_records_tokens_at_zero_cost():
-    # cursor path: subscription-backed (usd=0) but reports token usage. The tokens
+    # subscription-backed worker (usd=0) but reports token usage. The tokens
     # must land in the ledger / COST_UPDATE so the deck's token column counts them,
     # while $ stays flat.
     events = []
@@ -1572,9 +971,9 @@ def test_add_external_usd_records_tokens_at_zero_cost():
 
     cost = CostController(bus=_Bus())
     asyncio.run(cost.add_external_usd(
-        0.0, run_id="r", solver_id="cli-cursor-1", challenge_id="c",
+        0.0, run_id="r", solver_id="cli-pi-1", challenge_id="c",
         input_tokens=27140, output_tokens=30))
-    assert cost.global_usd() == 0.0          # no dollars from cursor
+    assert cost.global_usd() == 0.0          # no dollars from a subscription-backed worker
     p = [e for e in events if e.event_type is EventType.COST_UPDATE][-1].payload
     assert p["tokens"] == 27170 and p["input_tokens"] == 27140 and p["output_tokens"] == 30
 
@@ -1588,7 +987,7 @@ class _CaptureBus:
 
 class _StubDriver:
     """A CLI driver that returns a canned transcript — no subprocess."""
-    name = "claude"
+    name = "pi"
     def __init__(self, text): self._text = text
     def new_session(self): return "sess-x"
     def build_execute(self, *a, **k): return ["true"]
@@ -1615,7 +1014,7 @@ def _run_cli_solver(monkeypatch, transcript):
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
     drv = _StubDriver(transcript)
-    s = CliSolver(None, ch, bus=bus, driver=drv, engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=drv, engine="pi", kb=False)
     canned = lambda *a, **k: CliResult(text=transcript, session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", canned)
     monkeypatch.setattr(mod, "run_cli", canned)  # the no-bus fallback path
@@ -1671,7 +1070,7 @@ def test_record_fact_db_failure_does_not_emit_blackboard_fact():
         ch,
         bus=bus,
         driver=_StubDriver(""),
-        engine="claude",
+        engine="pi",
         kb=False,
         shared_graph=RejectingGraph(),
     )
@@ -1691,7 +1090,7 @@ def test_cli_solver_worker_status_reports_timeout(monkeypatch):
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
     drv = _StubDriver("")
-    s = CliSolver(None, ch, bus=bus, driver=drv, engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=drv, engine="pi", kb=False)
     calls = {"n": 0}
 
     def fake_stream(*a, **k):
@@ -1709,12 +1108,12 @@ def test_cli_solver_worker_status_reports_timeout(monkeypatch):
         "online": True,
         "status": "online",
         "reason": "started",
-        "engine": "claude",
+        "engine": "pi",
         "session": "",
         "worker_role": "bootstrap",
     }
     # once the worker's CLI session id is known it re-emits status carrying it, so
-    # the deck can surface a resume command (`claude -r <id>`) for manual attach.
+    # the deck can surface a resume command (`pi --session <id>`) for manual attach.
     assert any(s.payload.get("session") == "sess-x" for s in statuses)
     assert statuses[-1].payload["online"] is False
     assert statuses[-1].payload["status"] == "offline"
@@ -1735,7 +1134,7 @@ def test_cli_streaming_emits_busy_heartbeat_during_silent_turn(monkeypatch, tmp_
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude",
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi",
                   kb=False)
 
     def silent_stream(*a, **k):
@@ -1760,7 +1159,7 @@ def test_cli_solver_worker_status_reports_asyncio_cancel(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
 
     async def cancelled_bootstrap():
         raise asyncio.CancelledError()
@@ -1830,7 +1229,7 @@ def test_explore_emits_intent_claimed_and_structured_facts(monkeypatch):
         "VERIFIED_FACT=admin:admin works on /login\n"
         "DEADEND=no SQLi on search param\n"
     )
-    s = CliSolver(None, ch, bus=bus, driver=drv, engine="claude", kb=False,
+    s = CliSolver(None, ch, bus=bus, driver=drv, engine="pi", kb=False,
                   mode="explore", intent_goal="try credentials on /login",
                   intent_id="I42")
     canned = lambda *a, **k: CliResult(text=transcript, session="sess-x")
@@ -1940,7 +1339,7 @@ def test_explore_conclude_fallback_fires_on_no_markers(monkeypatch):
         return CliResult(text="DEADEND=login page has WAF, gave up\n", session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
     monkeypatch.setattr(mod, "run_cli", fake_stream)
-    s = CliSolver(None, ch, bus=bus, driver=drv, engine="claude", kb=False,
+    s = CliSolver(None, ch, bus=bus, driver=drv, engine="pi", kb=False,
                   mode="explore", intent_goal="probe /login")
     asyncio.run(s.run())
     assert call_count["n"] == 2  # main + conclude fallback
@@ -1950,54 +1349,12 @@ def test_explore_conclude_fallback_fires_on_no_markers(monkeypatch):
 
 # ── live streaming (the deck shows the worker working, not a dead pause) ──────
 
-def test_claude_parse_stream_line_shapes():
-    d = ClaudeCodeDriver()
-    # assistant text → reasoning step
-    s1 = d.parse_stream_line('{"type":"assistant","message":{"content":[{"type":"text","text":"probing /login"}]}}')
-    assert s1 and s1.kind == "reasoning" and "probing" in s1.text
-    # assistant tool_use → tool step (with the command as detail)
-    s2 = d.parse_stream_line('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"curl -s http://x"}}]}}')
-    assert s2 and s2.kind == "tool" and s2.tool == "Bash" and "curl" in s2.text
-    # tool_result → tool_result step
-    s3 = d.parse_stream_line('{"type":"user","message":{"content":[{"type":"tool_result","content":"HTTP 200 OK"}]}}')
-    assert s3 and s3.kind == "tool_result" and "200" in s3.text
-    # session id surfaced
-    s4 = d.parse_stream_line('{"type":"system","subtype":"init","session_id":"abc"}')
-    assert s4 and s4.kind == "session" and s4.session == "abc"
-    # noise → None
-    assert d.parse_stream_line("not json") is None
-
-
-def test_codex_parse_stream_line_shapes():
-    d = CodexDriver()
-    assert d.parse_stream_line('{"type":"thread.started","thread_id":"th1"}').session == "th1"
-    cmd = d.parse_stream_line('{"type":"item.started","item":{"type":"command_execution","command":"curl x"}}')
-    assert cmd and cmd.kind == "tool" and "curl" in cmd.text
-    res = d.parse_stream_line('{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"hi out"}}')
-    assert res and res.kind == "tool_result" and "hi out" in res.text
-    msg = d.parse_stream_line('{"type":"item.completed","item":{"type":"agent_message","text":"thinking..."}}')
-    assert msg and msg.kind == "reasoning" and "thinking" in msg.text
-
-
-def test_claude_stream_parse_recovers_result_from_jsonl():
-    # parse() must still pull the final flag/cost/session out of a stream-json dump
-    d = ClaudeCodeDriver()
-    dump = "\n".join([
-        '{"type":"system","subtype":"init","session_id":"s9"}',
-        '{"type":"assistant","message":{"content":[{"type":"text","text":"found it"}]}}',
-        '{"type":"result","result":"FOUND_FLAG=flag{stream}","total_cost_usd":0.5,"num_turns":4,"session_id":"s9"}',
-    ])
-    r = d.parse(dump, "")
-    assert "FOUND_FLAG=flag{stream}" in r.text
-    assert r.session == "s9" and r.cost_usd == 0.5 and r.num_turns == 4
-
-
 @pytest.mark.posix
 def test_run_cli_streaming_fires_on_step_per_line(tmp_path):
     # end-to-end: a fake echo command emits two JSONL lines; on_step sees both,
     # and parse() builds the final result from the accumulated stdout.
     from muteki.solver.cli_driver import run_cli_streaming, StreamStep
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     line1 = '{"type":"assistant","message":{"content":[{"type":"text","text":"step one"}]}}'
     line2 = '{"type":"result","result":"FOUND_FLAG=flag{ok}","session_id":"z"}'
     script = tmp_path / "fake.sh"
@@ -2177,8 +1534,8 @@ def test_write_board_file_is_run_level_single_file_symlinked_to_workers(tmp_path
     ch, g = _real_graph(tmp_path, facts=[("cli-c", "ghost1 password PWaB1xyz works, whoami ghost1", True)])
     s = _cli_solver(ch, kb=False, shared_graph=g)
     workspace = _P(tmp_path) / "workspace"
-    wd1 = workspace / "workers" / "cli-claude-1"
-    wd2 = workspace / "workers" / "cli-codex-2"
+    wd1 = workspace / "workers" / "cli-pi-1"
+    wd2 = workspace / "workers" / "cli-pi-2"
     assert s._write_board_file(wd1) is True
     assert s._write_board_file(wd2) is True
     root_board = workspace / ".muteki_board.md"
@@ -2475,7 +1832,7 @@ def test_run_loop_writes_board_file_into_worker_cwd(monkeypatch, tmp_path):
     ch, g = _real_graph(tmp_path, facts=facts)
     wd = _P(tempfile.mkdtemp())
     bus = _CaptureBus()
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude",
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi",
                   kb=False, shared_graph=g, workdir=str(wd))
     canned = lambda *a, **k: CliResult(text="FOUND_FLAG=NONE\n", session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", canned)
@@ -2506,7 +1863,7 @@ def test_bootstrap_extracts_structured_facts(monkeypatch):
         "DEADEND=UNION on trackingID errors out\n"
         "still working...\n"
     )
-    s = CliSolver(None, ch, bus=bus, driver=drv, engine="claude", kb=False,
+    s = CliSolver(None, ch, bus=bus, driver=drv, engine="pi", kb=False,
                   shared_graph=sg)
     canned = lambda *a, **k: CliResult(text=transcript, session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", canned)
@@ -2563,7 +1920,7 @@ def test_run_cli_streaming_cancel_event_kills_process(tmp_path):
     import time
     from muteki.solver.cli_driver import run_cli_streaming
 
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     # a script that would run for 30s, emitting a line then sleeping
     script = tmp_path / "slow.sh"
     script.write_text('#!/bin/sh\necho \'{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\'\nsleep 30\n')
@@ -2589,7 +1946,7 @@ def test_run_cli_streaming_bare_timeout_kills_silent_process(tmp_path):
     import time
     from muteki.solver.cli_driver import run_cli_streaming
 
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     t0 = time.time()
     # `sleep 30` emits nothing on stdout — the only way out is the watcher's timeout.
     res = run_cli_streaming(d, ["sleep", "30"], cwd=str(tmp_path),
@@ -2607,7 +1964,7 @@ def test_run_cli_streaming_does_not_hang_on_orphaned_stderr(tmp_path):
     import time
     from muteki.solver.cli_driver import run_cli_streaming
 
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     line = '{"type":"result","result":"FOUND_FLAG=flag{ok}","session_id":"z"}'
     script = tmp_path / "orphan_stderr.sh"
     script.write_text(
@@ -2640,7 +1997,7 @@ def test_run_cli_streaming_paused_time_excluded_from_timeout(tmp_path):
     import time
     from muteki.solver.cli_driver import run_cli_streaming
 
-    d = ClaudeCodeDriver()
+    d = PiDriver()
     paused = threading.Event()
     paused.set()                       # frozen from the start
     # Hold the freeze for ~2.5s (> the 1s timeout), then release. While the event is
@@ -2967,7 +2324,7 @@ def test_single_shot_buffered_guidance_does_not_resume(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     calls = {"n": 0}
 
     def fake_stream(driver, argv, **k):
@@ -2992,7 +2349,7 @@ def test_single_shot_one_conclude_fallback_on_timeout(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     s._session_established = True                  # allow the conclude resume
     calls = {"n": 0}
 
@@ -3016,7 +2373,7 @@ def test_single_shot_cancel_skips_conclude(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     calls = {"n": 0}
 
     def fake_stream(*a, **k):
@@ -3038,7 +2395,7 @@ def test_single_shot_steer_skips_conclude_and_deadend(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     calls = {"n": 0}
 
     def fake_stream(*a, **k):
@@ -3060,7 +2417,7 @@ def test_explore_steer_skips_conclude_and_deadend(monkeypatch):
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
     s = CliSolver(
-        None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False,
+        None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False,
         mode="explore", intent_goal="try redirected target")
     calls = {"n": 0}
 
@@ -3086,7 +2443,7 @@ def test_m4_no_flag_worker_exits_clean_without_deadend(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     calls = {"n": 0}
 
     def fake_stream(*a, **k):
@@ -3114,7 +2471,7 @@ def test_cancelled_turn_does_not_resume(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     calls = {"n": 0}
 
     def fake_stream(*a, **k):
@@ -3140,7 +2497,7 @@ def test_run_cli_streaming_steer_event_kills_and_flags():
     import threading
     import time as _t
     from muteki.solver.cli_driver import run_cli_streaming, get_driver
-    drv = get_driver("claude")
+    drv = get_driver("pi")
     steer = threading.Event()
 
     def fire():
@@ -3222,7 +2579,7 @@ def test_stream_markers_uses_worker_reported_need_kind():
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     asyncio.run(s._stream_markers(
         "NEED_INPUT=I need the operator to decide whether to burn the exploit\n"
         "NEED_KIND=operator_directive_needed\n"))
@@ -3239,7 +2596,7 @@ def test_stream_markers_emits_hitl_request_on_need_input():
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     asyncio.run(s._stream_markers(
         "NEED_INPUT=the target is connection-refused, instance may be expired\n"))
     reqs = [e for e in bus.events if e.event_type is EventType.HITL_REQUEST]
@@ -3258,7 +2615,7 @@ def test_need_kind_field_is_separate_from_legacy_kind():
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     asyncio.run(s._stream_markers(
         "NEED_INPUT=need exclusive access; another worker is hammering the same target\n"))
     reqs = [e for e in bus.events if e.event_type is EventType.HITL_REQUEST]
@@ -3272,7 +2629,7 @@ def test_need_kind_routes_dead_end_separately():
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
-    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
     asyncio.run(s._stream_markers(
         "NEED_INPUT=this exploit route is a dead end after repeated failures\n"))
     reqs = [e for e in bus.events if e.event_type is EventType.HITL_REQUEST]
@@ -3316,7 +2673,7 @@ def test_review_mode_parses_actions_but_never_accepts_flags(monkeypatch, tmp_pat
         'FOUND_FLAG=flag{review_must_not_win}\n'
     )
     s = CliSolver(None, ch, bus=bus, shared_graph=sg,
-                  driver=_StubDriver(transcript), engine="claude", kb=False,
+                  driver=_StubDriver(transcript), engine="pi", kb=False,
                   mode="review")
     monkeypatch.setattr(
         mod, "run_cli_streaming",

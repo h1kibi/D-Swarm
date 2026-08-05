@@ -37,10 +37,10 @@ def _solver(bus: EventBus) -> CliSolver:
     return CliSolver(
         spec=None,
         challenge=_token_challenge(),
-        engine="claude",
+        engine="pi",
         bus=bus,
         run_id="run-test-stream",
-        solver_label="cli-claude-test",
+        solver_label="cli-pi-test",
     )
 
 
@@ -64,7 +64,7 @@ async def test_found_flag_in_streamed_reasoning_is_accepted():
     sv = _solver(bus)
 
     chunk = (
-        "[cursor] L1 解出。\n"
+        "[pi] L1 解出。\n"
         "VERIFIED_FACT=admin panel = vault-admin.atlas-fintech.local\n"
         "FOUND_FLAG=bl_62c1be2414c0143a2da6b5b0982e12e7\n"
         "## L1 解题摘要 ...\n"
@@ -234,7 +234,7 @@ async def test_anti_launder_does_not_false_reject_own_cwd():
     real = "bl_77aa88bb99cc00dd11ee22ff33445566"
     # worker wrote its decrypt/extract result into its own cwd and prints it
     await sv._stream_markers(
-        "/Users/x/ccb/sessions/run-test-stream/workspace/workers/cli-claude-test/"
+        "/Users/x/ccb/sessions/run-test-stream/workspace/workers/cli-pi-test/"
         f"out.txt:\nFOUND_FLAG={real}\n")
     assert real in seen, "a flag in the worker's own cwd output must register"
 
@@ -258,8 +258,8 @@ async def test_static_flag_value_reused_across_runs_is_accepted():
         challenge=Challenge(
             id="run-test-static", name="rivulet", category="pwn",
             flag_format=r"flag\d?\{[^}]+\}", multi_flag=True, expected_flags=4),
-        engine="claude", bus=bus, run_id="run-test-static",
-        solver_label="cli-claude-static")
+        engine="pi", bus=bus, run_id="run-test-static",
+        solver_label="cli-pi-static")
 
     # a value some OTHER run also used (static flag) — recovered here from clean,
     # real target output with NO local-storage scrape signature → must register.
@@ -324,7 +324,7 @@ def _graph_solver(bus: EventBus, tmp_path, *, shared_graph=None, label="cli-fres
         flag_format=r"flag\{[^}]+\}", multi_flag=True, expected_flags=4)
     sg = shared_graph or SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=ch)
     sv = CliSolver(
-        spec=None, challenge=ch, engine="claude", bus=bus,
+        spec=None, challenge=ch, engine="pi", bus=bus,
         run_id="run-75379", solver_label=label, shared_graph=sg)
     return sv, sg
 

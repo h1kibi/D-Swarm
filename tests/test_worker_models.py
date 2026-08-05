@@ -15,44 +15,44 @@ def test_worker_model_options_are_static_and_custom_enabled() -> None:
     payload = worker_model_options_payload()
 
     assert payload["allow_custom"] is True
-    assert {m["id"] for m in payload["models"]["claude"]} >= {"sonnet", "opus"}
-    assert {m["id"] for m in payload["models"]["codex"]} >= {"gpt-5.5", "gpt-5.4-mini"}
-    assert {m["id"] for m in payload["models"]["cursor"]} >= {"auto", "composer-2.5-fast"}
+    assert {m["id"] for m in payload["models"]["pi"]} >= {
+        "deepseek-v4-flash", "deepseek-v4-pro"}
     assert payload["models"] == WORKER_MODEL_OPTIONS
 
 
 def test_probe_worker_model_injects_profile_model_and_account_env(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "_secrets" / "accounts" / "claude-main"
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
-    (root / "CLAUDE_CODE_OAUTH_TOKEN").write_text("oauth-token\n")
+    (root / "API_KEY").write_text("deepseek-secret\n")
     seen: dict[str, object] = {}
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        seen["token"] = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-        return subprocess.CompletedProcess(argv, 0, '{"result":"OK"}\n', "")
+        seen["key"] = os.environ.get("DEEPSEEK_API_KEY")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"agent_settled"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
 
     res = probe_worker_model(
         profile={
-            "id": "claude-sub",
-            "name": "claude-sub",
-            "engine": "claude",
-            "transport": "claude_code",
-            "credential_account": "claude-main",
+            "id": "pi-sub",
+            "name": "pi-sub",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_account": "pi-main",
             "runtime": "local",
         },
-        model="opus",
+        model="deepseek-v4-pro",
         sessions_root=tmp_path,
         backend="local",
     )
 
     assert res["ok"] is True
-    assert res["model"] == "opus"
-    assert seen["token"] == "oauth-token"
+    assert res["model"] == "deepseek-v4-pro"
+    assert seen["key"] == "deepseek-secret"
     assert "--model" in seen["argv"]
-    assert seen["argv"][seen["argv"].index("--model") + 1] == "opus"
+    assert seen["argv"][seen["argv"].index("--model") + 1] == "deepseek-v4-pro"
 
 
 def test_probe_worker_model_allows_local_system_login_without_registered_account(
@@ -62,19 +62,19 @@ def test_probe_worker_model_allows_local_system_login_without_registered_account
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, '{"result":"OK"}\n', "")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"agent_settled"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     res = probe_worker_model(
         profile={
-            "id": "claude-local",
-            "engine": "claude",
-            "transport": "claude_code",
+            "id": "pi-local",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_account": "",
             "runtime": "local",
         },
-        model="sonnet",
+        model="deepseek-v4-flash",
         sessions_root=tmp_path,
         backend="local",
     )
@@ -83,60 +83,52 @@ def test_probe_worker_model_allows_local_system_login_without_registered_account
     assert "--model" in seen["argv"]
 
 
-def test_probe_worker_model_does_not_default_local_codex_to_stale_account(
+def test_probe_worker_model_does_not_default_local_pi_to_stale_account(
     tmp_path, monkeypatch
 ) -> None:
-    # a host-installed codex (CODEX_HOME in the environment) must not leak into a
-    # LOCAL probe that should use the run's own accounts — clear it for this test.
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    codex_home = tmp_path / "_secrets" / "accounts" / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text('{"stale": true}\n')
+    # a host-installed pi (HOME ~/.pi sessions in the environment) must not leak
+    # into a LOCAL probe that should use the run's own accounts — the probe's env
+    # is exactly the account overlay, nothing from the host pi install.
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     seen: dict[str, object] = {}
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        seen["codex_home"] = os.environ.get("CODEX_HOME")
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            '{"type":"thread.started","thread_id":"t"}\n'
-            '{"type":"turn.completed","usage":{}}\n',
-            "",
-        )
+        seen["key"] = os.environ.get("DEEPSEEK_API_KEY")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"agent_settled"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     res = probe_worker_model(
         profile={
-            "id": "codex-local",
-            "engine": "codex",
-            "transport": "codex_cli",
+            "id": "pi-local",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_account": "",
             "runtime": "local",
         },
-        model="gpt-5.5",
+        model="deepseek-v4-flash",
         sessions_root=tmp_path,
         backend="local",
     )
 
     assert res["ok"] is True
-    assert seen["codex_home"] is None
+    assert seen["key"] is None  # no stale host credential leaked in
     assert "--model" in seen["argv"]
-    assert seen["argv"][seen["argv"].index("--model") + 1] == "gpt-5.5"
+    assert seen["argv"][seen["argv"].index("--model") + 1] == "deepseek-v4-flash"
 
 
 def test_probe_worker_model_runs_real_worker_container_when_web_is_containerized(
     tmp_path, monkeypatch
 ) -> None:
     # In a compose deploy the WEB process runs inside a container that does NOT
-    # ship the engine CLIs (claude/codex/cursor) — those live only in the WORKER
-    # image. A container-backend model probe must therefore run a real one-shot
-    # worker container and complete the same minimal hello turn there.
+    # ship the pi CLI — it lives only in the WORKER image. A container-backend
+    # model probe must therefore run a real one-shot worker container and
+    # complete the same minimal hello turn there.
     monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
-    codex_home = tmp_path / "_secrets" / "accounts" / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text('{"ok": true}\n')
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
+    root.mkdir(parents=True)
+    (root / "API_KEY").write_text("deepseek-secret\n")
     seen: dict[str, object] = {}
 
     def fake_docker(*args, timeout=30):
@@ -147,8 +139,7 @@ def test_probe_worker_model_runs_real_worker_container_when_web_is_containerized
             return subprocess.CompletedProcess(
                 ["docker", *args],
                 0,
-                '{"type":"thread.started","thread_id":"t"}\n'
-                '{"type":"turn.completed","usage":{}}\n',
+                '{"type":"agent_settled"}\n',
                 "",
             )
         raise AssertionError(f"unexpected docker command: {args}")
@@ -158,49 +149,42 @@ def test_probe_worker_model_runs_real_worker_container_when_web_is_containerized
 
     res = probe_worker_model(
         profile={
-            "id": "codex-seat",
-            "engine": "codex",
-            "transport": "codex_cli",
-            # Regression: a legacy/imported Codex auth.json seat can carry
-            # credential_mode=api_key while still using CODEX_HOME. That must not
-            # make the probe treat it like a custom endpoint and drop --model.
+            "id": "pi-seat",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_mode": "api_key",
-            "credential_account": "codex-main",
+            "credential_account": "pi-main",
             "runtime": "container",
         },
-        model="gpt-5.4",
+        model="deepseek-v4-flash",
         sessions_root=tmp_path,
         backend="container",
     )
 
     assert res["ok"] is True
     assert res["backend"] == "container"
-    assert res["engine"] == "codex"
-    assert res["model"] == "gpt-5.4"
+    assert res["engine"] == "pi"
+    assert res["model"] == "deepseek-v4-flash"
     run_args = seen["run_args"]
     assert run_args[0] == "run"
     assert "--entrypoint" in run_args and "bash" in run_args
     assert "--user" in run_args and "kali" in run_args
     assert any(str(a).startswith("type=bind") and "/run/muteki/accounts" in str(a) for a in run_args)
-    assert "gpt-5.4" in " ".join(str(a) for a in run_args)
+    assert "deepseek-v4-flash" in " ".join(str(a) for a in run_args)
 
 
-def test_probe_worker_model_container_maps_codex_home_seed(
+def test_probe_worker_model_container_maps_provider_key_and_base_url(
     tmp_path, monkeypatch
 ) -> None:
+    # A custom-endpoint pi account must reach the worker container as the
+    # provider key + base URL env (pi reads standard provider keys, not a CLI
+    # config seed).
     monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
-    codex_home = tmp_path / "_secrets" / "accounts" / "codex-main" / "codex-home"
-    codex_home.mkdir(parents=True)
-    (codex_home / "auth.json").write_text('{"ok": true}\n')
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
+    root.mkdir(parents=True)
+    (root / "API_KEY").write_text("deepseek-secret\n")
+    (root / "BASE_URL").write_text("https://api.deepseek.example/v1\n")
     seen: dict[str, object] = {}
-
-    def fake_runtime_env_for_engine(*_args, **_kwargs):
-        return SimpleNamespace(
-            account_id="codex-main",
-            env={
-                "MUTEKI_CODEX_HOME_SEED": "/run/muteki/accounts/codex-main/codex-home",
-            },
-        )
 
     def fake_docker(*args, timeout=30):
         if args[:2] == ("image", "inspect"):
@@ -210,42 +194,40 @@ def test_probe_worker_model_container_maps_codex_home_seed(
             return subprocess.CompletedProcess(
                 ["docker", *args],
                 0,
-                '{"type":"turn.completed","usage":{}}\n',
+                '{"type":"agent_settled"}\n',
                 "",
             )
         raise AssertionError(f"unexpected docker command: {args}")
 
     import apps.web.worker_models as worker_models
-    monkeypatch.setattr(worker_models, "runtime_env_for_engine", fake_runtime_env_for_engine)
     monkeypatch.setattr(worker_models, "_docker", fake_docker)
 
     res = probe_worker_model(
         profile={
-            "id": "codex-seat",
-            "engine": "codex",
-            "transport": "codex_cli",
-            "credential_account": "codex-main",
+            "id": "pi-seat",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_account": "pi-main",
             "runtime": "container",
         },
-        model="gpt-5.4",
+        model="deepseek-v4-flash",
         sessions_root=tmp_path,
         backend="container",
     )
 
     assert res["ok"] is True
     joined = " ".join(str(a) for a in seen["run_args"])
-    assert "MUTEKI_CODEX_HOME_SEED=/run/muteki/accounts/codex-main/codex-home" in joined
-    assert "CODEX_HOME" in joined
-    assert 'cp -R "$MUTEKI_CODEX_HOME_SEED"/. "$CODEX_HOME"/' in joined
+    assert "ANTHROPIC_BASE_URL=https://api.deepseek.example/v1" in joined
+    assert "ANTHROPIC_API_KEY_FILE=/run/muteki/accounts/pi-main/API_KEY" in joined
 
 
 def test_probe_worker_model_container_reports_model_rejection(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
-    root = tmp_path / "_secrets" / "accounts" / "claude-main"
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
-    (root / "CLAUDE_CODE_OAUTH_TOKEN").write_text("oauth-token\n")
+    (root / "API_KEY").write_text("deepseek-secret\n")
 
     def fake_docker(*args, timeout=30):
         if args[:2] == ("image", "inspect"):
@@ -255,7 +237,7 @@ def test_probe_worker_model_container_reports_model_rejection(
                 ["docker", *args],
                 1,
                 "",
-                "unknown model: claude-nope\n",
+                "unknown model: deepseek-v4-nope\n",
             )
         raise AssertionError(f"unexpected docker command: {args}")
 
@@ -264,13 +246,13 @@ def test_probe_worker_model_container_reports_model_rejection(
 
     res = probe_worker_model(
         profile={
-            "id": "claude-seat",
-            "engine": "claude",
-            "transport": "claude_code",
-            "credential_account": "claude-main",
+            "id": "pi-seat",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_account": "pi-main",
             "runtime": "container",
         },
-        model="claude-nope",
+        model="deepseek-v4-nope",
         sessions_root=tmp_path,
         backend="container",
     )
@@ -281,11 +263,11 @@ def test_probe_worker_model_container_reports_model_rejection(
     assert "unknown model" in res["detail"]
 
 
-def test_probe_worker_model_container_claude_endpoint_uses_custom_model(
+def test_probe_worker_model_container_pi_endpoint_uses_custom_model(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
-    root = tmp_path / "_secrets" / "accounts" / "deepseek-main"
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("deepseek-key\n")
     (root / "BASE_URL").write_text("https://api.deepseek.example/anthropic\n")
@@ -296,7 +278,7 @@ def test_probe_worker_model_container_claude_endpoint_uses_custom_model(
             return subprocess.CompletedProcess(["docker", *args], 0, "", "")
         if args and args[0] == "run":
             seen["run_args"] = args
-            return subprocess.CompletedProcess(["docker", *args], 0, '{"result":"OK"}\n', "")
+            return subprocess.CompletedProcess(["docker", *args], 0, '{"type":"agent_settled"}\n', "")
         raise AssertionError(f"unexpected docker command: {args}")
 
     import apps.web.worker_models as worker_models
@@ -304,10 +286,10 @@ def test_probe_worker_model_container_claude_endpoint_uses_custom_model(
 
     res = probe_worker_model(
         profile={
-            "id": "claude-ds",
-            "engine": "claude",
-            "transport": "claude_code",
-            "credential_account": "deepseek-main",
+            "id": "pi-ds",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_account": "pi-main",
             "credential_mode": "api_key",
             "base_url": "https://api.deepseek.example/anthropic",
             "runtime": "container",
@@ -330,26 +312,26 @@ def test_probe_worker_model_still_probes_host_for_local_backend_in_container(
     # probe (operator chose host semantics) must still shell the host CLI even
     # if MUTEKI_IN_CONTAINER happens to be set — the guard must not over-reach.
     monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
-    root = tmp_path / "_secrets" / "accounts" / "claude-main"
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
-    (root / "CLAUDE_CODE_OAUTH_TOKEN").write_text("oauth-token\n")
+    (root / "API_KEY").write_text("deepseek-secret\n")
     ran: dict[str, object] = {}
 
     def fake_run(argv, **kwargs):
         ran["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, '{"result":"OK"}\n', "")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"agent_settled"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     res = probe_worker_model(
         profile={
-            "id": "claude-sub",
-            "engine": "claude",
-            "transport": "claude_code",
-            "credential_account": "claude-main",
+            "id": "pi-sub",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_account": "pi-main",
             "runtime": "local",
         },
-        model="opus",
+        model="deepseek-v4-pro",
         sessions_root=tmp_path,
         backend="local",
     )

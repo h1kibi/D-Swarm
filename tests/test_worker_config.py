@@ -13,6 +13,7 @@ from apps.web.run_manager import RunManager
 from apps.web.drivers import _missing_profile_accounts
 from apps.web.drivers import build_driver
 from apps.web.worker_config import (
+    DEFAULT_CATEGORY_OVERRIDES,
     DEFAULT_ENGINES,
     DEFAULT_RUNTIME_PROFILES,
     DEFAULT_WORKER_PROFILES,
@@ -37,20 +38,23 @@ def test_config_defaults_when_empty(tmp_path):
     assert cfg["cost_budget_usd"] == 0.0
     assert cfg["stage_policy"]["budgets"]["max_total_workers"] == 0
     assert cfg["stage_policy"]["coordinator"]["review"]["enabled"] is True
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "claude-sub-container"
+    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "pi-web"
     assert cfg["stage_policy"]["coordinator"]["review"]["candidate_spike_threshold"] == 5
     assert cfg["llm_profiles"]["planner"]["model"] == "deepseek-v4-pro"
     assert cfg["runtime_profiles"] == DEFAULT_RUNTIME_PROFILES
     assert {r["id"] for r in cfg["runtime_profiles"]} >= {
         "docker-host-target", "docker-offline", "docker-pwn-heavy"}
     assert cfg["worker_profiles"] == DEFAULT_WORKER_PROFILES
-    assert cfg["overrides"] == {}
+    assert cfg["overrides"] == {
+        cat: {"engines": names, "start_workers": len(names)}
+        for cat, names in DEFAULT_CATEGORY_OVERRIDES.items()
+    }
 
 
 def test_config_set_engines_dedupes_and_filters(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    cfg = wc.set(engines=["claude", "bogus", "claude", "codex"])
-    assert cfg["engines"] == ["claude-sub-container", "codex-sub-container"]
+    cfg = wc.set(engines=["pi-web", "bogus", "pi-web", "pi-pwn"])
+    assert cfg["engines"] == ["pi-web", "pi-pwn"]
 
 
 # ── seat lineup tracks enabled toggles (regression) ──────────────────────────
@@ -72,44 +76,44 @@ def test_seat_lineup_reconciles_stale_engines_to_enabled_seats(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     # 3 enabled seats, but a stale lineup naming only one (the exact bug shape).
     wc.set_identity_model(seats=[
-        _seat("seat_claude_x", "claude"),
-        _seat("seat_codex_x", "codex"),
-        _seat("seat_cursor_x", "cursor"),
+        _seat("seat_pi_web_x", "pi"),
+        _seat("seat_pi_pwn_x", "pi"),
+        _seat("seat_pi_rev_x", "pi"),
     ])
     # inject a stale lineup the way a legacy config would carry it, then re-project.
-    wc._data["engines"] = ["cursor"]
+    wc._data["engines"] = ["pi"]
     wc._project_identity_to_legacy()
     engines = wc.get()["engines"]
-    # all three enabled seats race now — not just the stale "cursor".
-    assert set(engines) == {"seat_claude_x", "seat_codex_x", "seat_cursor_x"}
+    # all three enabled seats race now — not just the stale bare-engine "pi".
+    assert set(engines) == {"seat_pi_web_x", "seat_pi_pwn_x", "seat_pi_rev_x"}
 
 
 def test_seat_lineup_drops_disabled_seat(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     wc.set_identity_model(seats=[
-        _seat("seat_claude_x", "claude"),
-        _seat("seat_codex_x", "codex", enabled=False),  # disabled → out of lineup
-        _seat("seat_cursor_x", "cursor"),
+        _seat("seat_pi_web_x", "pi"),
+        _seat("seat_pi_pwn_x", "pi", enabled=False),  # disabled → out of lineup
+        _seat("seat_pi_rev_x", "pi"),
     ])
     engines = wc.get()["engines"]
-    assert set(engines) == {"seat_claude_x", "seat_cursor_x"}
-    assert "seat_codex_x" not in engines
+    assert set(engines) == {"seat_pi_web_x", "seat_pi_rev_x"}
+    assert "seat_pi_pwn_x" not in engines
 
 
 def test_seat_lineup_preserves_prior_order(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     wc.set_identity_model(seats=[
-        _seat("seat_claude_x", "claude"),
-        _seat("seat_codex_x", "codex"),
-        _seat("seat_cursor_x", "cursor"),
+        _seat("seat_pi_web_x", "pi"),
+        _seat("seat_pi_pwn_x", "pi"),
+        _seat("seat_pi_rev_x", "pi"),
     ])
     # an intentional ordering already present in `engines` is kept; newly-enabled
     # seats are appended (not reordered).
-    wc._data["engines"] = ["seat_cursor_x", "seat_claude_x"]
+    wc._data["engines"] = ["seat_pi_rev_x", "seat_pi_web_x"]
     wc._project_identity_to_legacy()
     engines = wc.get()["engines"]
-    assert engines[:2] == ["seat_cursor_x", "seat_claude_x"]
-    assert set(engines) == {"seat_claude_x", "seat_codex_x", "seat_cursor_x"}
+    assert engines[:2] == ["seat_pi_rev_x", "seat_pi_web_x"]
+    assert set(engines) == {"seat_pi_web_x", "seat_pi_pwn_x", "seat_pi_rev_x"}
 
 
 def test_backend_set_local_rejected_in_web_container(tmp_path, monkeypatch):
@@ -119,7 +123,7 @@ def test_backend_set_local_rejected_in_web_container(tmp_path, monkeypatch):
     monkeypatch.setattr(wcmod, "is_web_container", lambda: True)
     wc = WorkerConfigStore(root=tmp_path)
     with pytest.raises(ValueError, match="not allowed when the web control plane"):
-        wc.set(engines=["codex"], worker_backend="local")
+        wc.set(engines=["pi-web"], worker_backend="local")
 
 
 def test_backend_stale_local_coerced_on_read_in_web_container(tmp_path, monkeypatch):
@@ -129,7 +133,7 @@ def test_backend_stale_local_coerced_on_read_in_web_container(tmp_path, monkeypa
     import apps.web.worker_config as wcmod
     monkeypatch.setattr(wcmod, "is_web_container", lambda: False)
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(engines=["codex"], worker_backend="local")
+    wc.set(engines=["pi-web"], worker_backend="local")
     assert wc.get()["worker_backend"] == "local"   # host: preserved
     monkeypatch.setattr(wcmod, "is_web_container", lambda: True)
     assert wc.get()["worker_backend"] == "container"  # container: coerced on read
@@ -140,7 +144,7 @@ def test_backend_local_preserved_on_bare_host(tmp_path, monkeypatch):
     import apps.web.worker_config as wcmod
     monkeypatch.setattr(wcmod, "is_web_container", lambda: False)
     wc = WorkerConfigStore(root=tmp_path)
-    cfg = wc.set(engines=["codex"], worker_backend="local")
+    cfg = wc.set(engines=["pi-web"], worker_backend="local")
     assert cfg["worker_backend"] == "local"
 
 
@@ -164,18 +168,19 @@ def test_config_max_workers_is_derived_from_roster_sum(tmp_path):
     # mutated), and max_workers is computed FROM them — even if the request body
     # carries a stale/explicit max_workers, the derived sum wins.
     wc = WorkerConfigStore(root=tmp_path)
+    caps = {"pi-web": 2, "pi-pwn": 1, "pi-rev": 2}
     cfg = wc.set(
-        engines=["claude", "codex", "cursor"],
+        engines=["pi-web", "pi-pwn", "pi-rev"],
         max_workers=10,  # stale/ignored — overwritten by the derived sum
         worker_profiles=[
-            {**p, "max_running": p["max_running"]}
+            {**p, "max_running": caps.get(p["name"], p["max_running"])}
             for p in DEFAULT_WORKER_PROFILES
         ],
     )
 
     by_name = {p["name"]: p for p in cfg["worker_profiles"]}
     selected = [by_name[name] for name in cfg["engines"]]
-    # Defaults are [2, 1, 2] (claude, codex, cursor) — left untouched.
+    # the operator's typed caps are left untouched.
     assert [p["max_running"] for p in selected] == [2, 1, 2]
     # max_workers tracks the sum, NOT the supplied 10.
     assert cfg["max_workers"] == 5
@@ -189,36 +194,38 @@ def test_config_set_does_not_balloon_sole_eligible_seat(tmp_path):
     # set, and max_workers just equals that seat's capacity.
     wc = WorkerConfigStore(root=tmp_path)
     profiles = [
-        {**p, "max_running": 1 if p["engine"] == "cursor" else p["max_running"]}
+        {**p, "max_running": 1 if p["name"] == "pi-web" else p["max_running"]}
         for p in DEFAULT_WORKER_PROFILES
     ]
     cfg = wc.set(
-        engines=["cursor"],  # stale cursor-only dispatch lineup
+        engines=["pi-web"],  # stale single-profile dispatch lineup
         max_workers=6,
         worker_profiles=profiles,
     )
-    by_engine = {p["engine"]: p for p in cfg["worker_profiles"]}
-    assert by_engine["cursor"]["max_running"] == 1  # NOT bumped to 6
+    by_name = {p["name"]: p for p in cfg["worker_profiles"]}
+    assert by_name["pi-web"]["max_running"] == 1  # NOT bumped to 6
     assert cfg["max_workers"] == 1  # derived = the one eligible seat's cap
 
 
 def test_config_max_workers_tracks_roster_edit_up_and_down(tmp_path):
     # Editing a seat's concurrency moves the derived max_workers BOTH ways.
     wc = WorkerConfigStore(root=tmp_path)
-    base = [{**p, "max_running": p["max_running"]} for p in DEFAULT_WORKER_PROFILES]
-    wc.set(engines=["claude", "codex", "cursor"], worker_profiles=base)
+    caps = {"pi-web": 2, "pi-pwn": 1, "pi-rev": 2}
+    base = [{**p, "max_running": caps.get(p["name"], p["max_running"])}
+            for p in DEFAULT_WORKER_PROFILES]
+    wc.set(engines=["pi-web", "pi-pwn", "pi-rev"], worker_profiles=base)
 
-    # raise cursor 2 → 4: sum 2+1+2=5 becomes 2+1+4=7
-    up = [{**p, "max_running": 4 if p["engine"] == "cursor" else p["max_running"]}
-          for p in DEFAULT_WORKER_PROFILES]
+    # raise pi-rev 2 → 4: sum 2+1+2=5 becomes 2+1+4=7
+    up = [{**p, "max_running": 4 if p["name"] == "pi-rev" else p["max_running"]}
+          for p in base]
     cfg = wc.set(worker_profiles=up)
     assert cfg["max_workers"] == 7
 
-    # lower claude 2 → 1: sum 1+1+4 = 6  (max follows DOWN, not just up)
-    down = [{**p, "max_running": (1 if p["engine"] == "claude"
-                                  else 4 if p["engine"] == "cursor"
+    # lower pi-web 2 → 1: sum 1+1+4 = 6  (max follows DOWN, not just up)
+    down = [{**p, "max_running": (1 if p["name"] == "pi-web"
+                                  else 4 if p["name"] == "pi-rev"
                                   else p["max_running"])}
-            for p in DEFAULT_WORKER_PROFILES]
+            for p in base]
     cfg = wc.set(worker_profiles=down)
     assert cfg["max_workers"] == 6
 
@@ -226,9 +233,11 @@ def test_config_max_workers_tracks_roster_edit_up_and_down(tmp_path):
 def test_config_max_workers_counts_only_dispatched_seats(tmp_path):
     # Only seats in the dispatch lineup (engines) contribute to the derived max.
     wc = WorkerConfigStore(root=tmp_path)
-    profiles = [{**p, "max_running": p["max_running"]} for p in DEFAULT_WORKER_PROFILES]
-    # dispatch only claude(2) + codex(1); cursor(2) excluded → sum = 3
-    cfg = wc.set(engines=["claude", "codex"], worker_profiles=profiles)
+    caps = {"pi-web": 2, "pi-pwn": 1}
+    profiles = [{**p, "max_running": caps.get(p["name"], p["max_running"])}
+                for p in DEFAULT_WORKER_PROFILES]
+    # dispatch only pi-web(2) + pi-pwn(1); the other five excluded → sum = 3
+    cfg = wc.set(engines=["pi-web", "pi-pwn"], worker_profiles=profiles)
     assert cfg["max_workers"] == 3
 
 
@@ -242,13 +251,13 @@ def test_config_dedicated_review_seat_does_not_inflate_max_workers(tmp_path):
     # guards against folding review capacity into the ordinary ceiling.
     wc = WorkerConfigStore(root=tmp_path)
     ordinary = [
-        {**p, "max_running": 2} for p in DEFAULT_WORKER_PROFILES if p["engine"] == "claude"
+        {**p, "max_running": 2} for p in DEFAULT_WORKER_PROFILES if p["name"] == "pi-web"
     ]
     review_seat = {
         "id": "review-only",
         "name": "review-only",
-        "engine": "claude",
-        "transport": "claude_code",
+        "engine": "pi",
+        "transport": "pi_cli",
         "runtime": "local",
         "roles": ["review"],          # review-ONLY, no ordinary role
         "max_running": 9,             # would balloon max_workers IF wrongly counted
@@ -256,10 +265,10 @@ def test_config_dedicated_review_seat_does_not_inflate_max_workers(tmp_path):
         "enabled": True,
     }
     cfg = wc.set(
-        engines=["claude"],            # only the ordinary claude seat is dispatched
+        engines=["pi-web"],            # only the ordinary pi-web seat is dispatched
         worker_profiles=ordinary + [review_seat],
     )
-    # Derived ceiling = the ordinary claude seat's max_running (2) ONLY. The
+    # Derived ceiling = the ordinary pi-web seat's max_running (2) ONLY. The
     # review-only seat's max_running (9) is excluded — NOT 2+9=11.
     assert cfg["max_workers"] == 2
     saved_review = next(p for p in cfg["worker_profiles"] if p["name"] == "review-only")
@@ -280,11 +289,11 @@ def test_config_set_clamps_start_workers_to_max_workers(tmp_path):
 
 
 def test_config_persists_across_reload(tmp_path):
-    WorkerConfigStore(root=tmp_path).set(engines=["claude"], start_workers=1,
+    WorkerConfigStore(root=tmp_path).set(engines=["pi-web"], start_workers=1,
                                          max_workers=4, worker_backend="container",
                                          race_scout=False, race_timeout=300,
                                          wall_clock_budget=1800,
-                                         race_engines=["claude"],
+                                         race_engines=["pi-web"],
                                          max_total_workers=11,
                                          cost_budget_usd=1.25,
                                          stage_policy={
@@ -292,7 +301,7 @@ def test_config_persists_across_reload(tmp_path):
                                                  "wall_clock_budget": 1800,
                                                  "review": {
                                                      "enabled": True,
-                                                     "engine": "codex-sub-container",
+                                                     "engine": "pi-pwn",
                                                      "timeout": 333,
                                                      "after_fruitless_workers": 2,
                                                      "candidate_spike_threshold": 4,
@@ -304,19 +313,19 @@ def test_config_persists_across_reload(tmp_path):
                                              "titler": {"provider": "deepseek", "model": "titler-x"},
                                          })
     cfg = WorkerConfigStore(root=tmp_path).get()  # fresh load from disk
-    assert cfg["engines"] == ["claude-sub-container"]
+    assert cfg["engines"] == ["pi-web"]
     # max_workers is derived (Σ dispatched seats' max_running); dispatching the
-    # single claude seat (default max_running=2) yields 2, NOT the supplied 4.
-    assert cfg["start_workers"] == 1 and cfg["max_workers"] == 2
+    # single pi-web seat (default max_running=1) yields 1, NOT the supplied 4.
+    assert cfg["start_workers"] == 1 and cfg["max_workers"] == 1
     assert cfg["worker_backend"] == "container"
     assert cfg["race_scout"] is False
     assert cfg["race_timeout"] == 300
     assert cfg["wall_clock_budget"] == 1800
-    assert cfg["race_engines"] == ["claude-sub-container"]
+    assert cfg["race_engines"] == ["pi-web"]
     assert cfg["max_total_workers"] == 11
     assert cfg["cost_budget_usd"] == 1.25
-    assert cfg["stage_policy"]["race"]["engines"] == ["claude-sub-container"]
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "codex-sub-container"
+    assert cfg["stage_policy"]["race"]["engines"] == ["pi-web"]
+    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "pi-pwn"
     assert cfg["stage_policy"]["coordinator"]["review"]["timeout"] == 333
     assert cfg["stage_policy"]["coordinator"]["review"]["after_fruitless_workers"] == 2
     assert cfg["stage_policy"]["coordinator"]["review"]["candidate_spike_threshold"] == 4
@@ -327,10 +336,10 @@ def test_config_persists_across_reload(tmp_path):
 
 def test_resolve_uses_default_without_override(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(engines=["cursor", "claude", "codex"], start_workers=3,
+    wc.set(engines=["pi-web", "pi-pwn", "pi-rev"], start_workers=3,
            worker_backend="container", race_timeout=240)
-    r = wc.resolve("web")
-    assert r["engines"] == ["cursor-api-container", "claude-sub-container", "codex-sub-container"]
+    r = wc.resolve("unsorted")  # a category with no default direction override
+    assert r["engines"] == ["pi-web", "pi-pwn", "pi-rev"]
     assert r["start_workers"] == 3
     assert r["worker_backend"] == "container"
     assert r["race_timeout"] == 240
@@ -340,19 +349,18 @@ def test_resolve_uses_default_without_override(tmp_path):
 
 def test_resolve_applies_category_override(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(engines=["cursor", "claude", "codex"],
-           overrides={"pwn": {"engines": ["claude", "codex"], "start_workers": 2}})
+    wc.set(engines=["pi-web", "pi-pwn", "pi-rev"],
+           overrides={"pwn": {"engines": ["pi-pwn"], "start_workers": 2}})
     r = wc.resolve("pwn")
-    assert r["engines"] == ["claude-sub-container", "codex-sub-container"]
+    assert r["engines"] == ["pi-pwn"]
     assert r["start_workers"] == 2
     # a category with no override still gets the defaults
-    assert wc.resolve("web")["engines"] == [
-        "cursor-api-container", "claude-sub-container", "codex-sub-container"]
+    assert wc.resolve("web")["engines"] == ["pi-web", "pi-pwn", "pi-rev"]
 
 
 def test_resolve_override_start_workers_defaults_to_engine_count(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(overrides={"crypto": {"engines": ["claude"]}})  # no start_workers
+    wc.set(overrides={"crypto": {"engines": ["pi-crypto"]}})  # no start_workers
     assert wc.resolve("crypto")["start_workers"] == 1
 
 
@@ -362,7 +370,7 @@ def test_post_worker_cmd_requires_live_run(tmp_path):
     mgr = RunManager(sessions_root=tmp_path)
     run = mgr.create("run-x")
     # no live task → rejected (a finished/ghost run has no coordinator to act)
-    assert asyncio.run(mgr.post_worker_cmd("run-x", "spawn", engine="claude")) is False
+    assert asyncio.run(mgr.post_worker_cmd("run-x", "spawn", engine="pi-web")) is False
 
 
 def test_post_worker_cmd_enqueues_for_live_run(tmp_path):
@@ -371,21 +379,21 @@ def test_post_worker_cmd_enqueues_for_live_run(tmp_path):
 
     async def go():
         run.task = asyncio.create_task(asyncio.sleep(3600))
-        ok_spawn = await mgr.post_worker_cmd("run-y", "spawn", engine="cursor")
-        ok_kill = await mgr.post_worker_cmd("run-y", "kill", solver_id="cli-cursor")
+        ok_spawn = await mgr.post_worker_cmd("run-y", "spawn", engine="pi-web")
+        ok_kill = await mgr.post_worker_cmd("run-y", "kill", solver_id="cli-pi-web")
         run.task.cancel()
         return ok_spawn, ok_kill, [run.worker_cmds.get_nowait(),
                                    run.worker_cmds.get_nowait()]
 
     ok_spawn, ok_kill, cmds = asyncio.run(go())
     assert ok_spawn is True and ok_kill is True
-    assert cmds[0] == {"action": "spawn", "engine": "cursor"}
-    assert cmds[1] == {"action": "kill", "solver_id": "cli-cursor"}
+    assert cmds[0] == {"action": "spawn", "engine": "pi-web"}
+    assert cmds[1] == {"action": "kill", "solver_id": "cli-pi-web"}
 
 
 def test_post_worker_cmd_unknown_run_returns_false(tmp_path):
     mgr = RunManager(sessions_root=tmp_path)
-    assert asyncio.run(mgr.post_worker_cmd("ghost", "spawn", engine="claude")) is False
+    assert asyncio.run(mgr.post_worker_cmd("ghost", "spawn", engine="pi-web")) is False
 
 
 def test_config_rejects_invalid_backend_and_profiles(tmp_path):
@@ -403,30 +411,30 @@ def test_config_accepts_profile_schema(tmp_path):
     cfg = wc.set(
         runtime_profiles=[{"id": "docker-web", "backend": "container", "label": "Docker Web"}],
         worker_profiles=[{
-            "id": "claude-api-container",
-            "engine": "claude",
-            "transport": "claude_code",
+            "id": "pi-web-custom",
+            "engine": "pi",
+            "transport": "pi_cli",
             "auth": "oauth_token",
-            "credential_account": "claude-team",
+            "credential_account": "pi-team",
             "runtime": "docker-web",
             "roles": ["bootstrap", "explore"],
             "race": False,
             "max_running": 3,
             "priority": 7,
-            "model": "sonnet",
+            "model": "deepseek-v4-flash",
             "enabled": True,
         }],
     )
     assert cfg["runtime_profiles"][0]["backend"] == "container"
     p = cfg["worker_profiles"][0]
-    assert p["credential_account"] == "claude-team"
-    assert p["name"] == "claude-api-container"
+    assert p["credential_account"] == "pi-team"
+    assert p["name"] == "pi-web-custom"
     assert p["credential_mode"] == "oauth_token"
     assert p["roles"] == ["bootstrap", "explore", "review"]
     assert p["race"] is False
     assert p["max_running"] == 3
     assert p["priority"] == 7
-    assert p["model"] == "sonnet"
+    assert p["model"] == "deepseek-v4-flash"
 
 
 def test_worker_profiles_accept_review_role_and_default_roles_include_review(tmp_path):
@@ -434,23 +442,23 @@ def test_worker_profiles_accept_review_role_and_default_roles_include_review(tmp
     cfg = wc.set(
         runtime_profiles=[{"id": "local", "backend": "local", "label": "Local"}],
         worker_profiles=[{
-            "id": "review-codex",
-            "engine": "codex",
+            "id": "review-pi",
+            "engine": "pi",
             "runtime": "local",
             "roles": ["review"],
             "enabled": True,
         }],
-        engines=["review-codex"],
-        stage_policy={"coordinator": {"review": {"engine": "review-codex"}}},
+        engines=["review-pi"],
+        stage_policy={"coordinator": {"review": {"engine": "review-pi"}}},
     )
     assert cfg["worker_profiles"][0]["roles"] == ["review"]
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "review-codex"
+    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "review-pi"
 
     cfg2 = WorkerConfigStore(root=tmp_path / "other").set(
         runtime_profiles=[{"id": "local", "backend": "local", "label": "Local"}],
         worker_profiles=[{
             "id": "default-roles",
-            "engine": "claude",
+            "engine": "pi",
             "runtime": "local",
             "enabled": True,
         }],
@@ -462,11 +470,11 @@ def test_worker_profiles_accept_review_role_and_default_roles_include_review(tmp
 def test_worker_profile_migrates_execution_roles_to_review(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     cfg = wc.set(
-        engines=["legacy-claude"],
+        engines=["legacy-pi"],
         worker_profiles=[{
-            "id": "legacy-claude",
-            "engine": "claude",
-            "transport": "claude_code",
+            "id": "legacy-pi",
+            "engine": "pi",
+            "transport": "pi_cli",
             "runtime": "local",
             "roles": ["race", "bootstrap", "explore"],
         }],
@@ -481,16 +489,16 @@ def test_config_preserves_blank_credential_account_for_local_subscription_cli(tm
     cfg = wc.set(
         runtime_profiles=[{"id": "local", "backend": "local", "label": "Local"}],
         worker_profiles=[{
-            "id": "codex-local",
-            "engine": "codex",
-            "transport": "codex_cli",
+            "id": "pi-local",
+            "engine": "pi",
+            "transport": "pi_cli",
             "auth": "subscription",
             "credential_account": "",
             "runtime": "local",
             "roles": ["race", "bootstrap", "explore"],
             "enabled": True,
         }],
-        engines=["codex-local"],
+        engines=["pi-local"],
     )
 
     assert cfg["worker_profiles"][0]["credential_account"] == ""
@@ -500,12 +508,12 @@ def test_config_rejects_duplicate_profile_ids_and_unknown_runtime(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     with pytest.raises(ValueError):
         wc.set(worker_profiles=[
-            {"id": "dup", "engine": "claude", "runtime": "local"},
-            {"id": "dup", "engine": "codex", "runtime": "local"},
+            {"id": "dup", "engine": "pi", "runtime": "local"},
+            {"id": "dup", "engine": "pi", "runtime": "local"},
         ])
     with pytest.raises(ValueError):
         wc.set(worker_profiles=[
-            {"id": "bad-runtime", "engine": "claude", "runtime": "missing"},
+            {"id": "bad-runtime", "engine": "pi", "runtime": "missing"},
         ])
 
 
@@ -517,12 +525,12 @@ def test_missing_profile_accounts_detects_container_and_api_profiles(tmp_path, m
     )
     missing = _missing_profile_accounts(
         worker_profiles=[
-            {"id": "claude-sub", "engine": "claude", "runtime": "docker-web",
-             "auth": "subscription", "credential_account": "claude-main", "enabled": True},
-            {"id": "local-sub", "engine": "claude", "runtime": "local",
+            {"id": "pi-web-sub", "engine": "pi", "runtime": "docker-web",
+             "auth": "subscription", "credential_account": "pi-main", "enabled": True},
+            {"id": "local-sub", "engine": "pi", "runtime": "local",
              "auth": "subscription", "credential_account": "unused", "enabled": True},
-            {"id": "deepseek", "engine": "codex", "runtime": "local",
-             "auth": "api_key", "credential_account": "deepseek-main", "enabled": True},
+            {"id": "pi-api", "engine": "pi", "runtime": "local",
+             "auth": "api_key", "credential_account": "pi-api-main", "enabled": True},
         ],
         runtime_profiles=[
             {"id": "local", "backend": "local"},
@@ -530,8 +538,8 @@ def test_missing_profile_accounts_detects_container_and_api_profiles(tmp_path, m
         ],
         sessions_root=tmp_path,
     )
-    assert "claude-sub:claude-main" in missing
-    assert "deepseek:deepseek-main" in missing
+    assert "pi-web-sub:pi-main" in missing
+    assert "pi-api:pi-api-main" in missing
     assert all("local-sub" not in x for x in missing)
 
 
@@ -544,11 +552,11 @@ def test_missing_profile_accounts_allows_local_system_login_without_account(tmp_
 
     missing = _missing_profile_accounts(
         worker_profiles=[{
-            "id": "cursor-api-local",
-            "engine": "cursor",
+            "id": "pi-api-local",
+            "engine": "pi",
             "runtime": "local",
             "auth": "api_key",
-            "credential_account": "cursor-main",
+            "credential_account": "pi-main",
             "enabled": True,
         }],
         runtime_profiles=[{"id": "local", "backend": "local"}],
@@ -563,85 +571,82 @@ def test_worker_config_accepts_api_endpoint_profile_names(tmp_path):
     cfg = wc.set(
         runtime_profiles=[{"id": "local", "backend": "local"}],
         worker_profiles=[{
-            "id": "deepseek-codex",
-            "name": "deepseek-codex",
-            "engine": "codex",
-            "transport": "codex_cli",
+            "id": "pi-endpoint",
+            "name": "pi-endpoint",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_mode": "api",
-            "credential_account": "deepseek-main",
+            "credential_account": "pi-main",
             "base_url": "https://api.deepseek.example/v1",
             "api_key_ref": "env:MUTEKI_DEEPSEEK_API_KEY",
-            "wire_api": "responses",
             "runtime": "local",
             "model": "deepseek-chat",
         }],
-        engines=["deepseek-codex"],
+        engines=["pi-endpoint"],
     )
 
     # legacy foreign keys stay readable; the new model is attached additively.
-    assert cfg["engines"] == ["deepseek-codex"]
+    assert cfg["engines"] == ["pi-endpoint"]
     p = cfg["worker_profiles"][0]
-    assert p["engine"] == "codex"
+    assert p["engine"] == "pi"
     assert p["base_url"] == "https://api.deepseek.example/v1"
     assert p["api_key_ref"] == "env:MUTEKI_DEEPSEEK_API_KEY"
     # the endpoint is also captured in the new Credential/Seat model (additive)
-    seat = next(s for s in cfg["seats"] if s["engine"] == "codex")
-    assert seat["label"] == "deepseek-codex"
+    seat = next(s for s in cfg["seats"] if s["engine"] == "pi")
+    assert seat["label"] == "pi-endpoint"
     cred = next(c for c in cfg["credentials"] if c["id"] == seat["credential_id"])
     assert cred["kind"] == "custom_endpoint"
     assert cred["endpoint"]["base_url"] == "https://api.deepseek.example/v1"
 
 
-def test_account_base_url_hydrates_codex_profile_for_dispatch(tmp_path, monkeypatch):
+def test_account_base_url_hydrates_pi_profile_for_dispatch(tmp_path, monkeypatch):
     """Regression: the settings account form stores BASE_URL in the account store,
-    but Codex dispatch switches away from OpenAI only when profile.base_url is
+    but dispatch switches to the custom endpoint only when profile.base_url is
     present. Reading worker config must bridge the two."""
     from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
     from muteki.solver.cli_driver import driver_for
 
-    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
+    monkeypatch.setenv("MUTEKI_PI_BIN", "/usr/bin/pi")
     CredentialAccountStore(account_store_root(tmp_path)).upsert_secret(
-        account_id="codex-main",
+        account_id="pi-main",
         engine="api",
         secret="deepseek-secret",
         base_url="https://api.deepseek.example/v1",
-        target_engine="codex",
+        target_engine="pi",
     )
 
     cfg = WorkerConfigStore(root=tmp_path).get()
-    profile = next(p for p in cfg["worker_profiles"] if p["engine"] == "codex")
+    profile = next(p for p in cfg["worker_profiles"] if p["engine"] == "pi")
 
-    assert profile["credential_account"] == "codex-main"
+    assert profile["credential_account"] == "pi-main"
     assert profile["credential_mode"] == "api_key"
     assert profile["base_url"] == "https://api.deepseek.example/v1"
-    assert profile["wire_api"] == "responses"
 
     argv = driver_for(profile).build_execute("PROMPT", None, web_access=False)
-    exec_idx = argv.index("exec")
-    assert "model_provider=muteki" in argv[:exec_idx]
-    assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in argv[:exec_idx]
+    assert argv[0] == "/usr/bin/pi"  # endpoint wrapper keeps the pi CLI argv
+    assert "--mode" in argv
 
 
-def test_account_base_url_hydrates_empty_binding_new_schema_codex_profile(tmp_path):
+def test_account_base_url_hydrates_empty_binding_new_schema_pi_profile(tmp_path):
     """A saved seat can still be host-inherit/empty from the identity migration.
-    If the operator later registers codex-main as a custom endpoint, dispatch
-    should use that default endpoint instead of silently inheriting OpenAI."""
+    If the operator later registers pi-main as a custom endpoint, dispatch
+    should use that default endpoint instead of silently inheriting a provider."""
     from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
     from muteki.solver.identity_model import credential_id_for
 
     CredentialAccountStore(account_store_root(tmp_path)).upsert_secret(
-        account_id="codex-main",
+        account_id="pi-main",
         engine="api",
         secret="deepseek-secret",
         base_url="https://api.deepseek.example/v1",
-        target_engine="codex",
+        target_engine="pi",
     )
-    cred_id = credential_id_for("codex", legacy_account_id="codex-main")
+    cred_id = credential_id_for("pi", legacy_account_id="pi-main")
     WorkerConfigStore(root=tmp_path).set_identity_model(
         seats=[{
-            "id": "seat_codex_default",
-            "label": "codex-local",
-            "engine": "codex",
+            "id": "seat_pi_default",
+            "label": "pi-local",
+            "engine": "pi",
             "credential_id": cred_id,
             "environment_id": "local",
             "model": "deepseek-chat",
@@ -650,8 +655,8 @@ def test_account_base_url_hydrates_empty_binding_new_schema_codex_profile(tmp_pa
         }],
         credentials=[{
             "id": cred_id,
-            "label": "codex system CLI",
-            "engine": "codex",
+            "label": "pi system CLI",
+            "engine": "pi",
             "kind": "system_inherit",
             "secret_ref": "",
         }],
@@ -661,13 +666,13 @@ def test_account_base_url_hydrates_empty_binding_new_schema_codex_profile(tmp_pa
     cfg = WorkerConfigStore(root=tmp_path).get()
     profile = cfg["worker_profiles"][0]
 
-    assert profile["credential_account"] == "codex-main"
+    assert profile["credential_account"] == "pi-main"
     assert profile["base_url"] == "https://api.deepseek.example/v1"
     assert profile["credential_mode"] == "api_key"
 
 
 def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
-    root = tmp_path / "_secrets" / "accounts" / "deepseek-main"
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("secret\n")
 
@@ -683,14 +688,15 @@ def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "custom")
     missing = _missing_profile_accounts(
         worker_profiles=[{
-            "id": "deepseek-codex",
-            "name": "deepseek-codex",
-            "engine": "codex",
-            "transport": "codex_cli",
+            "id": "pi-endpoint",
+            "name": "pi-endpoint",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_mode": "api",
-            "credential_account": "deepseek-main",
+            "credential_account": "pi-main",
             "base_url": "https://api.deepseek.example/v1",
             "api_key_ref": "env:MUTEKI_DEEPSEEK_API_KEY",
             "runtime": "local",
@@ -701,17 +707,16 @@ def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
     )
 
     assert missing == []
-    exec_idx = seen["argv"].index("exec")
-    assert "model_provider=muteki" in seen["argv"][:exec_idx]
-    assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in seen["argv"][:exec_idx]
-    assert "model_providers.muteki.wire_api=responses" in seen["argv"][:exec_idx]
+    # the endpoint probe is a direct curl to the configured base_url
+    assert seen["argv"][0] == "curl"
+    assert "https://api.deepseek.example/v1" in seen["argv"]
     assert seen["env"]["OPENAI_API_KEY"] == "secret"
 
 
 def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path, monkeypatch):
-    root = tmp_path / "_secrets" / "accounts" / "claude-main"
+    root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
-    (root / "CLAUDE_CODE_OAUTH_TOKEN").write_text("oauth-token\n")
+    (root / "API_KEY").write_text("deepseek-secret\n")
 
     seen = {}
 
@@ -720,18 +725,19 @@ def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path
         # the probe now passes the credential env EXPLICITLY to the subprocess
         # (env=) instead of mutating the global os.environ — that's what makes
         # parallel probes safe. Read it from the passed env, not os.environ.
-        seen["token"] = (kwargs.get("env") or {}).get("CLAUDE_CODE_OAUTH_TOKEN")
-        return subprocess.CompletedProcess(argv, 0, '{"result":"OK"}\n', "")
+        seen["key"] = (kwargs.get("env") or {}).get("DEEPSEEK_API_KEY")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"agent_settled"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
     missing = _missing_profile_accounts(
         worker_profiles=[{
-            "id": "claude-sub",
-            "name": "claude-sub",
-            "engine": "claude",
-            "transport": "claude_code",
+            "id": "pi-sub",
+            "name": "pi-sub",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_mode": "subscription",
-            "credential_account": "claude-main",
+            "credential_account": "pi-main",
             "runtime": "docker-web",
             "enabled": True,
         }],
@@ -740,7 +746,7 @@ def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path
     )
 
     assert missing == []
-    assert seen["token"] == "oauth-token"
+    assert seen["key"] == "deepseek-secret"
     assert any("Reply with exactly: OK" in str(x) for x in seen["argv"])
 
 
@@ -749,14 +755,14 @@ def test_offline_rejects_custom_endpoint_profiles(tmp_path):
     driver = build_driver({
         "prompt": "solve http://example.test",
         "offline": True,
-        "engines": ["deepseek-codex"],
+        "engines": ["pi-endpoint"],
         "worker_profiles": [{
-            "id": "deepseek-codex",
-            "name": "deepseek-codex",
-            "engine": "codex",
-            "transport": "codex_cli",
+            "id": "pi-endpoint",
+            "name": "pi-endpoint",
+            "engine": "pi",
+            "transport": "pi_cli",
             "credential_mode": "api",
-            "credential_account": "deepseek-main",
+            "credential_account": "pi-main",
             "base_url": "https://api.deepseek.example/v1",
             "api_key_ref": "env:MUTEKI_DEEPSEEK_API_KEY",
             "runtime": "local",
@@ -808,71 +814,71 @@ def test_set_runtime_environment_unifies_all_enabled_profiles(tmp_path):
     # runtimes so we can prove both get rewritten.
     store.set(
         worker_profiles=[
-            {"id": "claude-sub", "name": "claude-sub", "engine": "claude",
-             "transport": "claude_code", "credential_mode": "subscription",
-             "credential_account": "claude-main", "runtime": "docker-web",
+            {"id": "pi-web-sub", "name": "pi-web-sub", "engine": "pi",
+             "transport": "pi_cli", "credential_mode": "subscription",
+             "credential_account": "pi-main", "runtime": "docker-web",
              "enabled": True},
-            {"id": "codex-override", "name": "codex-override", "engine": "codex",
-             "transport": "codex_cli", "credential_mode": "subscription",
-             "credential_account": "codex-main", "runtime": "docker-pwn-heavy",
+            {"id": "pi-pwn-override", "name": "pi-pwn-override", "engine": "pi",
+             "transport": "pi_cli", "credential_mode": "subscription",
+             "credential_account": "pi-main", "runtime": "docker-pwn-heavy",
              "enabled": True},
         ],
-        engines=["claude-sub"],  # only claude-sub is a DEFAULT engine
+        engines=["pi-web-sub"],  # only pi-web-sub is a DEFAULT engine
     )
-    store.set(overrides={"pwn": {"engines": ["codex-override"]}})
+    store.set(overrides={"pwn": {"engines": ["pi-pwn-override"]}})
 
     # flip the whole run to local
     cfg = store.set_runtime_environment(backend="local", runtime_id="local")
     assert cfg["worker_backend"] == "local"
     runtimes = {p["id"]: p["runtime"] for p in cfg["worker_profiles"]}
     # BOTH the default engine AND the override-only profile got rewritten
-    assert runtimes["claude-sub"] == "local"
-    assert runtimes["codex-override"] == "local"
+    assert runtimes["pi-web-sub"] == "local"
+    assert runtimes["pi-pwn-override"] == "local"
 
     # flip to a container recipe
     cfg = store.set_runtime_environment(backend="container", runtime_id="docker-offline")
     assert cfg["worker_backend"] == "container"
     runtimes = {p["id"]: p["runtime"] for p in cfg["worker_profiles"]}
-    assert runtimes["claude-sub"] == "docker-offline"
-    assert runtimes["codex-override"] == "docker-offline"
+    assert runtimes["pi-web-sub"] == "docker-offline"
+    assert runtimes["pi-pwn-override"] == "docker-offline"
 
 
-def test_set_runtime_environment_renames_builtin_profiles_for_backend(tmp_path):
+def test_set_runtime_environment_keeps_direction_profile_names(tmp_path):
+    # Pi-only roster: the seven direction profile NAMES are the ids — flipping
+    # the backend rewrites each profile's runtime, never the name.
     store = WorkerConfigStore(root=tmp_path)
 
     local = store.set_runtime_environment(backend="local", runtime_id="local")
     local_ids = [p["id"] for p in local["worker_profiles"]]
-    assert local_ids == ["claude-local", "codex-local", "cursor-api-local", "pi-api-local"]
+    assert local_ids == DEFAULT_ENGINES
     assert local["engines"] == local_ids
-    assert local["stage_policy"]["coordinator"]["review"]["engine"] == "claude-local"
+    assert local["stage_policy"]["coordinator"]["review"]["engine"] == "pi-web"
     assert all(p["runtime"] == "local" for p in local["worker_profiles"])
-    assert all(not p["id"].endswith("-container") for p in local["worker_profiles"])
 
     container = store.set_runtime_environment(backend="container", runtime_id="docker-web")
     container_ids = [p["id"] for p in container["worker_profiles"]]
-    assert container_ids == [
-        "claude-sub-container",
-        "codex-sub-container",
-        "cursor-api-container",
-        "pi-api-container",
-    ]
+    assert container_ids == DEFAULT_ENGINES
     assert container["engines"] == container_ids
-    assert container["stage_policy"]["coordinator"]["review"]["engine"] == "claude-sub-container"
+    assert container["stage_policy"]["coordinator"]["review"]["engine"] == "pi-web"
     assert all(p["runtime"] == "docker-web" for p in container["worker_profiles"])
 
 
-def test_get_remaps_stale_builtin_refs_to_current_backend(tmp_path):
+def test_get_drops_stale_refs_and_falls_back_to_enabled_seats(tmp_path):
+    # A legacy-shaped config whose refs don't match any current profile name must
+    # degrade safely: the engines lineup falls back to the enabled seats, stale
+    # race refs are dropped, and an unknown review engine falls back to a
+    # review-capable profile — never a crash.
     raw = {
         "worker_backend": "local",
-        "engines": ["claude-sub-container", "codex-sub-container"],
-        "race_engines": ["claude-sub-container"],
+        "engines": ["pi-web-container", "pi-pwn-container"],
+        "race_engines": ["pi-web-container"],
         "stage_policy": {
-            "race": {"enabled": True, "timeout": 720, "engines": ["codex-sub-container"]},
-            "coordinator": {"review": {"enabled": True, "engine": "claude-sub-container"}},
+            "race": {"enabled": True, "timeout": 720, "engines": ["pi-pwn-container"]},
+            "coordinator": {"review": {"enabled": True, "engine": "pi-web-container"}},
         },
         "worker_profiles": [
-            {**DEFAULT_WORKER_PROFILES[0], "id": "claude-local", "name": "claude-local", "runtime": "local"},
-            {**DEFAULT_WORKER_PROFILES[1], "id": "codex-local", "name": "codex-local", "runtime": "local"},
+            {**DEFAULT_WORKER_PROFILES[0], "id": "pi-web", "name": "pi-web", "runtime": "local"},
+            {**DEFAULT_WORKER_PROFILES[1], "id": "pi-pwn", "name": "pi-pwn", "runtime": "local"},
         ],
     }
     root = tmp_path / "_worker_config.json"
@@ -880,28 +886,23 @@ def test_get_remaps_stale_builtin_refs_to_current_backend(tmp_path):
 
     cfg = WorkerConfigStore(root=tmp_path).get()
 
-    assert cfg["engines"] == ["claude-local", "codex-local"]
-    assert cfg["race_engines"] == ["claude-local"]
-    assert cfg["stage_policy"]["race"]["engines"] == ["codex-local"]
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "claude-local"
+    assert cfg["engines"] == ["pi-web", "pi-pwn"]
+    assert cfg["race_engines"] == []
+    assert cfg["stage_policy"]["race"]["engines"] == ["pi-pwn-container"]
+    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "pi-web"
 
 
-def test_set_remaps_stale_builtin_refs_to_submitted_backend_profiles(tmp_path):
+def test_set_rejects_stale_unknown_profile_refs(tmp_path):
+    # A set() whose engines name no current profile must fail loudly (ValueError),
+    # not silently persist an empty lineup.
     store = WorkerConfigStore(root=tmp_path)
     local = store.set_runtime_environment(backend="local", runtime_id="local")
 
-    cfg = store.set(
-        engines=["claude-sub-container", "codex-sub-container", "cursor-api-container"],
-        worker_profiles=local["worker_profiles"],
-        stage_policy={
-            "race": {"enabled": True, "timeout": 720, "engines": ["codex-sub-container"]},
-            "coordinator": {"review": {"enabled": True, "engine": "claude-sub-container"}},
-        },
-    )
-
-    assert cfg["engines"] == ["claude-local", "codex-local", "cursor-api-local"]
-    assert cfg["stage_policy"]["race"]["engines"] == ["codex-local"]
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "claude-local"
+    with pytest.raises(ValueError, match="at least one enabled worker profile"):
+        store.set(
+            engines=["pi-web-container", "pi-pwn-container"],
+            worker_profiles=local["worker_profiles"],
+        )
 
 
 def test_set_runtime_environment_rejects_backend_runtime_mismatch(tmp_path):

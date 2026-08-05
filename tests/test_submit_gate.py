@@ -44,10 +44,10 @@ def _solver(bus: EventBus, *, rate_limited: bool, insight: InsightBus | None = N
     return CliSolver(
         spec=None,
         challenge=_challenge(rate_limited=rate_limited),
-        engine="claude",
+        engine="pi",
         bus=bus,
         run_id="run-test-gate",
-        solver_label="cli-claude-gate",
+        solver_label="cli-pi-gate",
         insight=insight,
     )
 
@@ -88,7 +88,7 @@ def test_parse_lockout_seconds(text, expected):
 async def test_worker_broadcasts_verifier_locked_on_cooldown():
     bus = EventBus()
     insight = InsightBus("run-test-gate")
-    other = insight.subscribe("cli-codex-sibling")  # a sibling inbox to receive it
+    other = insight.subscribe("cli-pi-sibling")  # a sibling inbox to receive it
     sv = _solver(bus, rate_limited=True, insight=insight)
 
     await sv._stream_markers(
@@ -130,7 +130,7 @@ async def test_reading_problem_doc_does_not_broadcast_phantom_lockout():
     verifier. Reading a doc that DESCRIBES the lockout must NOT trigger a backoff."""
     bus = EventBus()
     insight = InsightBus("run-test-gate")
-    other = insight.subscribe("cli-codex-sibling")
+    other = insight.subscribe("cli-pi-sibling")
     sv = _solver(bus, rate_limited=True, insight=insight)
 
     # the exact false-trigger surface: the CLI's file-read step over our problem doc
@@ -148,7 +148,7 @@ async def test_real_verifier_verdict_still_broadcasts():
     (with its characteristic phrasing) still records the deadline + broadcasts."""
     bus = EventBus()
     insight = InsightBus("run-test-gate")
-    other = insight.subscribe("cli-codex-sibling")
+    other = insight.subscribe("cli-pi-sibling")
     sv = _solver(bus, rate_limited=True, insight=insight)
 
     await sv._stream_markers(
@@ -165,7 +165,7 @@ async def test_real_verifier_verdict_still_broadcasts():
 async def test_worker_does_not_rebroadcast_same_lockout():
     bus = EventBus()
     insight = InsightBus("run-test-gate")
-    other = insight.subscribe("cli-codex-sibling")
+    other = insight.subscribe("cli-pi-sibling")
     sv = _solver(bus, rate_limited=True, insight=insight)
 
     v = "$ /opt/verify-people-recon.sh\nburn-lockout: locked for 30 minutes"
@@ -188,12 +188,12 @@ async def test_submit_locked_signal_holds_then_self_clears():
     sv = _solver(bus, rate_limited=True, insight=insight)
     sv._insight_inbox = insight.subscribe(sv.solver_id)
 
-    _put(sv, Insight(InsightKind.SUBMIT_LOCKED, "cli-codex-other", ""))
+    _put(sv, Insight(InsightKind.SUBMIT_LOCKED, "cli-pi-other", ""))
     sv._drain_control()
     assert sv._submit_blocked_now()
 
     # an explicit UNLOCK re-opens immediately
-    _put(sv, Insight(InsightKind.SUBMIT_UNLOCKED, "cli-codex-other", "rejected: over-claim"))
+    _put(sv, Insight(InsightKind.SUBMIT_UNLOCKED, "cli-pi-other", "rejected: over-claim"))
     sv._drain_control()
     assert not sv._submit_blocked_now()
 
@@ -205,7 +205,7 @@ async def test_verifier_locked_signal_sets_hard_deadline():
     sv = _solver(bus, rate_limited=True, insight=insight)
     sv._insight_inbox = insight.subscribe(sv.solver_id)
 
-    _put(sv, Insight(InsightKind.VERIFIER_LOCKED, "cli-codex-other", "1800"))
+    _put(sv, Insight(InsightKind.VERIFIER_LOCKED, "cli-pi-other", "1800"))
     sv._drain_control()
     assert sv._verifier_locked_now()
 
@@ -216,7 +216,7 @@ async def test_verifier_locked_signal_sets_hard_deadline():
 async def test_ready_to_submit_surfaces_delta_and_broadcast():
     bus = EventBus()
     insight = InsightBus("run-test-gate")
-    other = insight.subscribe("cli-codex-sibling")
+    other = insight.subscribe("cli-pi-sibling")
     seen = await _bb_deltas(bus, "ready_to_submit")
     sv = _solver(bus, rate_limited=True, insight=insight)
 
@@ -235,7 +235,7 @@ async def test_ready_to_submit_surfaces_delta_and_broadcast():
 async def test_gate_is_noop_when_flag_off():
     bus = EventBus()
     insight = InsightBus("run-test-gate")
-    other = insight.subscribe("cli-codex-sibling")
+    other = insight.subscribe("cli-pi-sibling")
     ready = await _bb_deltas(bus, "ready_to_submit")
     sv = _solver(bus, rate_limited=False, insight=insight)  # NOT rate-limited
 

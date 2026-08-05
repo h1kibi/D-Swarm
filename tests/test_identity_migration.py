@@ -18,20 +18,20 @@ from apps.web.worker_config import WorkerConfigStore
 LEGACY_CONFIG = {
     "worker_backend": "container",
     "worker_profiles": [
-        {"id": "claude-local", "name": "claude-local", "engine": "claude",
-         "credential_mode": "subscription", "credential_account": "claude-main",
-         "runtime": "docker-web", "model": "claude-opus-4-8",
+        {"id": "pi-web-local", "name": "pi-web-local", "engine": "pi",
+         "credential_mode": "subscription", "credential_account": "pi-main",
+         "runtime": "docker-web", "model": "deepseek-v4-pro",
          "roles": ["race", "review"], "race": True, "priority": 10, "enabled": True},
-        {"id": "codex-local", "name": "codex-local", "engine": "codex",
+        {"id": "pi-pwn-local", "name": "pi-pwn-local", "engine": "pi",
          "credential_mode": "subscription", "credential_account": "",
-         "runtime": "docker-web", "model": "gpt-5.4",
+         "runtime": "docker-web", "model": "deepseek-v4-flash",
          "roles": ["race", "review"], "race": True, "priority": 20, "enabled": True},
     ],
-    "engines": ["claude-local", "codex-local"],
-    "race_engines": ["claude-local"],
+    "engines": ["pi-web-local", "pi-pwn-local"],
+    "race_engines": ["pi-web-local"],
     "stage_policy": {
-        "race": {"engines": ["codex-local"]},
-        "coordinator": {"review": {"engine": "claude-local"}},
+        "race": {"engines": ["pi-pwn-local"]},
+        "coordinator": {"review": {"engine": "pi-web-local"}},
     },
 }
 
@@ -43,24 +43,19 @@ def _store(tmp_path: Path, cfg: dict, *, accounts: dict[str, str] | None = None)
     (tmp_path / "_worker_config.json").write_text(json.dumps(cfg), encoding="utf-8")
     if accounts:
         # materialize the credential files inspect() keys off, so _account_modes()
-        # reports them and the empty-binding codex profile resolves to engine_key.
+        # reports them and the empty-binding pi profile resolves to engine_key.
         root = tmp_path / "_secrets" / "accounts"
         for acct, mode in accounts.items():
             d = root / acct
             d.mkdir(parents=True, exist_ok=True)
-            if mode == "subscription_token":
-                (d / "CLAUDE_CODE_OAUTH_TOKEN").write_text("x")
-            elif mode == "chatgpt_auth_home":
-                (d / "codex-home").mkdir(exist_ok=True)
-                (d / "codex-home" / "auth.json").write_text("{}")
-            elif mode == "api_key":
-                (d / "CURSOR_API_KEY").write_text("x")
+            if mode == "api_key":
+                (d / "API_KEY").write_text("x")
     return WorkerConfigStore(root=tmp_path)
 
 
-# accounts present on disk for the round-trip tests (codex-main makes the empty
-# codex binding a legal engine_key instead of an illegal container+inherit).
-_ACCOUNTS = {"claude-main": "subscription_token", "codex-main": "chatgpt_auth_home"}
+# accounts present on disk for the round-trip tests (pi-main makes the empty
+# pi binding a legal engine_key instead of an illegal container+inherit).
+_ACCOUNTS = {"pi-main": "api_key"}
 
 
 # 1) legacy name refs resolve AND get() exposes new seat ids
@@ -68,12 +63,12 @@ def test_reads_legacy_profile_name_refs_and_exposes_seat_ids(tmp_path):
     st = _store(tmp_path, LEGACY_CONFIG)
     cfg = st.get()
     # legacy fields preserved (additive)
-    assert [p["name"] for p in cfg["worker_profiles"]] == ["claude-local", "codex-local"]
-    assert cfg["engines"] == ["claude-local", "codex-local"]
+    assert [p["name"] for p in cfg["worker_profiles"]] == ["pi-web-local", "pi-pwn-local"]
+    assert cfg["engines"] == ["pi-web-local", "pi-pwn-local"]
     # new model attached
     assert len(cfg["seats"]) == 2
     assert all(s["id"].startswith("seat_") for s in cfg["seats"])
-    assert cfg["seat_alias"]["claude-local"].startswith("seat_claude_")
+    assert cfg["seat_alias"]["pi-web-local"].startswith("seat_pi_")
 
 
 # 2) new seat-id config round-trips through disk
@@ -116,9 +111,9 @@ def test_inflight_legacy_name_alias_resolves(tmp_path):
     cfg = st.get()
     seats = cfg["seats"]
     alias = cfg["seat_alias"]
-    # the old review.engine value "claude-local" must map to the claude seat
-    sid = resolve_seat_ref("claude-local", seats=seats, alias_table=alias)
-    assert sid == alias["claude-local"]
+    # the old review.engine value "pi-web-local" must map to the pi-web seat
+    sid = resolve_seat_ref("pi-web-local", seats=seats, alias_table=alias)
+    assert sid == alias["pi-web-local"]
 
 
 # 5) the additive API accepts legacy AND new fields
@@ -145,13 +140,13 @@ def test_engines_roster_preserved_on_reload(tmp_path):
     assert len(cfg["engines"]) == 2
 
 
-# 7) empty binding migrates to inherited (codex-local), bound to default account
+# 7) empty binding migrates to inherited (pi-pwn-local), bound to default account
 def test_empty_binding_becomes_inherited_credential(tmp_path):
     st = _store(tmp_path, LEGACY_CONFIG)
     cfg = st.get()
-    codex_seat = next(s for s in cfg["seats"] if s["engine"] == "codex")
-    cred = next(c for c in cfg["credentials"] if c["id"] == codex_seat["credential_id"])
-    # with no account_modes on disk in tmp, codex falls back to host-inherit
+    pwn_seat = next(s for s in cfg["seats"] if s["model"] == "deepseek-v4-flash")
+    cred = next(c for c in cfg["credentials"] if c["id"] == pwn_seat["credential_id"])
+    # with no account_modes on disk in tmp, the empty binding falls back to host-inherit
     assert cred["kind"] in ("system_inherit", "engine_key")
 
 
@@ -159,20 +154,20 @@ def test_empty_binding_becomes_inherited_credential(tmp_path):
 def test_model_pin_survives_migration(tmp_path):
     st = _store(tmp_path, LEGACY_CONFIG)
     cfg = st.get()
-    claude_seat = next(s for s in cfg["seats"] if s["engine"] == "claude")
-    assert claude_seat["model"] == "claude-opus-4-8"
+    web_seat = next(s for s in cfg["seats"] if s["model"] == "deepseek-v4-pro")
+    assert web_seat["model"] == "deepseek-v4-pro"
     # and the adapted legacy profile still carries it (for the driver)
-    claude_prof = next(p for p in cfg["worker_profiles"] if p["engine"] == "claude")
-    assert claude_prof["model"] == "claude-opus-4-8"
+    web_prof = next(p for p in cfg["worker_profiles"] if p["name"] == "pi-web-local")
+    assert web_prof["model"] == "deepseek-v4-pro"
 
 
 # 9) race:false survives migration and still gates the race role
 def test_race_false_survives_migration(tmp_path):
     cfg = dict(LEGACY_CONFIG)
     cfg["worker_profiles"] = [dict(LEGACY_CONFIG["worker_profiles"][0], race=False)]
-    cfg["engines"] = ["claude-local"]
+    cfg["engines"] = ["pi-web-local"]
     cfg["race_engines"] = []
-    cfg["stage_policy"] = {"coordinator": {"review": {"engine": "claude-local"}}}
+    cfg["stage_policy"] = {"coordinator": {"review": {"engine": "pi-web-local"}}}
     st = _store(tmp_path, cfg)
     got = st.get()
     seat = got["seats"][0]
@@ -184,8 +179,8 @@ def test_race_false_survives_migration(tmp_path):
 def test_health_binding_fields_are_additive():
     from muteki.solver.profile_health import ProfileHealth
     h = ProfileHealth(
-        profile_id="p", engine="claude", backend="container", status="ok",
-        layer=None, blocker=None, detail="ok", model="", account_id="claude-main",
+        profile_id="p", engine="pi", backend="container", status="ok",
+        layer=None, blocker=None, detail="ok", model="", account_id="pi-main",
     )
     # defaults present, old fields intact
     assert h.binding_kind == "explicit"
@@ -206,12 +201,12 @@ def test_profile_health_route_accepts_old_name_and_new_seat_id(tmp_path, monkeyp
     # force the new-schema-on-disk persistence (mirrors a real UI save)
     st.set(worker_profiles=st.get()["worker_profiles"], engines=st.get()["engines"])
     stored = st.get()
-    seat_id = stored["seat_alias"]["claude-local"]
+    seat_id = stored["seat_alias"]["pi-web-local"]
 
     app = create_app(RunManager(sessions_root=str(tmp_path)))
     with TestClient(app) as c:
         # old legacy name resolves
-        r1 = c.post("/api/settings/profiles/claude-local/health")
+        r1 = c.post("/api/settings/profiles/pi-web-local/health")
         assert r1.status_code == 200
         # new seat id resolves
         r2 = c.post(f"/api/settings/profiles/{seat_id}/health")
@@ -226,9 +221,9 @@ def test_container_system_inherit_rejected_on_save(tmp_path):
     st = WorkerConfigStore(root=tmp_path)
     with pytest.raises(ValueError):
         st.set_identity_model(
-            seats=[{"id": "seat_x", "label": "X", "engine": "claude",
+            seats=[{"id": "seat_x", "label": "X", "engine": "pi",
                     "credential_id": "cred_h", "environment_id": "docker-web"}],
-            credentials=[{"id": "cred_h", "label": "host", "engine": "claude",
+            credentials=[{"id": "cred_h", "label": "host", "engine": "pi",
                           "kind": "system_inherit", "secret_ref": ""}],
             environments=[{"id": "docker-web", "label": "Docker", "backend": "container"}],
         )

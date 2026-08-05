@@ -111,12 +111,12 @@ def test_dispatch_feeds_kernel_selected_enabled_profiles_at_auth_depth(tmp_path,
     calls = _capture_kernel(monkeypatch)
 
     profiles = [
-        {"id": "claude-local", "name": "claude-local", "engine": "claude",
-         "runtime": "docker-web", "credential_account": "claude-main", "enabled": True},
-        {"id": "codex-local", "name": "codex-local", "engine": "codex",
+        {"id": "pi-local", "name": "pi-local", "engine": "pi",
+         "runtime": "docker-web", "credential_account": "pi-main", "enabled": True},
+        {"id": "pi-aux", "name": "pi-aux", "engine": "pi",
          "runtime": "docker-web", "credential_account": "", "enabled": True},
-        {"id": "disabled-one", "name": "disabled-one", "engine": "cursor",
-         "runtime": "local", "credential_account": "cursor-main", "enabled": False},
+        {"id": "disabled-one", "name": "disabled-one", "engine": "pi",
+         "runtime": "local", "credential_account": "pi-disabled", "enabled": False},
     ]
     _missing_profile_accounts(
         worker_profiles=profiles, runtime_profiles=_RUNTIME_PROFILES, sessions_root=tmp_path,
@@ -126,8 +126,8 @@ def test_dispatch_feeds_kernel_selected_enabled_profiles_at_auth_depth(tmp_path,
     # enabled profiles are evaluated; the disabled one is filtered out BEFORE the kernel
     assert "disabled-one" not in by_pid
     # GOLDEN: docker-web runtime → container backend; dispatch probes at auth depth
-    assert by_pid["claude-local"] == ("claude-local", "container", "auth")
-    assert by_pid["codex-local"] == ("codex-local", "container", "auth")
+    assert by_pid["pi-local"] == ("pi-local", "container", "auth")
+    assert by_pid["pi-aux"] == ("pi-aux", "container", "auth")
 
 
 # ── 3. settings endpoint arg-construction ────────────────────────────────────
@@ -147,26 +147,26 @@ def test_settings_endpoint_feeds_kernel_same_tuple_at_auth_depth(tmp_path, monke
     # seed a config with the docker-web profiles
     wc = WorkerConfigStore(root=tmp_path)
     wc.set(
-        engines=["claude-local"],
+        engines=["pi-local"],
         worker_backend="container",
         runtime_profiles=_RUNTIME_PROFILES,
         worker_profiles=[
-            {"id": "claude-local", "name": "claude-local", "engine": "claude",
-             "transport": "claude_code", "runtime": "docker-web",
-             "credential_account": "claude-main", "enabled": True},
+            {"id": "pi-local", "name": "pi-local", "engine": "pi",
+             "transport": "pi_cli", "runtime": "docker-web",
+             "credential_account": "pi-main", "enabled": True},
         ],
     )
     # after the identity migration the stored profile's id is the new seat id;
-    # the old name "claude-local" survives in the alias table. The endpoint must
+    # the old name "pi-local" survives in the alias table. The endpoint must
     # accept the old name (the "测连通" button still posts it) and resolve it.
     stored = wc.get()
-    seat_id = stored["seat_alias"]["claude-local"]
+    seat_id = stored["seat_alias"]["pi-local"]
 
     calls = _capture_kernel(monkeypatch)
 
     app = create_app(RunManager(sessions_root=str(tmp_path)))
     with TestClient(app) as c:
-        r = c.post("/api/settings/profiles/claude-local/health")
+        r = c.post("/api/settings/profiles/pi-local/health")
         assert r.status_code == 200
 
     by_pid = {c[0]: c for c in calls}
@@ -189,13 +189,13 @@ def test_settings_batch_endpoint_uses_binding_depth(tmp_path, monkeypatch):
 
     wc = WorkerConfigStore(root=tmp_path)
     wc.set(
-        engines=["claude-local"],
+        engines=["pi-local"],
         worker_backend="container",
         runtime_profiles=_RUNTIME_PROFILES,
         worker_profiles=[
-            {"id": "claude-local", "name": "claude-local", "engine": "claude",
-             "transport": "claude_code", "runtime": "docker-web",
-             "credential_account": "claude-main", "enabled": True},
+            {"id": "pi-local", "name": "pi-local", "engine": "pi",
+             "transport": "pi_cli", "runtime": "docker-web",
+             "credential_account": "pi-main", "enabled": True},
         ],
     )
     calls = _capture_kernel(monkeypatch)

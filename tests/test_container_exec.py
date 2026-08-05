@@ -45,7 +45,7 @@ def _handle(ws="/run/sessions/abc/workspace", container="muteki-run-nyu_2021q-x"
 
 def test_to_container_cwd_maps_subdir_under_workspace():
     h = _handle("/run/ws")
-    assert h.to_container_cwd("/run/ws/cli-claude-1") == f"{CONTAINER_WORKSPACE}/cli-claude-1"
+    assert h.to_container_cwd("/run/ws/cli-pi-1") == f"{CONTAINER_WORKSPACE}/cli-pi-1"
 
 
 def test_to_container_cwd_root_is_workspace():
@@ -80,10 +80,10 @@ def test_containerize_argv_replaces_host_path_with_bare_command():
     assert _containerize_argv("claude", argv)[1:] == argv[1:]
 
 
-def test_containerize_argv_cursor_maps_to_cursor_agent_abs_path():
-    # cursor-agent lives in ~/.local/bin (NOT on the container's default PATH) → the
-    # container binary must be the ABSOLUTE path, else exec-not-found.
-    assert _containerize_argv("cursor", ["/opt/cursor-agent", "-p"])[0] == "/home/kali/.local/bin/cursor-agent"
+def test_containerize_argv_pi_maps_to_container_bin():
+    # the in-container pi binary is the bare `pi` (the worker image bakes it at
+    # /usr/local/bin), whatever host path the resolver pinned.
+    assert _containerize_argv("pi", ["/opt/pi", "--mode", "json"])[0] == "pi"
 
 
 def test_containerize_argv_unknown_engine_strips_dir():
@@ -152,24 +152,24 @@ def test_exec_argv_targets_the_run_container_with_cwd_and_sentinel():
 def test_exec_argv_passes_only_whitelisted_env():
     h = _handle("/run/ws")
     cmd = _DockerExecBackend._exec_argv(
-        h, ["/host/claude"], container_cwd=CONTAINER_WORKSPACE,
+        h, ["/host/pi"], container_cwd=CONTAINER_WORKSPACE,
         env={
             "MUTEKI_X": "1",
             "ANTHROPIC_Y": "2",
             "HOME": "/leak",
             "PATH": "/leak",
-            "CLAUDE_CODE_OAUTH_TOKEN_FILE": "/run/muteki/accounts/claude-main/CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN": "plain-secret",
+            "DEEPSEEK_API_KEY_FILE": "/run/muteki/accounts/pi-main/API_KEY",
+            "DEEPSEEK_API_KEY": "plain-secret",
         },
-        driver_name="claude", tag="t1", timeout=600)
+        driver_name="pi", tag="t1", timeout=600)
     assert "MUTEKI_X=1" in cmd
     assert "ANTHROPIC_Y=2" in cmd
-    assert "CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/muteki/accounts/claude-main/CLAUDE_CODE_OAUTH_TOKEN" in cmd
-    assert "CLAUDE_CODE_OAUTH_TOKEN=plain-secret" in cmd
+    assert "DEEPSEEK_API_KEY_FILE=/run/muteki/accounts/pi-main/API_KEY" in cmd
+    assert "DEEPSEEK_API_KEY=plain-secret" in cmd
     # host HOME/PATH must NOT be forwarded (the container has its own)
     assert "HOME=/leak" not in cmd
     assert "PATH=/leak" not in cmd
-    assert 'cat "$CLAUDE_CODE_OAUTH_TOKEN_FILE"' in " ".join(cmd)
+    assert 'cat "$OPENAI_API_KEY_FILE"' in " ".join(cmd)
 
 
 def test_exec_argv_expands_api_key_files_inside_container():
@@ -195,9 +195,9 @@ def test_exec_argv_allows_only_isolated_container_home():
     h = _handle("/run/ws")
     cmd = _DockerExecBackend._exec_argv(
         h, ["/host/codex"], container_cwd=CONTAINER_WORKSPACE,
-        env={"HOME": f"{CONTAINER_WORKSPACE}/workers/_homes/cli-codex"},
+        env={"HOME": f"{CONTAINER_WORKSPACE}/workers/_homes/cli-pi"},
         driver_name="codex", tag="t2", timeout=600)
-    assert f"HOME={CONTAINER_WORKSPACE}/workers/_homes/cli-codex" in cmd
+    assert f"HOME={CONTAINER_WORKSPACE}/workers/_homes/cli-pi" in cmd
 
 
 # ── ensure_container mounts (rcp default: workspace + control + accounts) ──────

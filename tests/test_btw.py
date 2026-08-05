@@ -294,13 +294,13 @@ def test_build_btw_run_stats_sync_aggregates_cost_and_timing(tmp_path):
     jsonl = tmp_path / "run-stats.jsonl"
     events = [
         {"event_type": "run.started", "ts": 1000.0, "run_id": "r", "payload": {}},
-        {"event_type": "worker.status", "ts": 1001.0, "run_id": "r", "solver_id": "cli-claude",
+        {"event_type": "worker.status", "ts": 1001.0, "run_id": "r", "solver_id": "cli-pi",
          "payload": {"online": True, "status": "running", "engine": "claude"}},
-        {"event_type": "cost.update", "ts": 1002.0, "run_id": "r", "solver_id": "cli-claude",
+        {"event_type": "cost.update", "ts": 1002.0, "run_id": "r", "solver_id": "cli-pi",
          "payload": {"scope": "solver", "usd": 0.12, "tokens": 5000, "input_tokens": 3000, "output_tokens": 2000}},
-        {"event_type": "cost.update", "ts": 1003.0, "run_id": "r", "solver_id": "cli-codex",
+        {"event_type": "cost.update", "ts": 1003.0, "run_id": "r", "solver_id": "cli-pi",
          "payload": {"scope": "solver", "usd": 0.08, "tokens": 4000, "input_tokens": 2500, "output_tokens": 1500}},
-        {"event_type": "worker.finished", "ts": 1010.0, "run_id": "r", "solver_id": "cli-claude",
+        {"event_type": "worker.finished", "ts": 1010.0, "run_id": "r", "solver_id": "cli-pi",
          "payload": {"reason": "solved", "flag": "flag{xyz}"}},
         {"event_type": "run.finished", "ts": 1015.0, "run_id": "r", "payload": {}},
     ]
@@ -316,10 +316,10 @@ def test_build_btw_run_stats_sync_aggregates_cost_and_timing(tmp_path):
     # tokens: 5000 + 4000 = 9000
     assert "9000" in stats
     # per-solver breakdown
-    assert "cli-claude" in stats
-    assert "cli-codex" in stats
+    assert "cli-pi" in stats
+    assert "cli-pi" in stats
     # worker roster with found-flag marker
-    assert "cli-claude" in stats
+    assert "cli-pi" in stats
     assert "找到flag" in stats
 
 

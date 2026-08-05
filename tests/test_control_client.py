@@ -115,7 +115,7 @@ class _FakeSupervisor:
 
 
 class _Driver:
-    name = "claude"
+    name = "pi"
 
     def parse_stream_steps(self, line):
         return [StreamStep(kind="reasoning", text=line)]
@@ -276,8 +276,9 @@ def test_early_frames_before_started_are_not_lost(receiver):
 
 def test_filter_env_only_allowed_keys():
     out = cc._filter_env({
-        "MUTEKI_X": "1", "ANTHROPIC_KEY": "k", "CLAUDE_CODE_OAUTH_TOKEN_FILE": "/f",
-        "PATH": "/leak", "HOME": "/leak", "HOME_OK": "x",
+        "MUTEKI_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
+        "OPENAI_API_KEY": "v", "PATH": "/leak", "HOME": "/leak", "HOME_OK": "x",
     })
-    assert out == {"MUTEKI_X": "1", "ANTHROPIC_KEY": "k", "CLAUDE_CODE_OAUTH_TOKEN_FILE": "/f"}
+    assert out == {"MUTEKI_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
+                   "OPENAI_API_KEY": "v"}
     assert cc._filter_env({"HOME": "/home/kali/workspace/h"}) == {"HOME": "/home/kali/workspace/h"}

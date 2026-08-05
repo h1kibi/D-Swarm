@@ -253,10 +253,10 @@ def test_worker_filter_chips_are_compact_scroll_rail():
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
 
-        assert(lib.workerShortLabel("cli-cursor") === "cursor", "base cursor label");
-        assert(lib.workerShortLabel("cli-cursor-2") === "cursor-2", "numbered cursor label");
-        assert(lib.workerShortLabel("cli-claude-3") === "claude-3", "numbered claude label");
-        assert(lib.workerShortLabel("cli-codex-10") === "codex-10", "two-digit codex label");
+        assert(lib.workerShortLabel("cli-pi") === "pi", "base pi label");
+        assert(lib.workerShortLabel("cli-pi-2") === "pi-2", "numbered pi label");
+        assert(lib.workerShortLabel("cli-pi-3") === "pi-3", "numbered pi label");
+        assert(lib.workerShortLabel("cli-pi-10") === "pi-10", "two-digit pi label");
         assert(lib.workerShortLabel("reason") === "reason", "reason role label");
         """
     )
@@ -320,11 +320,11 @@ def test_worker_identity_uses_transport_not_name_substrings():
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
 
-        assert(lib.workerEngine("api-prod", "codex_cli") === "Codex", "codex transport label");
-        assert(lib.workerEngine("not-a-claude-name", "claude_code") === "Claude Code", "claude transport label");
-        assert(lib.workerEngine("plain-id", "cursor_agent") === "Cursor", "cursor transport label");
-        assert(lib.resumeCommand("codex_cli", "s1") === "codex exec resume s1", "codex resume from transport");
-        assert(lib.resumeCommand("cursor_agent", "s2") === "cursor-agent --resume s2", "cursor resume from transport");
+        assert(lib.workerEngine("api-prod", "pi_cli") === "Pi", "pi transport label");
+        assert(lib.workerEngine("cli-pi-3", "") === "Pi", "pi id label");
+        assert(lib.workerEngine("pi-web", "") === "Pi", "pi profile id label");
+        assert(lib.resumeCommand("pi_cli", "s1") === "pi --session s1", "pi resume from transport");
+        assert(lib.resumeCommand("pi", "s2") === "pi --session s2", "pi resume from engine");
         """
     )
     _run_ui_node(script)
