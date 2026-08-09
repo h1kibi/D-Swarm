@@ -5,15 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from muteki.solver.credential_accounts import (
+from dswarm.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
     CredentialAccountStore,
     account_store_root,
     runtime_env_for_engine,
 )
-from muteki.models.solve_graph import Challenge
-from muteki.solver.cli_solver import CliSolver
-from muteki.swarm.swarm import Swarm
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.cli_solver import CliSolver
+from dswarm.swarm.swarm import Swarm
 
 
 def test_account_store_root_is_sessions_secret_side_table(tmp_path):
@@ -26,7 +26,7 @@ def test_pi_container_prefers_key_file_without_reading_secret(tmp_path, monkeypa
     acct.mkdir(parents=True)
     (acct / "API_KEY").write_text("fake-key\n")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
 
     resolved = runtime_env_for_engine("pi", account_root=root, container=True)
 
@@ -44,7 +44,7 @@ def test_pi_local_reads_account_key_for_subprocess_env(tmp_path, monkeypatch):
     acct.mkdir(parents=True)
     (acct / "API_KEY").write_text("local-key\n")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
 
     resolved = runtime_env_for_engine("pi", account_root=root, container=False)
 
@@ -70,7 +70,7 @@ def test_pi_api_key_file_and_env_fallback(tmp_path, monkeypatch):
     acct = root / "pi-main"
     acct.mkdir(parents=True)
     (acct / "API_KEY").write_text("key-secret\n")
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-secret")
 
     resolved = runtime_env_for_engine("pi", account_root=root, container=True)
@@ -85,8 +85,8 @@ def test_engine_account_id_can_be_overridden(tmp_path, monkeypatch):
     acct = root / "team-pi"
     acct.mkdir(parents=True)
     (acct / "API_KEY").write_text("token\n")
-    monkeypatch.setenv("MUTEKI_PI_ACCOUNT_ID", "team-pi")
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_ACCOUNT_ID", "team-pi")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
 
     resolved = runtime_env_for_engine("pi", account_root=root, container=True)
 
@@ -99,7 +99,7 @@ def test_runtime_env_accepts_explicit_profile_account_id(tmp_path, monkeypatch):
     acct = root / "pi-team"
     acct.mkdir(parents=True)
     (acct / "API_KEY").write_text("token\n")
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
 
     resolved = runtime_env_for_engine(
         "pi", account_root=root, account_id="pi-team", container=True)
@@ -157,7 +157,7 @@ def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path, monkeypat
     assert acct["engine"] == "pi"
     assert acct["details"]["secret_value"] == "deepseek-key"   # echoed for edit
 
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "custom")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "custom")
     pi_env = runtime_env_for_engine(
         "pi", account_root=root, account_id="deepseek-main", container=False)
     assert pi_env.env["OPENAI_API_KEY"] == "deepseek-key"
@@ -185,7 +185,7 @@ def test_custom_endpoint_records_target_engine_for_binding(tmp_path, monkeypatch
     assert [a for a in store.list() if a["account_id"] == "pi-main"][0]["engine"] == "pi"
 
     # Engine-agnostic injection is preserved: the same dir still drives pi's env.
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "custom")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "custom")
     env = runtime_env_for_engine(
         "pi", account_root=root, account_id="pi-main", container=False).env
     assert env["OPENAI_BASE_URL"] == "https://openai.example/v1"
@@ -397,13 +397,13 @@ def test_swarm_worker_profile_selects_credential_account_and_runtime(tmp_path, m
     env = swarm._runtime_env_for("pi", "cli-pi", container=FakeHandle(), profile=profile)
     assert env["ANTHROPIC_API_KEY_FILE"].endswith(
         "/pi-team/API_KEY")
-    assert env["MUTEKI_WORKER_PROFILE_ID"] == "pi-sub-container"
-    assert env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] == "pi-team"
+    assert env["DSWARM_WORKER_PROFILE_ID"] == "pi-sub-container"
+    assert env["DSWARM_CREDENTIAL_ACCOUNT_ID"] == "pi-team"
     assert env["HOME"].startswith("/home/kali/workspace/")
 
 
 def test_pi_provider_env_overrides_host_provider_in_argv():
-    """route A P3: the per-worker env (MUTEKI_PI_PROVIDER=ctf-gateway for gateway
+    """route A P3: the per-worker env (DSWARM_PI_PROVIDER=ctf-gateway for gateway
     workers) must REPLACE the host-built --provider flag — otherwise pi calls the
     real deepseek endpoint with the task token as its key (instant 401)."""
     ch = Challenge(
@@ -419,7 +419,7 @@ def test_pi_provider_env_overrides_host_provider_in_argv():
             "--provider", "deepseek", "PROMPT"]
 
     out = solver._apply_runtime_argv(
-        argv, {"MUTEKI_PI_PROVIDER": "ctf-gateway", "DEEPSEEK_API_KEY": "tok"})
+        argv, {"DSWARM_PI_PROVIDER": "ctf-gateway", "DEEPSEEK_API_KEY": "tok"})
 
     i = out.index("--provider")
     assert out[i + 1] == "ctf-gateway"
@@ -438,7 +438,7 @@ def test_pi_provider_env_inserts_provider_when_argv_has_none():
     solver = CliSolver(None, ch, engine="pi")
     argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions", "PROMPT"]
 
-    out = solver._apply_runtime_argv(argv, {"MUTEKI_PI_PROVIDER": "ctf-gateway"})
+    out = solver._apply_runtime_argv(argv, {"DSWARM_PI_PROVIDER": "ctf-gateway"})
 
     assert out[-3:] == ["--provider", "ctf-gateway", "PROMPT"]
 
@@ -457,7 +457,7 @@ def test_pi_provider_env_absent_keeps_host_argv_untouched():
     argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions",
             "--provider", "deepseek", "PROMPT"]
 
-    out = solver._apply_runtime_argv(argv, {"MUTEKI_WORKER_MODEL": ""})
+    out = solver._apply_runtime_argv(argv, {"DSWARM_WORKER_MODEL": ""})
 
     assert out == argv
 
@@ -473,7 +473,7 @@ def test_profile_model_is_inserted_before_prompt_for_cli_drivers():
     solver = CliSolver(None, ch, engine="pi")
     argv = ["/usr/local/bin/pi", "--mode", "json", "--session-dir", ".pi-sessions", "PROMPT"]
 
-    out = solver._apply_runtime_argv(argv, {"MUTEKI_WORKER_MODEL": "deepseek-reasoner"})
+    out = solver._apply_runtime_argv(argv, {"DSWARM_WORKER_MODEL": "deepseek-reasoner"})
 
     assert out[-3:] == ["--model", "deepseek-reasoner", "PROMPT"]
 
@@ -828,7 +828,7 @@ def test_swarm_runtime_profile_options_reach_container_create(tmp_path, monkeypa
         seen.update(kwargs)
         return FakeHandle()
 
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     monkeypatch.setattr(ce, "ensure_container", fake_ensure_container)
 
     swarm = Swarm(
@@ -872,7 +872,7 @@ def test_swarm_container_failure_emits_runtime_degraded_and_falls_back(tmp_path,
     def boom(*args, **kwargs):
         raise RuntimeError("docker unavailable")
 
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     monkeypatch.setattr(ce, "ensure_container", boom)
 
     swarm = Swarm(
@@ -897,7 +897,7 @@ def test_swarm_container_failure_emits_runtime_degraded_and_falls_back(tmp_path,
 def test_detect_system_login_pi_key_env(monkeypatch):
     """pi's host-side login is a present provider key (DEEPSEEK_API_KEY etc.),
     checked directly — no keychain/file probing."""
-    from muteki.solver import credential_accounts as ca
+    from dswarm.solver import credential_accounts as ca
     assert ca.detect_system_login("pi", env={"DEEPSEEK_API_KEY": "x"}) == "present"
     # a truthy env WITHOUT the provider key reads as absent (env={} would fall
     # back to the process environment, which may legitimately have a key)
@@ -905,7 +905,7 @@ def test_detect_system_login_pi_key_env(monkeypatch):
 
 
 def test_detect_system_login_pi_provider_env_key_wins(monkeypatch):
-    from muteki.solver import credential_accounts as ca
+    from dswarm.solver import credential_accounts as ca
     # pi's provider env keys decide the login: deepseek key present → present
     assert ca.detect_system_login(
         "pi", env={"DEEPSEEK_API_KEY": "x"}) == "present"
@@ -915,7 +915,7 @@ def test_detect_system_login_pi_provider_env_key_wins(monkeypatch):
 
 
 def test_detect_system_login_never_raises_on_probe_failure(monkeypatch):
-    from muteki.solver import credential_accounts as ca
+    from dswarm.solver import credential_accounts as ca
     # unknown engines are reported as "unknown", never raised
     assert ca.detect_system_login("bogus-engine", env={}) == "unknown"
     # a bad env mapping still never raises

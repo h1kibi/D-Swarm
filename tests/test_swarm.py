@@ -12,13 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from muteki.core.llm import ModelSpec
-from muteki.models.solve_graph import Challenge
-from muteki.sandbox.manager import SandboxManager
-from muteki.solver.result import ArtifactStore
-from muteki.solver.types import SolverConfig
-from muteki.swarm.insight_bus import InsightBus, InsightKind
-from muteki.swarm.swarm import Swarm
+from dswarm.core.llm import ModelSpec
+from dswarm.models.solve_graph import Challenge
+from dswarm.sandbox.manager import SandboxManager
+from dswarm.solver.result import ArtifactStore
+from dswarm.swarm.insight_bus import InsightBus, InsightKind
+from dswarm.swarm.swarm import Swarm
 
 
 @pytest.fixture
@@ -32,7 +31,7 @@ def _reset_health_probe_cache():
     """The health-probe cache is process-wide (so sibling runs share verdicts in
     production). In tests that means a stubbed roster could leak across cases — clear
     it before AND after each test so verdicts never bleed."""
-    from muteki.swarm import swarm as _swarm_mod
+    from dswarm.swarm import swarm as _swarm_mod
     _swarm_mod._health_cache_clear()
     yield
     _swarm_mod._health_cache_clear()
@@ -67,7 +66,7 @@ async def test_insight_bus_backlog_for_late_subscriber() -> None:
 def _cli_swarm(challenge, tmp_path, *, cli_race, healthy, **kw):
     """Build a Swarm in CLI-executor mode with healthchecks stubbed, then build
     its solver lineup. `healthy` is the set of engine names whose probe passes."""
-    import muteki.solver.cli_driver as cd
+    import dswarm.solver.cli_driver as cd
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     swarm = Swarm(
@@ -93,6 +92,51 @@ def _cli_swarm(challenge, tmp_path, *, cli_race, healthy, **kw):
         for n, drv in cd.DRIVERS.items():
             drv.healthcheck = orig_hc[n]  # type: ignore[method-assign]
             drv.health_detail = orig_hd[n]  # type: ignore[method-assign]
+
+
+async def test_race_finalize_closes_active_intents(challenge, tmp_path: Path):
+    """Race mode must run the same graph-finalize sweep as coordinator mode.
+
+    Before the fix, _run_race closed shared_graph directly, leaving intents made
+    by an operator hint open/active after a solved run.
+    """
+    from dswarm.solver.types import SolveOutcome
+
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+        engines=["pi"],
+    )
+    assert sw.shared_graph is not None
+    db_path = sw.shared_graph.db_path
+    sw.shared_graph.propose_intent(
+        actor="coordinator", intent_id="I-hint", goal="operator supplied route")
+
+    class FinishedWorker:
+        solver_id = "cli-pi"
+        graph = None
+
+        async def run(self):
+            return SolveOutcome(True, "flag{race}", 1, None, "solved",
+                                flags=["flag{race}"])
+
+    sw._build_solvers = lambda: [FinishedWorker()]  # type: ignore[method-assign]
+    outcome = await sw._run_race()
+    assert outcome.solved is True
+
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+    reopened = SQLiteSharedGraph.open(db_path=db_path, challenge=challenge)
+    try:
+        with reopened._lock:
+            row = reopened._conn.execute(
+                "SELECT status, dispatch_state FROM intents WHERE intent_id=?",
+                ("I-hint",),
+            ).fetchone()
+        assert row == ("done", "closed")
+    finally:
+        reopened.close()
 
 
 def test_cli_race_builds_two_profiles(challenge, tmp_path: Path) -> None:
@@ -198,7 +242,7 @@ def _build_profile_race(challenge, tmp_path, profiles, *, healthy_base):
         llm=None, sandbox=sandbox, artifacts=arts,
         executor="cli", cli_race=True, worker_profiles=profiles,
     )
-    from muteki.solver.worker_profiles import base_engine_for_profile
+    from dswarm.solver.worker_profiles import base_engine_for_profile
     def _stub_probe(name, role):
         prof = swarm._profile_for_engine(name, role=role, advance=False)
         base = base_engine_for_profile(prof or name)
@@ -296,7 +340,7 @@ def test_container_unavailable_falls_back_local_on_host(challenge, tmp_path: Pat
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                worker_backend="container")
     sw._container_unavailable = True
-    import muteki.swarm.swarm as swmod
+    import dswarm.swarm.swarm as swmod
     # force host semantics regardless of where the test actually runs
     monkey = pytest.MonkeyPatch()
     monkey.setattr(swmod, "is_web_container", lambda: False)
@@ -315,7 +359,7 @@ def test_container_unavailable_hard_fails_in_web_container(challenge, tmp_path: 
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                worker_backend="container")
     sw._container_unavailable = True
-    import muteki.swarm.swarm as swmod
+    import dswarm.swarm.swarm as swmod
     monkey = pytest.MonkeyPatch()
     monkey.setattr(swmod, "is_web_container", lambda: True)
     try:
@@ -358,8 +402,8 @@ def _bus_health_swarm(challenge, tmp_path, *, healthy: dict[str, bool]):
     """Coordinator swarm wired to a real EventBus, with each engine's
     health_detail() stubbed from `healthy` (name -> ok). Returns (swarm, events)
     where events is a live-appended list of every emitted Event."""
-    import muteki.solver.cli_driver as cd
-    from muteki.core.event_bus import EventBus
+    import dswarm.solver.cli_driver as cd
+    from dswarm.core.event_bus import EventBus
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     bus = EventBus()
@@ -391,7 +435,7 @@ async def _noop() -> None:
 
 
 def _degrade_events(events):
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
     return [e for e in events
             if e.event_type is EventType.BLACKBOARD_DELTA
             and (e.payload or {}).get("kind") == "engine_degraded"]
@@ -430,7 +474,7 @@ async def test_healthy_engines_recovery_event(challenge, tmp_path: Path) -> None
         sw._healthy_engines()              # pi down → degraded
         await asyncio.sleep(0)
         # pi logs back in
-        import muteki.solver.cli_driver as cd
+        import dswarm.solver.cli_driver as cd
         cd.DRIVERS["pi"].health_detail = lambda *a, **k: (True, "")  # type: ignore[method-assign]
         roster = sw._healthy_engines()     # pi back → recovered event
         await asyncio.sleep(0)
@@ -440,6 +484,68 @@ async def test_healthy_engines_recovery_event(challenge, tmp_path: Path) -> None
     degr = _degrade_events(events)
     statuses = [e.payload["status"] for e in degr]
     assert statuses == ["degraded", "recovered"]
+
+
+def test_container_backend_health_probe_defers_to_worker_container(
+        challenge, tmp_path: Path, monkeypatch) -> None:
+    """Container workers must not be health-checked by a host-side CLI probe."""
+    import dswarm.solver.cli_driver as cd
+
+    sw = _coordinator_swarm(challenge, tmp_path, worker_backend="container")
+    called = {"driver_for": False}
+
+    def fail_driver_for(*args, **kwargs):
+        called["driver_for"] = True
+        raise AssertionError("host CLI health probe must not run for container workers")
+
+    monkeypatch.setattr(cd, "driver_for", fail_driver_for)
+    ok, detail = sw._probe_engine_health("pi", "bootstrap")
+
+    assert ok is True
+    assert detail == "deferred to worker container"
+    assert called["driver_for"] is False
+
+
+async def test_coordinator_empty_health_roster_finishes_explicitly(
+        challenge, tmp_path: Path) -> None:
+    """A failed health gate must not leave a run silently alive without workers."""
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import EventType
+
+    bus = EventBus()
+    events: list = []
+    bus.add_sink(lambda ev: events.append(ev) or _noop())
+    sw = _coordinator_swarm(challenge, tmp_path, bus=bus)
+    sw._healthy_engines_async = lambda: _empty_health()  # type: ignore[method-assign]
+    finalized: list[dict] = []
+    real_finalize = sw._finalize_coordinator_run
+
+    async def tracking_finalize(**kwargs):
+        finalized.append(kwargs)
+        await real_finalize(**kwargs)
+
+    sw._finalize_coordinator_run = tracking_finalize  # type: ignore[method-assign]
+    out = await sw._run_coordinator()
+
+    assert out.solved is False
+    assert out.reason == "worker_unavailable"
+    assert finalized and finalized[0]["terminal_reason"] == "worker_unavailable"
+    finished = [
+        e.payload for e in events
+        if e.event_type is EventType.RUN_FINISHED
+    ]
+    assert finished and finished[-1]["reason"] == "worker_unavailable"
+    health = [
+        e.payload for e in events
+        if e.event_type is EventType.BLACKBOARD_DELTA
+        and (e.payload or {}).get("kind") == "worker_health_check"
+    ]
+    assert [p["phase"] for p in health] == ["starting", "failed"]
+    assert health[-1]["reason"] == "no healthy worker profile"
+
+
+async def _empty_health():
+    return []
 
 
 async def test_healthy_engines_async_does_not_block_event_loop(
@@ -576,8 +682,8 @@ async def test_reconcile_blackboard_skill_resyncs_and_emits(challenge, tmp_path,
                                                              monkeypatch):
     """A non-container run reconciles deployed skill copies at launch: when something
     was stale it re-syncs AND emits a board delta so the drift is visible."""
-    from muteki.core.event_bus import EventBus
-    from muteki.solver import cli_solver
+    from dswarm.core.event_bus import EventBus
+    from dswarm.solver import cli_solver
 
     captured = []
     bus = EventBus()
@@ -591,7 +697,7 @@ async def test_reconcile_blackboard_skill_resyncs_and_emits(challenge, tmp_path,
 
     monkeypatch.setattr(
         cli_solver, "sync_deployed_blackboard_skills",
-        lambda: [{"path": "/home/u/.claude/skills/muteki-blackboard/blackboard.py",
+        lambda: [{"path": "/home/u/.claude/skills/dswarm-blackboard/blackboard.py",
                   "status": "synced", "was": "stale(deadbeef0000)", "now": "cafebabe1111"}])
 
     await sw._reconcile_blackboard_skill()
@@ -604,7 +710,7 @@ async def test_reconcile_blackboard_skill_skips_container_backend(challenge, tmp
                                                                   monkeypatch):
     """Container workers use the image-baked skill — the host reconcile must be skipped
     entirely (and never even call the sync)."""
-    from muteki.solver import cli_solver
+    from dswarm.solver import cli_solver
 
     sw = _probe_swarm(challenge, tmp_path, ["claude"])
     sw.worker_backend = "container"
@@ -640,6 +746,69 @@ def test_pick_engine_prefers_unrunning():
     assert sw._pick_engine(["pi"], healthy) == "pi"     # busy → least-loaded fallback
 
 
+def test_pick_engine_prefers_direction_profile(challenge, tmp_path: Path) -> None:
+    from dswarm.solver.worker_profiles import normalize_worker_profiles
+
+    profiles = normalize_worker_profiles([
+        {"id": "pi-web", "name": "pi-web", "engine": "pi", "transport": "pi_cli"},
+        {"id": "pi-pwn", "name": "pi-pwn", "engine": "pi", "transport": "pi_cli"},
+    ])
+    sw = _coordinator_swarm(challenge, tmp_path, worker_profiles=profiles,
+                            engines=["pi-web", "pi-pwn"])
+    # _profile_for_direction only returns profiles on this run's roster
+    assert sw._profile_for_direction("pwn") == "pi-pwn"
+    assert sw._profile_for_direction("crypto") == ""
+    # preferred (healthy + has capacity) wins over the idle heuristic
+    assert sw._pick_engine(["pi-web"], ["pi-web", "pi-pwn"], role="explore",
+                           preferred="pi-pwn") == "pi-pwn"
+    # preferred that is NOT on the roster → normal fallback
+    assert sw._pick_engine([], ["pi-web", "pi-pwn"], role="explore",
+                           preferred="pi-crypto") in ("pi-web", "pi-pwn")
+
+
+def test_open_intents_carry_direction(challenge, tmp_path: Path) -> None:
+    sw = _coordinator_swarm(challenge, tmp_path)
+    sw.shared_graph.propose_intent(
+        actor="reason", intent_id="I-dir", goal="crack the key",
+        payload={"worker_class": "code", "direction": "crypto"})
+    open_intents = sw._open_intents()
+    row = next(i for i in open_intents if i["intent_id"] == "I-dir")
+    assert row["direction"] == "crypto"
+
+
+def test_direction_from_profile_id_and_link_helpers() -> None:
+    from dswarm.swarm import swarm as swarm_mod
+
+    assert swarm_mod._direction_from_profile_id("pi-web") == "web"
+    assert swarm_mod._direction_from_profile_id("pi-aisec") == "aisec"
+    assert swarm_mod._direction_from_profile_id("pi-worker") == ""
+    assert swarm_mod._direction_from_profile_id("") == ""
+
+
+def test_ensure_direction_links_graceful_for_all_directions(tmp_path: Path) -> None:
+    from dswarm.swarm import swarm as swarm_mod
+
+    home = tmp_path / "home"
+    home.mkdir()
+    for direction in ("web", "pwn", "rev", "crypto", "misc", "forensics", "aisec"):
+        swarm_mod._ensure_direction_links(home, direction)
+    # vendored direction skills are linked for web; no crash for the others
+    assert (home / ".pi" / "agent" / "skills" / "ctf-web").is_symlink()
+    assert not (home / ".pi" / "agent" / "skills" / "dswarm-web").exists()
+
+
+def test_ensure_direction_links_surfaces_btfly_category_skill(tmp_path: Path) -> None:
+    from dswarm.swarm import swarm as swarm_mod
+
+    home = tmp_path / "home"
+    home.mkdir()
+    swarm_mod._ensure_direction_links(home, "web")
+    link = home / ".pi" / "agent" / "skills" / "web"
+    assert link.is_symlink()
+    # dangling container-absolute target (the worker container has it baked)
+    assert link.readlink() == Path("/home/ctf/.pi/agent/skills/web")
+
+
 def test_reason_backpressure_trips_on_large_ordinary_queue(challenge, tmp_path: Path):
     sw = _coordinator_swarm(challenge, tmp_path, max_workers=2)
     for i in range(4):
@@ -656,7 +825,7 @@ def test_reason_backpressure_trips_on_large_ordinary_queue(challenge, tmp_path: 
     assert sw._reason_backpressure_active(open_intents) is True
 
 
-# ── race-scout cold-start invariant (run-75379 BUG④) ─────────────────────────
+# ── race-scout cold-start invariant (run-75379 BUG④ ─────────────────────────
 # race-scout is a cold-start warmup for an EMPTY graph. On a reopen/resume of a
 # populated graph it re-races a challenge that already has facts (BUG④: 3 fresh
 # bootstrap workers re-racing 33+ verified facts). The guard must be an INVARIANT
@@ -727,7 +896,7 @@ async def _run_coordinator_briefly(sw, monkeypatch):
     """Enter _run_coordinator with no-op workers + dry Reason + a tiny wall clock so
     it returns fast. Records whether _run_race_scout fired and the phase_transition
     'from' tags emitted. Returns (race_called: bool, transitions: list[str])."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
     monkeypatch.setattr(sw, "_healthy_engines_async",
@@ -796,7 +965,7 @@ async def test_coordinator_runs_race_scout_on_cold_empty_graph(
     race_called, transitions = await _run_coordinator_briefly(sw, monkeypatch)
 
     assert race_called is True             # cold start: race-scout ran
-    assert "race" in transitions          # slow-path race→coordinator transition
+    assert "race" in transitions          # slow-path race鈫抍oordinator transition
     assert "resume" not in transitions
 
 
@@ -1053,7 +1222,7 @@ async def test_review_intent_remains_dispatchable_when_ordinary_slots_full(
 
 
 async def test_run_reason_passes_standing_guidance(challenge, tmp_path: Path, monkeypatch):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
 
     sw = _coordinator_swarm(challenge, tmp_path)
     sw.llm = object()
@@ -1069,7 +1238,7 @@ async def test_run_reason_passes_standing_guidance(challenge, tmp_path: Path, mo
         return ReasonResult(goal_met=False, intents=[], audit_notes=[])
 
     monkeypatch.setattr(sw.shared_graph, "to_reason_summary", fake_summary)
-    monkeypatch.setattr("muteki.solver.reason.run_reason", fake_run_reason)
+    monkeypatch.setattr("dswarm.solver.reason.run_reason", fake_run_reason)
 
     proposed = await sw._run_reason()
 
@@ -1079,7 +1248,7 @@ async def test_run_reason_passes_standing_guidance(challenge, tmp_path: Path, mo
 
 async def test_run_reason_persists_model_selected_fact_pins(
         challenge, tmp_path: Path, monkeypatch):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
 
     sw = _coordinator_swarm(challenge, tmp_path)
     sw.llm = object()
@@ -1097,7 +1266,7 @@ async def test_run_reason_persists_model_selected_fact_pins(
         return ReasonResult(goal_met=False, intents=[], audit_notes=[],
                             pinned_facts=[fact_seq])
 
-    monkeypatch.setattr("muteki.solver.reason.run_reason", fake_run_reason)
+    monkeypatch.setattr("dswarm.solver.reason.run_reason", fake_run_reason)
 
     proposed = await sw._run_reason()
 
@@ -1420,7 +1589,7 @@ async def test_apply_worker_cmds_rejects_unknown_engine_and_max(challenge, tmp_p
 
 async def test_coordinator_bootstrap_then_flag(challenge, tmp_path: Path, monkeypatch):
     """Bootstrap worker finds a flag → coordinator returns solved, no Reason needed."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
@@ -1449,7 +1618,7 @@ async def test_coordinator_bootstrap_then_flag(challenge, tmp_path: Path, monkey
 async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, monkeypatch):
     """expected_flags=2: one worker returning ONE flag must NOT end the run; the
     coordinator keeps going until two distinct flags are collected."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     challenge.expected_flags = 2
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
@@ -1484,7 +1653,7 @@ async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, mo
 async def test_coordinator_singleflag_stops_on_first(challenge, tmp_path: Path, monkeypatch):
     """expected_flags=1 (default): the first flag completes the run immediately —
     byte-identical to the legacy 'first flag wins'."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
@@ -1509,8 +1678,8 @@ async def test_coordinator_ctf_complete_reason_stops_dispatching(
     """run-61718 regression: after all real flags are already collected, Reason may
     return verdict=complete while old/irrelevant intents still exist. CTF must
     settle immediately instead of spawning another explore worker."""
-    from muteki.solver.reason import ReasonResult
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.reason import ReasonResult
+    from dswarm.solver.types import SolveOutcome
 
     challenge.expected_flags = 4
     challenge.multi_flag = True
@@ -1549,7 +1718,7 @@ async def test_coordinator_ctf_complete_reason_stops_dispatching(
 
 async def test_coordinator_reason_then_explore(challenge, tmp_path: Path, monkeypatch):
     """Bootstrap finds nothing → Reason proposes an intent → Explore claims it."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     # finite budget so the (now never-give-up) loop terminates for the assertion —
     # the swarm no longer stops on its own when Reason runs dry (CTF has a unique
@@ -1597,8 +1766,8 @@ async def test_coordinator_reason_then_explore(challenge, tmp_path: Path, monkey
 async def test_coordinator_rebootstrap_on_course_correct(challenge, tmp_path: Path, monkeypatch):
     """Reason verdict course_correct → coordinator spawns a re-bootstrap worker
     seeded with the drift direction (phase 7: adaptive mode switch)."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.solver.reason import ReasonResult
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
                             wall_clock_budget=0.3)
@@ -1641,8 +1810,8 @@ async def test_course_correct_runs_review_before_rebootstrap(challenge, tmp_path
     """Final flow: Reason course_correct must route through one review worker whose
     directive controls the rebootstrap, instead of immediately spawning another
     ordinary bootstrap on raw drift text."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.solver.reason import ReasonResult
 
     sw = _coordinator_swarm(
         challenge, tmp_path, start_workers=1, stall_seconds=0.01,
@@ -1720,7 +1889,7 @@ async def test_operator_hint_queues_review_request(challenge, tmp_path):
 
 
 async def test_completed_worker_threshold_starts_review(challenge, tmp_path: Path, monkeypatch):
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(
         challenge, tmp_path, start_workers=1, max_workers=2,
@@ -1759,7 +1928,7 @@ async def test_completed_worker_threshold_starts_review(challenge, tmp_path: Pat
 
 
 async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypatch):
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(
         challenge, tmp_path, start_workers=1, max_workers=2,
@@ -1804,7 +1973,7 @@ async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypa
 
 async def test_coordinator_respects_wall_clock_budget(challenge, tmp_path: Path, monkeypatch):
     """A worker that never finishes is cancelled when the budget is exhausted."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1,
                             wall_clock_budget=0.01, stall_seconds=999)
@@ -1832,7 +2001,7 @@ async def _async_zero():
 async def test_coordinator_winner_cancels_loser_solver(challenge, tmp_path: Path, monkeypatch):
     """When one worker finds the flag, the coordinator must call cancel() on the
     OTHER worker (which kills its CLI subprocess) — not merely cancel the task."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
@@ -1879,7 +2048,7 @@ async def test_coordinator_never_gives_up_rebootstraps_when_reason_dry(challenge
     is running, the coordinator must RE-BOOTSTRAP a fresh attempt, not declare
     'exhausted' and stop. We bound the test with a finite budget; within it, at
     least one retry-bootstrap must have been spawned."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
                             wall_clock_budget=0.4)
@@ -1954,9 +2123,9 @@ async def test_coordinator_emits_single_run_level_finished(challenge, tmp_path, 
     """The run-7345 bug: a worker ending must NOT mark the whole run finished. Each
     sub-worker emits WORKER_FINISHED; the coordinator emits exactly ONE run-level
     RUN_FINISHED when it actually settles (here: a worker solves)."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType
 
     captured = []
     bus = EventBus()
@@ -2009,8 +2178,8 @@ async def test_m11_cancelled_coordinator_finalizes_and_closes_graph(
     the shared_graph (release the SQLite WAL/-shm handles) and emit the run-level
     RUN_FINISHED — instead of leaking them (the cleanup used to sit after the finally,
     on the normal-return path only)."""
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType
 
     captured = []
     bus = EventBus()
@@ -2059,8 +2228,8 @@ async def test_finalize_merges_shared_graph_flags_before_finished(tmp_path):
     """Coordinator finalization is the last line of defense: if flags were already
     persisted in the shared graph, RUN_FINISHED must carry them even when there is
     no winner.json-producing worker outcome in hand."""
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import EventType
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import EventType
 
     ch = Challenge(id="c-multi", name="multi", category="web", points=0,
                    description="collect two", flag_format=r"flag\{[^}]+\}",
@@ -2094,7 +2263,7 @@ async def test_coordinator_does_not_steer_kill_on_global_fact_stall(
     steer-killed. The old design called request_steer() after stall_seconds of no
     global fact, which murdered freshly-spawned workers mid-exploit. There is no
     stall-kill anymore — a worker runs until it finishes on its own."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     # stall_seconds tiny: under the OLD code this would steer-kill the worker fast.
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
@@ -2131,7 +2300,7 @@ async def test_REDLINE_no_global_signal_kills_a_progressless_worker(
     completion — the coordinator must neither steer it nor cancel its task. This
     guards the single-shot migration against re-growing the run-7352 stall-kill leg
     in any form (steer OR cancel)."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     # tiny stall_seconds: the OLD stall-kill would have fired almost immediately.
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
@@ -2181,6 +2350,59 @@ def test_make_cli_worker_explore_gets_short_timeout(challenge, tmp_path):
     assert expl.timeout == 720, "explore worker must get the short explore_timeout"
     assert boot.timeout == 2400, "bootstrap worker keeps the long default timeout"
     assert expl.timeout < boot.timeout
+
+
+def test_generic_bootstrap_prefers_open_reason_intent(challenge, tmp_path):
+    """D (run-3154 intent starvation): a generic bootstrap spawn with no intent
+    must convert to a focused explore for the oldest compatible open reason
+    intent, claim it under its own solver_id, and adopt the intent's goal —
+    so focused intents are never starved by whole-challenge-rush churn."""
+    sw = _coordinator_swarm(challenge, tmp_path)
+    sw.shared_graph.propose_intent(
+        actor="reason", intent_id="I3-abc", goal="scan uploaded images for flag",
+        payload={"worker_class": "shell_agent"})
+    w = sw._make_cli_worker("pi", mode="bootstrap")
+    assert w.mode == "explore", "generic spawn must pivot to the open intent"
+    assert w.intent_id_assigned == "I3-abc"
+    assert w.intent_goal == "scan uploaded images for flag"
+    # claimed atomically under this worker → its conclusion is owner-accepted.
+    row = sw.shared_graph._conn.execute(
+        "SELECT worker, status FROM intents WHERE intent_id='I3-abc'").fetchone()
+    assert row[0] == w.solver_id
+    assert row[1] == "claimed"
+    # the intent is now owned — a second generic spawn pivots to nothing (no other
+    # open intent) and stays a generic whole-challenge rush.
+    w2 = sw._make_cli_worker("pi", mode="bootstrap")
+    assert w2.mode == "bootstrap"
+
+
+def test_generic_bootstrap_skips_incompatible_direction_intent(challenge, tmp_path):
+    """An open intent whose direction needs a different worker profile must NOT be
+    hijacked by a generic spawn of the wrong engine."""
+    sw = _coordinator_swarm(challenge, tmp_path)
+    sw.shared_graph.propose_intent(
+        actor="reason", intent_id="I-rev", goal="unpack the ELF",
+        payload={"worker_class": "shell_agent", "direction": "rev"})
+    w = sw._make_cli_worker("pi", mode="bootstrap")
+    assert w.mode == "bootstrap", "rev intent must not be claimed by a plain pi worker"
+    assert w.intent_id_assigned == ""
+
+
+def test_generic_bootstrap_claim_lost_falls_back_rejected(challenge, tmp_path, monkeypatch):
+    """If the atomic claim for the pre-empted open intent is lost (a concurrent
+    spawn won the race), the converted spawn must NOT duplicate the work — it
+    raises WorkerSpawnRejected (slot freed) instead of running a redundant
+    explore."""
+    from dswarm.swarm.swarm import WorkerSpawnRejected
+
+    sw = _coordinator_swarm(challenge, tmp_path)
+    monkeypatch.setattr(
+        sw, "_open_intents",
+        lambda: [{"intent_id": "I-taken", "goal": "probe admin",
+                  "worker_class": "shell_agent", "direction": ""}])
+    monkeypatch.setattr(sw.shared_graph, "claim_intent", lambda **kw: False)
+    with pytest.raises(WorkerSpawnRejected):
+        sw._make_cli_worker("pi", mode="bootstrap")
 
 
 def test_open_intents_includes_expired_lease(challenge, tmp_path):
@@ -2362,8 +2584,8 @@ async def test_drain_hitl_hint_records_operator_directive(challenge, tmp_path):
 async def test_drain_hitl_directive_classification_recorded(challenge, tmp_path):
     """F: a worker hand-raise (external_blocker) is persisted as a classified
     hitl_request so the deck can distinguish it from an auto-resolving kind."""
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType, hitl_request_payload
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType, hitl_request_payload
 
     bus = EventBus()
     sw = _coordinator_swarm(challenge, tmp_path, bus=bus)
@@ -2409,8 +2631,8 @@ def test_coordinator_rechecks_external_blocker_before_pausing(challenge, tmp_pat
 async def test_drain_hitl_mark_false_invalidates_only_target_flag_live(challenge, tmp_path):
     """A live run receiving mark_false must immediately remove only the selected
     flag and reopen only the intent linked to that flag."""
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import EventType
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import EventType
 
     bus = EventBus()
     events = []
@@ -2530,9 +2752,9 @@ async def test_dismiss_scoped_only_clears_that_worker(challenge, tmp_path):
 def test_m6_help_sink_dedups_same_blocker_and_caps(challenge, tmp_path):
     """M6: the same blocker raised by many workers is deduped on (worker, need), and
     the pending list is bounded so a never-give-up run can't grow it unbounded."""
-    from muteki.swarm.swarm import _PENDING_HELP_MAX
-    from muteki.core.events import EventType, hitl_request_payload
-    from muteki.core.event_bus import Event
+    from dswarm.swarm.swarm import _PENDING_HELP_MAX
+    from dswarm.core.events import EventType, hitl_request_payload
+    from dswarm.core.event_bus import Event
 
     async def _run():
         sw = _coordinator_swarm(challenge, tmp_path)
@@ -2567,7 +2789,7 @@ def test_m1_insight_bus_dedups_repeated_guidance():
     the bounded history — each copy would evict a real VERIFIED_FACT / DEAD_END and
     replay to every cold subscriber. An identical trailing guidance is dropped; a
     fact in between, or a changed hint, still publishes."""
-    from muteki.swarm.insight_bus import InsightBus, InsightKind
+    from dswarm.swarm.insight_bus import InsightBus, InsightKind
 
     async def _run():
         bus = InsightBus("run-kp")
@@ -2589,7 +2811,7 @@ def test_m1_insight_bus_dedups_repeated_guidance():
 async def test_defect4_standing_lru_caps_count(challenge, tmp_path):
     """defect-4: standing guidance is LRU-capped so the cumulative text can't bloat
     every new worker's prompt unbounded (the 36k-token claude empty-exit)."""
-    from muteki.swarm.swarm import _STANDING_MAX
+    from dswarm.swarm.swarm import _STANDING_MAX
     sw = _coordinator_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     for i in range(_STANDING_MAX + 5):
@@ -2618,7 +2840,7 @@ async def test_defect4_clear_standing(challenge, tmp_path):
 def test_defect4_standing_block_char_budget(challenge, tmp_path):
     """defect-4: even within the count cap, the per-worker injected block is bounded
     by a char budget (most-recent hints win)."""
-    from muteki.solver.cli_solver import CliSolver
+    from dswarm.solver.cli_solver import CliSolver
     s = CliSolver(None, challenge, driver=None, engine="pi", kb=False)
     s._standing_guidance = ["x" * 3000, "y" * 3000, "z-newest"]  # 6KB+ > 4KB budget
     block = s._standing_block()
@@ -2663,7 +2885,7 @@ async def test_m3_redirect_reaches_next_spawned_worker(challenge, tmp_path, monk
 async def test_race_scout_fast_path_flag_wins(challenge, tmp_path, monkeypatch):
     """FAST PATH: a race worker captures the flag → the coordinator finishes via the
     race phase and NEVER enters the main coordinator loop (no _run_reason call)."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             wall_clock_budget=2.0)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
@@ -2694,7 +2916,7 @@ async def test_race_scout_fast_path_flag_wins(challenge, tmp_path, monkeypatch):
 async def test_race_scout_slow_path_hands_off_to_coordinator(challenge, tmp_path, monkeypatch):
     """SLOW PATH: no race worker captures the flag → their facts are on the graph and
     the coordinator falls through to the main solve loop (_run_reason IS called)."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             wall_clock_budget=0.5)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
@@ -2722,7 +2944,7 @@ async def test_race_scout_slow_path_hands_off_to_coordinator(challenge, tmp_path
 async def test_race_scout_disabled_does_not_race(challenge, tmp_path, monkeypatch):
     """race_scout=False → the race phase is skipped entirely; the first workers come
     from the main coordinator loop (bootstrap), not a parallel race round."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=False,
                             wall_clock_budget=0.3)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
@@ -2779,7 +3001,7 @@ def test_stage_policy_overrides_race_budget_and_planner(challenge, tmp_path):
 def test_stage_policy_reads_coordinator_key():
     """The coordinator stage policy is keyed "coordinator"; from_config reads it and
     round-trips it through model_dump. Unknown keys are ignored."""
-    from muteki.swarm.stage_policy import StagePolicy
+    from dswarm.swarm.stage_policy import StagePolicy
     sp = StagePolicy.from_config({"coordinator": {"wall_clock_budget": 7},
                                   "unknown_key": {"wall_clock_budget": 42}})
     assert sp.coordinator == {"wall_clock_budget": 7}
@@ -2794,7 +3016,7 @@ async def test_race_scout_empty_healthy_subset_returns_three_tuple(challenge, tm
 
 
 async def test_race_scout_slow_path_emits_phase_transition(challenge, tmp_path, monkeypatch):
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
     events = []
 
     class Bus:
@@ -2820,7 +3042,7 @@ async def test_race_scout_slow_path_emits_phase_transition(challenge, tmp_path, 
 
 
 async def test_worker_budget_hard_gate_finishes_budget_exhausted(challenge, tmp_path, monkeypatch):
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
     events = []
 
     class Bus:
@@ -2851,7 +3073,7 @@ async def test_worker_budget_hard_gate_finishes_budget_exhausted(challenge, tmp_
 
 
 async def test_cost_budget_hard_gate_finishes_budget_exhausted(challenge, tmp_path, monkeypatch):
-    from muteki.core.cost import CostController
+    from dswarm.core.cost import CostController
     events = []
 
     class Bus:
@@ -2900,7 +3122,7 @@ async def test_operator_stop_interrupts_race_scout_wait(challenge, tmp_path, mon
 async def test_race_scout_no_global_signal_kills_worker(challenge, tmp_path, monkeypatch):
     """RED LINE: the race phase produces no flag and no facts, yet no race worker is
     cancelled by a global signal — each runs to its own natural exit (run-7352)."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
     sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
                             stall_seconds=0.01, wall_clock_budget=0.5)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
@@ -3041,9 +3263,9 @@ async def test_coordinator_pauses_on_need_input_until_operator(challenge, tmp_pa
     """A worker emitting HITL_REQUEST (NEED_INPUT) while the swarm goes idle must
     make the coordinator WAIT for the operator instead of re-bootstrapping into the
     same unsolvable-without-help wall. An operator command unblocks it."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType, hitl_request_payload
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType, hitl_request_payload
 
     bus = EventBus()
     inbox: asyncio.Queue = asyncio.Queue()
@@ -3114,9 +3336,9 @@ async def test_coordinator_pauses_on_need_input_while_BUSY(challenge, tmp_path, 
     hurled at the same no-token wall). Here we FORCE the busy state: _run_reason keeps
     'proposing' and _open_intents always returns a non-empty list. The coordinator
     must STILL pause on a pending NEED_INPUT and stop spawning new workers."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType, hitl_request_payload
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType, hitl_request_payload
 
     bus = EventBus()
     inbox: asyncio.Queue = asyncio.Queue()
@@ -3197,9 +3419,9 @@ async def test_coordinator_need_input_pause_respects_finite_budget(
     eval, no operator present) must still exhaust the budget and terminate rather than
     block forever on `_operator_event.wait()`. The old code waited unconditionally; the
     fix mirrors the barren pause's budget-aware wait_for + budget_exhausted break."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType, hitl_request_payload
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType, hitl_request_payload
 
     bus = EventBus()
     inbox: asyncio.Queue = asyncio.Queue()
@@ -3246,15 +3468,15 @@ async def test_operator_pause_stops_spawning_resume_continues(challenge, tmp_pat
     and a `resume` must continue. This is the meaningful pause for a single-shot swarm
     (the old behavior had NO swarm-level pause wired to the operator's pause command,
     so 'pause' looked like a no-op button)."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
     # EventType must be imported INTO this function's scope: the _bb_spy sink below
     # references it, and EventBus.emit() runs every sink inside `try/except
     # Exception: pass` (a slow/failing sink must never wedge the publish). Without
     # the import the sink raised NameError on EVERY event — silently swallowed by
     # emit — so paused_seen never flipped and the assert failed regardless of the
     # (correct) production pause logic. This was the whole "flake".
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
 
     bus = EventBus()
     inbox: asyncio.Queue = asyncio.Queue()
@@ -3329,9 +3551,9 @@ async def test_coordinator_barren_backpressure_pauses_single_flag(
     single-flag chained run had NO spend cap and could spike workers without bound.
     Here every worker is fruitless and the board never grows; after barren_limit
     completions the coordinator must emit the pause and stop spawning."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType
 
     bus = EventBus()
     inbox: asyncio.Queue = asyncio.Queue()
@@ -3399,9 +3621,9 @@ async def test_coordinator_barren_resets_on_new_fact(challenge, tmp_path, monkey
     deep-exploit worker mid-chain that just produced a candidate is making
     progress and must not be paused. With the board growing each round, the run
     must NEVER hit the barren pause before its finite budget ends it."""
-    from muteki.solver.types import SolveOutcome
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event, EventType
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event, EventType
 
     bus = EventBus()
     sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, bus=bus,
@@ -3447,7 +3669,7 @@ def test_missing_profile_does_not_leak_budget(challenge, tmp_path):
     (the old code did _reserve_worker_spawn() BEFORE resolving the profile, then
     bailed — leaking a phantom spawn toward max_total_workers and crashing the
     coordinator with a bare RuntimeError)."""
-    from muteki.swarm.swarm import WorkerSpawnRejected
+    from dswarm.swarm.swarm import WorkerSpawnRejected
     sw = _coordinator_swarm(
         challenge, tmp_path,
         worker_profiles=[{"id": "pi-sub", "engine": "pi",
@@ -3499,11 +3721,11 @@ def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkey
     """#11: one-container-per-run. A second engine whose profile asks for a DIFFERENT
     runtime than the container was built with must be flagged runtime_degraded, not
     silently inherit the first profile's isolation settings."""
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
 
     class _FakeHandle:
-        container = "muteki-run-x"
-    # _container_for_engine does `from muteki.solver.container_exec import
+        container = "dswarm-run-x"
+    # _container_for_engine does `from dswarm.solver.container_exec import
     # ensure_container` at call time, so patch it on the SOURCE module.
     monkeypatch.setattr(ce, "ensure_container",
                         lambda *a, **k: _FakeHandle(), raising=False)
@@ -3531,13 +3753,17 @@ def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkey
 
 
 def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, tmp_path, monkeypatch):
-    import muteki.solver.container_exec as container_exec
+    import dswarm.solver.container_exec as container_exec
 
     wroot = tmp_path / "workspace" / "workers"
     wroot.mkdir(parents=True, exist_ok=True)
     sw = _coordinator_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=wroot,
     )
+    sw._gateway_token = "task-token"
+    monkeypatch.delenv("DSWARM_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("DSWARM_BLACKBOARD_URL", raising=False)
+    monkeypatch.setenv("DSWARM_MODEL_GATEWAY_PORT", "19101")
     chowned = []
     monkeypatch.setattr(
         container_exec, "_chown_tree_to_worker",
@@ -3553,18 +3779,141 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     env = sw._runtime_env_for("pi", "cli-pi", container=_FakeContainer())
 
     assert env["HOME"] == "/home/kali/workspace/homes/cli-pi"
+    assert env["DSWARM_TASK_TOKEN"] == "task-token"
+    assert env["DEEPSEEK_API_KEY"] == "task-token"
+    assert env["DSWARM_PI_PROVIDER"] == "ctf-gateway"
+    assert env["DSWARM_GATEWAY_URL"] == "http://host.docker.internal:19101/v1"
+    assert env["DSWARM_WORKER_MODEL"] == "deepseek-v4-flash"
     home = tmp_path / "workspace" / "homes" / "cli-pi"
     assert chowned == [home]
-    for rel in (
-        ".pi/agent/skills/muteki-blackboard",
-    ):
+    expected_links = {
+        ".pi/agent/skills/dswarm-blackboard": "/home/kali/workspace/.dswarm_runtime/dswarm-blackboard",
+        ".pi/agent/settings.json": "/opt/dswarm/pi-config/settings.json",
+        ".pi/agent/models-store.json": "/opt/dswarm/pi-config/models-store.json",
+        ".pi/agent/models.json": "/opt/dswarm/pi-config/models.json",
+        ".pi/agent/extensions": "/opt/dswarm/pi-config/extensions",
+    }
+    for rel, target in expected_links.items():
         link = home / rel
         assert link.is_symlink()
         # WindowsPath normalizes separators; the target is a POSIX container path
-        assert str(link.readlink()).replace("\\", "/") == "/opt/muteki/muteki-blackboard"
+        assert str(link.readlink()).replace("\\", "/") == target
 
 
 # ── review-policy sanitization ───────────────────────────────────────────────
+
+def test_container_runtime_prefers_mapped_shared_graph_db(
+        challenge, tmp_path, monkeypatch):
+    import dswarm.solver.container_exec as container_exec
+
+    workspace = tmp_path / "workspace"
+    worker_root = workspace / "workers"
+    worker_root.mkdir(parents=True)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container", worker_root=worker_root,
+        graph_dir=workspace / "graph", blackboard_token="bb-token",
+    )
+    monkeypatch.delenv("DSWARM_BLACKBOARD_URL", raising=False)
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", lambda _path: None)
+
+    class FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return (path.replace(str(workspace), "/home/kali/workspace")
+                    .replace("\\", "/"))
+
+    env = sw._runtime_env_for("pi", "cli-pi", container=FakeContainer())
+
+    assert env["DSWARM_BLACKBOARD_DB"] == "/home/kali/workspace/graph/shared_graph.db"
+    assert "DSWARM_BLACKBOARD_URL" not in env
+    assert "DSWARM_BLACKBOARD_RUN_ID" not in env
+    assert "DSWARM_BLACKBOARD_TOKEN" not in env
+
+
+def test_container_runtime_explicit_blackboard_url_overrides_shared_db(
+        challenge, tmp_path, monkeypatch):
+    import dswarm.solver.container_exec as container_exec
+
+    workspace = tmp_path / "workspace"
+    worker_root = workspace / "workers"
+    worker_root.mkdir(parents=True)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container", worker_root=worker_root,
+        graph_dir=workspace / "graph", blackboard_token="bb-token",
+    )
+    monkeypatch.setenv(
+        "DSWARM_BLACKBOARD_URL", "http://blackboard.internal:8000/api/blackboard")
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", lambda _path: None)
+
+    class FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return (path.replace(str(workspace), "/home/kali/workspace")
+                    .replace("\\", "/"))
+
+    env = sw._runtime_env_for("pi", "cli-pi", container=FakeContainer())
+
+    assert env["DSWARM_BLACKBOARD_DB"] == "/home/kali/workspace/graph/shared_graph.db"
+    assert env["DSWARM_BLACKBOARD_URL"] == \
+        "http://blackboard.internal:8000/api/blackboard"
+    assert env["DSWARM_BLACKBOARD_RUN_ID"] == sw.run_id
+    assert env["DSWARM_BLACKBOARD_TOKEN"] == "bb-token"
+
+
+def test_runtime_uses_http_blackboard_fallback_without_shared_graph(
+        challenge, tmp_path, monkeypatch):
+    sw = _coordinator_swarm(challenge, tmp_path, blackboard_token="bb-token")
+    if sw.shared_graph is not None:
+        sw.shared_graph.close()
+    sw.shared_graph = None
+    monkeypatch.delenv("DSWARM_BLACKBOARD_URL", raising=False)
+
+    env = sw._runtime_env_for("pi", "cli-pi", container=None)
+
+    assert env["DSWARM_BLACKBOARD_URL"].endswith("/api/blackboard")
+    assert env["DSWARM_BLACKBOARD_RUN_ID"] == sw.run_id
+    assert env["DSWARM_BLACKBOARD_TOKEN"] == "bb-token"
+    assert "DSWARM_BLACKBOARD_DB" not in env
+
+
+@pytest.mark.asyncio
+async def test_finalize_refreshes_workspace_board_atomically_and_idempotently(
+        challenge, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    worker_root = workspace / "workers"
+    worker_root.mkdir(parents=True)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_root=worker_root, graph_dir=workspace / "graph")
+    assert sw.shared_graph is not None
+    sw.shared_graph.propose_intent(
+        actor="reason", intent_id="I-final-board", goal="inspect the final route")
+    assert sw.shared_graph.claim_intent(
+        worker="cli-pi", intent_id="I-final-board") is True
+
+    board_path = workspace / ".dswarm_board.md"
+    board_path.write_text(
+        "<!-- dswarm-team-board -->\n## Open intents\n- stale claimed intent\n",
+        encoding="utf-8",
+    )
+
+    async def fail_bus_drain(**_kwargs):
+        raise RuntimeError("simulated bus failure")
+
+    monkeypatch.setattr(sw, "_drain_graph_to_bus", fail_bus_drain)
+
+    await sw._finalize_coordinator_run(
+        winner="cli-pi", flag="flag{done}", goal_complete=True, per_solver={})
+
+    first = board_path.read_text(encoding="utf-8")
+    assert first.startswith("<!-- dswarm-team-board -->\n")
+    assert "## Open intents" not in first
+    assert "## Already attempted" in first
+    assert "inspect the final route" in first
+    assert "closed_by_solve" in first
+    assert "stale claimed intent" not in first
+
+    await sw._finalize_coordinator_run(
+        winner="cli-pi", flag="flag{done}", goal_complete=True, per_solver={})
+    assert board_path.read_text(encoding="utf-8") == first
+
 
 def test_clean_review_policy_preserves_max_challenges_per_cycle():
     """run-75377 knob: an operator-set max_challenges_per_cycle must survive
@@ -3642,7 +3991,7 @@ def test_lifecycle_integration_directive_review_resource_compact(challenge, tmp_
     assert "I-free" in revived
 
 
-# ── split-brain flag-completion source of truth (run-75379 BUG②) ─────────────
+# ── split-brain flag-completion source of truth (run-75379 BUG④ ─────────────
 # A flag reaches the AUTHORITATIVE shared graph the moment a worker accepts it
 # (_accept_flag → shared_graph.flag_found), but _found_flags (the in-memory list
 # _flags_complete() reads) is fed ONLY from a reaped `outcome.flags`. A worker
@@ -3707,11 +4056,11 @@ def test_sync_flags_noop_without_graph(challenge, tmp_path: Path):
 
 async def test_coordinator_finalizes_when_flag_only_on_graph(challenge, tmp_path: Path,
                                                              monkeypatch):
-    """End-to-end (run-75379 BUG②): expected_flags=2 where each worker writes its
+    """End-to-end (run-75379 BUG②: expected_flags=2 where each worker writes its
     flag to the shared graph (as _accept_flag does) but returns a SolveOutcome with
     EMPTY flags — the leak. The per-reap tally stays at 0; only the graph reconcile
     drives completion. The run must finalize solved instead of spawning forever."""
-    from muteki.solver.types import SolveOutcome
+    from dswarm.solver.types import SolveOutcome
 
     challenge.expected_flags = 2
     challenge.multi_flag = True

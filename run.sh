@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — launch a Project Muteki frontend.
+# run.sh — launch a Project D-Swarm frontend.
 #
 #   ./run.sh tui [tui-args...]      Textual TUI command deck (in-process).
 #   ./run.sh web [web-opts...]      Web command deck (FastAPI backend + Next UI).
@@ -15,15 +15,15 @@
 #   ./run.sh web --port 9000                  override backend port
 #   ./run.sh web --ui-port 3002               override UI port
 #   ./run.sh web --host 0.0.0.0               bind address (default 127.0.0.1).
-#                                             Non-loopback REQUIRES MUTEKI_WEB_PASSWORD
+#                                             Non-loopback REQUIRES DSWARM_WEB_PASSWORD
 #                                             (the backend refuses to start otherwise).
 #
-# Auth: set MUTEKI_WEB_PASSWORD to require a login password for the web deck.
+# Auth: set DSWARM_WEB_PASSWORD to require a login password for the web deck.
 # When set, open http://localhost:3001 and enter it. Leave unset only for a
 # loopback-only (127.0.0.1) single-operator setup.
 #
 # Secrets: a repo-root .env is auto-loaded (see .env.example). A shell-exported
-# var always wins. --swarm needs MUTEKI_DEEPSEEK_API_KEY.
+# var always wins. --swarm needs DSWARM_DEEPSEEK_API_KEY.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -64,8 +64,8 @@ run_tui() {
 
 run_web() {
   require_uv
-  local backend_only=0 port=8000 host=127.0.0.1 ui_port="${MUTEKI_UI_PORT:-3001}"
-  local rebuild_ui="${MUTEKI_UI_REBUILD:-auto}"
+  local backend_only=0 port=8000 host=127.0.0.1 ui_port="${DSWARM_UI_PORT:-3001}"
+  local rebuild_ui="${DSWARM_UI_REBUILD:-auto}"
   local passthru=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -106,9 +106,9 @@ run_web() {
     elif [ "$host" != "0.0.0.0" ] && [ "$host" != "::" ]; then
       backend_host="$host"
     fi
-    local backend_url="${MUTEKI_BACKEND:-http://${backend_host}:${port}}"
+    local backend_url="${DSWARM_BACKEND:-http://${backend_host}:${port}}"
     local build_id="$ui_dir/.next/BUILD_ID"
-    local backend_marker="$ui_dir/.next/MUTEKI_BACKEND"
+    local backend_marker="$ui_dir/.next/DSWARM_BACKEND"
     local need_build=0
     case "$rebuild_ui" in
       1|true|yes|always) need_build=1 ;;
@@ -124,11 +124,11 @@ run_web() {
           need_build=1
         fi
         ;;
-      *) echo "ERROR: invalid MUTEKI_UI_REBUILD/--rebuild setting: $rebuild_ui" >&2; exit 1 ;;
+      *) echo "ERROR: invalid DSWARM_UI_REBUILD/--rebuild setting: $rebuild_ui" >&2; exit 1 ;;
     esac
     if [ "$need_build" -eq 1 ]; then
-      echo "==> Building production Next UI (MUTEKI_BACKEND=$backend_url)…"
-      ( cd "$ui_dir" && MUTEKI_BACKEND="$backend_url" npm run build )
+      echo "==> Building production Next UI (DSWARM_BACKEND=$backend_url)…"
+      ( cd "$ui_dir" && DSWARM_BACKEND="$backend_url" npm run build )
       printf '%s\n' "$backend_url" > "$backend_marker"
     fi
     if [ -f "$ui_dir/.next/standalone/server.js" ]; then
@@ -145,9 +145,9 @@ run_web() {
     echo "==> Starting production Next UI on http://${host}:${ui_port}"
     echo "    UI proxies /api to $backend_url; browser traffic stays same-origin."
     if [ -f "$ui_dir/.next/standalone/server.js" ]; then
-      ( cd "$ui_dir" && MUTEKI_BACKEND="$backend_url" PORT="$ui_port" HOSTNAME="$host" node .next/standalone/server.js ) &
+      ( cd "$ui_dir" && DSWARM_BACKEND="$backend_url" PORT="$ui_port" HOSTNAME="$host" node .next/standalone/server.js ) &
     else
-      ( cd "$ui_dir" && MUTEKI_BACKEND="$backend_url" npx next start -p "$ui_port" -H "$host" ) &
+      ( cd "$ui_dir" && DSWARM_BACKEND="$backend_url" npx next start -p "$ui_port" -H "$host" ) &
     fi
     ui_pid=$!
   fi
@@ -161,13 +161,13 @@ run_web() {
   # exec would drop the trap; run in foreground so cleanup fires on Ctrl+C.
   # Export the bind host so create_app can see it (uvicorn's --host is NOT
   # visible to the app) and fail-fast on a non-loopback bind with no password.
-  export MUTEKI_WEB_BIND="$host"
+  export DSWARM_WEB_BIND="$host"
   # Linux worker containers reach the host-side reverse control plane through
   # host.docker.internal:host-gateway, which cannot hit a receiver bound only to
   # 127.0.0.1. Docker compose already sets this explicitly; for bare-metal
   # `run.sh web` choose the reachable default unless the operator overrode it.
-  if [ -z "${MUTEKI_CONTROL_BIND+x}" ] && [ "$(uname -s 2>/dev/null || true)" = "Linux" ]; then
-    export MUTEKI_CONTROL_BIND=0.0.0.0
+  if [ -z "${DSWARM_CONTROL_BIND+x}" ] && [ "$(uname -s 2>/dev/null || true)" = "Linux" ]; then
+    export DSWARM_CONTROL_BIND=0.0.0.0
   fi
   uv run uvicorn apps.web.server:create_app --factory \
       --host "$host" --port "$port" "${passthru[@]+"${passthru[@]}"}"

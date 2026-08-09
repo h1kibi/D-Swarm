@@ -25,7 +25,7 @@ from apps.web.run_scheduler import (
     RunScheduler,
 )
 from apps.web.server import create_app
-from muteki.core.events import Event, EventType
+from dswarm.core.events import Event, EventType
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -160,11 +160,11 @@ def test_set_limit_clamps_and_persists(tmp_path):
 
 
 def test_env_limit_seed(monkeypatch, tmp_path):
-    monkeypatch.setenv("MUTEKI_MAX_CONCURRENT_RUNS", "2")
+    monkeypatch.setenv("DSWARM_MAX_CONCURRENT_RUNS", "2")
     assert RunScheduler(str(tmp_path / "s")).max_concurrent_runs == 2
-    monkeypatch.setenv("MUTEKI_MAX_CONCURRENT_RUNS", "99")
+    monkeypatch.setenv("DSWARM_MAX_CONCURRENT_RUNS", "99")
     assert RunScheduler(str(tmp_path / "s")).max_concurrent_runs == MAX_CONCURRENT_RUNS
-    monkeypatch.delenv("MUTEKI_MAX_CONCURRENT_RUNS")
+    monkeypatch.delenv("DSWARM_MAX_CONCURRENT_RUNS")
     assert RunScheduler(str(tmp_path / "s")).max_concurrent_runs == DEFAULT_MAX_CONCURRENT_RUNS
 
 

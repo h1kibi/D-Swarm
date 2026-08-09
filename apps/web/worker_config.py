@@ -18,15 +18,17 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from muteki.core.runtime_env import is_web_container
-from muteki.solver.worker_profiles import (
+from dswarm.core.runtime_env import is_web_container
+from dswarm.solver.worker_profiles import (
+    DEFAULT_WORKER_IMAGE,
     VALID_BASE_ENGINES,
     base_engine_for_profile,
+    direction_image,
     normalize_profile_roster,
     normalize_worker_profiles,
     resolve_seat_ref,
 )
-from muteki.solver.identity_model import (
+from dswarm.solver.identity_model import (
     migrate_legacy_config,
     seats_to_legacy_profiles,
     is_legal_combo,
@@ -42,7 +44,7 @@ DEFAULT_MAX_TOTAL_WORKERS = 0
 DEFAULT_COST_BUDGET_USD = 0.0
 DEFAULT_REVIEW_POLICY = {
     "enabled": True,
-    "engine": "pi-web",
+    "engine": "pi-worker",
     "after_race": True,
     "after_fruitless_workers": 3,
     "after_duplicate_intents": 2,
@@ -74,67 +76,45 @@ DEFAULT_RUNTIME_PROFILES = [
     {"id": "docker-pwn-heavy", "backend": "container", "label": "Docker pwn heavy",
      "network": "bridge", "memory": "24g", "cpus": "8", "pids_limit": 4096},
 ]
-# Pi-only roster (route A): one engine (pi), seven DIRECTION profiles. All are
-# plain pi for now — they are the specialization hooks (per-profile model /
-# runtime image / prompt later). The per-category override map routes each
-# challenge to its direction profile.
+# Pi-only roster (route A): one engine (pi), seven DIRECTION profiles plus the
+# generic pi-worker fallback. Each direction is a specialization hook: its own
+# worker image (Kali base + direction config layer), prompt, skill extensions
+# and (optionally) its own base_url / credential account. All inherit the
+# shared pi-main account by default so an existing deployment keeps running;
+# the operator can bind a per-direction account / base_url in settings later.
+# The per-category override map routes each challenge to its direction profile;
+# each routed direction needs a recon slot plus one focused explore/attack slot,
+# and the global worker ceiling still limits total concurrency.
+def _direction_profiles() -> list[dict[str, object]]:
+    from dswarm.solver.worker_profiles import DIRECTIONS
+
+    out: list[dict[str, object]] = []
+    for direction in DIRECTIONS:
+        out.append({
+            "id": f"pi-{direction}", "name": f"pi-{direction}",
+            "engine": "pi", "transport": "pi_cli",
+            "auth": "api_key", "credential_mode": "api_key",
+            "api_key_ref": "", "base_url": "", "wire_api": "",
+            "runtime": "docker-web",
+            "roles": ["recon", "bootstrap", "explore", "respond", "review"],
+            "image": direction_image(direction),
+            "race": True, "max_running": 2, "max_review_running": 1,
+            "priority": 10, "model": "", "enabled": True,
+        })
+    return out
+
+
 DEFAULT_WORKER_PROFILES = [
-    {"id": "pi-web", "name": "pi-web",
+    {"id": "pi-worker", "name": "pi-worker",
      "engine": "pi", "transport": "pi_cli",
      "auth": "api_key", "credential_mode": "api_key",
      "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
      "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 10, "model": "",
+     "runtime": "docker-web", "roles": ["recon", "bootstrap", "explore", "respond", "review"],
+     "image": DEFAULT_WORKER_IMAGE,
+     "race": True, "max_running": 3, "max_review_running": 1, "priority": 10, "model": "",
      "enabled": True},
-    {"id": "pi-pwn", "name": "pi-pwn",
-     "engine": "pi", "transport": "pi_cli",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 20, "model": "",
-     "enabled": True},
-    {"id": "pi-rev", "name": "pi-rev",
-     "engine": "pi", "transport": "pi_cli",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 30, "model": "",
-     "enabled": True},
-    {"id": "pi-crypto", "name": "pi-crypto",
-     "engine": "pi", "transport": "pi_cli",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 40, "model": "",
-     "enabled": True},
-    {"id": "pi-misc", "name": "pi-misc",
-     "engine": "pi", "transport": "pi_cli",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 50, "model": "",
-     "enabled": True},
-    {"id": "pi-forensics", "name": "pi-forensics",
-     "engine": "pi", "transport": "pi_cli",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 60, "model": "",
-     "enabled": True},
-    {"id": "pi-AIsec", "name": "pi-AIsec",
-     "engine": "pi", "transport": "pi_cli",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 70, "model": "",
-     "enabled": True},
+    *_direction_profiles(),
 ]
 DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
 
@@ -148,7 +128,7 @@ DEFAULT_CATEGORY_OVERRIDES = {
     "crypto": ["pi-crypto"],
     "misc": ["pi-misc"],
     "forensics": ["pi-forensics"],
-    "aisec": ["pi-AIsec"],
+    "aisec": ["pi-aisec"],
 }
 
 
@@ -235,6 +215,9 @@ def _canonical_profile_aliases(profile: dict[str, Any]) -> set[str]:
 
 def _clean_engines(value: Any, profiles: list[dict[str, Any]] | None = None) -> list[str]:
     """Filter to known profile names, expanding legacy base-engine names."""
+    # Direction profile names (pi-web/pi-pwn/...) are REAL profiles now — do NOT
+    # collapse them to pi-worker. Only the legacy base-engine "pi" expands (in
+    # normalize_profile_roster) to every enabled pi profile.
     return normalize_profile_roster(value, profiles or DEFAULT_WORKER_PROFILES)
 
 
@@ -377,7 +360,7 @@ class WorkerConfigStore:
         profile to its real default account as engine_key (not host-inherit).
         Never raises — a missing/locked secrets store just yields {}."""
         try:
-            from muteki.solver.credential_accounts import (
+            from dswarm.solver.credential_accounts import (
                 CredentialAccountStore, account_store_root,
             )
             store = CredentialAccountStore(account_store_root(self._root))
@@ -396,7 +379,7 @@ class WorkerConfigStore:
         worker config JSON.
         """
         try:
-            from muteki.solver.credential_accounts import (
+            from dswarm.solver.credential_accounts import (
                 CredentialAccountStore, account_store_root,
             )
             store = CredentialAccountStore(account_store_root(self._root))
@@ -497,23 +480,16 @@ class WorkerConfigStore:
         ]
         start_workers = self._coerce_pos_int(d.get("start_workers"), len(engines))
         max_workers = self._coerce_pos_int(d.get("max_workers"), DEFAULT_MAX_WORKERS)
-        race_scout = self._coerce_bool(d.get("race_scout"), True)
-        race_timeout = self._coerce_pos_int(d.get("race_timeout"), DEFAULT_RACE_TIMEOUT)
         wall_clock_budget = self._coerce_nonneg_int(
             d.get("wall_clock_budget"), DEFAULT_WALL_CLOCK_BUDGET)
         max_total_workers = self._coerce_nonneg_int(
             d.get("max_total_workers"), DEFAULT_MAX_TOTAL_WORKERS)
         cost_budget_usd = self._coerce_nonneg_float(
             d.get("cost_budget_usd"), DEFAULT_COST_BUDGET_USD)
-        race_engines = _clean_engines_for_backend(
-            d.get("race_engines"), worker_profiles, worker_backend)
         llm_profiles = self._clean_llm_profiles(d.get("llm_profiles"))
         raw_stage_policy = d.get("stage_policy")
         if isinstance(raw_stage_policy, dict):
             raw_stage_policy = json.loads(json.dumps(raw_stage_policy))
-            race = raw_stage_policy.setdefault("race", {})
-            race["engines"] = _remap_profile_refs(
-                race.get("engines"), worker_profiles, worker_backend)
             review = raw_stage_policy.setdefault("coordinator", {}).setdefault("review", {})
             review["engine"] = _remap_profile_ref(
                 review.get("engine") or DEFAULT_REVIEW_POLICY["engine"],
@@ -521,9 +497,6 @@ class WorkerConfigStore:
                 worker_backend,
             )
         stage_policy = self._clean_stage_policy(raw_stage_policy, {
-            "race_scout": race_scout,
-            "race_timeout": race_timeout,
-            "race_engines": race_engines,
             "wall_clock_budget": wall_clock_budget,
             "max_total_workers": max_total_workers,
             "cost_budget_usd": cost_budget_usd,
@@ -573,10 +546,7 @@ class WorkerConfigStore:
             "start_workers": start_workers,
             "max_workers": max_workers,
             "worker_backend": worker_backend,
-            "race_scout": race_scout,
-            "race_timeout": race_timeout,
             "wall_clock_budget": wall_clock_budget,
-            "race_engines": race_engines,
             "max_total_workers": max_total_workers,
             "cost_budget_usd": cost_budget_usd,
             "stage_policy": stage_policy,
@@ -616,15 +586,29 @@ class WorkerConfigStore:
         cfg = self.get()
         ov = cfg["overrides"].get((category or "").strip())
         if ov:
+            # Category overrides narrow the roster to one direction profile. The
+            # global fallback ceiling may still be 10 (or the sum of every enabled
+            # profile), which lets the coordinator repeatedly try to dispatch past
+            # that direction profile's max_running capacity. Derive the ceiling from
+            # the effective category roster so bootstrap + explore share exactly the
+            # configured seats and no bogus "no available worker profile" events are
+            # emitted after the profile is full.
+            selected = set(ov["engines"])
+            eligible = [
+                p for p in cfg["worker_profiles"]
+                if _profile_name(p) in selected
+                and p.get("enabled", True)
+                and _ordinary_worker_roles(p)
+            ]
+            category_max_workers = sum(
+                self._coerce_pos_int(p.get("max_running"), 1) for p in eligible
+            ) or cfg["max_workers"]
             return {
                 "engines": ov["engines"],
-                "start_workers": ov["start_workers"],
-                "max_workers": cfg["max_workers"],
+                "start_workers": min(ov["start_workers"], category_max_workers),
+                "max_workers": category_max_workers,
                 "worker_backend": cfg["worker_backend"],
-                "race_scout": cfg["race_scout"],
-                "race_timeout": cfg["race_timeout"],
                 "wall_clock_budget": cfg["wall_clock_budget"],
-                "race_engines": cfg["race_engines"],
                 "max_total_workers": cfg["max_total_workers"],
                 "cost_budget_usd": cfg["cost_budget_usd"],
                 "stage_policy": cfg["stage_policy"],
@@ -637,10 +621,7 @@ class WorkerConfigStore:
             "start_workers": cfg["start_workers"],
             "max_workers": cfg["max_workers"],
             "worker_backend": cfg["worker_backend"],
-            "race_scout": cfg["race_scout"],
-            "race_timeout": cfg["race_timeout"],
             "wall_clock_budget": cfg["wall_clock_budget"],
-            "race_engines": cfg["race_engines"],
             "max_total_workers": cfg["max_total_workers"],
             "cost_budget_usd": cfg["cost_budget_usd"],
             "stage_policy": cfg["stage_policy"],
@@ -1065,7 +1046,7 @@ class WorkerConfigStore:
             provider = str(raw.get("provider") or out[key]["provider"]).strip()
             # base_url is the OpenAI-compatible endpoint override; empty = default
             # DeepSeek. The API key is NOT stored here — it stays in .env
-            # (MUTEKI_DEEPSEEK_API_KEY). A non-string/garbage value normalizes to "".
+            # (DSWARM_DEEPSEEK_API_KEY). A non-string/garbage value normalizes to "".
             raw_base = raw.get("base_url")
             base_url = str(raw_base).strip() if isinstance(raw_base, str) else ""
             if not model:
@@ -1083,12 +1064,6 @@ class WorkerConfigStore:
     def _clean_stage_policy(value: Any, defaults: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             value = {}
-        race_timeout = int(value.get("race", {}).get("timeout")
-                           or defaults.get("race_timeout") or DEFAULT_RACE_TIMEOUT)
-        race_enabled = bool(value.get("race", {}).get(
-            "enabled", defaults.get("race_scout", True)))
-        raw_race_engines = value.get("race", {}).get("engines")
-        race_engines = raw_race_engines or defaults.get("race_engines") or []
         wall = int((value.get("coordinator") or {}).get(
             "wall_clock_budget", defaults.get("wall_clock_budget", 0)) or 0)
         max_workers = int(value.get("budgets", {}).get(
@@ -1116,8 +1091,6 @@ class WorkerConfigStore:
                     review[key] = bool(raw_review.get(key))
         return {
             "prepare": dict(value.get("prepare") or {}),
-            "race": {"enabled": race_enabled, "timeout": race_timeout,
-                     "engines": list(race_engines or [])},
             "coordinator": {"wall_clock_budget": wall, "review": review},
             "budgets": {"max_total_workers": max_workers,
                         "cost_budget_usd": cost},

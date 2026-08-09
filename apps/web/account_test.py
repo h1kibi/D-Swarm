@@ -26,7 +26,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-from muteki.solver.credential_accounts import (
+from dswarm.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
     project_account_root,
 )
@@ -63,11 +63,11 @@ def probe_account(
 
     Returns the historical {ok, detail, layer?} shape. Never raises.
     """
-    from muteki.solver.credential_accounts import (
+    from dswarm.solver.credential_accounts import (
         CredentialAccountStore,
         account_store_root,
     )
-    from muteki.solver.profile_health import evaluate_profile_health
+    from dswarm.solver.profile_health import evaluate_profile_health
 
     engine = (engine or "").strip().lower()
     account_id = (account_id or "").strip()
@@ -186,7 +186,7 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
       mount  → container uid can't read the projected credential
       cli    → engine binary won't launch in the container
     """
-    from muteki.solver.container_exec import (
+    from dswarm.solver.container_exec import (
         WORKER_IMAGE,
         _CATEGORY_IMAGES,
         CONTAINER_WORKSPACE,
@@ -197,7 +197,7 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
     # Probe the image the workers will ACTUALLY run. Dispatch picks the worker
     # image per challenge CATEGORY (worker_image_for_category → the route-A
     # ctf-swarm-pi-<cat> images); the old hardcoded WORKER_IMAGE (upstream
-    # ghcr.io/fishcodetech/muteki-worker:latest) is NOT installed on route-A
+    # ghcr.io/fishcodetech/dswarm-worker:latest) is NOT installed on route-A
     # hosts, so the plumbing probe false-failed every profile before any worker
     # spawned ("镜像缺失或不可用"). Prefer the first locally-present category
     # image (any of them proves the same plumbing: supervisor image + account
@@ -232,13 +232,13 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
     import tempfile
     _tmp_base = None
     if _HOST_DATA_ROOT:
-        _tmp_base = os.path.join(os.environ.get("MUTEKI_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT,
+        _tmp_base = os.path.join(os.environ.get("DSWARM_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT,
                                  "_tmp", "account-tests")
         try:
             os.makedirs(_tmp_base, exist_ok=True)
         except OSError:
             _tmp_base = None
-    with tempfile.TemporaryDirectory(prefix="muteki-acct-test-", dir=_tmp_base) as td:
+    with tempfile.TemporaryDirectory(prefix="dswarm-acct-test-", dir=_tmp_base) as td:
         workspace = os.path.join(td, "ws")
         projection = os.path.join(td, "accounts")
         os.makedirs(workspace, exist_ok=True)
@@ -254,9 +254,9 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
         # quota + need network, out of scope for a plumbing test).
         cred_path = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}"
         script = (
-            f"test -r {cred_path} || {{ echo MUTEKI_MOUNT_UNREADABLE; exit 71; }}; "
-            f"{bin_path} --version >/dev/null 2>&1 || {{ echo MUTEKI_CLI_FAIL; exit 72; }}; "
-            "echo MUTEKI_OK"
+            f"test -r {cred_path} || {{ echo DSWARM_MOUNT_UNREADABLE; exit 71; }}; "
+            f"{bin_path} --version >/dev/null 2>&1 || {{ echo DSWARM_CLI_FAIL; exit 72; }}; "
+            "echo DSWARM_OK"
         )
         run_cmd = [
             "run", "--rm", "--init",
@@ -276,9 +276,9 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
         except subprocess.TimeoutExpired:
             return _result(False, "容器探测超时（>60s）", layer="cli")
         out = (run.stdout or "") + (run.stderr or "")
-        if "MUTEKI_MOUNT_UNREADABLE" in out or run.returncode == 71:
+        if "DSWARM_MOUNT_UNREADABLE" in out or run.returncode == 71:
             return _result(False, "容器内无法读取凭据（uid 不匹配或挂载失败）", layer="mount")
-        if "MUTEKI_CLI_FAIL" in out or run.returncode == 72:
+        if "DSWARM_CLI_FAIL" in out or run.returncode == 72:
             return _result(False, f"容器内 {engine} CLI 无法启动", layer="cli")
         if run.returncode != 0:
             return _result(False, f"容器探测失败: {out.strip()[:160]}", layer="cli")

@@ -85,7 +85,7 @@ def test_backend_for_profile_golden(runtime, worker_backend, in_web, expected):
 def _capture_kernel(monkeypatch):
     """Patch the kernel to record every (profile_id, backend, depth) it's asked to
     evaluate, and return a green verdict so the caller proceeds."""
-    from muteki.solver.profile_health import ProfileHealth
+    from dswarm.solver.profile_health import ProfileHealth
 
     calls: list[tuple[str, str, str]] = []
 
@@ -100,14 +100,14 @@ def _capture_kernel(monkeypatch):
 
     # dispatch imports the kernel lazily INSIDE _missing_profile_accounts, so patch
     # the source symbol.
-    monkeypatch.setattr("muteki.solver.profile_health.evaluate_profile_health", _fake)
+    monkeypatch.setattr("dswarm.solver.profile_health.evaluate_profile_health", _fake)
     return calls
 
 
 def test_dispatch_feeds_kernel_selected_enabled_profiles_at_auth_depth(tmp_path, monkeypatch):
     from apps.web.drivers import _missing_profile_accounts
 
-    monkeypatch.setattr("muteki.core.runtime_env.is_web_container", lambda: False)
+    monkeypatch.setattr("dswarm.core.runtime_env.is_web_container", lambda: False)
     calls = _capture_kernel(monkeypatch)
 
     profiles = [
@@ -141,8 +141,8 @@ def test_settings_endpoint_feeds_kernel_same_tuple_at_auth_depth(tmp_path, monke
     from apps.web.server import create_app
     from apps.web.run_manager import RunManager
 
-    monkeypatch.setattr("muteki.core.runtime_env.is_web_container", lambda: False)
-    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
+    monkeypatch.setattr("dswarm.core.runtime_env.is_web_container", lambda: False)
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
 
     # seed a config with the docker-web profiles
     wc = WorkerConfigStore(root=tmp_path)
@@ -184,8 +184,8 @@ def test_settings_batch_endpoint_uses_binding_depth(tmp_path, monkeypatch):
     from apps.web.server import create_app
     from apps.web.run_manager import RunManager
 
-    monkeypatch.setattr("muteki.core.runtime_env.is_web_container", lambda: False)
-    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
+    monkeypatch.setattr("dswarm.core.runtime_env.is_web_container", lambda: False)
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
 
     wc = WorkerConfigStore(root=tmp_path)
     wc.set(

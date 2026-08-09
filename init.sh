@@ -42,27 +42,27 @@ fi
 
 PYTEST_ARGS=(-q)
 
-# The pwn SDK is optional and depends on pwntools / the muteki-pwn container.
+# The pwn SDK is optional and depends on pwntools / the dswarm-pwn container.
 # Keep the default session bootstrap lean: pwn-specific tests only run when the
 # operator explicitly opts in after installing those tools.
-if [[ "${MUTEKI_RUN_PWN_TESTS:-0}" != "1" ]]; then
+if [[ "${DSWARM_RUN_PWN_TESTS:-0}" != "1" ]]; then
   PYTEST_ARGS+=(--ignore=tests/test_kit_pwn.py)
 fi
 
 echo "==> [3/3] Fast test suite (unit + scripted-loop; pwn optional; live tests skip without API key)"
 # The web entrypoint auto-loads a repo-root .env (dotenv_boot.load_env). If the
-# operator has filled MUTEKI_WEB_PASSWORD there, the web app would start with auth
+# operator has filled DSWARM_WEB_PASSWORD there, the web app would start with auth
 # ON and the unauthenticated web-server tests would all 401. Exporting it EMPTY for
 # the test run wins over the file (load_dotenv override=False) and keeps auth off —
 # without an empty var, `env -u` would let .env supply the value again. Scoped to
 # this command only, so it never leaks into a later `./run.sh web`.
-MUTEKI_WEB_PASSWORD= uv run pytest "${PYTEST_ARGS[@]}"
+DSWARM_WEB_PASSWORD= uv run pytest "${PYTEST_ARGS[@]}"
 echo
 echo "OK — suite green. See README.md to get started; AGENTS.md for the dev map."
 
 # Optional pwn SDK verification:
-#   MUTEKI_RUN_PWN_TESTS=1 ./init.sh
-# Requires pwntools (and dynamic tests may require the muteki-pwn image).
+#   DSWARM_RUN_PWN_TESTS=1 ./init.sh
+# Requires pwntools (and dynamic tests may require the dswarm-pwn image).
 #
 # To run a real challenge (needs an API key), use the web deck:
 #   ./run.sh web   → create a run, flip the offline toggle for a clean black-box.

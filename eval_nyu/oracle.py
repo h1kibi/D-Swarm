@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from muteki.solver.gate import is_placeholder_flag
+from dswarm.solver.gate import is_placeholder_flag
 
 _ANGLE_TEMPLATE = re.compile(r"^<[^>]{0,30}>$")
 

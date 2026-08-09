@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Build the muteki worker image (ONE generic image — not a per-recipe tag). Two steps:
+# Build the dswarm worker image (ONE generic image — not a per-recipe tag). Two steps:
 #   1) cross-compile the Go runtime-agent (supervisor) to docker/worker/runtime_agent
 #      (the docker build context — COPY ./runtime_agent resolves relative to it).
 #   2) docker build the amd64 image, tagging both the version and :latest.
 #
 # Usage: ./docker/worker/build.sh [repo] [version]
-#   repo:    image repository (default: muteki-worker; e.g. ghcr.io/fishcodetech/muteki-worker)
-#   version: version tag       (default: 0.2.5)
+#   repo:    image repository (default: dswarm-worker; e.g. ghcr.io/h1kibi/dswarm-worker)
+#   version: version tag       (default: 0.3.0-rc.1)
 # Tags built: <repo>:<version> AND <repo>:latest (code defaults to :latest).
 set -euo pipefail
 
-REPO_IMAGE="${1:-muteki-worker}"
-VERSION="${2:-0.2.5}"
+REPO_IMAGE="${1:-dswarm-worker}"
+VERSION="${2:-0.3.0-rc.1}"
 TAG="${REPO_IMAGE}:${VERSION}"
 LATEST="${REPO_IMAGE}:latest"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,9 +24,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 ls -la "$HERE/runtime_agent"
 file "$HERE/runtime_agent" 2>/dev/null || true
 
-echo ">> syncing muteki-blackboard skill into docker build context..."
-cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
-cp "$REPO/skills/muteki-blackboard/blackboard.py" "$HERE/blackboard.py"
+echo ">> syncing dswarm-blackboard skill into docker build context..."
+cp "$REPO/skills/dswarm-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
+cp "$REPO/skills/dswarm-blackboard/blackboard.py" "$HERE/blackboard.py"
 chmod +x "$HERE/blackboard.py"
 
 # --platform linux/amd64 (full form, not the "amd64" shorthand) + --load forces the
@@ -41,4 +41,4 @@ docker build --platform linux/amd64 --load \
 
 echo ">> done: $TAG (+ $LATEST)"
 echo ">> quick verify (bypass ENTRYPOINT, it's the supervisor):"
-echo "   docker run --rm --entrypoint sh $TAG -c 'which claude codex cursor-agent ghidra sage vol radare2; ls /opt/muteki'"
+echo "   docker run --rm --entrypoint sh $TAG -c 'which claude codex cursor-agent ghidra sage vol radare2; ls /opt/dswarm'"

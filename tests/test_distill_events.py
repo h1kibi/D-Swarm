@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from muteki.learning.distill import distill, distill_from_events, Template
-from muteki.models.solve_graph import Challenge, SolveGraph
-from muteki.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.learning.distill import distill, distill_from_events, Template
+from dswarm.models.solve_graph import Challenge, SolveGraph
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
 
 def _solved_shared_graph(tmp_path):

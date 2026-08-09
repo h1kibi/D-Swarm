@@ -4,13 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ChatMessage, DeckState, isReviewWorkerLane, isWorkerLane, COORDINATOR_IDS } from "@/lib/events";
 import { useT, useLang } from "@/lib/i18n";
+import { readKey, writeKey } from "@/lib/storage";
 import { workerColor, workerEngine, workerInitial, workerShortLabel } from "@/lib/workers";
 import { Icon } from "@/components/Icon";
 import { PanelEmpty } from "@/components/PanelEmpty";
 import { ChipFilterBar } from "@/components/ChipFilterBar";
 
 // Stable filter key + display metadata for a message's speaker. Workers key by
-// their solverId (so each cli-claude-N filters independently); coordinator,
+// their solverId (so each cli-pi-N filters independently); planner,
 // system, and human collapse into one bucket each.
 const COORD_KEY = "__coordinator";
 const SYSTEM_KEY = "__system";
@@ -24,9 +25,9 @@ function speakerKey(m: ChatMessage): string {
 }
 
 /**
- * The raw activity stream — every worker + coordinator + system event in time
+ * The raw activity stream — every worker + planner + system event in time
  * order (the old main-timeline firehose). Lives in a secondary panel now so the
- * coordinator conversation stays readable; this is where the operator inspects
+ * Decision Timeline stays readable; this is where the operator inspects
  * the full play-by-play.
  */
 
@@ -75,7 +76,7 @@ const PIN_SLOP = 40;
 // Same speaker within this window (ms) → suppress the repeated header for a
 // denser, iMessage/Slack-style grouped log.
 const GROUP_WINDOW_MS = 60_000;
-const COMPACT_KEY = "muteki.activity.compact";
+const COMPACT_KEY = "dswarm.activity.compact";
 
 export function ActivityStream({ deck }: { deck: DeckState }) {
   const t = useT();
@@ -85,12 +86,12 @@ export function ActivityStream({ deck }: { deck: DeckState }) {
   // ── density toggle (comfortable ↔ compact), persisted to localStorage ──────
   const [compact, setCompact] = useState(false);
   useEffect(() => {
-    try { if (window.localStorage.getItem(COMPACT_KEY) === "1") setCompact(true); } catch { /* ignore */ }
+    if (readKey(COMPACT_KEY) === "1") setCompact(true);
   }, []);
   const toggleCompact = () =>
     setCompact((v) => {
       const next = !v;
-      try { window.localStorage.setItem(COMPACT_KEY, next ? "1" : "0"); } catch { /* ignore */ }
+      writeKey(COMPACT_KEY, next ? "1" : "0");
       return next;
     });
 
@@ -107,7 +108,7 @@ export function ActivityStream({ deck }: { deck: DeckState }) {
       if (seen.has(key)) continue;
       if (key === HUMAN_KEY) seen.set(key, { key, label: t("coord.you"), fullLabel: t("coord.you"), sub: "", initial: "你" });
       else if (key === SYSTEM_KEY) seen.set(key, { key, label: "system", fullLabel: "system", sub: "", initial: "S" });
-      else if (key === COORD_KEY) seen.set(key, { key, label: t("coord.title"), fullLabel: t("coord.title"), sub: "", color: workerColor("reason"), initial: "CO" });
+      else if (key === COORD_KEY) seen.set(key, { key, label: t("coord.title"), fullLabel: t("coord.title"), sub: "", color: workerColor("reason"), initial: "PL" });
       else {
         const review = isReviewWorkerLane(deck.lanes[key]);
         seen.set(key, {

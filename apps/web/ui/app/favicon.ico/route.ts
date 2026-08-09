@@ -1,7 +1,7 @@
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#0f172a"/>
-  <path d="M16 36 29 13h19L35 32h13L27 55l6-19H16Z" fill="#22d3ee"/>
-  <path d="M29 13h19L35 32h13" fill="none" stroke="#f472b6" stroke-width="4" stroke-linejoin="round"/>
+const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#ffffff"/>
+  <path fill-rule="evenodd" fill="#0D5C45" d="M11 5h17.5c15.25 0 22.5 10.5 22.5 27S43.75 59 28.5 59H11V5zm10 11.25v27.5h7.5c8.5 0 11.25-5.5 11.25-13.75S37 16.25 28.5 16.25H21z"/>
 </svg>`;
 
 export const dynamic = "force-static";

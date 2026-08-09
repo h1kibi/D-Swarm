@@ -28,7 +28,7 @@ sudo——装包、改系统、起服务都可以。
 
 - 工具齐全。缺什么先 `which` / `apt list --installed 2>/dev/null | grep -i <x>` 查，确实没有
   再 `apt install` / `apt-get install`（会自动 sudo）或 `pip3 install --break-system-packages`。
-- 这是蜂群协作环境。若 `$MUTEKI_BLACKBOARD_DB` 存在，开始新方向前先读共享黑板：
+- 这是蜂群协作环境。若 `$DSWARM_BLACKBOARD_DB` 存在，开始新方向前先读共享黑板：
   `blackboard.py read-review`、`blackboard.py read-deadends`、`blackboard.py read-facts`。
   被 Review-Arbiter 标成 challenged 的事实先别依赖；
   suppressed route 不要重复打，除非你拿到了能 reopen 的新证据；branch 要按独立假设分别验证。

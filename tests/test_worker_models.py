@@ -32,7 +32,7 @@ def test_probe_worker_model_injects_profile_model_and_account_env(tmp_path, monk
         return subprocess.CompletedProcess(argv, 0, '{"type":"agent_settled"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
 
     res = probe_worker_model(
         profile={
@@ -125,7 +125,7 @@ def test_probe_worker_model_runs_real_worker_container_when_web_is_containerized
     # ship the pi CLI — it lives only in the WORKER image. A container-backend
     # model probe must therefore run a real one-shot worker container and
     # complete the same minimal hello turn there.
-    monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
+    monkeypatch.setenv("DSWARM_IN_CONTAINER", "1")
     root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("deepseek-secret\n")
@@ -169,7 +169,7 @@ def test_probe_worker_model_runs_real_worker_container_when_web_is_containerized
     assert run_args[0] == "run"
     assert "--entrypoint" in run_args and "bash" in run_args
     assert "--user" in run_args and "kali" in run_args
-    assert any(str(a).startswith("type=bind") and "/run/muteki/accounts" in str(a) for a in run_args)
+    assert any(str(a).startswith("type=bind") and "/run/dswarm/accounts" in str(a) for a in run_args)
     assert "deepseek-v4-flash" in " ".join(str(a) for a in run_args)
 
 
@@ -179,7 +179,7 @@ def test_probe_worker_model_container_maps_provider_key_and_base_url(
     # A custom-endpoint pi account must reach the worker container as the
     # provider key + base URL env (pi reads standard provider keys, not a CLI
     # config seed).
-    monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
+    monkeypatch.setenv("DSWARM_IN_CONTAINER", "1")
     root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("deepseek-secret\n")
@@ -218,13 +218,13 @@ def test_probe_worker_model_container_maps_provider_key_and_base_url(
     assert res["ok"] is True
     joined = " ".join(str(a) for a in seen["run_args"])
     assert "ANTHROPIC_BASE_URL=https://api.deepseek.example/v1" in joined
-    assert "ANTHROPIC_API_KEY_FILE=/run/muteki/accounts/pi-main/API_KEY" in joined
+    assert "ANTHROPIC_API_KEY_FILE=/run/dswarm/accounts/pi-main/API_KEY" in joined
 
 
 def test_probe_worker_model_container_reports_model_rejection(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
+    monkeypatch.setenv("DSWARM_IN_CONTAINER", "1")
     root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("deepseek-secret\n")
@@ -266,7 +266,7 @@ def test_probe_worker_model_container_reports_model_rejection(
 def test_probe_worker_model_container_pi_endpoint_uses_custom_model(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
+    monkeypatch.setenv("DSWARM_IN_CONTAINER", "1")
     root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("deepseek-key\n")
@@ -310,8 +310,8 @@ def test_probe_worker_model_still_probes_host_for_local_backend_in_container(
 ) -> None:
     # The defer is gated on backend == "container". An explicit local-backend
     # probe (operator chose host semantics) must still shell the host CLI even
-    # if MUTEKI_IN_CONTAINER happens to be set — the guard must not over-reach.
-    monkeypatch.setenv("MUTEKI_IN_CONTAINER", "1")
+    # if DSWARM_IN_CONTAINER happens to be set — the guard must not over-reach.
+    monkeypatch.setenv("DSWARM_IN_CONTAINER", "1")
     root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("deepseek-secret\n")

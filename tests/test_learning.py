@@ -6,8 +6,8 @@ executor; what remains is distillation + the template store.)
 
 from pathlib import Path
 
-from muteki.learning.distill import Template, TemplateStore, distill, distill_and_store
-from muteki.models.solve_graph import Challenge, HypothesisStatus, SolveGraph
+from dswarm.learning.distill import Template, TemplateStore, distill, distill_and_store
+from dswarm.models.solve_graph import Challenge, HypothesisStatus, SolveGraph
 
 
 def _solved_graph() -> SolveGraph:

@@ -1,26 +1,26 @@
-# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 3 engine CLIs).
+# dswarm worker image — SLIM build (plain Ubuntu + reverse-connector + 3 engine CLIs).
 # A lightweight alternative to the full Kali image for FAST testing: it ships ONLY
 #   - the in-container Runtime Control Plane supervisor (runtime_agent, PID1/ENTRYPOINT)
 #   - the three engine CLIs (claude / codex / cursor-agent)
-#   - the muteki-blackboard skill
+#   - the dswarm-blackboard skill
 # and NOTHING from the CTF toolchain (no kali-linux-headless, ghidra, sagemath,
 # volatility3, pwntools, knowledge base, …). It pulls/builds in a fraction of the
 # time and is meant for wiring/integration tests where you only need a worker that
 # can connect back, run an agent, and write the blackboard — not actually solve.
 #
 # It keeps the EXACT SAME in-container path contract as the Kali image so
-# container_exec.py needs NO change — just point MUTEKI_WORKER_IMAGE at this tag:
+# container_exec.py needs NO change — just point DSWARM_WORKER_IMAGE at this tag:
 #   - user            : kali (NOPASSWD sudo)
 #   - workspace       : /home/kali/workspace   (CONTAINER_WORKSPACE)
 #   - cursor-agent    : /home/kali/.local/bin/cursor-agent  (_CONTAINER_BIN["cursor"])
 #   - claude/codex    : /usr/local/bin (on default PATH)
-#   - control / accts : /run/muteki/control , /run/muteki/accounts
-#   - ENTRYPOINT      : /opt/muteki/runtime_agent --sock … --workspace …
+#   - control / accts : /run/dswarm/control , /run/dswarm/accounts
+#   - ENTRYPOINT      : /opt/dswarm/runtime_agent --sock … --workspace …
 #
 # Build (always via docker/worker-slim/build.sh, which cross-compiles runtime_agent):
-#   ./docker/worker-slim/build.sh                       # → muteki-worker-slim:0.1.0 + :latest
-#   ./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.1.0
-# Then run a slim swarm with:  MUTEKI_WORKER_IMAGE=muteki-worker-slim:latest ./run.sh …
+#   ./docker/worker-slim/build.sh                       # → dswarm-worker-slim:0.1.0 + :latest
+#   ./docker/worker-slim/build.sh ghcr.io/fishcodetech/dswarm-worker-slim 0.1.0
+# Then run a slim swarm with:  DSWARM_WORKER_IMAGE=dswarm-worker-slim:latest ./run.sh …
 #
 # Platform: amd64 (match the Kali image + the cross-compiled runtime_agent). Set by the
 # build command (--platform linux/amd64), NOT a FROM const (same BuildKit arm64 export
@@ -59,11 +59,11 @@ RUN useradd -m -s /bin/bash kali && \
 # demand. Models sometimes type `apt-get install ...` without `sudo`; because
 # /usr/local/bin is before /usr/bin, these wrappers transparently retry common
 # package-manager commands through NOPASSWD sudo when the caller is not root.
-RUN cat > /usr/local/sbin/muteki-auto-sudo <<'EOF' && \
-    chmod +x /usr/local/sbin/muteki-auto-sudo && \
-    ln -sf /usr/local/sbin/muteki-auto-sudo /usr/local/bin/apt-get && \
-    ln -sf /usr/local/sbin/muteki-auto-sudo /usr/local/bin/apt && \
-    ln -sf /usr/local/sbin/muteki-auto-sudo /usr/local/bin/dpkg
+RUN cat > /usr/local/sbin/dswarm-auto-sudo <<'EOF' && \
+    chmod +x /usr/local/sbin/dswarm-auto-sudo && \
+    ln -sf /usr/local/sbin/dswarm-auto-sudo /usr/local/bin/apt-get && \
+    ln -sf /usr/local/sbin/dswarm-auto-sudo /usr/local/bin/apt && \
+    ln -sf /usr/local/sbin/dswarm-auto-sudo /usr/local/bin/dpkg
 #!/bin/sh
 name="$(basename "$0")"
 real="/usr/bin/$name"
@@ -94,70 +94,70 @@ USER root
 
 # 5) Runtime Agent (Go supervisor) — cross-compiled static binary, COPY'd in.
 #    build.sh outputs it to docker/worker-slim/runtime_agent (this build context).
-COPY ./runtime_agent /opt/muteki/runtime_agent
-RUN chmod +x /opt/muteki/runtime_agent
+COPY ./runtime_agent /opt/dswarm/runtime_agent
+RUN chmod +x /opt/dswarm/runtime_agent
 
 # 6) Tool-awareness map + blackboard skill, baked OUTSIDE the mounted workspace. The
 #    supervisor cp's AGENTS.md/CLAUDE.md into the workspace AFTER the host bind-mount so
 #    the CLIs auto-read them (claude←CLAUDE.md, codex←AGENTS.md). Same content, two
 #    names. The blackboard skill goes to the known CLI skill roots.
 #    (Verbatim parity with Kali image §8 — same in-container layout.)
-COPY ./AGENTS.md /opt/muteki/AGENTS.md
-COPY ./AGENTS.md /opt/muteki/CLAUDE.md
-COPY ./blackboard.SKILL.md /opt/muteki/muteki-blackboard/SKILL.md
-COPY ./blackboard.py /opt/muteki/muteki-blackboard/blackboard.py
-RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py /usr/local/bin/blackboard.py && \
+COPY ./AGENTS.md /opt/dswarm/AGENTS.md
+COPY ./AGENTS.md /opt/dswarm/CLAUDE.md
+COPY ./blackboard.SKILL.md /opt/dswarm/dswarm-blackboard/SKILL.md
+COPY ./blackboard.py /opt/dswarm/dswarm-blackboard/blackboard.py
+RUN chmod +x /opt/dswarm/dswarm-blackboard/blackboard.py && \
+    cp /opt/dswarm/dswarm-blackboard/blackboard.py /usr/local/bin/blackboard.py && \
     chmod +x /usr/local/bin/blackboard.py && \
     install -d -o kali -g kali \
-      /home/kali/.claude/skills/muteki-blackboard \
-      /home/kali/.agents/skills/muteki-blackboard \
-      /home/kali/.codex/skills/muteki-blackboard \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard \
-      /home/kali/.cursor/skills/muteki-blackboard && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.claude/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.claude/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.agents/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.codex/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.codex/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.cursor/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py && \
+      /home/kali/.claude/skills/dswarm-blackboard \
+      /home/kali/.agents/skills/dswarm-blackboard \
+      /home/kali/.codex/skills/dswarm-blackboard \
+      /home/kali/.cursor/skills-cursor/dswarm-blackboard \
+      /home/kali/.cursor/skills/dswarm-blackboard && \
+    cp /opt/dswarm/dswarm-blackboard/SKILL.md \
+      /home/kali/.claude/skills/dswarm-blackboard/SKILL.md && \
+    cp /opt/dswarm/dswarm-blackboard/blackboard.py \
+      /home/kali/.claude/skills/dswarm-blackboard/blackboard.py && \
+    cp /opt/dswarm/dswarm-blackboard/SKILL.md \
+      /home/kali/.agents/skills/dswarm-blackboard/SKILL.md && \
+    cp /opt/dswarm/dswarm-blackboard/blackboard.py \
+      /home/kali/.agents/skills/dswarm-blackboard/blackboard.py && \
+    cp /opt/dswarm/dswarm-blackboard/SKILL.md \
+      /home/kali/.codex/skills/dswarm-blackboard/SKILL.md && \
+    cp /opt/dswarm/dswarm-blackboard/blackboard.py \
+      /home/kali/.codex/skills/dswarm-blackboard/blackboard.py && \
+    cp /opt/dswarm/dswarm-blackboard/SKILL.md \
+      /home/kali/.cursor/skills-cursor/dswarm-blackboard/SKILL.md && \
+    cp /opt/dswarm/dswarm-blackboard/blackboard.py \
+      /home/kali/.cursor/skills-cursor/dswarm-blackboard/blackboard.py && \
+    cp /opt/dswarm/dswarm-blackboard/SKILL.md \
+      /home/kali/.cursor/skills/dswarm-blackboard/SKILL.md && \
+    cp /opt/dswarm/dswarm-blackboard/blackboard.py \
+      /home/kali/.cursor/skills/dswarm-blackboard/blackboard.py && \
     chown -R kali:kali /home/kali/.claude /home/kali/.agents /home/kali/.codex /home/kali/.cursor && \
     chmod +x \
-      /home/kali/.claude/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.codex/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py
+      /home/kali/.claude/skills/dswarm-blackboard/blackboard.py \
+      /home/kali/.agents/skills/dswarm-blackboard/blackboard.py \
+      /home/kali/.codex/skills/dswarm-blackboard/blackboard.py \
+      /home/kali/.cursor/skills-cursor/dswarm-blackboard/blackboard.py \
+      /home/kali/.cursor/skills/dswarm-blackboard/blackboard.py
 
 # 7) workspace + control dir; supervisor as ENTRYPOINT (PID1). Verbatim parity with
 #    the Kali image §9 so the bind-mount targets and control socket path are identical.
 RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
-    mkdir -p /run/muteki/control /run/muteki/accounts && \
-    chown -R kali:kali /run/muteki
+    mkdir -p /run/dswarm/control /run/dswarm/accounts && \
+    chown -R kali:kali /run/dswarm
 
 # Version label so the settings "image version check" (P2 v3) has a fact to read.
 # build.sh passes --build-arg IMAGE_VERSION=<version>.
 ARG IMAGE_VERSION=dev
-LABEL org.opencontainers.image.title="muteki-worker-slim" \
-      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 3 agent CLIs, no CTF toolchain" \
+LABEL org.opencontainers.image.title="dswarm-worker-slim" \
+      org.opencontainers.image.description="Slim Ubuntu dswarm worker: reverse-connector + 3 agent CLIs, no CTF toolchain" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 
 WORKDIR /home/kali/workspace
 # Supervisor runs as root (PID1) so it can drop workers to the kali uid; the worker
 # itself runs as kali (with sudo). It listens on the bind-mounted control socket.
 # IDENTICAL ENTRYPOINT to the Kali image — container_exec appends --connect/--run-id.
-ENTRYPOINT ["/opt/muteki/runtime_agent", "--sock", "/run/muteki/control/control.sock", "--workspace", "/home/kali/workspace"]
+ENTRYPOINT ["/opt/dswarm/runtime_agent", "--sock", "/run/dswarm/control/control.sock", "--workspace", "/home/kali/workspace"]

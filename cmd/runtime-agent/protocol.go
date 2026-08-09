@@ -4,7 +4,7 @@ package main
 // connection (§8-9 of docs/DESIGN_worker_image_clean_rebuild.md). Dependency-free
 // (encoding/json only) so the supervisor stays a single static binary.
 //
-// The host-side Python client (muteki/solver/control_client.py) speaks the exact
+// The host-side Python client (dswarm/solver/control_client.py) speaks the exact
 // same frames; any change here must be mirrored there.
 //
 // Topology (reverse-connect, forward-control):

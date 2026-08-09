@@ -58,7 +58,7 @@ def test_planner_forwards_base_url(monkeypatch):
     """build_driver's coordinator path constructs LLMClient with the planner
     profile's base_url. We patch LLMClient where drivers.py imports it (lazy
     import inside build_driver) and stop the run right after construction."""
-    import muteki.core.llm as llm_mod
+    import dswarm.core.llm as llm_mod
 
     seen = {}
 
@@ -90,7 +90,6 @@ def test_planner_forwards_base_url(monkeypatch):
         mgr = RunManager(sessions_root=td)
         driver = build_driver({
             "prompt": "solve me",
-            "coordinator": True,
             "engines": ["local-claude"],
             # local runtime → no credential account required (host login),
             # so build_driver reaches the coordinator LLMClient construction.
@@ -113,3 +112,58 @@ def test_planner_forwards_base_url(monkeypatch):
             asyncio.run(driver(run))
 
     assert seen.get("base_url") == "https://planner.endpoint.test/v1"
+
+
+def test_planner_uses_registered_pi_account_when_env_key_absent(monkeypatch):
+    """The Reason planner falls back to pi-main's key when env has no key."""
+    import dswarm.core.llm as llm_mod
+    from dswarm.solver.credential_accounts import (
+        CredentialAccountStore,
+        account_store_root,
+    )
+
+    monkeypatch.delenv("DSWARM_DEEPSEEK_API_KEY", raising=False)
+    seen = {}
+
+    class _LLM:
+        def __init__(self, *, api_key: str | None = None, base_url: str | None = None, **_kw):
+            seen["api_key"] = api_key
+            seen["base_url"] = base_url
+
+        async def __aenter__(self):
+            raise _StopHere()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _StopHere(BaseException):
+        pass
+
+    monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+
+    from apps.web.drivers import build_driver
+    from apps.web.run_manager import RunManager
+
+    import tempfile
+    import apps.web.drivers as drivers_mod
+    monkeypatch.setattr(drivers_mod, "_missing_profile_accounts", lambda **kw: [])
+    with tempfile.TemporaryDirectory() as td:
+        CredentialAccountStore(account_store_root(td)).upsert_secret(
+            account_id="pi-main", engine="pi", secret="account-deepseek-key"
+        )
+        mgr = RunManager(sessions_root=td)
+        driver = build_driver({
+            "prompt": "solve me",
+            "worker_backend": "local",
+            "runtime_profiles": [{"id": "local", "backend": "local"}],
+            "llm_profiles": {
+                "planner": {"provider": "deepseek", "model": "p-x", "base_url": ""},
+                "titler": {"provider": "deepseek", "model": "t-x", "base_url": ""},
+            },
+        }, mgr=mgr)
+        run = mgr.create("planner-account-key")
+        with pytest.raises(_StopHere):
+            asyncio.run(driver(run))
+
+    assert seen.get("api_key") == "account-deepseek-key"
+    assert seen.get("base_url") is None

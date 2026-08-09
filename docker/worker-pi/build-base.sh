@@ -11,7 +11,7 @@
 # Usage: ./docker/worker-pi/build-base.sh   (PI_VERSION env overrides)
 set -uo pipefail
 
-PI_VERSION="${PI_VERSION:-0.83.0}"
+PI_VERSION="${PI_VERSION:-0.84.1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BTFLY="$(cd "$HERE/../../references/btfly" && pwd)"
 cd "$BTFLY"

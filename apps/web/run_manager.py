@@ -16,7 +16,9 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import shutil
+import tarfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,10 +26,10 @@ from typing import Any, Awaitable, Callable, Optional
 
 from apps.web.run_meta import FolderStore, RunMetaStore
 from apps.web.worker_config import WorkerConfigStore
-from muteki.core.cost import CostController
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType, hitl_response_payload
-from muteki.core.session_store import SessionStore
+from dswarm.core.cost import CostController
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType, hitl_response_payload
+from dswarm.core.session_store import SessionStore
 
 LOG = logging.getLogger(__name__)
 
@@ -92,6 +94,12 @@ class Run:
     queued: bool = False
     queue_position: Optional[int] = None
     cancelled: bool = False
+    blackboard_token: str = ""
+    # Safe, durable copy of the dispatch options used to create this run. A
+    # finished run can be continued after a server restart without silently
+    # falling back to a different global worker roster/backend. Secrets are
+    # redacted before this is stored (see remember_dispatch).
+    dispatch_body: dict[str, Any] = field(default_factory=dict)
 
     def merge_flags(self, flags: Any) -> None:
         """Accumulate flags from an event payload (dedup, keep order); keep the
@@ -187,13 +195,13 @@ def _apply_blackboard_meta(run: "Run", ev: Event) -> None:
 class RunManager:
     def __init__(self, *, sessions_root: "str | Path | None" = None) -> None:
         # P2-v3: in the compose layout the sessions/ tree must live UNDER the
-        # mirrored data root (MUTEKI_HOST_DATA_ROOT bind-mounted into the web
+        # mirrored data root (DSWARM_HOST_DATA_ROOT bind-mounted into the web
         # container), so worker sibling containers — launched by the host daemon —
-        # can bind-mount the same physical dir. MUTEKI_SESSIONS_ROOT names it
+        # can bind-mount the same physical dir. DSWARM_SESSIONS_ROOT names it
         # (compose points it at <data root>/sessions). Default "sessions" (CWD-
         # relative) preserves the bare-host behaviour.
         if sessions_root is None:
-            sessions_root = os.environ.get("MUTEKI_SESSIONS_ROOT") or "sessions"
+            sessions_root = os.environ.get("DSWARM_SESSIONS_ROOT") or "sessions"
         self.sessions_root = Path(sessions_root)
         self.sessions_root.mkdir(parents=True, exist_ok=True)
         self.runs: dict[str, Run] = {}
@@ -396,8 +404,20 @@ class RunManager:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         await run.bus.close()
+        self._drop_board_schema(run_id)
         self._delete_artifacts(run_id)
         return True
+
+    def _drop_board_schema(self, run_id: str) -> None:
+        dsn = os.environ.get("DSWARM_BOARD_DSN", "").strip()
+        if not dsn:
+            return
+        try:
+            from dswarm.swarm.postgres_board import PostgresBoard
+
+            PostgresBoard(dsn, challenge_id=run_id).drop_schema()
+        except Exception:  # noqa: BLE001 - cleanup failure must not break delete
+            LOG.warning("board schema cleanup failed for run %s", run_id)
 
     def _delete_artifacts(self, run_id: str) -> None:
         self.meta.forget(run_id)
@@ -465,6 +485,150 @@ class RunManager:
             except Exception:
                 LOG.exception("retention sweep failed; continuing")
 
+    @staticmethod
+    def _redact_dispatch_value(value: Any, key: str = "") -> Any:
+        """Return JSON-safe dispatch settings without copying credentials.
+
+        Dispatch profiles identify credential accounts, but a caller must never
+        put raw API keys/tokens/passwords into the run workspace. The account
+        store remains the source of truth for secrets.
+        """
+        secret_words = (
+            "api_key", "apikey", "access_token", "refresh_token", "secret",
+            "password", "passwd", "authorization", "private_key",
+        )
+        lowered = key.lower().replace("-", "_")
+        if any(word in lowered for word in secret_words):
+            return None
+        if isinstance(value, dict):
+            return {
+                str(k): v
+                for k, raw in value.items()
+                if (v := RunManager._redact_dispatch_value(raw, str(k))) is not None
+            }
+        if isinstance(value, (list, tuple)):
+            return [RunManager._redact_dispatch_value(v, key) for v in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _strip_legacy_dispatch_fields(body: dict[str, Any]) -> dict[str, Any]:
+        """Remove pre-v3 swarm knobs from a persisted recovery snapshot.
+
+        ``build_driver`` intentionally rejects these fields for new requests. Older
+        runs, however, were started while the knobs were still accepted and may
+        have a sidecar containing them. Replaying that sidecar must not turn a
+        valid historical run into an unrecoverable configuration error.
+        """
+        config = dict(body or {})
+        for key in ("cli_race", "race_scout", "race_timeout", "race_engines",
+                    "coordinator", "cold_start"):
+            config.pop(key, None)
+        stage = config.get("stage_policy")
+        if isinstance(stage, dict):
+            stage = dict(stage)
+            stage.pop("race", None)
+            stage.pop("coordinator", None)
+            config["stage_policy"] = stage
+        return config
+
+    def remember_dispatch(self, run_id: str, body: dict[str, Any] | None) -> dict[str, Any]:
+        """Persist the non-secret dispatch settings needed by ``resolve``.
+
+        This is deliberately a sidecar, not a graph event: it is operator
+        configuration, not solver evidence. Writes are atomic so a process crash
+        cannot leave a partially-written config that makes recovery ambiguous.
+        """
+        run = self.runs.get(run_id) or self.create(run_id)
+        safe = self._redact_dispatch_value(dict(body or {}))
+        config = self._strip_legacy_dispatch_fields(
+            safe if isinstance(safe, dict) else {}
+        )
+        run.dispatch_body = config
+        path = self.workspace_dir(run_id) / ".dswarm_dispatch.json"
+        try:
+            import json
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            LOG.exception("could not persist dispatch settings for %s", run_id)
+        return config
+
+    def _load_dispatch(self, run_id: str) -> dict[str, Any]:
+        run = self.runs.get(run_id)
+        if run is not None and run.dispatch_body:
+            return self._strip_legacy_dispatch_fields(run.dispatch_body)
+        path = self.sessions_root / run_id.replace("/", "_").replace("..", "_") / "workspace" / ".dswarm_dispatch.json"
+        try:
+            import json
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return self._strip_legacy_dispatch_fields(raw) if isinstance(raw, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    async def _infer_dispatch_from_history(self, run_id: str) -> dict[str, Any]:
+        """Recover enough of a pre-sidecar dispatch to continue old runs.
+
+        Sidecars were introduced after some runs already existed. For those runs,
+        resolving with today's global roster can select a different profile (or a
+        host-only health probe) and leave the reopened run with no worker. The
+        event log contains the non-secret facts needed for a safe best-effort
+        reconstruction: engines that actually came online and the runtime backend
+        reported by those workers. Never infer credentials or arbitrary options.
+        """
+        engines: list[str] = []
+        backend = ""
+        online_workers: set[str] = set()
+        try:
+            async for ev in self.runs[run_id].store.replay(run_id):
+                if ev.event_type is not EventType.WORKER_STATUS:
+                    continue
+                payload = ev.payload or {}
+                if payload.get("online"):
+                    engine = str(payload.get("engine") or "").strip()
+                    if engine and engine not in engines:
+                        engines.append(engine)
+                    # worker.status is a heartbeat stream, not a spawn stream.
+                    # Counting every online heartbeat inflated start_workers (run
+                    # 1806 would recover with eight workers although only one was
+                    # ever active). Prefer the durable solver id; old events without
+                    # one fall back to the engine/role pair and therefore count once.
+                    solver_id = str(getattr(ev, "solver_id", "") or "").strip()
+                    role = str(payload.get("worker_role") or "").strip()
+                    online_workers.add(solver_id or f"{engine}:{role}")
+                runtime = payload.get("runtime")
+                if isinstance(runtime, dict) and runtime.get("backend"):
+                    backend = str(runtime["backend"]).strip()
+        except Exception:
+            return {}
+        started_workers = len({key for key in online_workers if key.strip(":")})
+        inferred: dict[str, Any] = {}
+        if engines:
+            # Historical worker events report the BASE engine (pi). Map it to the
+            # run category's direction profile so an old-run resolve keeps the
+            # single-worker behavior instead of expanding "pi" across all
+            # direction profiles.
+            from dswarm.solver.worker_profiles import direction_profile_name
+
+            run = self.runs.get(run_id)
+            category = str(getattr(run, "category", "") or "").strip()
+            resolved: list[str] = []
+            for engine in engines:
+                if engine == "pi":
+                    profile = direction_profile_name(category) or "pi-worker"
+                else:
+                    profile = engine
+                if profile not in resolved:
+                    resolved.append(profile)
+            inferred["engines"] = resolved
+        if backend in ("local", "container"):
+            inferred["worker_backend"] = backend
+        if started_workers:
+            inferred["start_workers"] = min(started_workers, 8)
+        return inferred
+
     def workspace_dir(self, run_id: str) -> Path:
         """Per-run persistent workspace: sessions/{id}/workspace/.
 
@@ -523,7 +687,12 @@ class RunManager:
         run = Run(
             run_id=run_id, bus=bus, cost=CostController(bus=bus), store=store,
             created_seq=self._seq,
+            blackboard_token=secrets.token_urlsafe(32),
         )
+        # Restore the non-secret dispatch sidecar when this handle is created
+        # after a backend restart. The helper is intentionally best-effort: old
+        # runs simply have no sidecar and resolve falls back to their challenge.
+        run.dispatch_body = self._load_dispatch(run_id)
         # sniff run.started / run.finished off the bus to keep rail metadata fresh
         # without making the run anything but a dumb event source.
         async def _meta_sink(ev: Event) -> None:
@@ -626,6 +795,73 @@ class RunManager:
         self._apply_meta(run)
         return run
 
+    def board_token(self, run_id: str) -> str:
+        run = self.get(run_id)
+        return run.blackboard_token if run else ""
+
+    def verify_board_token(self, run_id: str, token: str) -> bool:
+        expected = self.board_token(run_id)
+        return bool(expected) and secrets.compare_digest(expected, str(token or ""))
+
+    def archive_legacy_runs(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Archive old SQLite runs under sessions/_archive before cleanup.
+
+        The operation is intentionally conservative: each run is archived to a
+        tar.gz, the archive is opened and validated, and only then is the original
+        run directory removed. Any failure leaves the source data in place.
+        """
+        archive_root = self.sessions_root / "_archive"
+        archived: list[str] = []
+        skipped: list[str] = []
+        failed: list[dict[str, str]] = []
+        for path in sorted(self.sessions_root.iterdir()):
+            name = path.name
+            if not path.is_dir() or name.startswith("_"):
+                continue
+            if name in self.runs:
+                run = self.runs[name]
+                if run.started and not run.finished:
+                    skipped.append(f"{name}:active")
+                    continue
+            graph_db = path / "graph" / "shared_graph.db"
+            jsonl = self.sessions_root / f"{name}.jsonl"
+            if not graph_db.exists() and not jsonl.exists():
+                skipped.append(f"{name}:no_data")
+                continue
+            if dry_run:
+                archived.append(name)
+                continue
+            archive_root.mkdir(parents=True, exist_ok=True)
+            archive_path = archive_root / f"{name}.tar.gz"
+            if archive_path.exists():
+                skipped.append(f"{name}:archive_exists")
+                continue
+            try:
+                with tarfile.open(archive_path, "w:gz") as tar:
+                    tar.add(path, arcname=name)
+                    if jsonl.exists():
+                        tar.add(jsonl, arcname=f"{name}.jsonl")
+                with tarfile.open(archive_path, "r:gz") as check:
+                    if not check.getnames():
+                        raise RuntimeError("archive is empty")
+                shutil.rmtree(path)
+                if jsonl.exists():
+                    jsonl.unlink()
+                archived.append(name)
+            except Exception as exc:  # noqa: BLE001 - cleanup must not lose data
+                failed.append({"run_id": name, "error": str(exc)})
+                if archive_path.exists():
+                    try:
+                        archive_path.unlink()
+                    except OSError:
+                        pass
+        return {
+            "dry_run": dry_run,
+            "archived": archived,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
     @staticmethod
     def _bump_bus_seq(bus: EventBus, seq: int) -> None:
         try:
@@ -687,6 +923,7 @@ class RunManager:
             try:
                 await driver(run)
             except Exception as exc:
+                LOG.exception("driver crashed for run %s", run_id)
                 failure_detail = str(exc)[:500]
             finally:
                 # If the driver exited WITHOUT emitting RUN_FINISHED (cancelled
@@ -955,30 +1192,36 @@ class RunManager:
         return True
 
     async def resolve(self, run_id: str, body: dict[str, Any] | None = None) -> bool:
-        """"继续做题" — relaunch the FULL coordinator swarm on a finished run.
+        """Continue a finished run through the normal scheduler/launch path.
 
-        Unlike a standby (one cold-started worker resuming the winner's session to
-        answer a follow-up), this reopens the run and re-runs the real Swarm:
-        bootstrap workers + reason/explore scaling, reusing the SAME workspace_dir
-        so the persisted shared_graph (verified facts / dead-ends) carries straight
-        over — the swarm builds ON the prior evidence instead of from scratch.
-
-        The challenge is reconstructed from winner.json (the durable run snapshot),
-        falling back to the run's rail metadata. Caller-supplied `body` fields win
-        (e.g. an operator hint folded into the description, a new target)."""
+        Recovery must be indistinguishable from a normal dispatch after the
+        ``RUN_REOPENED`` marker: it gets a scheduler slot, uses ``_launch`` for
+        exception handling/terminal events, and restores the original dispatch
+        settings. The old implementation created an untracked task directly; a
+        preflight/worker exception therefore produced only ``run.reopened`` and
+        silently closed the bus, leaving the UI claiming that the swarm was back
+        while no worker ever came online.
+        """
         run = self.runs.get(run_id)
         if run is None:
             return False
         if run.task is not None and not run.task.done():
             return False  # already live — nothing to relaunch (use HITL instead)
+        # A previous failed recovery must not leave a scheduler slot or queue entry
+        # that makes the next click look successful but never dispatch.
+        if self.scheduler.is_active(run_id) or self.scheduler.is_queued(run_id):
+            return False
 
-        # rebuild the challenge body from the durable winner.json snapshot.
+        # Reconstruct the challenge from the durable winner/event history, then
+        # layer the saved dispatch body underneath it. This preserves custom
+        # engines/profiles/backend across a server restart instead of silently
+        # using today's global settings.
         ch: dict[str, Any] = {}
         try:
             import json
             wp = self.workspace_dir(run_id) / "winner.json"
             if wp.exists():
-                ch = (json.loads(wp.read_text()) or {}).get("challenge") or {}
+                ch = (json.loads(wp.read_text(encoding="utf-8")) or {}).get("challenge") or {}
         except Exception:
             ch = {}
         if not ch:
@@ -986,46 +1229,69 @@ class RunManager:
                 async for ev in run.store.replay(run_id):
                     if ev.event_type is EventType.RUN_STARTED:
                         ch = (ev.payload or {}).get("challenge") or {}
+                        # Keep looking: multiple workers emit run.started, but the
+                        # challenge payload is equivalent and the first is enough.
                         break
             except Exception:
                 ch = {}
-        if not ch:  # degrade to rail metadata
+        saved = self._load_dispatch(run_id)
+        if not saved:
+            # Compatibility for runs created before .dswarm_dispatch.json existed.
+            # Prefer the roster/backend that really produced prior worker events over
+            # whatever global worker settings happen to be active today.
+            saved = await self._infer_dispatch_from_history(run_id)
+        saved_ch = saved.get("challenge") if isinstance(saved.get("challenge"), dict) else {}
+        if not ch:
+            ch = dict(saved_ch)
+        if not ch:
             ch = {"name": run.name or run_id, "category": run.category or "web",
                   "expected_flags": run.expected_flags,
                   "multi_flag": run.multi_flag}
-        merged = {"challenge": ch, **(body or {})}
-        if body and body.get("challenge"):
-            merged["challenge"] = {**ch, **body["challenge"]}
-        # "继续做题" 跳过 race-scout 竞速层：竞速是"从空图并行单发初探"，只在冷启动有意义。
-        # resolve 复用同一个 workspace_dir，shared_graph 已满是 verified facts / dead-ends,
-        # 应直接进主协调器循环(规划/派发)在已有证据上续做,而不是再竞速一轮
-        # 从头探(浪费一轮 + 把已死方向重提)。操作者显式传 race_scout 仍可覆盖。
-        # cold_start=False 是 run-75379 BUG④ 的显式信号：协调器内部以此为不变量直接跳过竞速
-        # (race_scout=False 现为冗余保险)。即便某条复跑路径忘了传，Swarm 还有图状态兜底。
-        merged.setdefault("race_scout", False)
-        merged.setdefault("cold_start", False)
+        merged = {**saved, "challenge": {**saved_ch, **ch}, **(body or {})}
+        if body and isinstance(body.get("challenge"), dict):
+            merged["challenge"] = {**saved_ch, **ch, **body["challenge"]}
 
-        # revive the closed bus so the relaunched swarm's events reach SSE, and
-        # reopen the run state (rail flips back to running).
+        # Continue directly in the coordinator on the existing evidence graph.
+        # Do not inject the former race_scout/cold_start knobs here: current
+        # build_driver deliberately rejects those legacy fields. Reusing the same
+        # workspace already gives the coordinator its existing graph context.
+
+        # Build synchronously before changing lifecycle state. Configuration errors
+        # should be returned by /resolve, not recorded as a misleading reopen.
+        from apps.web.drivers import build_driver
+        driver = build_driver(merged, mgr=self)
+        self.remember_dispatch(run_id, merged)
+
+        # Reopen the bus and reset every lifecycle bit that can make the rail show a
+        # stale terminal/queued/cancelled state. Keep old flags as deliberate
+        # evidence carried into the continuation.
         self._fresh_bus(run)
+        run.started = True
         run.finished = False
         run.solved = False
         run.paused = False
+        run.queued = False
+        run.queue_position = None
+        run.cancelled = False
+        run.awaiting_help = False
+        run.help_text = ""
         await run.bus.emit(Event(
             event_type=EventType.RUN_REOPENED, run_id=run_id,
             payload={"reason": "resolve"}))
 
-        from apps.web.drivers import build_driver
-        driver = build_driver(merged, mgr=self)
-
-        async def _go() -> None:
-            try:
-                await driver(run)
-            finally:
-                run.finished = True
-                await run.bus.close()
-
-        run.task = asyncio.create_task(_go())
+        position = self.scheduler.submit(run_id, driver)
+        if position is None:
+            # _launch owns the task, catches driver failures, emits a terminal
+            # runtime_failure, releases the slot, and closes the bus.
+            self._launch(run, driver)
+        else:
+            run.queued = True
+            run.queue_position = position
+            await run.bus.emit(Event(
+                event_type=EventType.RUN_QUEUED, run_id=run_id,
+                payload={"position": position,
+                         "active": self.scheduler.active_count,
+                         "limit": self.scheduler.max_concurrent_runs}))
         return True
 
     def _fresh_bus(self, run: Run) -> None:

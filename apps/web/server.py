@@ -17,6 +17,7 @@ schema is the only contract (§3).
 from __future__ import annotations
 
 import asyncio
+import httpx
 import json
 import os
 import re
@@ -49,9 +50,9 @@ from apps.web.auth import (
     verify_token,
 )
 from apps.web.run_manager import Run, RunManager
-from muteki.core.dotenv_boot import load_env
-from muteki.core.events import Event, EventType
-from muteki.solver.credential_accounts import (
+from dswarm.core.dotenv_boot import load_env
+from dswarm.core.events import Event, EventType
+from dswarm.solver.credential_accounts import (
     CredentialAccountStore,
     account_store_root,
 )
@@ -76,13 +77,26 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _btw_timeout_exception(exc: BaseException) -> bool:
+    """Return whether a BTW failure is a transport or wall-clock timeout.
+
+    httpx.ReadTimeout often has an empty string representation, so checking only
+    the exception text turns it into the misleading raw ``ReadTimeout`` shown in
+    the UI. Keep the classification type-based and include wrapped timeout classes.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)):
+        return True
+    names = {cls.__name__.lower() for cls in type(exc).__mro__}
+    return any("timeout" in name for name in names)
+
+
 # Upload guards: a CTF handout is small (a cipher blob, a binary, a pcap). Cap
 # per-file size and per-request count so a stray drag-drop can't fill the disk.
 # Both are configurable for larger handouts (disk images, big pcaps):
-#   MUTEKI_MAX_UPLOAD_MB    (default 25)  — per-file size cap, in MB
-#   MUTEKI_MAX_UPLOAD_FILES (default 20)  — max files per request
-MAX_UPLOAD_BYTES = max(1, _env_int("MUTEKI_MAX_UPLOAD_MB", 25)) * 1024 * 1024
-MAX_UPLOAD_FILES = max(1, _env_int("MUTEKI_MAX_UPLOAD_FILES", 20))
+#   DSWARM_MAX_UPLOAD_MB    (default 25)  — per-file size cap, in MB
+#   DSWARM_MAX_UPLOAD_FILES (default 20)  — max files per request
+MAX_UPLOAD_BYTES = max(1, _env_int("DSWARM_MAX_UPLOAD_MB", 25)) * 1024 * 1024
+MAX_UPLOAD_FILES = max(1, _env_int("DSWARM_MAX_UPLOAD_FILES", 20))
 
 
 async def _require_dict_body(request: "Request", *, allow_empty: bool = False) -> dict[str, Any]:
@@ -114,7 +128,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     # Retention policy (BE-auto-archive): auto-archive idle runs, then delete the
     # ones that stay idle. Defaults: archive after 3 days, delete after 7 days,
-    # sweep hourly. All env-tunable; set MUTEKI_RETENTION_ENABLED=0 to disable
+    # sweep hourly. All env-tunable; set DSWARM_RETENTION_ENABLED=0 to disable
     # (pinned runs are NEVER auto-touched).
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -123,18 +137,18 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # before any container starts. Lazy-starts on first use too, but starting it
         # here makes "control port already in use" surface at boot, not mid-run.
         try:
-            from muteki.solver.control_receiver import ControlReceiver
+            from dswarm.solver.control_receiver import ControlReceiver
             ControlReceiver.instance()
         except OSError as exc:  # port already bound (another backend?) — log, continue
             print(f"[control-receiver] could not bind control port: {exc}", flush=True)
         task: Optional[asyncio.Task] = None
-        enabled = os.environ.get("MUTEKI_RETENTION_ENABLED", "1").lower() not in (
+        enabled = os.environ.get("DSWARM_RETENTION_ENABLED", "1").lower() not in (
             "0", "false", "no", "off", "")
         if enabled:
             task = asyncio.create_task(mgr.retention_loop(
-                interval_s=_env_float("MUTEKI_RETENTION_INTERVAL", 3600.0),
-                archive_after_s=_env_float("MUTEKI_ARCHIVE_DAYS", 3.0) * 86400.0,
-                delete_after_s=_env_float("MUTEKI_DELETE_DAYS", 7.0) * 86400.0,
+                interval_s=_env_float("DSWARM_RETENTION_INTERVAL", 3600.0),
+                archive_after_s=_env_float("DSWARM_ARCHIVE_DAYS", 3.0) * 86400.0,
+                delete_after_s=_env_float("DSWARM_DELETE_DAYS", 7.0) * 86400.0,
             ))
         try:
             yield
@@ -147,7 +161,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             # never wired up before — shutdown() existed but nothing called it.
             await mgr.shutdown()
 
-    app = FastAPI(title="Project Muteki — Command Deck", lifespan=lifespan)
+    app = FastAPI(title="Project D-Swarm — Command Deck", lifespan=lifespan)
     app.state.manager = mgr
 
     # Auth (P3): a single-password gate in front of /api. fail_fast_check refuses
@@ -243,7 +257,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # in_container (P2-v3): tells the UI the coordinator runs inside a
         # container, so the deck must force container mode and disable the
         # "local" worker-isolation toggle (local is rejected server-side anyway).
-        from muteki.core.runtime_env import is_web_container
+        from dswarm.core.runtime_env import is_web_container
         cfg: AuthConfig = app.state.auth
         return {"authenticated": True, "auth_required": cfg.enabled,
                 "in_container": is_web_container()}
@@ -351,8 +365,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/credentials")
     async def run_credentials(run_id: str) -> Any:
-        from muteki.models.solve_graph import Challenge
-        from muteki.swarm.shared_graph import SQLiteSharedGraph
+        from dswarm.models.solve_graph import Challenge
+        from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
         mgr: RunManager = app.state.manager
         run = mgr.get(run_id)
@@ -372,34 +386,38 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             if graph is not None:
                 graph.close()
 
-    # ── BTW side-query worker (separate one-shot process, no swarm slot) ──────
+    # BTW side-query observer (separate, no swarm slot)
     # Independent route (not /hitl), no run.hitl queue, no InsightBus GUIDANCE,
     # no bus.emit, no CostController, no CliSolver, no scheduler/max_worker slot.
-    # Each turn cold-starts one CLI worker process, passes the frontend transcript
-    # for multi-turn context, streams its answer, and kills it on disconnect or
-    # superseding /btw request. The process exits after the turn.
+    # Normal turns use a bounded read-only evidence package plus one fixed model
+    # call. Explicit deep-audit turns retain the isolated CLI worker path below.
     @app.post("/api/runs/{run_id}/btw")
     async def btw(run_id: str, request: Request) -> Any:
         from apps.web.drivers import (
+            _planner_llm_credentials,
             _runtime_for_profile,
             _standby_profile_for,
         )
         from apps.web.worker_config import backend_for_profile, resolve_worker_backend
-        from muteki.core.runtime_env import is_web_container
-        from muteki.solver.btw import (
+        from dswarm.core.runtime_env import is_web_container
+        from dswarm.solver.btw import (
             BtwLimiter,
             BtwWorkerPaths,
+            BTW_MODEL,
+            build_btw_evidence_pack_sync,
             build_btw_worker_prompt,
+            btw_evidence_messages,
+            parse_btw_structured_answer,
             run_meta_dict,
             sanitize_transcript,
             stream_btw_worker_deltas,
         )
-        from muteki.solver.cli_driver import driver_for
-        from muteki.solver.credential_accounts import (
+        from dswarm.solver.cli_driver import driver_for
+        from dswarm.solver.credential_accounts import (
             account_store_root,
             runtime_env_for_engine,
         )
-        from muteki.solver.worker_profiles import base_engine_for_profile
+        from dswarm.solver.worker_profiles import base_engine_for_profile
 
         body = await _require_dict_body(request)
         question = str(body.get("question") or "").strip()
@@ -420,7 +438,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         root = mgr.workspace_dir(run_id).resolve()
         graph_db = root / "graph" / "shared_graph.db"
         jsonl_path = (mgr.sessions_root / f"{safe}.jsonl").resolve()
-        board_path = root / ".muteki_board.md"
+        board_path = root / ".dswarm_board.md"
         winner_path = root / "winner.json"
         arts_path = root / "arts"
         uploads_path = (mgr.sessions_root / safe / "uploads").resolve()
@@ -440,6 +458,149 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             limiter = BtwLimiter()
             app.state.btw_limiters = limiter  # type: ignore[attr-defined]
 
+        wc = mgr.worker_config.resolve(challenge_category)
+        worker_profiles = wc.get("worker_profiles") or []
+        runtime_profiles = wc.get("runtime_profiles") or []
+
+        # Normal BTW is a bounded evidence-pack summary. A shell worker is an
+        # explicit deep-audit mode only; this prevents a routine side question
+        # from cold-starting a tool-using CLI for minutes.
+        deep_audit = bool(body.get("deep_audit")) or str(body.get("mode") or "").strip().lower() in {
+            "audit", "deep_audit", "deep-audit",
+        } or body.get("worker_backend") is not None
+        if not deep_audit:
+            async def evidence_stream():
+                this_task = asyncio.current_task()
+                cancelled = False
+                if this_task is not None:
+                    limiter.acquire(run_id, this_task)
+                try:
+                    yield {"data": json.dumps({"status": "正在整理只读证据…"}, ensure_ascii=False)}
+                    pack = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            build_btw_evidence_pack_sync,
+                            graph_db_path=str(graph_db),
+                            jsonl_path=str(jsonl_path),
+                            challenge_id=run_id,
+                            challenge_name=challenge_name,
+                            challenge_category=challenge_category,
+                            run_meta=meta,
+                            board_path=str(board_path),
+                            winner_path=str(winner_path),
+                            arts_path=str(arts_path),
+                            uploads_path=str(uploads_path),
+                        ),
+                        timeout=5.0,
+                    )
+                    yield {"data": json.dumps({"status": "正在生成观察结论…"}, ensure_ascii=False)}
+                    from dswarm.core.llm import LLMClient
+                    from dswarm.solver.btw import _BTW_AUTH_FAILURE
+
+                    configured_base = (
+                        os.environ.get("DSWARM_BTW_BASE_URL")
+                        or os.environ.get("DSWARM_DEEPSEEK_BASE_URL")
+                        or ""
+                    ).strip()
+                    account_key, account_base = _planner_llm_credentials(
+                        sessions_root=mgr.sessions_root,
+                        worker_profiles=worker_profiles,
+                        planner_base=configured_base,
+                    )
+                    api_key = (
+                        os.environ.get("DSWARM_BTW_API_KEY")
+                        or os.environ.get("DSWARM_DEEPSEEK_API_KEY")
+                        or os.environ.get("DEEPSEEK_API_KEY")
+                        or account_key
+                        or ""
+                    )
+                    base_url = configured_base or account_base or "https://api.deepseek.com/v1"
+                    if not api_key:
+                        payload = {
+                            "final": "观察员暂时无法回答：旁路总结服务未配置 API 凭据。请检查 BTW/DeepSeek provider 配置。",
+                            "answer_type": "insufficient", "evidence_refs": [],
+                        }
+                    else:
+                        messages = btw_evidence_messages(
+                            question=question,
+                            pack=pack,
+                            transcript=transcript,
+                            context_hint=context_hint,
+                        )
+                        # The previous 8s per-read timeout was shorter than the
+                        # 25s BTW wall-clock budget. Reasoning models can spend
+                        # several seconds before emitting the first byte, so the
+                        # transport raised httpx.ReadTimeout prematurely. Keep a
+                        # bounded request, but leave the read timeout enough room
+                        # for the model to start and finish. Both values remain
+                        # operator-configurable for slower/faster gateways.
+                        read_timeout = max(8.0, _env_float("DSWARM_BTW_LLM_READ_TIMEOUT", 20.0))
+                        overall_timeout = max(
+                            read_timeout,
+                            _env_float("DSWARM_BTW_LLM_OVERALL_TIMEOUT", 35.0),
+                        )
+                        async with LLMClient(
+                            api_key=api_key,
+                            base_url=base_url,
+                            timeout=read_timeout,
+                            overall_timeout=overall_timeout,
+                        ) as client:
+                            result = await client.chat(
+                                model=BTW_MODEL,
+                                messages=messages,
+                                temperature=0.2,
+                                # Reasoning models spend the output budget on
+                                # reasoning_content before emitting the structured
+                                # answer. A small fixed cap can therefore return
+                                # finish_reason=length with empty content. Omit the
+                                # cap and let the model endpoint use its own limit;
+                                # the prompt still requires a concise JSON answer.
+                                max_tokens=None,
+                                stream=False,
+                            )
+                        if result.finish_reason == "timeout":
+                            answer = f"观察员暂时无法在 {overall_timeout:.0f} 秒内完成只读总结；没有启动深度 worker。可稍后重试，或主动选择深度审计。"
+                            payload = {"final": answer, "answer_type": "insufficient", "evidence_refs": []}
+                        elif not result.content.strip():
+                            answer = "观察员没有返回可读结论；证据包已生成，但模型响应为空。没有启动深度 worker。"
+                            payload = {"final": answer, "answer_type": "insufficient", "evidence_refs": []}
+                        else:
+                            parsed = parse_btw_structured_answer(result.content, pack)
+                            payload = {
+                                "final": parsed["answer_markdown"],
+                                "answer_type": parsed["answer_type"],
+                                "evidence_refs": parsed["evidence_refs"],
+                                "uncertainties": parsed["uncertainties"],
+                            }
+                    yield {"data": json.dumps(payload, ensure_ascii=False)}
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    raw_error = str(exc).strip()
+                    lowered = raw_error.lower()
+                    if "401" in raw_error or "api key" in lowered or "authentication" in lowered:
+                        msg = _BTW_AUTH_FAILURE
+                    elif _btw_timeout_exception(exc) or "timeout" in lowered:
+                        msg = "观察员只读总结请求超时；证据包可能已生成，但模型没有及时返回。没有启动深度 worker。"
+                    else:
+                        detail = raw_error or type(exc).__name__
+                        prefix = "观察员暂时无法完成只读总结："
+                        msg = detail if detail.startswith(prefix) else prefix + detail[:180]
+                    # `final` is the user-facing failure answer. Do not also emit
+                    # the same text as `error`, otherwise the UI renders it twice
+                    # (once in the assistant bubble and once in the error banner).
+                    yield {"data": json.dumps({
+                        "final": msg,
+                        "answer_type": "insufficient", "evidence_refs": [],
+                    }, ensure_ascii=False)}
+                finally:
+                    if this_task is not None:
+                        limiter.release(run_id, this_task)
+                if not cancelled:
+                    yield {"data": json.dumps({"done": True}, ensure_ascii=False)}
+
+            return EventSourceResponse(evidence_stream(), ping=10)
+
         winner: dict[str, Any] = {}
         if winner_path.exists():
             try:
@@ -448,10 +609,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                     winner = raw
             except Exception:
                 winner = {}
-        wc = mgr.worker_config.resolve(challenge_category)
-        worker_profiles = wc.get("worker_profiles") or []
-        runtime_profiles = wc.get("runtime_profiles") or []
-
         def _pick_profile() -> tuple[dict[str, Any] | None, str]:
             requested = str(
                 body.get("profile") or body.get("engine") or ""
@@ -484,12 +641,16 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             this_task = asyncio.current_task()
             if this_task is not None:
                 limiter.acquire(run_id, this_task)
+            # A CLI observer can spend its first minutes reading SQLite/artifacts
+            # before it emits a complete assistant message.  Send an explicit SSE
+            # status first so the UI does not look like a dead/empty reply.
+            yield {"data": json.dumps({"status": "正在读取 run 证据…"}, ensure_ascii=False)}
             profile, selected = _pick_profile()
             transport = base_engine_for_profile(profile or selected)
             worker_backend = resolve_worker_backend(
                 request_backend=body.get("worker_backend"),
                 config_backend=wc.get("worker_backend"),
-                env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+                env_backend=os.environ.get("DSWARM_WORKER_BACKEND"),
                 in_web_container=is_web_container(),
             )
             backend = (
@@ -510,7 +671,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             workdir.mkdir(parents=True, exist_ok=True)
             try:
                 if backend == "container":
-                    from muteki.solver.container_exec import (
+                    from dswarm.solver.container_exec import (
                         _chown_tree_to_worker,
                         ensure_container,
                     )
@@ -558,29 +719,58 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                     account_id=(profile.get("credential_account") if profile else None),
                     container=container is not None,
                 ).env
-                worker_env["MUTEKI_BTW_WORKER"] = "1"
-                worker_env["MUTEKI_BLACKBOARD_DB"] = ""
+                worker_env["DSWARM_BTW_WORKER"] = "1"
+                worker_env["DSWARM_BLACKBOARD_DB"] = ""
                 if profile:
-                    worker_env["MUTEKI_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
-                    worker_env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] = str(
+                    worker_env["DSWARM_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
+                    worker_env["DSWARM_CREDENTIAL_ACCOUNT_ID"] = str(
                         profile.get("credential_account") or ""
                     )
                     if profile.get("model"):
-                        worker_env["MUTEKI_WORKER_MODEL"] = str(profile["model"])
+                        worker_env["DSWARM_WORKER_MODEL"] = str(profile["model"])
                 if container is not None:
                     home_host = root / "homes" / f"btw-{transport}"
                     home_host.mkdir(parents=True, exist_ok=True)
-                    from muteki.solver.container_exec import _chown_tree_to_worker
+                    # BTW uses an isolated HOME just like normal container workers.
+                    # Expose only the image-baked Pi provider config; do not link the
+                    # blackboard skill because BTW is strictly read-only.
+                    from dswarm.swarm.swarm import _ensure_pi_config_links
+                    _ensure_pi_config_links(home_host)
+                    from dswarm.solver.container_exec import _chown_tree_to_worker
                     await asyncio.to_thread(_chown_tree_to_worker, str(home_host))
                     mapper = getattr(container, "to_container_path", None)
                     worker_env["HOME"] = (
                         mapper(str(home_host)) if callable(mapper) else str(home_host)
                     )
+
+                if container is not None:
+                    # Container Pi workers authenticate through the local model
+                    # gateway. Reuse the run token when the swarm is active;
+                    # ModelGateway.issue() revokes an existing token and would
+                    # otherwise break ordinary workers in the same run.
+                    from dswarm.solver.modelgateway import ModelGateway
+
+                    gw = ModelGateway.instance()
+                    gw.account_root = str(account_root)
+                    gw.sessions_root = str(mgr.sessions_root)
+                    gateway_token = gw.token_for_run(run_id) or gw.issue(run_id)
+                    worker_env["DEEPSEEK_API_KEY"] = gateway_token
+                    worker_env.pop("DEEPSEEK_API_KEY_FILE", None)
+                    worker_env["DSWARM_TASK_TOKEN"] = gateway_token
+                    worker_env["DSWARM_GATEWAY_URL"] = os.environ.get(
+                        "DSWARM_GATEWAY_URL",
+                        f"http://host.docker.internal:"
+                        f"{os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
+                    )
+                    worker_env["DSWARM_PI_PROVIDER"] = "ctf-gateway"
+                    if not worker_env.get("DSWARM_WORKER_MODEL"):
+                        worker_env["DSWARM_WORKER_MODEL"] = "deepseek-v4-flash"
+
                 async for chunk in stream_btw_worker_deltas(
                     driver=driver_for(profile or transport),
                     prompt=prompt,
                     cwd=str(workdir),
-                    timeout=_env_int("MUTEKI_BTW_WORKER_TIMEOUT", 240),
+                    timeout=_env_int("DSWARM_BTW_WORKER_TIMEOUT", 240),
                     env=worker_env,
                     container=container,
                     web_access=False,
@@ -593,11 +783,26 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 # limiter cancel or client disconnect — stop cleanly.
                 pass
             except Exception as e:  # noqa: BLE001
-                yield {"data": json.dumps({"error": str(e)[:300]}, ensure_ascii=False)}
+                raw_error = str(e).strip()
+                if _btw_timeout_exception(e) or "timeout" in raw_error.lower():
+                    detail = "观察员深度审计请求超时；旁路 worker 没有及时返回。"
+                else:
+                    detail = raw_error or type(e).__name__
+                yield {"data": json.dumps({"error": detail[:300]}, ensure_ascii=False)}
             finally:
                 this_task = asyncio.current_task()
                 if this_task is not None:
                     limiter.release(run_id, this_task)
+                try:
+                    import shutil
+                    workdir_resolved = workdir.resolve()
+                    worker_root_resolved = worker_root.resolve()
+                    workdir_resolved.relative_to(worker_root_resolved)
+                    shutil.rmtree(workdir_resolved)
+                except Exception:
+                    # Cleanup must never mask the observer answer or turn a
+                    # completed BTW request into a 500.
+                    pass
             yield {"data": json.dumps({"done": True}, ensure_ascii=False)}
 
         return EventSourceResponse(stream(), ping=10)
@@ -612,7 +817,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.get("/api/engines")
     async def engines() -> Any:
-        from muteki.solver.cli_driver import engine_status
+        from dswarm.solver.cli_driver import engine_status
 
         now = time.time()
         if _engine_cache["data"] is not None and now - _engine_cache["ts"] <= _engine_cache_ttl_s:
@@ -647,7 +852,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # DEEP self-check. `backend` query selects local (host CLI + auth) vs
         # container (docker run --rm: image + CLI launchable inside the worker
         # image). On-demand only — the self-check page triggers it.
-        from muteki.solver.cli_driver import engine_health
+        from dswarm.solver.cli_driver import engine_health
 
         backend = str(request.query_params.get("backend") or "local")
         if backend not in ("local", "container"):
@@ -677,15 +882,15 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def put_worker_settings(request: Request) -> Any:
         body = await _require_dict_body(request)
         try:
+            from apps.web.drivers import _reject_legacy_swarm_fields
+
+            _reject_legacy_swarm_fields(body)
             cfg = app.state.manager.worker_config.set(
                 engines=body.get("engines"),
                 start_workers=body.get("start_workers"),
                 max_workers=body.get("max_workers"),
                 worker_backend=body.get("worker_backend"),
-                race_scout=body.get("race_scout"),
-                race_timeout=body.get("race_timeout"),
                 wall_clock_budget=body.get("wall_clock_budget"),
-                race_engines=body.get("race_engines"),
                 max_total_workers=body.get("max_total_workers"),
                 cost_budget_usd=body.get("cost_budget_usd"),
                 stage_policy=body.get("stage_policy"),
@@ -727,8 +932,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # what a real run would use.
         from dataclasses import asdict
 
-        from muteki.core.runtime_env import is_web_container
-        from muteki.solver.profile_health import evaluate_profile_health
+        from dswarm.core.runtime_env import is_web_container
+        from dswarm.solver.profile_health import evaluate_profile_health
         from apps.web.worker_config import backend_for_profile
 
         cfg = app.state.manager.worker_config.get()
@@ -761,8 +966,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # die on profile_unhealthy.
         from dataclasses import asdict
 
-        from muteki.core.runtime_env import is_web_container
-        from muteki.solver.profile_health import evaluate_profile_health
+        from dswarm.core.runtime_env import is_web_container
+        from dswarm.solver.profile_health import evaluate_profile_health
         from apps.web.worker_config import backend_for_profile
 
         cfg = app.state.manager.worker_config.get()
@@ -777,7 +982,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # name (e.g. "claude-local") survives only in the alias table. Resolve it so
         # the "测连通" button keeps working with either an old name or a new seat id.
         if match is None:
-            from muteki.solver.worker_profiles import resolve_seat_ref
+            from dswarm.solver.worker_profiles import resolve_seat_ref
             sid = resolve_seat_ref(
                 profile_id, seats=cfg.get("seats") or [],
                 alias_table=cfg.get("seat_alias") or {},
@@ -887,7 +1092,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def get_system_login() -> Any:
         # Host-side login presence per engine (DESIGN §2.3 補強B). Drives the
         # local-mode credentials UI ("默认用系统登录"). Read-only, never raises.
-        from muteki.solver.credential_accounts import detect_system_login
+        from dswarm.solver.credential_accounts import detect_system_login
 
         logins = await asyncio.to_thread(
             lambda: {e: detect_system_login(e) for e in ("pi",)}
@@ -934,7 +1139,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         body = await _require_dict_body(request)
         from apps.web.drivers import build_driver
 
-        driver = build_driver(body, mgr=app.state.manager)
+        try:
+            driver = build_driver(body, mgr=app.state.manager)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # seed rail metadata up front so the row appears the instant we dispatch
         # (before run.started lands) — conversational dispatch infers the rest.
         run = app.state.manager.get(run_id) or app.state.manager.create(run_id)
@@ -954,6 +1162,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         run.flags = []
         run.paused = False
         run.started = True
+        # Keep the non-secret roster/backend/profile settings beside the run so a
+        # later "继续解题" does not silently resolve against a different global
+        # configuration.
+        app.state.manager.remember_dispatch(run_id, body)
         await app.state.manager.start(run_id, driver)
 
         # ChatGPT-style auto-title: if the operator gave no explicit name, kick off
@@ -982,6 +1194,53 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             resp["queued"] = True
             resp["position"] = run.queue_position
         return resp
+
+    @app.post("/api/blackboard/{run_id}")
+    async def blackboard_command(run_id: str, request: Request) -> Any:
+        token = request.headers.get("X-Blackboard-Token", "")
+        if not app.state.manager.verify_board_token(run_id, token):
+            raise HTTPException(status_code=401, detail="invalid blackboard token")
+        body = await _require_dict_body(request, allow_empty=True)
+        import subprocess
+        import sys
+
+        from dswarm.solver.cli_solver import _repo_blackboard_script
+
+        cmd = str(body.get("cmd") or "").strip()
+        allowed = {
+            "read-facts", "read-review", "read-routes", "read-branches",
+            "read-deadends", "read-flags", "list-intents", "write-fact",
+            "mark-deadend", "claim", "claim-activity", "list-activities",
+            "claim-resource", "release-resource", "read-resource-locks",
+            "read-directives", "directive-status",
+        }
+        if cmd not in allowed:
+            raise HTTPException(status_code=400, detail=f"unsupported blackboard command: {cmd}")
+        script = _repo_blackboard_script()
+        if not script:
+            raise HTTPException(status_code=500, detail="blackboard script unavailable")
+        args = [str(a) for a in (body.get("args") or []) if isinstance(a, (str, int, float))]
+        root = app.state.manager.workspace_dir(run_id)
+        graph_dir = root / "graph"
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["DSWARM_BLACKBOARD_DB"] = str(graph_dir / "shared_graph.db")
+        env["DSWARM_WORKER_ID"] = str(body.get("worker") or "worker")
+        env["DSWARM_INTENT_ID"] = str(body.get("intent_id") or "")
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, script, cmd, *args],
+            cwd=str(graph_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
     @app.post("/api/runs/{run_id}/uploads")
     async def upload_files(
         run_id: str, files: list[UploadFile] = File(...)
@@ -1141,7 +1400,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         return EventSourceResponse(
             gen(),
             ping=10,
-            ping_message_factory=lambda: ServerSentEvent(comment="muteki-ping"),
+            ping_message_factory=lambda: ServerSentEvent(comment="dswarm-ping"),
         )
 
     @app.websocket("/api/runs/{run_id}/terminal")
@@ -1180,8 +1439,22 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         its workspace so verified facts carry over). Distinct from /hitl which, on a
         finished run, only cold-starts a single standby worker for a follow-up."""
         body = await _require_dict_body(request, allow_empty=True)
-        ok = await app.state.manager.resolve(run_id, body)
-        return {"ok": ok}
+        try:
+            ok = await app.state.manager.resolve(run_id, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            # Configuration/preflight failures happen before the run is reopened;
+            # never return 200/ok=true for a recovery that cannot be launched.
+            raise HTTPException(status_code=503, detail=str(exc)[:500]) from exc
+        if not ok:
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "detail": "run is already active or queued"},
+            )
+        run = app.state.manager.get(run_id)
+        return {"ok": True, "queued": bool(run and run.queued),
+                "position": run.queue_position if run and run.queued else None}
 
     @app.post("/api/runs/{run_id}/workers")
     async def spawn_worker(run_id: str, request: Request) -> Any:

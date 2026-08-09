@@ -1,0 +1,35 @@
+# Route-A direction image: a THIN layer on the full Kali base (Dockerfile).
+# Each direction only adds its prompt/skills/extensions/provider defaults; the
+# toolchain, pi runtime, supervisor, blackboard skill and pi config are
+# inherited from the base.
+ARG BASE_IMAGE=ctf-swarm-pi-base:0.3.0-rc.1
+FROM ${BASE_IMAGE}
+USER root
+
+ARG IMAGE_VERSION=dev
+ARG DIRECTION=web
+
+COPY directions/${DIRECTION}/ /opt/dswarm/direction/
+RUN if [ -f /opt/dswarm/direction/models.json ]; then \
+      cp /opt/dswarm/direction/models.json /opt/dswarm/pi-config/models.json; \
+    fi && \
+    if [ -d /opt/dswarm/direction/extensions ]; then \
+      find /opt/dswarm/direction/extensions -maxdepth 1 -type f -name '*.ts' \
+           ! -name '.gitkeep' -exec cp {} /opt/dswarm/pi-config/extensions/ \; ; \
+    fi && \
+    cp /opt/dswarm/pi-config/models.json /home/ctf/.pi/agent/models.json && \
+    find /opt/dswarm/pi-config/extensions -maxdepth 1 -type f -name '*.ts' \
+      -exec cp {} /home/ctf/.pi/agent/extensions/ \; && \
+    for s in /opt/dswarm/direction/skills/*/; do \
+      [ -d "$s" ] || continue; \
+      ln -sf "$s" "/home/ctf/.pi/agent/skills/$(basename "$s")"; \
+    done && \
+    for f in /opt/dswarm/direction/skills/*; do \
+      [ -f "$f" ] || continue; \
+      [ "$(basename "$f")" = ".gitkeep" ] && continue; \
+      ln -sf "$f" "/home/ctf/.pi/agent/skills/$(basename "$f")"; \
+    done
+
+LABEL org.opencontainers.image.title="ctf-swarm-pi-${DIRECTION}" \
+      org.opencontainers.image.description="Kali pi worker, ${DIRECTION} direction layer (route A)" \
+      org.opencontainers.image.version="${IMAGE_VERSION}"

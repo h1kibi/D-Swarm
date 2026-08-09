@@ -4,13 +4,13 @@ Tests the values the operator is EDITING (passed in the request body), not the
 saved config — so a freshly-typed base_url/model is what gets tested.
 
 Key correctness rule (reviewer P3): judge `ok` by API success, NOT by non-empty
-content. The configured models are reasoning models (muteki/core/llm.py header):
+content. The configured models are reasoning models (dswarm/core/llm.py header):
 tokens go to `reasoning_content` first, so a small cap can return empty `content`
 on a perfectly healthy endpoint. We use the client's default cap and treat "chat
 returned without raising" as success.
 
 The API key is NOT taken from the request — it stays in .env
-(MUTEKI_DEEPSEEK_API_KEY). base_url empty → default DeepSeek endpoint.
+(DSWARM_DEEPSEEK_API_KEY). base_url empty → default DeepSeek endpoint.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ async def test_llm_endpoint(
     model: Optional[str] = None,
 ) -> dict[str, Any]:
     """Make one minimal chat against the (edited) endpoint. Never raises."""
-    from muteki.core.llm import LLMClient
+    from dswarm.core.llm import LLMClient
 
     which = (which or "").strip() or "planner"
     base_url = (base_url or "").strip()

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
-from muteki.solver.profile_health import (
+from dswarm.solver.credential_accounts import CredentialAccountStore, account_store_root
+from dswarm.solver.profile_health import (
     ProfileHealth,
     evaluate_profile_health,
     needs_auth_probe,
@@ -114,7 +114,7 @@ def test_needs_auth_probe_bare_subscription_local_no_login(monkeypatch):
     """A bare subscription with NO system login still needs a probe (keyed mode
     path); with a present login it does not (zero-probe fast path)."""
     monkeypatch.setattr(
-        "muteki.solver.profile_health.detect_system_login", lambda engine, env=None: "present"
+        "dswarm.solver.profile_health.detect_system_login", lambda engine, env=None: "present"
     )
     sub = {"name": "pi-local", "engine": "pi", "credential_mode": "subscription"}
     # subscription is not a keyed mode and login present → no probe needed locally
@@ -140,7 +140,7 @@ def test_auth_layer_pins_profile_model(tmp_path, monkeypatch):
         seen["arg"] = arg
         return _Drv()
 
-    monkeypatch.setattr("muteki.solver.cli_driver.driver_for", _capture)
+    monkeypatch.setattr("dswarm.solver.cli_driver.driver_for", _capture)
     h = evaluate_profile_health(
         {"name": "pi-local", "engine": "pi",
          "credential_account": "pi-main", "model": "deepseek-v4-pro",
@@ -168,15 +168,15 @@ def test_auth_layer_env_is_always_container_false(tmp_path, monkeypatch):
             env = {"DEEPSEEK_API_KEY": "tok-123"}
         return _R()
 
-    monkeypatch.setattr("muteki.solver.profile_health.runtime_env_for_engine", _fake_env)
+    monkeypatch.setattr("dswarm.solver.profile_health.runtime_env_for_engine", _fake_env)
     monkeypatch.setattr(
-        "muteki.solver.cli_driver.driver_for",
+        "dswarm.solver.cli_driver.driver_for",
         lambda profile: type("D", (), {"health_detail": lambda self, env=None: (True, "ok")})(),
     )
     # plumbing must PASS so the auth layer is reached (container plumbing gates
     # before auth — itself a correct ordering we rely on).
     monkeypatch.setattr(
-        "muteki.solver.profile_health._probe_container_plumbing",
+        "dswarm.solver.profile_health._probe_container_plumbing",
         lambda **kw: (True, None, "plumbing ok"),
     )
     # backend=container, but the auth env resolution must STILL be container=False
@@ -194,7 +194,7 @@ def test_auth_failure_reports_auth_layer(tmp_path, monkeypatch):
     used to miss."""
     _register_pi(tmp_path)
     monkeypatch.setattr(
-        "muteki.solver.cli_driver.driver_for",
+        "dswarm.solver.cli_driver.driver_for",
         lambda profile: type("D", (), {"health_detail": lambda self, env=None: (False, "api_error_status:403")})(),
     )
     h = evaluate_profile_health(
@@ -216,7 +216,7 @@ def test_binding_depth_never_probes(tmp_path, monkeypatch):
         called["n"] += 1
         raise AssertionError("driver_for must not be called at binding depth")
 
-    monkeypatch.setattr("muteki.solver.cli_driver.driver_for", _boom)
+    monkeypatch.setattr("dswarm.solver.cli_driver.driver_for", _boom)
     h = evaluate_profile_health(
         {"name": "pi-local", "engine": "pi",
          "credential_account": "pi-main", "credential_mode": "api_key", "enabled": True},

@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import subprocess
 
-import muteki.solver.container_exec as ce
-from muteki.solver.container_exec import _oom_kill_count
+import dswarm.solver.container_exec as ce
+from dswarm.solver.container_exec import _oom_kill_count
 
 
 def _fake_completed(stdout: str, rc: int = 0) -> subprocess.CompletedProcess:

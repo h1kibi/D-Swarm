@@ -1,10 +1,10 @@
 # ctf-swarm — CTF 自动化解题系统
 
-基于 **muteki**（AGPL-3.0）内核的 CTF / 授权渗透测试多 Agent 自动化解题平台，融合 **CTF-BTFly** 的工程资产：
+基于 **dswarm**（AGPL-3.0）内核的 CTF / 授权渗透测试多 Agent 自动化解题平台，融合 **CTF-BTFly** 的工程资产：
 
-- **内核（来自 muteki，只读不重写）**：Swarm 协调器、SharedGraph 事件源共享黑板、Reason 规划、provenance gate、blackboard skill、HITL、容器后端。
-- **BTFly 资产（路线 A 逐步并入）**：Pi RPC worker 引擎、按题型分类的 Docker 镜像、CTF 知识库（`skills/` 100+ 参考文档）、模型网关（task token 换真实 key）。
-- **控制面**：FastAPI + Next.js 指挥台（muteki 原版）。
+- **内核（来自 dswarm，只读不重写）**：Swarm 协调器、SharedGraph 事件源共享黑板、Reason 规划、provenance gate、blackboard skill、HITL、容器后端。
+- **BTFly 资产（路线 A 逐步并入）**：Pi RPC worker 引擎、统一 Kali worker 镜像、CTF 知识库（`skills/` 100+ 参考文档）、模型网关（task token 换真实 key）。
+- **控制面**：FastAPI + Next.js 指挥台（dswarm 原版）。
 
 > ⚠️ 本工具是攻击性安全自动化工具，只允许用于明确授权的 CTF、自有靶场和书面授权的渗透测试。勿对未授权目标使用。
 
@@ -16,34 +16,34 @@ uv run pytest -m "not live"  # 测试套件（无 key 时 live 测试自动跳�
 ./run.sh web                 # FastAPI 后端 (:8000) + Next 指挥台 (:3001)
 ```
 
-配置通过 `MUTEKI_*` 环境变量（见 `.env.example`）；Reason 规划器需要 `MUTEKI_DEEPSEEK_API_KEY`。
+配置通过 `DSWARM_*` 环境变量（见 `.env.example`）；Reason 规划器需要 `DSWARM_DEEPSEEK_API_KEY`。
 
 ## 目录结构
 
 | 路径 | 内容 |
 | --- | --- |
-| `muteki/` | 内核：swarm / solver / models / sandbox / learning / core |
+| `dswarm/` | 内核：swarm / solver / models / sandbox / learning / core |
 | `apps/web/` | FastAPI 后端 + Next.js 指挥台 |
 | `apps/tui/` | Textual TUI（未完工） |
 | `cmd/runtime-agent/` | 容器内 Go supervisor（反向连接） |
 | `docker/` | worker 镜像（BTFly 分类镜像逐步并入） |
-| `skills/` | muteki-blackboard skill |
+| `skills/` | dswarm-blackboard skill |
 | `docs/` | 设计文档 01–06（06 为路线 A 实施计划） |
 | `references/btfly/` | BTFly 参考源码（git 历史 a141bb5，AGPL-3.0，只读参考） |
 
 ## 路线与状态
 
-- **路线 A**：fork muteki 为底座，BTFly 资产以功能形式并入。许可证 AGPL-3.0（已接受）。
-- 进度：P0 基线完成（BTFly 参考恢复、muteki 测试通过 1009/1009+）；P1（Pi 引擎）进行中。
+- **路线 A**：fork dswarm 为底座，BTFly 资产以功能形式并入。许可证 AGPL-3.0（已接受）。
+- 进度：P0 基线完成（BTFly 参考恢复、dswarm 测试通过 1009/1009+）；P1（Pi 引擎）进行中。
 - 详见 [docs/06-route-a-plan.md](docs/06-route-a-plan.md)。
 
 ## 开发约定
 
-- 内核（`muteki/`）只读：所有 BTFly 资产落在扩展点（driver / docker / web 层），跟踪上游更新：`git fetch upstream && git merge upstream/main`。
+- 内核（`dswarm/`）只读：所有 BTFly 资产落在扩展点（driver / docker / web 层），跟踪上游更新：`git fetch upstream && git merge upstream/main`。
 - 测试：Windows 宿主跑测试用 `PYTHONUTF8=1`；容器执行路径的 POSIX 专属测试在 Windows 上跳过。
-- Worker 引擎名册：`claude` / `codex` / `cursor`（muteki 原生）+ `pi`（路线 A 新增，进行中）。
+- Worker 引擎名册：`pi`（当前唯一 worker 引擎；方向 profile 统一使用同一 Kali 镜像）。
 
 ## 上游
 
-- muteki（内核）：AGPL-3.0，本仓库 upstream remote。
+- dswarm（内核）：AGPL-3.0，本仓库 upstream remote。
 - CTF-BTFly（参考）：源码在 `references/btfly/`，commit `a141bb5`，AGPL-3.0。

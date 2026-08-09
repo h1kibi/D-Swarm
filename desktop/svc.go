@@ -1,4 +1,4 @@
-// Package desktop — the P6 desktop shell: a Wails window over the muteki
+// Package desktop — the P6 desktop shell: a Wails window over the dswarm
 // backend (FastAPI/uvicorn) + the Next.js command deck.
 //
 // svc.go is the child-process supervisor: spawn / health-wait / stop the two
@@ -43,16 +43,18 @@ type Snapshot struct {
 
 // Service runs ONE child process with health polling and log capture.
 type Service struct {
-	Name      string
-	Argv      []string // argv[0] resolved by exec.LookPath at Start (npm.cmd etc.)
-	Dir       string
-	ExtraEnv  []string // KEY=VALUE appended to os.Environ()
-	HealthURL string   // GET probe; empty = no health wait
-	HealthTTL time.Duration
-	LogCap    int
+	Name          string
+	Argv          []string // argv[0] resolved by exec.LookPath at Start (npm.cmd etc.)
+	Dir           string
+	ExtraEnv      []string // KEY=VALUE appended to os.Environ()
+	HealthURL     string   // GET probe; empty = no health wait
+	HealthTTL     time.Duration
+	LogCap        int
+	ReuseExisting bool // adopt an already healthy service on the configured endpoint
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
+	managed  bool // true only when this Service started the process
 	state    ServiceState
 	lastErr  string
 	logTail  []string
@@ -101,7 +103,21 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.state = StateStarting
 	s.lastErr = ""
+	s.managed = false
 	s.mu.Unlock()
+
+	// The desktop shell may be started while run.sh web (or another desktop
+	// instance) already owns the configured endpoint. Reuse a healthy D-Swarm
+	// service instead of launching a second process that immediately dies with
+	// EADDRINUSE. The adopted process is deliberately not killed on shutdown.
+	if s.ReuseExisting && s.HealthURL != "" && healthy(s.HealthURL, 750*time.Millisecond) {
+		s.mu.Lock()
+		s.state = StateRunning
+		s.managed = false
+		s.mu.Unlock()
+		s.log(fmt.Sprintf("reusing existing healthy service at %s", s.HealthURL))
+		return nil
+	}
 
 	bin, err := exec.LookPath(s.Argv[0])
 	if err != nil {
@@ -133,6 +149,7 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	s.cmd = cmd
+	s.managed = true
 	s.mu.Unlock()
 
 	go pumpLines(stdout, s.log)
@@ -142,6 +159,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.mu.Lock()
 		was := s.state
 		s.cmd = nil
+		s.managed = false
 		s.mu.Unlock()
 		if was == StateRunning || was == StateStarting {
 			s.setState(StateStopped)
@@ -156,12 +174,40 @@ func (s *Service) Start(ctx context.Context) error {
 				_ = s.Stop()
 				return err
 			}
+			s.mu.Lock()
+			processGone := s.cmd == nil
+			processErr := s.lastErr
+			s.mu.Unlock()
+			if processGone {
+				// Another supervisor can win the bind race between our initial
+				// probe and cmd.Start. If that winner is healthy, adopt it rather
+				// than reporting a false startup failure.
+				if s.ReuseExisting && healthy(s.HealthURL, 750*time.Millisecond) {
+					s.mu.Lock()
+					s.state = StateRunning
+					s.managed = false
+					s.mu.Unlock()
+					s.log(fmt.Sprintf("adopted service that won the startup bind race at %s", s.HealthURL))
+					return nil
+				}
+				if processErr == "" {
+					processErr = "process exited before health probe became ready"
+				}
+				s.setState(StateError)
+				s.mu.Lock()
+				s.lastErr = processErr
+				s.mu.Unlock()
+				return fmt.Errorf("%s: %s", s.Name, processErr)
+			}
 			if healthy(s.HealthURL, 2*time.Second) {
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
 		if !healthy(s.HealthURL, 2*time.Second) {
+			// A failed health start must not leave a child process behind. This
+			// was a source of subsequent port conflicts after a failed boot.
+			_ = s.Stop()
 			s.setState(StateError)
 			s.mu.Lock()
 			s.lastErr = fmt.Sprintf("health probe %s never returned 200", s.HealthURL)
@@ -185,6 +231,12 @@ func (s *Service) healthTTL() time.Duration {
 func (s *Service) Stop() error {
 	s.mu.Lock()
 	cmd := s.cmd
+	managed := s.managed
+	if !managed {
+		s.state = StateStopped
+		s.mu.Unlock()
+		return nil
+	}
 	if cmd == nil || cmd.Process == nil {
 		s.mu.Unlock()
 		return nil
@@ -291,29 +343,60 @@ func (s *Supervisor) Status() map[string]Snapshot {
 	}
 }
 
-// RepoRoot resolves the muteki repo root: MUTEKI_REPO_ROOT wins; else the cwd
-// if it contains pyproject.toml; else walk up from the executable.
-func RepoRoot(exe string, cwd string) string {
-	if v := strings.TrimSpace(os.Getenv("MUTEKI_REPO_ROOT")); v != "" {
-		return v
+// RepoRoot resolves a usable D-Swarm checkout.  It deliberately validates both
+// the Python project marker and the deck package: accepting an arbitrary cwd
+// makes npm/Next inherit the drive root and Watchpack then tries to watch C:\.
+func RepoRoot(exe string, cwd string) (string, error) {
+	if v := strings.TrimSpace(os.Getenv("DSWARM_REPO_ROOT")); v != "" {
+		if root, ok := validRepoRoot(v); ok {
+			return root, nil
+		}
+		return "", fmt.Errorf("DSWARM_REPO_ROOT is not a D-Swarm checkout: %s", v)
 	}
-	candidates := []string{cwd}
+
+	starts := []string{cwd}
 	if exe != "" {
-		d := filepath.Dir(exe)
-		for i := 0; i < 4; i++ { // bin → build → desktop → repo root
-			candidates = append(candidates, d)
-			d = filepath.Dir(d)
+		starts = append(starts, filepath.Dir(exe))
+	}
+	seen := make(map[string]struct{})
+	for _, start := range starts {
+		for dir := strings.TrimSpace(start); dir != ""; {
+			absolute, err := filepath.Abs(dir)
+			if err != nil {
+				break
+			}
+			key := filepath.Clean(absolute)
+			if _, duplicate := seen[key]; !duplicate {
+				seen[key] = struct{}{}
+				if root, ok := validRepoRoot(key); ok {
+					return root, nil
+				}
+			}
+			parent := filepath.Dir(key)
+			if parent == key { // volume root
+				break
+			}
+			dir = parent
 		}
 	}
-	for _, c := range candidates {
-		if c == "" {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(c, "pyproject.toml")); err == nil {
-			return c
-		}
+	return "", fmt.Errorf("could not find a D-Swarm checkout from cwd %q or executable %q; set DSWARM_REPO_ROOT", cwd, exe)
+}
+
+func validRepoRoot(dir string) (string, bool) {
+	if strings.TrimSpace(dir) == "" {
+		return "", false
 	}
-	return cwd
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return "", false
+	}
+	if _, err := os.Stat(filepath.Join(root, "pyproject.toml")); err != nil {
+		return "", false
+	}
+	if _, err := os.Stat(filepath.Join(root, "apps", "web", "ui", "package.json")); err != nil {
+		return "", false
+	}
+	return root, true
 }
 
 // BackendService builds the uvicorn service for the repo root.
@@ -326,45 +409,77 @@ func BackendService(root string, python string, port int) *Service {
 		}
 	}
 	return &Service{
-		Name:      "backend",
-		Argv:      []string{python, "-m", "uvicorn", "apps.web.server:create_app", "--host", "127.0.0.1", "--port", fmt.Sprint(port)},
-		Dir:       root,
-		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/api/runs", port),
-		ExtraEnv:  []string{"MUTEKI_BACKEND_PORT=" + fmt.Sprint(port)},
+		Name:          "backend",
+		Argv:          []string{python, "-m", "uvicorn", "apps.web.server:create_app", "--host", "127.0.0.1", "--port", fmt.Sprint(port)},
+		Dir:           root,
+		HealthURL:     fmt.Sprintf("http://127.0.0.1:%d/api/runs", port),
+		ReuseExisting: true,
+		ExtraEnv:      []string{"DSWARM_BACKEND_PORT=" + fmt.Sprint(port)},
 	}
 }
 
-// UiService builds the Next deck service; missing node_modules triggers a
-// one-time npm install (UI_MODE=prod builds then serves, default dev server).
-// MUTEKI_BACKEND points the deck's /api proxy at OUR backend (default 8000 is
+// UiService builds the Next deck service. The desktop defaults to a production
+// Next server; development mode is opt-in with DSWARM_UI_MODE=dev.
+// DSWARM_BACKEND points the deck's /api proxy at OUR backend (default 8000 is
 // what next.config assumes, but the port override must reach the right one).
 func UiService(root string, port int, backendPort int, mode string) *Service {
 	uiDir := filepath.Join(root, "apps", "web", "ui")
-	argv := []string{"npm.cmd", "run", "dev", "--", "-p", fmt.Sprint(port)}
-	extra := []string{"MUTEKI_UI_PORT=" + fmt.Sprint(port),
-		"MUTEKI_BACKEND=http://127.0.0.1:" + fmt.Sprint(backendPort)}
-	if strings.EqualFold(strings.TrimSpace(mode), "prod") {
-		argv = []string{"npm.cmd", "run", "start"}
-		extra = append(extra, "PORT="+fmt.Sprint(port))
+	argv := []string{"npm.cmd", "run", "start", "--", "-p", fmt.Sprint(port)}
+	extra := []string{"DSWARM_UI_PORT=" + fmt.Sprint(port),
+		"DSWARM_BACKEND=http://127.0.0.1:" + fmt.Sprint(backendPort)}
+	if strings.EqualFold(strings.TrimSpace(mode), "dev") {
+		argv = []string{"npm.cmd", "run", "dev", "--", "-p", fmt.Sprint(port)}
 	}
 	return &Service{
-		Name:      "ui",
-		Argv:      argv,
-		Dir:       uiDir,
-		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/", port),
-		HealthTTL: 240 * time.Second, // first Next compile can take a while
-		ExtraEnv:  extra,
+		Name:          "ui",
+		Argv:          argv,
+		Dir:           uiDir,
+		HealthURL:     fmt.Sprintf("http://127.0.0.1:%d/", port),
+		HealthTTL:     240 * time.Second, // first Next compile can take a while
+		ReuseExisting: true,
+		ExtraEnv:      extra,
 	}
+}
+
+// uiDir validates the deck directory before any child process is launched.
+func uiDir(root string) (string, error) {
+	dir := filepath.Join(root, "apps", "web", "ui")
+	if _, err := os.Stat(filepath.Join(dir, "package.json")); err != nil {
+		return "", fmt.Errorf("deck UI is missing at %s: %w", dir, err)
+	}
+	return dir, nil
 }
 
 // EnsureUiDeps runs npm install in the ui dir when node_modules is missing.
 func EnsureUiDeps(root string) error {
-	uiDir := filepath.Join(root, "apps", "web", "ui")
+	uiDir, err := uiDir(root)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(uiDir, "node_modules")); err == nil {
 		return nil
 	}
 	fmt.Println("[ui] node_modules missing — running npm install (one-time)")
 	cmd := exec.Command("npm.cmd", "install", "--no-audit", "--no-fund")
+	cmd.Dir = uiDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// EnsureUiBuild materializes a production Next build. next start refuses a dev
+// .next directory, so this also gives a clear startup error rather than a proxy
+// that appears alive but cannot serve the deck.
+func EnsureUiBuild(root string) error {
+	uiDir, err := uiDir(root)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(uiDir, ".next", "BUILD_ID")); err == nil {
+		return nil
+	}
+	fmt.Println("[ui] production build missing — running npm run build (one-time)")
+	cmd := exec.Command("npm.cmd", "run", "build")
 	cmd.Dir = uiDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

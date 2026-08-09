@@ -2,24 +2,23 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/logo-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="./assets/logo-light.png">
-    <img alt="Muteki Logo" src="./assets/logo-light.png" width="320">
+    <img alt="D-Swarm Logo" src="./assets/logo-light.png" width="320">
   </picture>
 </p>
 
-<h1 align="center">無敵 · Project Muteki</h1>
+<h1 align="center">無敵 · Project D-Swarm</h1>
 
 <p align="center">
   <strong>多模型异构 AI Agent 蜂群 · 自主攻防安全自动化</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/FishCodeTech/muteki/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
+  <a href="https://github.com/h1kibi/D-Swarm/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-≥3.13-3776AB.svg?logo=python&logoColor=white" alt="Python"></a>
-  <a href="https://github.com/FishCodeTech/muteki/stargazers"><img src="https://img.shields.io/github/stars/FishCodeTech/muteki?style=social" alt="Stars"></a>
-  <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
-  <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
-  <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-Claude_Code_%7C_Codex_%7C_Cursor-orange" alt="Engines">
+  <a href="https://github.com/h1kibi/D-Swarm/stargazers"><img src="https://img.shields.io/github/stars/h1kibi/D-Swarm?style=social" alt="Stars"></a>
+  <a href="https://github.com/h1kibi/D-Swarm/issues"><img src="https://img.shields.io/github/issues/h1kibi/D-Swarm" alt="Issues"></a>
+  <a href="https://github.com/h1kibi/D-Swarm/pulls"><img src="https://img.shields.io/github/issues-pr/h1kibi/D-Swarm" alt="PRs"></a>
+  <img src="https://img.shields.io/badge/engines-Pi-blue" alt="Engines">
 </p>
 
 <p align="center">
@@ -27,28 +26,28 @@
 </p>
 
 <p align="center">
-  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
+  <a href="https://www.star-history.com/#h1kibi/D-Swarm&amp;Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=h1kibi/D-Swarm&amp;type=Date&amp;theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=h1kibi/D-Swarm&amp;type=Date">
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=h1kibi/D-Swarm&amp;type=Date">
     </picture>
   </a>
 </p>
 
 ---
 
-这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 目标就是成为如项目名称，**無敵 · Project Muteki**
+这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 目标就是成为如项目名称，**無敵 · Project D-Swarm**
 
-项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标，目前只支持cursor、codex、claude code的指挥和下发。未来将持续更新迭代支持更多种类的cli agent。
+项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。当前 worker 引擎是 `pi` CLI agent，未来将持续更新迭代支持更多种类的 CLI agent。
 
-Muteki就是为了解决单一ai agent在解决一个目标是极其容易陷入一个点死循环，无法自拔，无法完成最终的目标，并且单一agent效率极低，我设计了一套架构来解决这个问题，他可能不是最完美的，我将继续不断迭代升级。
+D-Swarm就是为了解决单一ai agent在解决一个目标是极其容易陷入一个点死循环，无法自拔，无法完成最终的目标，并且单一agent效率极低，我设计了一套架构来解决这个问题，他可能不是最完美的，我将继续不断迭代升级。
 
 ctf只是一个最基础的功能，核心架构是为了满足实现各类场景下的多agent协同目标驱动，经过实测，该可以独立自动化完成渗透测试、代码审计、ctf题解，网络安全等。
 
 > ## ⚠️ 运行信任边界 —— 运行前必读
 >
-> Muteki 是**攻击性安全自动化工具**。它驱动 CLI agent 执行命令、调用安全工具、访问目标服务;
+> D-Swarm 是**攻击性安全自动化工具**。它驱动 CLI agent 执行命令、调用安全工具、访问目标服务;
 > **它不承诺隔离恶意 challenge**。
 >
 > 推荐**只在专用、可丢弃的环境里运行** —— 专用 VPS、throwaway VM,或无敏感数据的独立机器。不要在
@@ -64,7 +63,7 @@ ctf只是一个最基础的功能，核心架构是为了满足实现各类场�
 
 ![image-20260624162932292](./assets/image-20260624162932292.png)
 
-春秋云镜渗透测试靶场blackmaze，三个月0解，muteki 2小时速通一血（为什么平台显示39小时因为期间涉及到各种调试测试多flag的模式支持，所以浪费时间较多，实际解题时间仅花费2小时。）。
+春秋云镜渗透测试靶场blackmaze，三个月0解，dswarm 2小时速通一血（为什么平台显示39小时因为期间涉及到各种调试测试多flag的模式支持，所以浪费时间较多，实际解题时间仅花费2小时。）。
 
 ![ee318ffa895e4b2ffd6df67da6c15f90](./assets/ee318ffa895e4b2ffd6df67da6c15f90.png)
 
@@ -76,7 +75,7 @@ hackthebox全种类 insane、hard难度ak。
 
 nyuctf benchmark全题目测评成绩，可看文章结尾
 
-更多你们知道和不知道的各种比赛的一血、高分，均有muteki的身影出现，在此不一一赘述。
+更多你们知道和不知道的各种比赛的一血、高分，均有dswarm的身影出现，在此不一一赘述。
 
 总之经过为期一个月的工程化优化，架构能力调教。bug修复，本项目正式开源，没有欺骗star，没有吹逼文案，没有打击你们的自信，没有子群，没有社区，没有骗钱，没有付费，没有营销，直接开源共享。
 
@@ -88,9 +87,9 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 
 ## 架构
 
-無敵让一群异构的编码 Agent（Claude Code / Codex / cursor-agent）扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **异构 + 共享证据 + 溯源闸门**。
+無敵让一群基于 `pi` CLI agent 的 worker 扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **共享证据 + 溯源闸门**。
 
-而 worker 是怎么把数据交到平台、又怎么看到队友进展的？**全靠每个 worker 内置的 `muteki-blackboard` skill**——这是 worker 与黑板之间唯一的数据通道。
+而 worker 是怎么把数据交到平台、又怎么看到队友进展的？**全靠每个 worker 内置的 `dswarm-blackboard` skill**——这是 worker 与黑板之间唯一的数据通道。
 
 详细架构说明，请参考：[docs/工作原理.md](docs/工作原理.md)
 
@@ -102,7 +101,7 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 
 ### 一张图看懂：解题阶段 × agent 循环
 
-外层 `①②③④` 是一次 run 的四个阶段，内层 `(1)~(5)` 是阶段 ③ 每一拍的协作循环。难题的功夫全在 ③ 这个圈里，而圈里 worker ↔ 黑板的每一次读写都走 `muteki-blackboard` skill。
+外层 `①②③④` 是一次 run 的四个阶段，内层 `(1)~(5)` 是阶段 ③ 每一拍的协作循环。难题的功夫全在 ③ 这个圈里，而圈里 worker ↔ 黑板的每一次读写都走 `dswarm-blackboard` skill。
 
 ![1782305107059](./assets/1782305107059.png)
 
@@ -117,7 +116,7 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 | **④ 收尾**      | 攒够 flag / 操作员停 / 预算耗尽 | 落 winner、释放认领、发终态事件、清扫                | RUN_FINISHED + 可复盘的黑板 |
 
 
-为了防止muteki在做单一任务时进入死循环，我们设定了一个review机制，当muteki在执行任务时，会定期进行review，review机制会检查已经记录的事实并验证，然后随时及时纠正。
+为了防止dswarm在做单一任务时进入死循环，我们设定了一个review机制，当dswarm在执行任务时，会定期进行review，review机制会检查已经记录的事实并验证，然后随时及时纠正。
 
 ---
 
@@ -132,12 +131,12 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 #     只起后端:  ./run.sh web --backend-only
 ```
 
-仓库根目录的 `.env` 会被自动加载(从 `.env.example` 复制);shell 导出的变量始终优先。配置通过`MUTEKI_*` 环境变量。
+仓库根目录的 `.env` 会被自动加载(从 `.env.example` 复制);shell 导出的变量始终优先。配置通过`DSWARM_*` 环境变量。
 
 推荐设置项：
 
 ```
-MUTEKI_DEEPSEEK_API_KEY=sk-xxxx
+DSWARM_DEEPSEEK_API_KEY=sk-xxxx
 ```
 
 主要是核心是用于设置Reason 规划器 来规划整套agent的凭据，你也可以换成其他的任意端点，和在前端设置中配置模型内容。默认是deepseek，因为相比较来说性价比较高。
@@ -156,19 +155,17 @@ MUTEKI_DEEPSEEK_API_KEY=sk-xxxx
 - 你打算用的**引擎 CLI**,需在 `PATH` 上(见下)
 - 当前项目仅在macos上进行过测试，未在windows上进行测试，请酌情处理。
 
-### 专有引擎 CLI
+### Worker CLI
 
-Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的那些。它们各有自己的 license, 且会向各自的厂商回传数据:
-
-
-| 引擎       | CLI                                  | 厂商        | 凭据                                  |
-| -------- | ------------------------------------ | --------- | ----------------------------------- |
-| `claude` | `@anthropic-ai/claude-code`          | Anthropic | OAuth token(`claude setup-token`)   |
-| `codex`  | `@openai/codex`                      | OpenAI    | `~/.codex/auth.json`(`codex login`) |
-| `cursor` | `cursor-agent`(`cursor.com/install`) | Cursor    | API key                             |
+D-Swarm 通过 `pi` CLI agent 执行实际解题工作。`pi` 的凭据通常在 worker 设置或环境变量中配置：
 
 
-至少需要其中一个才能跑。除这三个外,还可在 worker profile 里配置**自定义 OpenAI 兼容端点**
+| 引擎 | CLI                     | 说明                            | 凭据                |
+| --- | ----------------------- | ------------------------------- | ------------------ |
+| `pi` | `pi`（Pi Coding Agent） | 当前唯一 worker 引擎             | 在 worker 设置中配置 |
+
+
+至少需要可用的 `pi` 才能跑。还可在 worker profile 里配置**自定义 OpenAI 兼容端点**
 (`base_url` + key)—— 适合自托管或第三方模型。凭据从 macOS Keychain / 环境读取并注入到 worker
 环境;见 [凭据](#凭据) 与 [SECURITY.md](SECURITY.md)。
 
@@ -176,7 +173,7 @@ Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的�
 
 ## 凭据
 
-三个agent 凭据会跟随着网页设置中进行配置，走本地模式一下可以不需要配置，只需要保证你自己运行cli的时候，订阅可用即可。
+`pi` 的凭据会跟随着网页设置中进行配置，走本地模式一下可以不需要配置，只需要保证你自己运行 CLI 的时候订阅可用即可。
 
 剩余情况一般用于配置远程环境、容器环境，需要涉及到容器的凭据信息。
 
@@ -185,12 +182,10 @@ Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的�
 容器模式下，或者其他情况你如果需要使用key，那么可以参考下面这种方式进行配置
 
 
-| 引擎       | 账户目录里的文件                  | 怎么拿到                                  |
-| -------- | ------------------------- | ------------------------------------- |
-| `claude` | `CLAUDE_CODE_OAUTH_TOKEN` | `claude setup-token`                  |
-| `codex`  | `codex-home/auth.json`    | `codex login`(拷 `~/.codex/auth.json`) |
-| `cursor` | `CURSOR_API_KEY`          | cursor.com → API key                  |
-| 自定义端点    | `API_KEY` + `BASE_URL`    | 任意 OpenAI 兼容厂商                        |
+| 引擎     | 配置方式                         | 说明                         |
+| -------- | -------------------------------- | ---------------------------- |
+| `pi`     | Worker Settings / `DSWARM_*` 环境变量 | 当前唯一 worker 引擎         |
+| 自定义端点 | `API_KEY` + `BASE_URL`          | 任意 OpenAI 兼容厂商         |
 
 
 ![image-20260624184417919](./assets/image-20260624184417919.png)
@@ -202,7 +197,7 @@ Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的�
 - `**container`** 模式下账户是**必须的** —— 宿主登录不会挂进容器，会通过命令注入和文件挂在的方式将凭据挂到容器里
 - `**local`** 模式下,若没注册账户,worker 会继承宿主 CLI 已有的登录，当然你也可以手工配置。
 
-DeepSeek 推理模型(协调器用,不是 worker 引擎)单独通过 `.env` 里的 `MUTEKI_DEEPSEEK_API_KEY`配置。
+DeepSeek 推理模型(协调器用,不是 worker 引擎)单独通过 `.env` 里的 `DSWARM_DEEPSEEK_API_KEY`配置。
 
 ![image-20260624184600517](./assets/image-20260624184600517.png)
 
@@ -216,29 +211,29 @@ DeepSeek 推理模型(协调器用,不是 worker 引擎)单独通过 `.env` 里�
 
 | 镜像 | 用途 |
 | --- | --- |
-| `ghcr.io/fishcodetech/muteki-worker:latest` | 完整 Kali worker 镜像，用于真实 CTF 运行。体积大，但包含预期的 pwn/rev/取证工具链。 |
-| `ghcr.io/fishcodetech/muteki-worker-slim:latest` | 轻量 worker，用于联调、冒烟测试和受限部署。有 supervisor 和三个引擎 CLI，但没有完整 Kali 工具链。 |
-| `ghcr.io/fishcodetech/muteki-web:latest` | release 流水线产出的 FastAPI 控制面镜像。 |
-| `ghcr.io/fishcodetech/muteki-ui:latest` | release 流水线产出的 Next 指挥台镜像。 |
+| `ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1` | 完整 Kali pi worker 镜像，用于真实 CTF 运行。体积大，但包含预期的 pwn/rev/取证工具链。 |
+| `ghcr.io/h1kibi/dswarm-worker-slim:0.3.0-rc.1` | 轻量 worker，用于联调、冒烟测试和受限部署。有 supervisor，但没有完整 Kali 工具链。 |
+| `ghcr.io/h1kibi/dswarm-web:0.3.0-rc.1` | release 流水线产出的 FastAPI 控制面镜像。 |
+| `ghcr.io/h1kibi/dswarm-ui:0.3.0-rc.1` | release 流水线产出的 Next 指挥台镜像。 |
 
 正常 compose 部署时，先在宿主 Docker daemon 上拉 worker 镜像：
 
 ```bash
-docker pull ghcr.io/fishcodetech/muteki-worker:latest
+docker pull ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1
 ```
 
-应用默认使用 `ghcr.io/fishcodetech/muteki-worker:latest`。如需覆盖，用 `MUTEKI_WORKER_IMAGE`：
+应用默认使用 `ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1`。如需覆盖，用 `DSWARM_WORKER_IMAGE`：
 
 ```bash
-MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
+DSWARM_WORKER_IMAGE=ghcr.io/h1kibi/dswarm-worker-slim:0.3.0-rc.1 ./run.sh web
 ```
 
 **或从源码构建 worker 镜像:**
 
 ```bash
-./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.5
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.5 amd64
+./docker/worker-kali/build.sh
+./docker/worker-kali/build.sh ghcr.io/h1kibi/dswarm-worker-pi 0.3.0-rc.1
+./docker/worker-slim/build.sh ghcr.io/h1kibi/dswarm-worker-slim 0.3.0-rc.1 amd64
 ```
 
 完整镜像会比较大(Kali headless + Ghidra + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
@@ -265,7 +260,7 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 ./run.sh web --backend-only
 ```
 
-默认绑 loopback，密码可选。如果你把后端暴露到非 loopback 地址（`./run.sh web --host 0.0.0.0`），就**必须**先设 `MUTEKI_WEB_PASSWORD`——否则服务器拒绝启动，保证 `/api`（含订阅 token）永不裸奔。详见 [`.env.example`](.env.example) 里的 P3 鉴权段。
+默认绑 loopback，密码可选。如果你把后端暴露到非 loopback 地址（`./run.sh web --host 0.0.0.0`），就**必须**先设 `DSWARM_WEB_PASSWORD`——否则服务器拒绝启动，保证 `/api`（含订阅 token）永不裸奔。详见 [`.env.example`](.env.example) 里的 P3 鉴权段。
 
 ### B) Docker Compose（整套控制面容器化）
 
@@ -273,27 +268,27 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 拓扑：
 
-- **`web-api`** —— FastAPI 协调器。挂宿主 docker socket，把 **worker 作为兄弟容器**起在宿主 daemon 上（不是 dind）。容器内 supervisor 经 `muteki_net` 回连 `web-api:9100`。
+- **`web-api`** —— FastAPI 协调器。挂宿主 docker socket，把 **worker 作为兄弟容器**起在宿主 daemon 上（不是 dind）。容器内 supervisor 经 `dswarm_net` 回连 `web-api:9100`。
 - **`ui`** —— Next 命令台，`/api` 反代到 `web-api`。
 - **worker** 不是 compose 服务 —— 由 `web-api` 每次 run 时 `docker run` 拉一个。
 
 ```bash
 # 1. 宿主 daemon 上要先有 worker 镜像。
 #    compose 会从当前 checkout 构建 web-api/ui，但不负责构建 worker。
-docker pull ghcr.io/fishcodetech/muteki-worker:latest
+ docker pull ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1
 
 # 2. 起控制面。两个变量必填：
-#    - MUTEKI_HOST_DATA_ROOT：一个宿主绝对路径，以同一路径挂进 web-api，
+#    - DSWARM_HOST_DATA_ROOT：一个宿主绝对路径，以同一路径挂进 web-api，
 #      让 worker 的 mount（由宿主 daemon 解析）落到真实宿主路径上。
-#    - MUTEKI_WEB_PASSWORD：compose 把命令台绑到 0.0.0.0，所以密码强制。
-MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
-MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
+#    - DSWARM_WEB_PASSWORD：compose 把命令台绑到 0.0.0.0，所以密码强制。
+DSWARM_HOST_DATA_ROOT=/opt/dswarm/data \
+DSWARM_WEB_PASSWORD='choose-a-strong-one' \
   docker compose up --build
 
-# 3. 访问 http://localhost:3001  （UI 端口可用 MUTEKI_UI_PORT 改）
+# 3. 访问 http://localhost:3001  （UI 端口可用 DSWARM_UI_PORT 改）
 ```
 
-只有做冒烟测试，或确认 worker 可以自行安装缺失工具时，才建议用 `MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest`。真实 CTF 运行优先用完整 worker 镜像。
+只有做冒烟测试，或确认 worker 可以自行安装缺失工具时，才建议用 `DSWARM_WORKER_IMAGE=ghcr.io/h1kibi/dswarm-worker-slim:0.3.0-rc.1`。真实 CTF 运行优先用完整 Kali worker 镜像。
 
 容器模式下平台强制**强一致性**：web 进程一旦检测到自己在容器内，就*必须*用容器 worker 后端，**拒绝回落宿主本机 CLI**——镜像缺失 / socket 不可达 / 网络名错会让 run 显式失败，而不是悄悄起错东西。UI 里 `local` 开关被隐藏/锁死。
 
@@ -308,7 +303,7 @@ MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
 1. 打开项目后会进入这样的页面
   ![image-20260624192301784](./assets/image-20260624192301784.png)
 2. 优先点开左下角设置页面，勾选你的出战引擎，以及配置你的worker模型
-  模型选择这块，如果你已经获得了cyber、cvp的认证，我推荐你使用opus4.8和gpt-5.5，如果没有，个人推荐使用gpt5.4,opus4.6。cursor个人推荐compose2.5，在简单题上有奇效。
+  Worker 使用的模型在 Worker Settings 中按 profile 配置；Reason 规划器默认使用 `deepseek-v4-pro`，也可在设置中替换为任意兼容端点。
    当然，你也可以通过自定义的baseurl来配置自定义的国产模型。（deepseek、kimi、glm）。
    ![image-20260624192335651](./assets/image-20260624192335651.png)
 3. 运行环境推荐选择本地，如有特殊需求可以选择容器，容器会提醒你配置相关的凭据，这块请自行配置，你可以通过点击测模型来测试是否正确工作，测试方式会调用agent并让模型重复 ok。
@@ -337,7 +332,7 @@ MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
 
 ## 测评
 
-Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了全量评测。结果如下：
+D-Swarm 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了全量评测。结果如下：
 
 ### 能力评测(宿主工具链)
 
@@ -370,7 +365,7 @@ Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 
 | 路径                   | 内容                                                                                |
 | -------------------- | --------------------------------------------------------------------------------- |
-| `muteki/`            | 核心:`swarm/`(协调器)、`solver/`(CLI driver、gate、控制平面)、`models/`、`platform/`、`sandbox/` |
+| `dswarm/`            | 核心:`swarm/`(协调器)、`solver/`(CLI driver、gate、控制平面)、`models/`、`platform/`、`sandbox/` |
 | `apps/web/`          | FastAPI 后端(`server.py`)+ Next.js 操作者 UI(`ui/`)                                    |
 | `apps/tui/`          | Textual TUI 指挥台 （未完工）                                                             |
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
@@ -400,7 +395,7 @@ sessions/
 │       │   └── shared_graph.db #    ★ 共享黑板：事件溯源 SQLite，唯一事实来源（facts/intents/dead-ends/...）
 │       ├── arts/               # 工件库：工具输出 / 转录快照（<hex>.txt，按 artifact_id 寻址、可 peek 回看）
 │       ├── workers/            # 每个 worker 各自的 cwd（scratch）
-│       │   └── cli-codex-2/    #    一个 worker 的工作目录（agent 临时文件 + 指向 inputs/shared 的相对符号链接）
+│       │   └── cli-pi-2/       #    一个 worker 的工作目录（agent 临时文件 + 指向 inputs/shared 的相对符号链接）
 │       ├── homes/              # 每个 worker 的隔离 HOME（容器模式尤其需要）
 │       ├── final/              # 最终产物
 │       ├── tmp/                # 临时目录
@@ -408,7 +403,7 @@ sessions/
 │       ├── manifest.json       # 工作区清单：拓扑 + inputs 列表 + runtime 元数据
 │       ├── winner.json         # 胜出 worker 的续接句柄（解出后追问 / 写 writeup / 复盘用）
 │       ├── writeup.md          # （解出后生成的）题解，可选
-│       └── .muteki_board.md    # 黑板快照：写给 worker 直接读的 Markdown 版
+│       └── .dswarm_board.md    # 黑板快照：写给 worker 直接读的 Markdown 版
 │
 ├── _secrets/accounts/<id>/     # 凭据账号库（目录 0700 / 文件 0600，从不进镜像或 prompt）
 ├── _worker_config.json         # 全局 worker 配置（引擎名册 / profile）
@@ -419,7 +414,7 @@ sessions/
 
 - `**run-XXXX.jsonl`（事件历史）** 和 `**run-XXXX/`（干活的文件）** 用同一个 run id 关联：前者能重放给前端，后者是真正落盘的工作区。
 - `**inputs/` 和 `shared/` 都是内容寻址（CAS）**：同一份文件只存一份，worker 目录里全是相对符号链接——所以 `workers/` 可随用随删而不丢数据。
-- `**graph/shared_graph.db` 是核心**：黑板的全部状态都在这；worker 通过 `muteki-blackboard` skill 读写它。
+- `**graph/shared_graph.db` 是核心**：黑板的全部状态都在这；worker 通过 `dswarm-blackboard` skill 读写它。
 - **收尾只清 `workers/` 下非 winner 的 scratch**，`shared/`、`graph/`、`arts/`、`final/`、`winner.json` 都保留，所以一道题跑完后仍可完整复盘。
 
 ---

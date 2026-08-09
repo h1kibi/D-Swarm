@@ -21,9 +21,9 @@ import uvicorn
 
 from apps.web.run_manager import RunManager
 from apps.web.server import create_app
-from muteki.core.events import EventType
-from muteki.models.solve_graph import Challenge
-from muteki.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.core.events import EventType
+from dswarm.models.solve_graph import Challenge
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
 
 def _free_port() -> int:
@@ -61,7 +61,7 @@ class _Server:
 
 @pytest.fixture
 def server():
-    app = create_app(RunManager(sessions_root="/tmp/muteki_web_sessions"))
+    app = create_app(RunManager(sessions_root="/tmp/dswarm_web_sessions"))
     with _Server(app) as s:
         yield s
 
@@ -161,8 +161,8 @@ async def test_credentials_endpoint_reads_shared_graph(tmp_path) -> None:
 async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
-    monkeypatch.delenv("MUTEKI_WEB_BIND", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
     mgr = RunManager(sessions_root=tmp_path)
     run = mgr.create("btw-run")
     run.name = "btw demo"
@@ -172,7 +172,7 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     # without consuming a review/swarm slot.
     root = mgr.workspace_dir(run.run_id)
     (root / "winner.json").write_text(
-        json.dumps({"engine": "pi-web"}),
+        json.dumps({"engine": "pi-worker"}),
         encoding="utf-8",
     )
     seen: dict[str, object] = {}
@@ -188,7 +188,7 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
         yield "answer"
 
     monkeypatch.setattr(
-        "muteki.solver.btw.stream_btw_worker_deltas",
+        "dswarm.solver.btw.stream_btw_worker_deltas",
         fake_stream_btw_worker_deltas,
     )
 
@@ -221,6 +221,7 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
         "worker ",
         "answer",
     ]
+    assert frames[0] == {"status": "正在读取 run 证据…"}
     assert frames[-1] == {"done": True}
     prompt = str(seen["prompt"])
     assert "本轮问题" in prompt
@@ -229,12 +230,224 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     assert "shared_graph.db" in prompt
     assert seen["web_access"] is False
     assert seen["kb_access"] is False
-    assert seen["env"]["MUTEKI_BTW_WORKER"] == "1"  # type: ignore[index]
-    assert getattr(seen["driver"], "profile", {}).get("name") == "pi-web"
+    assert seen["env"]["DSWARM_BTW_WORKER"] == "1"  # type: ignore[index]
+    assert getattr(seen["driver"], "profile", {}).get("name") == "pi-worker"
     # cwd is the _btw worker dir; separators are platform-specific
     assert ("workers" + os.sep + "_btw") in str(seen["cwd"])
     assert run.worker_cmds.empty()
 
+
+async def test_btw_default_uses_evidence_pack_and_authoritative_final(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    run = mgr.create("btw-evidence-run")
+    run.name = "evidence demo"
+    run.category = "web"
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        content = '{"answer_markdown":"已读取 **只读证据**。","evidence_refs":[],"uncertainties":[],"answer_type":"summary"}'
+        finish_reason = "stop"
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def chat(self, **kwargs):
+            seen["messages"] = kwargs["messages"]
+            seen["model"] = kwargs["model"]
+            seen["stream"] = kwargs["stream"]
+            seen["max_tokens"] = kwargs["max_tokens"]
+            return FakeResponse()
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FakeLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False
+    ) as client:
+        resp = await client.post("/api/runs/btw-evidence-run/btw", json={"question": "总结"})
+
+    assert resp.status_code == 200
+    frames = [
+        json.loads(line.removeprefix("data: "))
+        for line in resp.text.splitlines() if line.startswith("data: ")
+    ]
+    assert frames[0]["status"] == "正在整理只读证据…"
+    assert frames[-2]["final"] == "已读取 **只读证据**。"
+    assert frames[-1] == {"done": True}
+    assert not any("delta" in frame for frame in frames)
+    assert seen["model"] == "deepseek-v4-flash"
+    assert seen["stream"] is False
+    assert seen["max_tokens"] is None
+    assert "EVIDENCE_PACK" in str(seen["messages"][0]["content"])
+    assert run.worker_cmds.empty()
+
+
+async def test_btw_readonly_failure_is_one_user_facing_answer(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    mgr = RunManager(sessions_root=tmp_path)
+    mgr.create("btw-failure-run")
+
+    def fail_pack(**kwargs):
+        raise TimeoutError()
+
+    monkeypatch.setattr("dswarm.solver.btw.build_btw_evidence_pack_sync", fail_pack)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        timeout=10,
+        trust_env=False,
+    ) as client:
+        resp = await client.post(
+            "/api/runs/btw-failure-run/btw",
+            json={"question": "总结当前进展"},
+        )
+
+    assert resp.status_code == 200
+    frames = [
+        json.loads(line.removeprefix("data: "))
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    failure = frames[-2]
+    assert "final" in failure
+    assert "error" not in failure
+    assert "请求超时" in failure["final"]
+    assert frames[-1] == {"done": True}
+
+
+
+async def test_btw_readonly_httpx_read_timeout_is_normalized(tmp_path, monkeypatch):
+    """httpx.ReadTimeout has an empty str(); never expose the raw class name."""
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    mgr.create("btw-read-timeout-run")
+
+    class FailingLLM:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def chat(self, **kwargs):
+            raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FailingLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        timeout=10,
+        trust_env=False,
+    ) as client:
+        resp = await client.post(
+            "/api/runs/btw-read-timeout-run/btw",
+            json={"question": "总结当前进展"},
+        )
+
+    assert resp.status_code == 200
+    frames = [
+        json.loads(line.removeprefix("data: "))
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    failure = frames[-2]
+    assert "只读总结请求超时" in failure["final"]
+    assert "ReadTimeout" not in failure["final"]
+    assert "error" not in failure
+    assert frames[-1] == {"done": True}
+
+
+async def test_btw_container_reuses_gateway_token_and_sets_pi_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    mgr = RunManager(sessions_root=tmp_path)
+    run = mgr.create("btw-container-run")
+    run.name = "btw container demo"
+    run.category = "web"
+
+    class FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return "/workspace/" + Path(path).name
+
+    class FakeGateway:
+        account_root = None
+        sessions_root = None
+
+        def token_for_run(self, run_id: str) -> str:
+            assert run_id == "btw-container-run"
+            return "reused-task-token"
+
+        def issue(self, run_id: str) -> str:
+            raise AssertionError("BTW must not revoke an active run token")
+
+    fake_gateway = FakeGateway()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "apps.web.worker_config.backend_for_profile",
+        lambda *args, **kwargs: "container",
+    )
+    monkeypatch.setattr(
+        "dswarm.solver.container_exec.ensure_container",
+        lambda *args, **kwargs: FakeContainer(),
+    )
+    monkeypatch.setattr(
+        "dswarm.solver.container_exec._chown_tree_to_worker",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "dswarm.solver.modelgateway.ModelGateway.instance",
+        staticmethod(lambda: fake_gateway),
+    )
+
+    async def fake_stream_btw_worker_deltas(**kwargs):
+        seen.update(kwargs)
+        yield "ok"
+
+    monkeypatch.setattr(
+        "dswarm.solver.btw.stream_btw_worker_deltas",
+        fake_stream_btw_worker_deltas,
+    )
+
+    app = create_app(mgr)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        timeout=10,
+        trust_env=False,
+    ) as client:
+        resp = await client.post(
+            "/api/runs/btw-container-run/btw",
+            json={"question": "为什么这么久", "worker_backend": "container"},
+        )
+
+    assert resp.status_code == 200
+    env = seen["env"]
+    assert env["DSWARM_TASK_TOKEN"] == "reused-task-token"  # type: ignore[index]
+    assert env["DEEPSEEK_API_KEY"] == "reused-task-token"  # type: ignore[index]
+    assert env["DSWARM_PI_PROVIDER"] == "ctf-gateway"  # type: ignore[index]
+    assert env["DSWARM_GATEWAY_URL"].endswith("/v1")  # type: ignore[index]
+    assert env["DSWARM_WORKER_MODEL"] == "deepseek-v4-flash"  # type: ignore[index]
+    assert seen["container"] is not None
 
 async def test_hitl_post_is_accepted_and_echoed(server) -> None:
     async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
@@ -277,6 +490,16 @@ async def test_non_dict_body_is_rejected_with_400(server) -> None:
             assert r.status_code == 400, f"{method} {path} should 400 on a list body, got {r.status_code}"
 
 
+async def test_legacy_swarm_fields_are_rejected_with_400(server) -> None:
+    async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
+        r = await client.post(
+            "/api/runs/legacy-start/start",
+            json={"kind": "swarm", "challenge": {"description": "solve"}, "race_scout": True},
+        )
+        assert r.status_code == 400
+        assert "legacy swarm fields" in r.text
+
+
 async def test_worker_model_options_and_probe_routes(server, monkeypatch) -> None:
     from apps.web import worker_models
 
@@ -306,7 +529,7 @@ async def test_worker_model_options_and_probe_routes(server, monkeypatch) -> Non
 
 
 async def test_engine_health_route_passes_enabled_worker_profiles(tmp_path, monkeypatch) -> None:
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     seen = {}
 
@@ -355,7 +578,7 @@ async def test_worker_routes_accept_empty_body(server) -> None:
 async def test_engines_endpoint_singleflights_slow_probe(tmp_path, monkeypatch) -> None:
     """A slow engine-status refresh must not stack duplicate CLI hello probes when
     the deck or multiple tabs hit /api/engines concurrently."""
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     calls = 0
     calls_lock = threading.Lock()
@@ -385,7 +608,7 @@ async def test_engines_endpoint_passes_enabled_worker_profiles(tmp_path, monkeyp
     """The top engine bar must probe the configured worker profile/model, not a
     bare engine default. Otherwise Claude can be shown as down when the default
     model is exhausted but the selected Sonnet profile is usable."""
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     seen = {}
 
@@ -549,8 +772,8 @@ async def test_fresh_subscriber_replays_full_history_past_ring_overflow(tmp_path
     SessionStore history, not just the truncated ring. Without this, a deck that
     connects mid/post-run never leaves the empty state (the real bug seen while
     backtesting a long web challenge)."""
-    from muteki.core.event_bus import EventBus
-    from muteki.core.events import Event
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.events import Event
 
     # a run whose bus has a TINY ring so we overflow it cheaply
     manager = RunManager(sessions_root=str(tmp_path / "sessions"))
@@ -675,19 +898,169 @@ async def test_upload_sanitizes_path_traversal_filename(tmp_path) -> None:
             assert not (sessions.parent / "etc" / "evil").exists()
 
 
-# ── ghost-running guard: a run whose durable history ENDS on run.started with no
+@pytest.mark.asyncio
+async def test_resolve_uses_scheduler_launch_and_finishes_mock(tmp_path) -> None:
+    """Continue must use the same scheduler/launch lifecycle as /start.
+
+    Regression for recovery runs that emitted only run.reopened: the old direct
+    create_task path bypassed the scheduler and had no terminal error guard.
+    """
+    from dswarm.core.events import Event
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("resolve-run")
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED, run_id=run.run_id,
+        payload={"challenge": {"name": "resolve", "category": "web"}}))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED, run_id=run.run_id,
+        payload={"solved": False, "reason": "finished"}))
+
+    assert await mgr.resolve(run.run_id, {"kind": "mock", "tick": 0.001})
+    assert run.started is True
+    assert mgr.scheduler.active_count == 1
+    await asyncio.wait_for(run.task, timeout=5)
+
+    assert run.finished is True
+    assert mgr.scheduler.active_count == 0
+    events = [ev async for ev in run.store.replay(run.run_id)]
+    kinds = [ev.event_type for ev in events]
+    assert EventType.RUN_REOPENED in kinds
+    assert EventType.RUN_FINISHED in kinds
+
+
+@pytest.mark.asyncio
+async def test_resolve_driver_failure_emits_terminal_runtime_failure(tmp_path, monkeypatch) -> None:
+    """A recovery driver crash must be durable and observable, never a ghost run."""
+    from dswarm.core.events import Event
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("resolve-failure")
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED, run_id=run.run_id,
+        payload={"challenge": {"name": "failure", "category": "web"}}))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED, run_id=run.run_id,
+        payload={"solved": False, "reason": "finished"}))
+
+    async def boom(_run):
+        raise RuntimeError("worker bootstrap exploded")
+
+    monkeypatch.setattr("apps.web.drivers.build_driver", lambda _body, mgr=None: boom)
+    assert await mgr.resolve(run.run_id, {})
+    await asyncio.wait_for(run.task, timeout=5)
+
+    events = [ev async for ev in run.store.replay(run.run_id)]
+    terminal = [ev for ev in events if ev.event_type is EventType.RUN_FINISHED][-1]
+    assert terminal.payload["reason"] == "runtime_failure"
+    assert "worker bootstrap exploded" in terminal.payload["detail"]
+    assert run.finished is True
+    assert mgr.scheduler.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_infers_pre_sidecar_roster_from_worker_history(tmp_path, monkeypatch) -> None:
+    """Old runs without a dispatch sidecar must not silently use today's roster."""
+    from dswarm.core.events import Event
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("legacy-resolve")
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED, run_id=run.run_id,
+        payload={"challenge": {"name": "legacy", "category": "web"}}))
+    await run.bus.emit(Event(
+        event_type=EventType.WORKER_STATUS, run_id=run.run_id,
+        payload={"online": True, "engine": "pi",
+                 "runtime": {"backend": "container"}}))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED, run_id=run.run_id,
+        payload={"solved": False, "reason": "finished"}))
+
+    captured: dict = {}
+    async def driver(_run):
+        captured.update(_run.manager_dispatch if hasattr(_run, "manager_dispatch") else {})
+        await _run.bus.emit(Event(
+            event_type=EventType.RUN_FINISHED, run_id=_run.run_id,
+            payload={"solved": False, "reason": "mock"}))
+
+    def build(body, mgr=None):
+        captured.update(body)
+        return driver
+
+    monkeypatch.setattr("apps.web.drivers.build_driver", build)
+    assert await mgr.resolve(run.run_id, {"kind": "mock"})
+    await asyncio.wait_for(run.task, timeout=5)
+    # the historical base engine "pi" is recovered as the category's direction
+    # profile (web), keeping old-run resolve on a single worker
+    assert captured["engines"] == ["pi-web"]
+    assert captured["worker_backend"] == "container"
+    assert "race_scout" not in captured
+
+
+@pytest.mark.asyncio
+async def test_resolve_strips_legacy_fields_from_saved_sidecar(tmp_path, monkeypatch) -> None:
+    from dswarm.core.events import Event
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("legacy-sidecar")
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED, run_id=run.run_id,
+        payload={"challenge": {"name": "legacy", "category": "web"}}))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED, run_id=run.run_id,
+        payload={"solved": False, "reason": "finished"}))
+    mgr.remember_dispatch(run.run_id, {
+        "kind": "mock", "race_scout": False, "cold_start": False,
+        "stage_policy": {"race": {"enabled": False}, "budgets": {"max_total_workers": 2}},
+    })
+    captured: dict = {}
+    async def driver(_run):
+        await _run.bus.emit(Event(
+            event_type=EventType.RUN_FINISHED, run_id=_run.run_id,
+            payload={"solved": False, "reason": "mock"}))
+    def build(body, mgr=None):
+        captured.update(body)
+        return driver
+    monkeypatch.setattr("apps.web.drivers.build_driver", build)
+    assert await mgr.resolve(run.run_id, {})
+    await asyncio.wait_for(run.task, timeout=5)
+    assert "race_scout" not in captured
+    assert "cold_start" not in captured
+    assert "race" not in captured["stage_policy"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_settings_survive_resolve_and_redact_secrets(tmp_path) -> None:
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("dispatch-config")
+    saved = mgr.remember_dispatch(run.run_id, {
+        "kind": "swarm", "worker_backend": "container",
+        "engines": ["pi"], "worker_profiles": [{"name": "pi", "credential_account": "acct"}],
+        "api_key": "must-not-persist",
+    })
+    assert saved["worker_backend"] == "container"
+    assert "api_key" not in saved
+    assert (mgr.workspace_dir(run.run_id) / ".dswarm_dispatch.json").exists()
+
+    mgr2 = RunManager(sessions_root=str(tmp_path / "sessions"))
+    restored = mgr2.create(run.run_id)
+    assert restored.dispatch_body["worker_backend"] == "container"
+    assert "api_key" not in restored.dispatch_body
+
+
+# 👻👻 ghost-running guard: a run whose durable history ENDS on run.started with no
 # live task must get a synthetic RUN_FINISHED on stream open, so the deck settles
-# to "finished" (not stuck on running → only Stop shown). This is the run-4305 fix.
+# to "finished" (not stuck on running — only Stop shown). This is the run-4305 fix.
 @pytest.fixture
 def server_mgr():
-    mgr = RunManager(sessions_root="/tmp/muteki_web_ghost_sessions")
+    mgr = RunManager(sessions_root="/tmp/dswarm_web_ghost_sessions")
     app = create_app(mgr)
     with _Server(app) as s:
         yield s, mgr
 
 
 async def test_events_injects_run_finished_for_ghost_run(server_mgr) -> None:
-    from muteki.core.events import Event
+    from dswarm.core.events import Event
     s, mgr = server_mgr
     rid = "ghost-run-1"
     run = mgr.create(rid)
@@ -698,7 +1071,7 @@ async def test_events_injects_run_finished_for_ghost_run(server_mgr) -> None:
                              payload={"text": "working...\n"}))
     run.started = True
     run.finished = False
-    run.task = None  # dead task → ghost
+    run.task = None  # dead task — ghost
     # opening a FRESH event stream must replay history THEN inject RUN_FINISHED.
     async with httpx.AsyncClient(base_url=s.base, timeout=30, trust_env=False) as client:
         seen: set = set()
@@ -709,7 +1082,7 @@ async def test_events_injects_run_finished_for_ghost_run(server_mgr) -> None:
 
 
 async def test_finished_event_stream_stays_open_after_replay(server_mgr) -> None:
-    from muteki.core.events import Event
+    from dswarm.core.events import Event
     s, mgr = server_mgr
     rid = f"finished-run-{uuid.uuid4().hex}"
     run = mgr.create(rid)
@@ -755,7 +1128,7 @@ def test_rehydrate_force_settles_started_unfinished_run(tmp_path) -> None:
     # ghost run: a run whose on-disk summary says started=True but finished=False
     # (killed mid-run before RUN_FINISHED). On restart, _rehydrate has no live task,
     # so it MUST settle it to finished — else the rail spins forever.
-    from muteki.core.events import Event
+    from dswarm.core.events import Event
     sessions = tmp_path / "sessions"
     mgr1 = RunManager(sessions_root=str(sessions))
     run = mgr1.create("ghost-2")
@@ -768,7 +1141,7 @@ def test_rehydrate_force_settles_started_unfinished_run(tmp_path) -> None:
         await run.bus.close()
     asyncio.run(seed())
 
-    # a fresh manager rehydrates from disk → the started-but-unfinished run settles.
+    # a fresh manager rehydrates from disk — the started-but-unfinished run settles.
     mgr2 = RunManager(sessions_root=str(sessions))
     r2 = mgr2.runs.get("ghost-2")
     assert r2 is not None

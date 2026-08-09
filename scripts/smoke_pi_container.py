@@ -1,10 +1,10 @@
 """P2 acceptance smoke: a REAL swarm run with a pi worker INSIDE the per-category
-worker container (ctf-swarm-pi-web:0.1.0, rcp supervisor backend).
+worker container (ctf-swarm-pi:0.2.0, rcp supervisor backend).
 
 - boots a local HTTP target (bound to 0.0.0.0; the container reaches it via
   host.docker.internal)
 - creates a credential account (pi-main/API_KEY) for the container key injection
-- runs the muteki coordinator (executor=cli, engines=["pi"],
+- runs the dswarm coordinator (executor=cli, engines=["pi"],
   worker_backend="container")
 - expects: pi worker inside the container curls the target, the flag passes the
   provenance gate, the run finishes solved.
@@ -23,13 +23,13 @@ from pathlib import Path
 
 sys.path.insert(0, r"C:\Projects\Agent-projects\ctf-swarm")
 
-from muteki.core.cost import CostController
-from muteki.core.event_bus import EventBus
-from muteki.core.llm import LLMClient
-from muteki.models.solve_graph import Challenge
-from muteki.sandbox.manager import SandboxManager
-from muteki.solver.result import ArtifactStore
-from muteki.swarm.swarm import Swarm
+from dswarm.core.cost import CostController
+from dswarm.core.event_bus import EventBus
+from dswarm.core.llm import LLMClient
+from dswarm.models.solve_graph import Challenge
+from dswarm.sandbox.manager import SandboxManager
+from dswarm.solver.result import ArtifactStore
+from dswarm.swarm.swarm import Swarm
 
 FLAG = "flag{smoke_pi_container_ok}"
 PORT = 18889
@@ -60,12 +60,12 @@ def start_target(root: Path) -> threading.Thread:
 
 
 async def main() -> int:
-    os.environ.setdefault("MUTEKI_DEEPSEEK_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
-    os.environ.setdefault("MUTEKI_PI_PROVIDER", "deepseek")
+    os.environ.setdefault("DSWARM_DEEPSEEK_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
+    os.environ.setdefault("DSWARM_PI_PROVIDER", "deepseek")
     # Docker Desktop: the supervisor's in-container chown over the bind mount can
     # take ~60s before it dials back — allow more than the 40s default.
-    os.environ.setdefault("MUTEKI_CONTROL_LINK_DEADLINE", "120")
-    if not os.environ["MUTEKI_DEEPSEEK_API_KEY"]:
+    os.environ.setdefault("DSWARM_CONTROL_LINK_DEADLINE", "120")
+    if not os.environ["DSWARM_DEEPSEEK_API_KEY"]:
         print("FATAL: no DEEPSEEK_API_KEY in environment")
         return 2
 
@@ -86,7 +86,7 @@ async def main() -> int:
     # RUNNING — ensure_container would reuse it with a STALE token and the new
     # supervisor Hello gets rejected. Remove any leftover run container first.
     import subprocess as _cleanup_sp
-    _cleanup_sp.run(["docker", "rm", "-f", "muteki-run-smoke-pi-container"],
+    _cleanup_sp.run(["docker", "rm", "-f", "dswarm-run-smoke-pi-container"],
                     capture_output=True, timeout=30)
     accounts = root / "accounts"
     acct = accounts / "pi-main"
@@ -135,14 +135,14 @@ async def main() -> int:
         wall_clock_budget=90.0,
         barren_limit=3,
     )
-    print("swarm constructed; running (container backend, image=ctf-swarm-pi-web)...", flush=True)
+    print("swarm constructed; running (container backend, image=ctf-swarm-pi)...", flush=True)
     # gateway request logging to the smoke stdout (it logs at INFO via logging)
     import logging as _logging
     _logging.basicConfig(level=_logging.INFO, format="%(levelname)s %(name)s: %(message)s",
                          stream=sys.stdout, force=True)
     import subprocess as _sp
     # spy on the rcp exec spec: what argv/env actually goes to the supervisor
-    import muteki.solver.control_client as _cc
+    import dswarm.solver.control_client as _cc
     _orig_rcp = _cc.run_cli_streaming_rcp
 
     def _spy_rcp(driver, argv, **kw):
@@ -189,7 +189,7 @@ async def main() -> int:
 
     _cc.run_cli_streaming_rcp = _spy_rcp
     # spy on CliSolver.run for the full worker exception
-    import muteki.solver.cli_solver as _cs
+    import dswarm.solver.cli_solver as _cs
     _orig_solver_run = _cs.CliSolver.run
 
     def _spy_solver_run(self, *a, **k):
@@ -204,7 +204,7 @@ async def main() -> int:
 
     _cs.CliSolver.run = _spy_solver_run
     # spy on the container streaming entry (covers pre-rcp steps)
-    import muteki.solver.container_exec as _ce
+    import dswarm.solver.container_exec as _ce
     _orig_rsc = _ce.run_cli_streaming_container
 
     def _spy_rsc(driver, argv, **kw):
@@ -225,18 +225,18 @@ async def main() -> int:
     def _mid_dump():
         time.sleep(20)
         try:
-            r = _sp.run(["docker", "logs", "muteki-run-smoke-pi-container"],
+            r = _sp.run(["docker", "logs", "dswarm-run-smoke-pi-container"],
                         capture_output=True, text=True, timeout=20)
             print("=== MID supervisor logs ===", flush=True)
             print((r.stdout or "")[-3000:], flush=True)
             print((r.stderr or "")[-1500:], flush=True)
-            r2 = _sp.run(["docker", "exec", "muteki-run-smoke-pi-container",
+            r2 = _sp.run(["docker", "exec", "dswarm-run-smoke-pi-container",
                           "sh", "-c", "ps aux | head -20"],
                          capture_output=True, text=True, timeout=20)
             print("=== MID container ps ===", flush=True)
             print((r2.stdout or "")[-2000:], flush=True)
             # container -> gateway reachability, right from inside the worker container
-            r3 = _sp.run(["docker", "exec", "muteki-run-smoke-pi-container",
+            r3 = _sp.run(["docker", "exec", "dswarm-run-smoke-pi-container",
                           "sh", "-c",
                           "curl -sS -m 8 http://host.docker.internal:9101/health 2>&1; "
                           "echo; echo RC=$?; "
@@ -262,7 +262,7 @@ async def main() -> int:
             else:
                 print("  MISSING", flush=True)
             import subprocess as _sp
-            r = _sp.run(["docker", "logs", "muteki-run-smoke-pi-container"],
+            r = _sp.run(["docker", "logs", "dswarm-run-smoke-pi-container"],
                         capture_output=True, text=True, timeout=30)
             print("=== supervisor logs ===", flush=True)
             print((r.stdout or "")[-4000:], flush=True)
@@ -271,7 +271,7 @@ async def main() -> int:
             print("diag:", e, flush=True)
         # teardown the run container whatever happened
         try:
-            from muteki.solver.container_exec import teardown_container
+            from dswarm.solver.container_exec import teardown_container
             teardown_container("smoke-pi-container", remove=True)
         except Exception as e:
             print("teardown:", e, flush=True)

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from muteki.core.events import (
+from dswarm.core.events import (
     Event,
     EventType,
     context_state_payload,

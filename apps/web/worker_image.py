@@ -6,8 +6,8 @@ Four checks, surfaced to the UI as green / yellow / red:
   - version: does the pulled image's OCI version label match what the app expects?
   - pull   : a one-click `docker pull` action (separate POST endpoint).
 
-The image name is container_exec.WORKER_IMAGE (env MUTEKI_WORKER_IMAGE). The
-expected version is env MUTEKI_WORKER_IMAGE_VERSION (unset → version check is
+The image name is container_exec.WORKER_IMAGE (env DSWARM_WORKER_IMAGE). The
+expected version is env DSWARM_WORKER_IMAGE_VERSION (unset → version check is
 informational only: report the image's own version, status "unknown" not "red").
 
 All docker calls go through subprocess with encoding="utf-8", errors="replace"
@@ -22,11 +22,11 @@ import os
 import subprocess
 from typing import Any
 
-from muteki.solver.container_exec import WORKER_IMAGE
+from dswarm.solver.container_exec import WORKER_IMAGE
 
 # Expected worker-image version, set by the deployment (compose). Unset → the
 # version check is informational (we report what's pulled, don't flag a mismatch).
-EXPECTED_WORKER_VERSION = os.environ.get("MUTEKI_WORKER_IMAGE_VERSION", "").strip()
+EXPECTED_WORKER_VERSION = os.environ.get("DSWARM_WORKER_IMAGE_VERSION", "").strip()
 
 _VERSION_LABEL = "org.opencontainers.image.version"
 
@@ -96,7 +96,7 @@ def image_status() -> dict[str, Any]:
 
     if not EXPECTED_WORKER_VERSION:
         version_status = "unknown"          # informational only
-        version_detail = "no expected version configured (MUTEKI_WORKER_IMAGE_VERSION)"
+        version_detail = "no expected version configured (DSWARM_WORKER_IMAGE_VERSION)"
     elif not pulled:
         version_status = "unknown"
         version_detail = "image not pulled"

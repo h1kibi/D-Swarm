@@ -2,7 +2,7 @@
 
 - `posix` mark: tests that exercise POSIX-only behavior (container exec paths,
   process groups, /bin/sh scripts, chmod semantics). They are skipped on
-  Windows — muteki's container execution is Linux-container based, so these
+  Windows — dswarm's container execution is Linux-container based, so these
   tests are only meaningful on a POSIX host (or CI).
 - `Path.read_text` default encoding: on a Chinese-locale Windows host the
   locale codec is GBK, which breaks reading UTF-8 source/UI files. The whole

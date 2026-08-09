@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType
-from muteki.core.session_store import SessionStore
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType
+from dswarm.core.session_store import SessionStore
 
 
 def _ev(i: int) -> Event:

@@ -3,7 +3,7 @@
 Ported from BTFly's `internal/agent/service.go` queue semantics (a start that
 would exceed the global execution limit lands in a FIFO `queued` wait list;
 whenever a slot frees — run end, limit raise, queued cancel — the next queued
-run is dispatched), mapped onto muteki's asyncio + per-run EventBus model.
+run is dispatched), mapped onto dswarm's asyncio + per-run EventBus model.
 
 The scheduler is a PURE POLICY object: it owns the queue, the concurrency
 limit, the hold (pause) set, and the persisted settings — but it owns NO event
@@ -46,9 +46,9 @@ MAX_CONCURRENT_RUNS = 8
 
 
 def _env_limit() -> int:
-    """Boot-time limit seed: MUTEKI_MAX_CONCURRENT_RUNS (clamped); the persisted
+    """Boot-time limit seed: DSWARM_MAX_CONCURRENT_RUNS (clamped); the persisted
     scheduler.json value wins over this once set (set_limit always saves)."""
-    raw = (os.environ.get("MUTEKI_MAX_CONCURRENT_RUNS") or "").strip()
+    raw = (os.environ.get("DSWARM_MAX_CONCURRENT_RUNS") or "").strip()
     if not raw:
         return DEFAULT_MAX_CONCURRENT_RUNS
     try:

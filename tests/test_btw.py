@@ -14,16 +14,20 @@ from pathlib import Path
 
 import pytest
 
-from muteki.models.solve_graph import Challenge
-from muteki.swarm.shared_graph import SQLiteSharedGraph
-from muteki.solver.btw import (
+from dswarm.models.solve_graph import Challenge
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.solver.btw import (
     BTW_MODEL,
+    apply_btw_runtime_argv,
     BtwWorkerPaths,
     btw_messages,
+    btw_evidence_messages,
+    build_btw_evidence_pack_sync,
     build_btw_context_sync,
     build_btw_worker_prompt,
     sanitize_transcript,
     stream_btw_worker_deltas,
+    parse_btw_structured_answer,
 )
 
 
@@ -154,7 +158,7 @@ def test_build_btw_worker_prompt_is_readonly_and_multiturn():
         workspace="/run/ws",
         jsonl="/run/r.jsonl",
         graph_db="/run/ws/graph/shared_graph.db",
-        board="/run/ws/.muteki_board.md",
+        board="/run/ws/.dswarm_board.md",
         winner="/run/ws/winner.json",
         arts="/run/ws/arts",
         uploads="/run/uploads",
@@ -179,11 +183,58 @@ def test_build_btw_worker_prompt_is_readonly_and_multiturn():
     assert "不要调用或写入 blackboard" in prompt
     assert "不要修改 `shared_graph.db`" in prompt
     assert "不要输出 `FOUND_FLAG=`" in prompt
+    # The observer must not wander into the installed source tree for a run-file
+    # audit: that made bug questions spend the whole BTW timeout in exploration.
+    assert "Inspect only the run files listed below" in prompt
+    assert "Do NOT search or read the D-Swarm source tree" in prompt
+    assert "Do one focused evidence pass, then answer" in prompt
 
+
+def test_apply_btw_runtime_argv_honors_worker_provider_and_model():
+    argv = ["pi", "--mode", "json", "PROMPT"]
+    out = apply_btw_runtime_argv(
+        argv,
+        {
+            "DSWARM_PI_PROVIDER": "ctf-gateway",
+            "DSWARM_WORKER_MODEL": "deepseek-v4-flash",
+        },
+    )
+    assert out[-1] == "PROMPT"
+    assert out[out.index("--provider") + 1] == "ctf-gateway"
+    assert out[out.index("--model") + 1] == "deepseek-v4-flash"
+
+
+def test_apply_btw_runtime_argv_overwrites_provider_without_duplicate_model():
+    argv = ["pi", "--provider", "anthropic", "--model", "old-model", "PROMPT"]
+    out = apply_btw_runtime_argv(
+        argv,
+        {
+            "DSWARM_PI_PROVIDER": "ctf-gateway",
+            "DSWARM_WORKER_MODEL": "deepseek-v4-flash",
+        },
+    )
+    assert out.count("--provider") == 1
+    assert out.count("--model") == 1
+    assert out[out.index("--provider") + 1] == "ctf-gateway"
+    assert out[out.index("--model") + 1] == "old-model"
+
+
+def test_apply_btw_runtime_argv_inserts_before_double_dash():
+    argv = ["pi", "--mode", "json", "--", "PROMPT"]
+    out = apply_btw_runtime_argv(
+        argv,
+        {
+            "DSWARM_PI_PROVIDER": "ctf-gateway",
+            "DSWARM_WORKER_MODEL": "deepseek-v4-flash",
+        },
+    )
+    assert out.index("--provider") < out.index("--")
+    assert out.index("--model") < out.index("--")
+    assert out[-1] == "PROMPT"
 
 @pytest.mark.asyncio
 async def test_stream_btw_worker_deltas_uses_one_cli_run(monkeypatch, tmp_path):
-    from muteki.solver.cli_driver import CliResult, StreamStep
+    from dswarm.solver.cli_driver import CliResult, StreamStep
 
     calls: list[dict] = []
 
@@ -219,7 +270,7 @@ async def test_stream_btw_worker_deltas_uses_one_cli_run(monkeypatch, tmp_path):
         return CliResult(text="final text")
 
     monkeypatch.setattr(
-        "muteki.solver.cli_driver.run_cli_streaming",
+        "dswarm.solver.cli_driver.run_cli_streaming",
         fake_run_cli_streaming,
     )
 
@@ -229,7 +280,8 @@ async def test_stream_btw_worker_deltas_uses_one_cli_run(monkeypatch, tmp_path):
         prompt="PROMPT",
         cwd=str(tmp_path),
         timeout=7,
-        env={"MUTEKI_BTW_WORKER": "1"},
+        env={"DSWARM_BTW_WORKER": "1", "DSWARM_PI_PROVIDER": "ctf-gateway",
+              "DSWARM_WORKER_MODEL": "deepseek-v4-flash"},
         web_access=False,
         kb_access=False,
     ):
@@ -242,7 +294,143 @@ async def test_stream_btw_worker_deltas_uses_one_cli_run(monkeypatch, tmp_path):
     assert calls[0]["stream"] is True
     assert calls[1]["cwd"] == str(tmp_path)
     assert calls[1]["timeout"] == 7
-    assert calls[1]["env"] == {"MUTEKI_BTW_WORKER": "1"}
+    assert calls[1]["env"]["DSWARM_BTW_WORKER"] == "1"
+    assert calls[1]["argv"][calls[1]["argv"].index("--provider") + 1] == "ctf-gateway"
+    assert calls[1]["argv"][calls[1]["argv"].index("--model") + 1] == "deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_stream_btw_worker_deltas_deduplicates_pi_complete_messages(monkeypatch, tmp_path):
+    """Pi may repeat one complete assistant message at message_end/turn_end.
+
+    BTW receives complete reasoning blocks, not text_delta events, so it must
+    not append lifecycle echoes as if they were fresh answer text.
+    """
+    from dswarm.solver.cli_driver import CliResult, StreamStep
+
+    class FakeDriver:
+        name = "fake"
+
+        def new_session(self):
+            return "sid"
+
+        def build_execute(self, prompt, session, **kwargs):
+            return ["fake", "run"]
+
+    def fake_run_cli_streaming(driver, argv, *, cwd, timeout, on_step, **_kw):
+        on_step(StreamStep("reasoning", text="完整答案"))
+        on_step(StreamStep("reasoning", text="完整答案"))
+        on_step(StreamStep("reasoning", text="完整答案追加"))
+        on_step(StreamStep("reasoning", text="完整答案追加"))
+        on_step(StreamStep("reasoning", text="完整答案"))
+        return CliResult(text="完整答案追加")
+
+    monkeypatch.setattr(
+        "dswarm.solver.cli_driver.run_cli_streaming",
+        fake_run_cli_streaming,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in stream_btw_worker_deltas(
+            driver=FakeDriver(),
+            prompt="PROMPT",
+            cwd=str(tmp_path),
+            timeout=7,
+        )
+    ]
+
+    assert chunks == ["完整答案", "追加"]
+
+
+@pytest.mark.asyncio
+async def test_stream_btw_worker_deltas_surfaces_auth_failure_without_secret(
+        monkeypatch, tmp_path):
+    from dswarm.solver.cli_driver import CliResult
+
+    class FakeDriver:
+        name = "fake"
+
+        def new_session(self):
+            return "sid"
+
+        def build_execute(self, prompt, session, **kwargs):
+            return ["fake", "run"]
+
+    def fake_run_cli_streaming(*_args, **_kwargs):
+        return CliResult(
+            text='{"stopReason":"error","errorMessage":"401 authentication_error '
+                 'invalid x-api-key SECRET_VALUE"}',
+            raw_stderr="provider rejected token SECRET_VALUE",
+        )
+
+    monkeypatch.setattr(
+        "dswarm.solver.cli_driver.run_cli_streaming", fake_run_cli_streaming)
+
+    chunks = []
+    with pytest.raises(RuntimeError) as exc_info:
+        async for chunk in stream_btw_worker_deltas(
+            driver=FakeDriver(), prompt="PROMPT", cwd=str(tmp_path), timeout=7,
+        ):
+            chunks.append(chunk)
+
+    message = str(exc_info.value)
+    assert chunks == []
+    assert "认证失败" in message
+    assert "SECRET_VALUE" not in message
+    assert "stopReason" not in message
+
+
+@pytest.mark.asyncio
+async def test_stream_btw_worker_deltas_surfaces_generic_cli_error(monkeypatch, tmp_path):
+    from dswarm.solver.cli_driver import CliResult
+
+    class FakeDriver:
+        name = "fake"
+
+        def new_session(self):
+            return "sid"
+
+        def build_execute(self, prompt, session, **kwargs):
+            return ["fake", "run"]
+
+    monkeypatch.setattr(
+        "dswarm.solver.cli_driver.run_cli_streaming",
+        lambda *_args, **_kwargs: CliResult(
+            text='{"stopReason":"error","errorMessage":"provider unavailable"}'),
+    )
+
+    with pytest.raises(RuntimeError, match="CLI 返回 error 状态"):
+        async for _chunk in stream_btw_worker_deltas(
+            driver=FakeDriver(), prompt="PROMPT", cwd=str(tmp_path), timeout=7,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_stream_btw_worker_deltas_rejects_empty_result(monkeypatch, tmp_path):
+    from dswarm.solver.cli_driver import CliResult
+
+    class FakeDriver:
+        name = "fake"
+
+        def new_session(self):
+            return "sid"
+
+        def build_execute(self, prompt, session, **kwargs):
+            return ["fake", "run"]
+
+    monkeypatch.setattr(
+        "dswarm.solver.cli_driver.run_cli_streaming",
+        lambda *_args, **_kwargs: CliResult(text=""),
+    )
+
+    with pytest.raises(RuntimeError, match="未返回任何回答"):
+        async for _chunk in stream_btw_worker_deltas(
+            driver=FakeDriver(), prompt="PROMPT", cwd=str(tmp_path), timeout=7,
+        ):
+            pass
+
 
 
 def test_build_btw_context_sync_degrades_when_graph_missing(tmp_path):
@@ -289,7 +477,7 @@ def test_build_btw_run_stats_sync_aggregates_cost_and_timing(tmp_path):
     how much / how many tokens'. This is the ONLY reliable source on a
     historical run after a server restart (in-memory CostController is empty)."""
     import json as _json
-    from muteki.solver.btw import build_btw_run_stats_sync
+    from dswarm.solver.btw import build_btw_run_stats_sync
 
     jsonl = tmp_path / "run-stats.jsonl"
     events = [
@@ -325,14 +513,14 @@ def test_build_btw_run_stats_sync_aggregates_cost_and_timing(tmp_path):
 
 def test_build_btw_run_stats_sync_missing_file_returns_empty(tmp_path):
     """A missing JSONL must degrade to empty string, never raise."""
-    from muteki.solver.btw import build_btw_run_stats_sync
+    from dswarm.solver.btw import build_btw_run_stats_sync
     assert build_btw_run_stats_sync(str(tmp_path / "nope.jsonl")) == ""
 
 
 def test_build_btw_context_sync_includes_run_stats(tmp_path):
     """The full context must include the run-stats block when jsonl_path is given."""
     import json as _json
-    from muteki.solver.btw import build_btw_context_sync
+    from dswarm.solver.btw import build_btw_context_sync
 
     jsonl = tmp_path / "r.jsonl"
     with jsonl.open("w", encoding="utf-8") as f:
@@ -349,3 +537,44 @@ def test_build_btw_context_sync_includes_run_stats(tmp_path):
     assert "Run 维度统计" in ctx
     assert "30秒" in ctx  # 130 - 100
     assert "0.5" in ctx
+
+
+
+def test_btw_evidence_pack_is_bounded_deduplicated_and_citable(tmp_path):
+    db = tmp_path / "graph.db"
+    graph = SQLiteSharedGraph.open(db_path=db, challenge=_chal())
+    graph.add_evidence(actor="worker", source="stdout", fact="verified route exists", verified=True)
+    graph.add_evidence(actor="worker", source="stdout", fact="candidate route exists", verified=False)
+    graph.close()
+    arts = tmp_path / "arts"
+    arts.mkdir()
+    (arts / "recon.txt").write_text("line one\nline two", encoding="utf-8")
+
+    pack = build_btw_evidence_pack_sync(
+        graph_db_path=str(db), jsonl_path=str(tmp_path / "missing.jsonl"),
+        challenge_id="t1", challenge_name="demo", challenge_category="web",
+        run_meta={"state": "finished", "workers": [{"id": "worker"}]},
+        arts_path=str(arts), max_events=10,
+    )
+    ids = {item["id"] for key in ("facts", "events", "dead_ends", "artifacts") for item in pack[key]}
+    assert "fact:1" in ids
+    assert any(item["kind"] == "verified" for item in pack["facts"])
+    assert pack["artifacts"][0]["id"] == "artifact:recon.txt"
+    assert len(pack["facts"]) == len({(x["kind"], x["text"]) for x in pack["facts"]})
+
+    messages = btw_evidence_messages("有哪些事实？", pack, [])
+    assert "EVIDENCE_PACK" in messages[0]["content"]
+    answer = parse_btw_structured_answer(
+        '{"answer_markdown":"结论 **明确**","evidence_refs":["fact:1","fact:999"],"uncertainties":[],"answer_type":"bug_audit"}',
+        pack,
+    )
+    assert answer["answer_markdown"] == "结论 **明确**"
+    assert answer["evidence_refs"] == ["fact:1"]
+    assert answer["answer_type"] == "bug_audit"
+
+
+def test_parse_btw_structured_answer_degrades_invalid_json():
+    result = parse_btw_structured_answer("不是 JSON", {"facts": [], "events": [], "dead_ends": [], "artifacts": []})
+    assert result["answer_markdown"] == "不是 JSON"
+    assert result["answer_type"] == "insufficient"
+    assert result["evidence_refs"] == []

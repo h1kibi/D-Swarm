@@ -5,8 +5,8 @@ edges (never compact an active intent) hold. See docs/AUDIT_intent_fact_accumula
 
 from __future__ import annotations
 
-from muteki.models.solve_graph import Challenge
-from muteki.swarm.shared_graph import (
+from dswarm.models.solve_graph import Challenge
+from dswarm.swarm.shared_graph import (
     EV_FACT_REJECTED,
     EV_INTENT_STATE_CHANGED,
     INTENT_DISPATCH_ACTIVE,

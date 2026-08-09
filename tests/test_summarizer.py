@@ -8,12 +8,12 @@ import tempfile
 
 import pytest
 
-from muteki.core.events import EventType, node_summarized_payload
-from muteki.models.solve_graph import Challenge
-from muteki.solver.summarizer import (
+from dswarm.core.events import EventType, node_summarized_payload
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.summarizer import (
     _clean, fallback_summary, summarize_node, translate_need,
 )
-from muteki.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
 
 def _graph() -> SQLiteSharedGraph:
@@ -40,10 +40,10 @@ def test_clean_rejects_runaway_and_falls_back():
 
 
 def test_clean_rejects_mid_sentence_fragments():
-    raw = "[cursor] Beta real flag is in HTTP header X-Muteki-Flag, not the body"
-    bad = "中输出。Beta 真实 flag 在 HTTP 头 X-Muteki-Flag，非响应体。"
+    raw = "[cursor] Beta real flag is in HTTP header X-DSwarm-Flag, not the body"
+    bad = "中输出。Beta 真实 flag 在 HTTP 头 X-DSwarm-Flag，非响应体。"
     assert _clean(bad, raw) == fallback_summary(raw)
-    assert _clean("Beta 真实 flag 在 HTTP 头 X-Muteki-Flag，非响应体。", raw).startswith("Beta")
+    assert _clean("Beta 真实 flag 在 HTTP 头 X-DSwarm-Flag，非响应体。", raw).startswith("Beta")
 
 
 def test_payload_shape():
@@ -132,7 +132,7 @@ class _FakeLLMZh:
 
 
 def test_translate_need_emits_hitl_translated():
-    from muteki.solver.summarizer import translate_need
+    from dswarm.solver.summarizer import translate_need
     bus = _FakeBus()
     out = asyncio.run(translate_need(
         "Need a public VPS for a reverse shell (I'm behind NAT), target 10.0.0.5:4444",
@@ -155,7 +155,7 @@ def test_translate_need_empty_is_noop():
 
 def test_translate_need_skips_when_zh_equals_raw():
     """If the worker already wrote Chinese (model echoes it), don't emit a no-op."""
-    from muteki.solver.summarizer import translate_need
+    from dswarm.solver.summarizer import translate_need
 
     class _Echo:
         async def chat(self, **kw):

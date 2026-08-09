@@ -2,9 +2,9 @@
 
 import pytest
 
-from muteki.core.cost import Budget, CostController, ModelPrice
-from muteki.core.event_bus import EventBus
-from muteki.core.events import EventType
+from dswarm.core.cost import Budget, CostController, ModelPrice
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import EventType
 
 
 async def test_accumulates_per_scope() -> None:

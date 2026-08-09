@@ -4,7 +4,7 @@ import { useState } from "react";
 
 /**
  * Launch a run — a "new project" form, scoped to a CTF challenge spec.
- * Two modes: a real swarm (needs MUTEKI_DEEPSEEK_API_KEY on the backend) or a
+ * Two modes: a real swarm (needs DSWARM_DEEPSEEK_API_KEY on the backend) or a
  * keyless mock stream for UI/e2e. The body shape matches drivers.build_driver.
  */
 export function LaunchForm({

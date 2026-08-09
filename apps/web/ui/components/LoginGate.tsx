@@ -8,7 +8,7 @@ import { useT } from "@/lib/i18n";
  * Auth gate (P3). Wraps the whole deck. On mount it asks the backend whether a
  * valid token is present (checkAuth → GET /api/auth/me). Three outcomes:
  *
- *   - auth disabled (no MUTEKI_WEB_PASSWORD on the server)  → render children.
+ *   - auth disabled (no DSWARM_WEB_PASSWORD on the server)  → render children.
  *   - token already valid                                   → render children.
  *   - otherwise                                             → show the password form.
  *
@@ -106,8 +106,8 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
           }}
         >
           <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 17, fontWeight: 650, color: "var(--bright)" }}>
-              Project Muteki
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 17, fontWeight: 650, color: "var(--bright)" }}>
+              <span>D-Swarm</span>
             </div>
             <div style={{ marginTop: 4, fontSize: 13, color: "var(--muted)" }}>
               {t("login.subtitle")}

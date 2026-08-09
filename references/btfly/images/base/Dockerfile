@@ -4,7 +4,10 @@ FROM node:24-bookworm-slim AS node-runtime
 FROM python:3.12-slim-bookworm
 
 # Pi 版本固定以保证 RPC 协议稳定；APT 镜像允许构建时覆盖。
-ARG PI_VERSION=0.81.1
+# Locked to 0.84.1 (the extension API surface D-Swarm's base extensions are
+# written against). Bump only after re-verifying RPC + the ctf-gateway
+# provider compat flags.
+ARG PI_VERSION=0.84.1
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
 ARG APT_SECURITY_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian-security

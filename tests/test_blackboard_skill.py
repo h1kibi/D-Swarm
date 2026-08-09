@@ -1,12 +1,13 @@
-"""The muteki-blackboard skill's CLI (blackboard.py) round-trips against a real
+"""The dswarm-blackboard skill's CLI (blackboard.py) round-trips against a real
 SQLiteSharedGraph DB: read facts/dead-ends, write fact, mark dead-end, claim intent.
 
 This is what a swarm worker (claude/codex) actually runs inside its container to
 coordinate through the shared board (stigmergy). We drive it as a subprocess with
-MUTEKI_BLACKBOARD_DB pointed at a freshly-built graph, exactly like a worker.
+DSWARM_BLACKBOARD_DB pointed at a freshly-built graph, exactly like a worker.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import sqlite3
 import subprocess
@@ -15,11 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from muteki.models.solve_graph import Challenge
-from muteki.solver.cli_solver import CliSolver
-from muteki.swarm.shared_graph import SQLiteSharedGraph, _normalize_fact_identity
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.cli_solver import CliSolver
+from dswarm.solver.workspace import materialize_shared_artifact, link_shared_into_worker
+from dswarm.swarm.shared_graph import SQLiteSharedGraph, _normalize_fact_identity
 
-_SKILL = Path(__file__).resolve().parents[1] / "skills" / "muteki-blackboard" / "blackboard.py"
+_SKILL = Path(__file__).resolve().parents[1] / "skills" / "dswarm-blackboard" / "blackboard.py"
 
 
 def _board(tmp_path):
@@ -27,16 +29,20 @@ def _board(tmp_path):
     return SQLiteSharedGraph.open(db_path=tmp_path / "shared_graph.db", challenge=ch)
 
 
-def _run(db, *args, worker="cli-pi", intent_id=""):
+def _run(db, *args, worker="cli-pi", intent_id="", cwd=None):
     # PYTHONUTF8=1: the skill subprocess must emit UTF-8 on every host — the test
     # parent runs in UTF-8 mode (pytest -X utf8) and would otherwise try to
     # decode a GBK-cp936 console stream on a Chinese-locale Windows host.
     env = {**os.environ, "PYTHONUTF8": "1",
-           "MUTEKI_BLACKBOARD_DB": str(db), "MUTEKI_WORKER_ID": worker}
+           "DSWARM_BLACKBOARD_DB": str(db), "DSWARM_WORKER_ID": worker}
+    # The SQLite skill tests must not inherit a developer's HTTP-mode settings.
+    for key in ("DSWARM_BLACKBOARD_URL", "DSWARM_BLACKBOARD_RUN_ID",
+                "DSWARM_BLACKBOARD_TOKEN"):
+        env.pop(key, None)
     if intent_id:
-        env["MUTEKI_INTENT_ID"] = intent_id
+        env["DSWARM_INTENT_ID"] = intent_id
     r = subprocess.run([sys.executable, str(_SKILL), *args],
-                       capture_output=True, text=True, env=env, timeout=30,
+                       capture_output=True, text=True, env=env, timeout=30, cwd=cwd,
                        # explicit utf-8: the parent may run on a GBK-locale host
                        # (pytest without -X utf8); the skill subprocess always
                        # emits UTF-8 (PYTHONUTF8=1 above).
@@ -50,7 +56,7 @@ def test_skill_file_exists():
     skill_md = _SKILL.parent / "SKILL.md"
     assert skill_md.exists()
     text = skill_md.read_text()
-    assert "muteki-blackboard" in text and "read-deadends" in text
+    assert "dswarm-blackboard" in text and "read-deadends" in text
     assert "read-review" in text
 
 
@@ -62,17 +68,162 @@ def test_read_empty_board(tmp_path):
     assert "no dead-ends" in _run(db, "read-deadends").lower()
 
 
-def test_write_fact_then_read(tmp_path):
+def test_write_fact_verified_without_artifact_is_downgraded(tmp_path):
     g = _board(tmp_path)
     db = g.db_path
     g.close()
-    _run(db, "write-fact", "admin:admin works on /login", "--verified")
-    out = _run(db, "read-facts")
-    assert "admin:admin works on /login" in out
-    assert "VERIFIED" in out
-    # verified-only filter still shows it
-    assert "admin:admin" in _run(db, "read-facts", "--verified-only")
+    out = _run(db, "write-fact", "admin:admin works on /login", "--verified")
+    assert "candidate fact" in out
+    facts = _run(db, "read-facts")
+    assert "admin:admin works on /login" in facts
+    assert "candidate" in facts.lower()
+    assert "admin:admin" not in _run(db, "read-facts", "--verified-only")
 
+
+def test_write_fact_foreign_or_missing_artifacts_are_downgraded(tmp_path):
+    workspace = tmp_path / "workspace"
+    graph_dir = workspace / "graph"
+    graph_dir.mkdir(parents=True)
+    g = _board(graph_dir)
+    db = g.db_path
+    g.close()
+
+    worker = workspace / "workers" / "cli-pi"
+    worker.mkdir(parents=True)
+    sibling = workspace / "workers" / "cli-codex" / "secret.txt"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("sibling scratch", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+
+    cases = [
+        (workspace / "missing.txt", "missing artifact"),
+        (sibling, "sibling artifact"),
+        (outside, "outside artifact"),
+    ]
+    for artifact, fact in cases:
+        out = _run(
+            db, "write-fact", fact, "--verified", "--artifact", str(artifact),
+            cwd=worker,
+        )
+        assert "candidate fact" in out
+        assert fact not in _run(db, "read-facts", "--verified-only")
+
+
+def test_write_fact_materializes_own_worker_artifact_and_registers_poc(tmp_path):
+    workspace = tmp_path / "workspace"
+    graph_dir = workspace / "graph"
+    graph_dir.mkdir(parents=True)
+    g = _board(graph_dir)
+    db = g.db_path
+    g.close()
+
+    worker = workspace / "workers" / "cli-pi"
+    proof = worker / "shared" / "flag-poc.sh"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("#!/bin/sh\necho proof\n", encoding="utf-8")
+
+    out = _run(
+        db, "write-fact", "proof-backed fact", "--verified", "--artifact", str(proof),
+        cwd=worker,
+    )
+    assert "verified fact" in out
+    assert "registered directional PoC" in out
+    assert "proof-backed fact" in _run(db, "read-facts", "--verified-only")
+    with sqlite3.connect(db) as conn:
+        fact = conn.execute(
+            "SELECT artifact_id, verified FROM events WHERE kind='fact_added' "
+            "AND payload LIKE '%proof-backed fact%'"
+        ).fetchone()
+        poc = conn.execute(
+            "SELECT artifact_id, path, status, entry_command FROM pocs"
+        ).fetchone()
+    assert fact is not None and fact[1] == 1
+    assert poc == (
+        fact[0],
+        f"shared/objects/{fact[0][:2]}/{fact[0][2:4]}/{fact[0]}",
+        "directional",
+        "(no entry command supplied; inspect artifact before reuse)",
+    )
+    assert (workspace / poc[1]).read_text(encoding="utf-8") == "#!/bin/sh\necho proof\n"
+
+    # The same materialized evidence may back a distinct fact.  Its PoC event is
+    # deduplicated, but the second fact must still be durable.
+    again = _run(
+        db, "write-fact", "second proof-backed fact", "--verified", "--artifact", str(proof),
+        cwd=worker,
+    )
+    assert "verified fact" in again
+    assert "second proof-backed fact" in _run(db, "read-facts", "--verified-only")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pocs").fetchone()[0] == 1
+
+
+def test_write_fact_materialization_redacts_flag_like_literals(tmp_path):
+    workspace = tmp_path / "workspace"
+    graph_dir = workspace / "graph"
+    graph_dir.mkdir(parents=True)
+    g = _board(graph_dir)
+    db = g.db_path
+    g.close()
+    worker = workspace / "workers" / "cli-pi"
+    proof = worker / "poc.sh"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("echo flag{do_not_persist}\n", encoding="utf-8")
+
+    _run(db, "write-fact", "redacted proof", "--verified", "--artifact", str(proof), cwd=worker)
+    with sqlite3.connect(db) as conn:
+        artifact_id = conn.execute(
+            "SELECT artifact_id FROM events WHERE kind='fact_added' AND payload LIKE '%redacted proof%'"
+        ).fetchone()[0]
+        status = conn.execute("SELECT status FROM pocs").fetchone()[0]
+    body = (workspace / "shared" / "objects" / artifact_id[:2] / artifact_id[2:4] / artifact_id).read_text()
+    assert "flag{do_not_persist}" not in body
+    assert "<PRIOR_FLAG>" in body
+    assert status == "quarantined"
+
+
+def test_write_fact_verified_requires_real_shared_cas_artifact(tmp_path):
+    workspace = tmp_path / "workspace"
+    graph_dir = workspace / "graph"
+    graph_dir.mkdir(parents=True)
+    g = _board(graph_dir)
+    db = g.db_path
+    g.close()
+
+    source = tmp_path / "proof.txt"
+    source.write_text("curl output proving the fact", encoding="utf-8")
+    materialized = materialize_shared_artifact(
+        workspace, source, name="proof.txt", kind="test-proof")
+    worker = workspace / "workers" / "cli-pi"
+    worker.mkdir(parents=True)
+    linked = link_shared_into_worker(
+        workspace, worker, "proof.txt", materialized["sha256"])
+
+    out = _run(
+        db, "write-fact", "proof-backed fact", "--verified", "--artifact", str(linked),
+        cwd=worker,
+    )
+    assert "verified fact" in out
+    assert "proof-backed fact" in _run(db, "read-facts", "--verified-only")
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT artifact_id, verified FROM events WHERE kind='fact_added' "
+            "AND payload LIKE '%proof-backed fact%'"
+        ).fetchone()
+    assert row == (materialized["sha256"], 1)
+
+
+def test_write_fact_claimed_persistence_without_file_stays_candidate(tmp_path):
+    g = _board(tmp_path)
+    db = g.db_path
+    g.close()
+    out = _run(
+        db, "write-fact", "persisted to ./shared/missing.md", "--verified",
+        "--artifact", "./shared/missing.md", cwd=tmp_path,
+    )
+    assert "candidate fact" in out
+    assert "persisted to" not in _run(db, "read-facts", "--verified-only")
 
 def test_candidate_fact_excluded_by_verified_only(tmp_path):
     g = _board(tmp_path)
@@ -228,7 +379,7 @@ def _dedupe_key_for(db, text, *, worker="cli-pi", script=None):
     if skill is None:
         _run(db, "write-fact", text, worker=worker)
     else:
-        env = {**os.environ, "MUTEKI_BLACKBOARD_DB": str(db), "MUTEKI_WORKER_ID": worker}
+        env = {**os.environ, "DSWARM_BLACKBOARD_DB": str(db), "DSWARM_WORKER_ID": worker}
         r = subprocess.run([sys.executable, skill, "write-fact", text],
                            capture_output=True, text=True, env=env, timeout=30)
         assert r.returncode == 0, f"{skill} write-fact failed: {r.stderr}"
@@ -309,10 +460,10 @@ def test_sync_deployed_blackboard_skills_resyncs_stale_and_missing(tmp_path, mon
     """The launch-time safety net overwrites a stale/missing deployed copy from the
     repo source and leaves a fresh one alone — closing the run-75378 drift gap for the
     auto-discovered user-scope copies."""
-    from muteki.solver import cli_solver
+    from dswarm.solver import cli_solver
 
-    claude = tmp_path / ".claude" / "skills" / "muteki-blackboard" / "blackboard.py"
-    agents = tmp_path / ".agents" / "skills" / "muteki-blackboard" / "blackboard.py"
+    claude = tmp_path / ".claude" / "skills" / "dswarm-blackboard" / "blackboard.py"
+    agents = tmp_path / ".agents" / "skills" / "dswarm-blackboard" / "blackboard.py"
     monkeypatch.setattr(cli_solver, "_DEPLOYED_BLACKBOARD_SCRIPTS",
                         (str(claude), str(agents)))
     src = Path(cli_solver._repo_blackboard_script())
@@ -340,8 +491,63 @@ def test_sync_deployed_blackboard_skills_resyncs_stale_and_missing(tmp_path, mon
 def test_sync_deployed_blackboard_skills_no_source_is_noop(monkeypatch):
     """An installed deployment (no repo skill adjacent to the package) reports
     'no-source' and touches nothing — the deployed copy IS the source of truth there."""
-    from muteki.solver import cli_solver
+    from dswarm.solver import cli_solver
 
     monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
     rows = cli_solver.sync_deployed_blackboard_skills()
     assert rows and all(r["status"] == "no-source" for r in rows)
+
+
+def test_blackboard_db_path_accepts_windows_path_from_posix_shell(monkeypatch):
+    """A worker launched by WSL/Git Bash can inherit a Windows DB path.
+
+    sqlite3 would otherwise treat ``C:\\...`` as a literal relative filename and
+    open/create an empty DB, making read-facts crash with "no such table: events".
+    """
+    spec = importlib.util.spec_from_file_location("bb_skill_path_test", _SKILL)
+    assert spec and spec.loader
+    bb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bb)
+
+    raw = r"C:\Projects\Agent-projects\ctf-swarm\sessions\run-x\workspace\graph\shared_graph.db"
+    converted = "/mnt/c/Projects/Agent-projects/ctf-swarm/sessions/run-x/workspace/graph/shared_graph.db"
+    monkeypatch.setattr(bb.os, "name", "posix", raising=False)
+    monkeypatch.setenv("DSWARM_BLACKBOARD_DB", raw)
+    monkeypatch.setattr(bb.os.path, "exists", lambda p: p == converted)
+
+    assert bb._db_path() == converted
+
+
+def test_skill_write_fact_does_not_link_missing_intent_product(tmp_path):
+    g = _board(tmp_path)
+    db = g.db_path
+    g.close()
+    _run(db, "write-fact", "orphan result", intent_id="missing-intent")
+    with sqlite3.connect(db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM intent_products WHERE intent_id=?",
+            ("missing-intent",),
+        ).fetchone()[0]
+        payload = conn.execute(
+            "SELECT payload FROM events WHERE kind='fact_added' "
+            "AND payload LIKE '%orphan result%'"
+        ).fetchone()[0]
+    assert count == 0
+    assert '"orphan_intent_id": "missing-intent"' in payload
+
+
+def test_skill_http_connection_failure_is_not_reported_as_success(tmp_path):
+    env = {**os.environ, "PYTHONUTF8": "1",
+           "DSWARM_BLACKBOARD_URL": "http://127.0.0.1:1/api/blackboard",
+           "DSWARM_BLACKBOARD_RUN_ID": "run-test",
+           "DSWARM_BLACKBOARD_TOKEN": "test-token",
+           "DSWARM_WORKER_ID": "cli-pi"}
+    env.pop("DSWARM_BLACKBOARD_DB", None)
+    result = subprocess.run(
+        [sys.executable, str(_SKILL), "read-facts"],
+        capture_output=True, text=True, env=env, timeout=30,
+        encoding="utf-8", errors="replace",
+    )
+    assert result.returncode != 0
+    assert "blackboard HTTP call failed" in result.stderr
+    assert "OK" not in result.stdout

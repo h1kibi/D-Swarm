@@ -16,13 +16,13 @@ import time
 
 import pytest
 
-from muteki.solver.cli_driver import CliResult, StreamStep
-from muteki.solver import control_client as cc
-from muteki.solver import control_receiver as cr
+from dswarm.solver.cli_driver import CliResult, StreamStep
+from dswarm.solver import control_client as cc
+from dswarm.solver import control_receiver as cr
 
 
 def test_control_bind_defaults_to_loopback_and_honors_env(monkeypatch):
-    # P2-v3: the receiver bind address is env-driven (MUTEKI_CONTROL_BIND). Default
+    # P2-v3: the receiver bind address is env-driven (DSWARM_CONTROL_BIND). Default
     # stays 127.0.0.1 (classic single-host) so this is a pure additive knob; the
     # compose layout sets 0.0.0.0 so sibling worker containers can reach it. An
     # explicit host always wins over the env default (tests pass host=...).
@@ -109,7 +109,7 @@ class _FakeSupervisor:
             self.signals.append(req)
             self._send({"t": "resp", "req_id": rid, "ok": True})
         elif op == "Health":
-            self._send({"t": "resp", "req_id": rid, "ok": True, "version": "muteki-runtime-agent/2"})
+            self._send({"t": "resp", "req_id": rid, "ok": True, "version": "dswarm-runtime-agent/2"})
         else:
             self._send({"t": "resp", "req_id": rid, "ok": True})
 
@@ -276,9 +276,9 @@ def test_early_frames_before_started_are_not_lost(receiver):
 
 def test_filter_env_only_allowed_keys():
     out = cc._filter_env({
-        "MUTEKI_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
+        "DSWARM_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
         "OPENAI_API_KEY": "v", "PATH": "/leak", "HOME": "/leak", "HOME_OK": "x",
     })
-    assert out == {"MUTEKI_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
+    assert out == {"DSWARM_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
                    "OPENAI_API_KEY": "v"}
     assert cc._filter_env({"HOME": "/home/kali/workspace/h"}) == {"HOME": "/home/kali/workspace/h"}

@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from muteki.models.solve_graph import Challenge
-from muteki.solver.types import SolveOutcome
-from muteki.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.types import SolveOutcome
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
 
 def _challenge() -> Challenge:
@@ -23,8 +23,8 @@ def _challenge() -> Challenge:
 
 # ── A: winner.json persistence (via Swarm._persist_winner) ──────────────────
 def test_persist_winner_writes_session_handle(tmp_path):
-    from muteki.swarm.swarm import Swarm
-    from muteki.sandbox.manager import SandboxManager
+    from dswarm.swarm.swarm import Swarm
+    from dswarm.sandbox.manager import SandboxManager
 
     graph_dir = tmp_path / "graph"
     sw = Swarm(
@@ -47,8 +47,8 @@ def test_persist_winner_writes_session_handle(tmp_path):
 
 
 def test_persist_winner_carries_all_flags(tmp_path):
-    from muteki.swarm.swarm import Swarm
-    from muteki.sandbox.manager import SandboxManager
+    from dswarm.swarm.swarm import Swarm
+    from dswarm.sandbox.manager import SandboxManager
     import json
 
     graph_dir = tmp_path / "graph"
@@ -69,8 +69,8 @@ def test_persist_winner_carries_all_flags(tmp_path):
 
 
 def test_persist_winner_skips_without_session(tmp_path):
-    from muteki.swarm.swarm import Swarm
-    from muteki.sandbox.manager import SandboxManager
+    from dswarm.swarm.swarm import Swarm
+    from dswarm.sandbox.manager import SandboxManager
 
     graph_dir = tmp_path / "graph"
     sw = Swarm(_challenge(), [], llm=None,
@@ -230,7 +230,7 @@ def test_fresh_bus_revives_closed_bus(tmp_path):
         assert run.bus is not old
         assert run.bus._closed is False
         # the new bus still persists to the SessionStore + carries seq forward
-        from muteki.core.events import Event, EventType
+        from dswarm.core.events import Event, EventType
         await run.bus.emit(Event(event_type=EventType.REASONING_DELTA,
                                  run_id="run-x", payload={"text": "hi"}))
 
@@ -239,7 +239,7 @@ def test_fresh_bus_revives_closed_bus(tmp_path):
 
 def test_rehydrated_run_bus_continues_after_persisted_stream_seq(tmp_path):
     from apps.web import run_manager as rm
-    from muteki.core.events import Event, EventType
+    from dswarm.core.events import Event, EventType
 
     async def _run():
         sessions = tmp_path / "sessions"
@@ -310,7 +310,7 @@ def test_post_hitl_stop_on_finished_run_is_noop(tmp_path, monkeypatch):
 
 def test_post_hitl_stop_echoes_hitl_response(tmp_path):
     from apps.web import run_manager as rm
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
 
     async def _run():
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
@@ -358,7 +358,7 @@ def test_m4_post_hitl_reports_delivery_status(tmp_path):
     """M4: HITL_RESPONSE carries a `delivery` status so the operator knows where a
     command went — queued_for_next_worker (live hint) vs no_live_workers / standby."""
     from apps.web import run_manager as rm
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
 
     async def _run():
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
@@ -429,7 +429,7 @@ def test_mark_false_standby_uses_operator_selected_flag(tmp_path, monkeypatch):
     """Multi-flag false-positive feedback must target the operator-selected flag,
     not blindly invalidate winner.flag/run.flag (usually the first flag)."""
     from apps.web import run_manager as rm
-    import muteki.solver.cli_solver as cli_solver
+    import dswarm.solver.cli_solver as cli_solver
     import apps.web.drivers as drivers
 
     captured = {}
@@ -492,14 +492,14 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
     """
     from apps.web import run_manager as rm
     import apps.web.drivers as drivers
-    import muteki.solver.cli_solver as cli_solver
-    import muteki.solver.container_exec as container_exec
+    import dswarm.solver.cli_solver as cli_solver
+    import dswarm.solver.container_exec as container_exec
 
     monkeypatch.setattr(drivers, "is_web_container", lambda: True)
     captured = {}
 
     class FakeHandle:
-        container = "muteki-run-run-x"
+        container = "dswarm-run-run-x"
 
         def to_container_path(self, host_path):
             return "/home/kali/workspace/" + Path(host_path).name
@@ -585,10 +585,10 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
     assert ok is True
     assert captured["ensure"]["run_id"] == "run-x"
     assert captured["ensure"]["network"] == "bridge"
-    assert captured["solver_kwargs"]["container"].container == "muteki-run-run-x"
+    assert captured["solver_kwargs"]["container"].container == "dswarm-run-run-x"
     assert captured["solver_kwargs"]["engine"] == "pi"
     assert captured["solver_kwargs"]["resume_session"] == "thread-1"
-    assert captured["solver_kwargs"]["worker_env"]["MUTEKI_WORKER_MODEL"] == "deepseek-v4-pro"
+    assert captured["solver_kwargs"]["worker_env"]["DSWARM_WORKER_MODEL"] == "deepseek-v4-pro"
     assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-pi")
     assert captured["chown"] == ["standby-pi", "cli-pi"]
     assert captured["teardown"] == {"run_id": "run-x", "remove": True}
@@ -598,8 +598,8 @@ def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, mo
     """Old runs may have no winner.json; standby must still recover the original
     challenge payload instead of launching a context-free worker."""
     from apps.web import run_manager as rm
-    import muteki.solver.cli_solver as cli_solver
-    from muteki.core.events import Event, EventType
+    import dswarm.solver.cli_solver as cli_solver
+    from dswarm.core.events import Event, EventType
     from apps.web.drivers import build_standby_driver
 
     captured = {}
@@ -647,7 +647,7 @@ def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, mo
 
 def test_standby_failure_is_logged_and_emitted(tmp_path, monkeypatch, caplog):
     from apps.web import run_manager as rm
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
     import apps.web.drivers as drivers
 
     async def _boom(run):
@@ -719,7 +719,7 @@ def test_resolve_reuses_challenge_from_session_jsonl_without_winner(tmp_path, mo
     challenge from the durable run.started JSONL instead of collapsing back to
     name/category only."""
     from apps.web import run_manager as rm
-    from muteki.core.events import Event, EventType
+    from dswarm.core.events import Event, EventType
     import apps.web.drivers as drivers
 
     seen = {}
@@ -781,7 +781,7 @@ def test_post_hitl_stop_settles_ghost_run(tmp_path):
     RUN_FINISHED) and whose task is dead. Stop must FORCE it finished + broadcast
     RUN_FINISHED so the deck unsticks — not silently no-op."""
     from apps.web import run_manager as rm
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
 
     async def _run():
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))

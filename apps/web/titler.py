@@ -16,9 +16,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from muteki.core.events import Event, EventType
-from muteki.core.event_bus import EventBus
-from muteki.core.llm import LLMClient
+from dswarm.core.events import Event, EventType
+from dswarm.core.event_bus import EventBus
+from dswarm.core.llm import LLMClient
 
 TITLE_MODEL = "deepseek-v4-flash"
 

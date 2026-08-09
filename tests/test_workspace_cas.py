@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from muteki.solver.workspace import (
+from dswarm.solver.workspace import (
     cleanup_worker_scratch,
     ensure_workspace,
     link_shared_into_worker,

@@ -1,27 +1,25 @@
-"""CLI worker executor — driver argv construction, output parsing, flag extraction,
+"""CLI worker executor 鈥?driver argv construction, output parsing, flag extraction,
 external-USD cost accounting. Pure/unit (no real CLI subprocess, no API key)."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from muteki.core.cost import Budget, CostController
-from muteki.core.events import EventType
-from muteki.models.solve_graph import Challenge
-from muteki.solver import cli_solver
-from muteki.solver.cli_driver import (
+from dswarm.core.cost import Budget, CostController
+from dswarm.core.events import EventType
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver import cli_solver
+from dswarm.solver.cli_driver import (
     PiDriver, StreamStep, DRIVERS,
-    driver_for, get_driver, _descendant_pids, _kill_proc_tree,
-    _probe_health_with_creds,
+    driver_for, get_driver, _kill_proc_tree,
 )
-from muteki.solver.cli_solver import CliSolver
-from muteki.solver.container_exec import CONTAINER_WORKSPACE, ContainerHandle
+from dswarm.solver.cli_solver import CliSolver
+from dswarm.solver.container_exec import CONTAINER_WORKSPACE, ContainerHandle
 
 
 def _CP(rc: int, out: str = "", err: str = "") -> "subprocess.CompletedProcess":
@@ -29,7 +27,7 @@ def _CP(rc: int, out: str = "", err: str = "") -> "subprocess.CompletedProcess":
     return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
 
 
-# ── driver argv ───────────────────────────────────────────────────────────────
+# 鈹€鈹€ driver argv 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
@@ -51,7 +49,7 @@ def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
     handle = ContainerHandle(
         run_id="env-map",
         host_workspace=str(workspace),
-        container="muteki-run-env-map",
+        container="dswarm-run-env-map",
     )
     solver = CliSolver(
         None,
@@ -65,7 +63,7 @@ def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
     env = solver._worker_env()
 
     assert env["HOME"] == f"{CONTAINER_WORKSPACE}/workers/_homes/cli-pi"
-    assert env["MUTEKI_BLACKBOARD_DB"] == f"{CONTAINER_WORKSPACE}/graph/shared_graph.db"
+    assert env["DSWARM_BLACKBOARD_DB"] == f"{CONTAINER_WORKSPACE}/graph/shared_graph.db"
 
 
 def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
@@ -93,8 +91,8 @@ def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
 
 def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_path):
     """A source checkout (the test env) resolves the skill to the IN-REPO copy for
-    EVERY engine — no deployed ~/.pi or ~/.agents copy that can drift out of sync
-    (run-75378). The container path is still the image-baked one."""
+    EVERY engine 鈥?no deployed ~/.pi or ~/.agents copy that can drift out of sync
+    (run-75378). A container gets a run-local materialized copy, not a stale image copy."""
     ch = Challenge(
         id="env-board",
         name="env-board",
@@ -105,21 +103,24 @@ def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_pa
 
     repo_skill = (
         Path(cli_solver.__file__).resolve().parent.parent.parent
-        / "skills" / "muteki-blackboard" / "blackboard.py"
+        / "skills" / "dswarm-blackboard" / "blackboard.py"
     )
     assert repo_skill.is_file()  # sanity: we ARE running from a source checkout
 
     for engine in ("pi",):
         env = CliSolver(None, ch, engine=engine)._worker_env()
-        assert env["MUTEKI_BLACKBOARD_SCRIPT"] == str(repo_skill)
+        assert env["DSWARM_BLACKBOARD_SCRIPT"] == str(repo_skill)
 
     handle = ContainerHandle(
         run_id="env-board",
         host_workspace=str(tmp_path),
-        container="muteki-run-env-board",
+        container="dswarm-run-env-board",
     )
     cont_env = CliSolver(None, ch, engine="pi", container=handle)._worker_env()
-    assert cont_env["MUTEKI_BLACKBOARD_SCRIPT"] == "/usr/local/bin/blackboard.py"
+    runtime_script = tmp_path / ".dswarm_runtime" / "dswarm-blackboard" / "blackboard.py"
+    assert runtime_script.is_file()
+    assert runtime_script.read_bytes() == repo_skill.read_bytes()
+    assert cont_env["DSWARM_BLACKBOARD_SCRIPT"] ==         f"{CONTAINER_WORKSPACE}/.dswarm_runtime/dswarm-blackboard/blackboard.py"
 
 
 def test_worker_env_blackboard_script_falls_back_to_deployed_for_installs(monkeypatch):
@@ -136,8 +137,8 @@ def test_worker_env_blackboard_script_falls_back_to_deployed_for_installs(monkey
     monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
 
     env = CliSolver(None, ch, engine="pi")._worker_env()
-    assert env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.pi/agent/skills/muteki-blackboard/blackboard.py")
+    assert env["DSWARM_BLACKBOARD_SCRIPT"].endswith(
+        "/.pi/agent/skills/dswarm-blackboard/blackboard.py")
 
 
 def test_worker_env_exposes_current_intent_id():
@@ -157,11 +158,11 @@ def test_worker_env_exposes_current_intent_id():
         intent_id="I-admin",
     )
 
-    assert solver._worker_env()["MUTEKI_INTENT_ID"] == "I-admin"
+    assert solver._worker_env()["DSWARM_INTENT_ID"] == "I-admin"
 
 
 # argv[0] is the RESOLVED engine binary (a pinned official path), not the bare
-# name — so assert against d.bin, which is the contract these tests actually mean.
+# name 鈥?so assert against d.bin, which is the contract these tests actually mean.
 def test_pi_sends_a_real_hello_probe():
     # pi builds a non-empty one-turn json-mode argv carrying the hello prompt
     # (the codex/cursor symmetry fix retired with those engines).
@@ -172,7 +173,7 @@ def test_pi_sends_a_real_hello_probe():
 
 
 def test_health_detail_retries_once_then_succeeds(monkeypatch):
-    # a single transient miss must NOT report red — retry recovers it.
+    # a single transient miss must NOT report red 鈥?retry recovers it.
     d = PiDriver()
     _ = d.bin  # resolve+cache the binary BEFORE we mock run (resolution probes too)
     calls = {"n": 0}
@@ -183,8 +184,8 @@ def test_health_detail_retries_once_then_succeeds(monkeypatch):
             return _CP(1, "", "rate limit (overloaded)")  # transient
         return _CP(0, '{"type":"agent_settled"}')          # recovered
 
-    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
-    monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
+    monkeypatch.setattr("dswarm.solver.cli_driver.subprocess.run", fake_run)
+    monkeypatch.setattr("dswarm.solver.cli_driver.time.sleep", lambda *_: None)
     ok, detail = d.health_detail()
     assert ok is True and detail == ""
     assert calls["n"] == 2  # exactly one retry
@@ -197,8 +198,8 @@ def test_health_detail_classifies_persistent_failure(monkeypatch):
     def fake_run(argv, **kw):
         return _CP(1, "", "Invalid API key (401)")
 
-    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
-    monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
+    monkeypatch.setattr("dswarm.solver.cli_driver.subprocess.run", fake_run)
+    monkeypatch.setattr("dswarm.solver.cli_driver.time.sleep", lambda *_: None)
     ok, detail = d.health_detail()
     assert ok is False
     # the real reason is surfaced, NOT a blanket "check login / quota"
@@ -212,8 +213,8 @@ def test_health_detail_classifies_timeout(monkeypatch):
     def fake_run(argv, **kw):
         raise subprocess.TimeoutExpired(cmd="x", timeout=60)
 
-    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
-    monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
+    monkeypatch.setattr("dswarm.solver.cli_driver.subprocess.run", fake_run)
+    monkeypatch.setattr("dswarm.solver.cli_driver.time.sleep", lambda *_: None)
     ok, detail = d.health_detail()
     assert ok is False and "timed out" in detail
 
@@ -229,9 +230,9 @@ def test_healthcheck_bool_delegates_to_detail(monkeypatch):
 
 
 def test_engine_status_is_cheap_and_does_not_deep_probe(monkeypatch):
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
-    monkeypatch.setenv("MUTEKI_PI_BIN", "/usr/bin/pi")
+    monkeypatch.setenv("DSWARM_PI_BIN", "/usr/bin/pi")
     monkeypatch.setattr(cli_driver, "_runs_ok", lambda _path: True)
 
     def fail_deep_probe():
@@ -273,7 +274,7 @@ def test_health_detail_falls_back_to_version_when_no_hello(monkeypatch):
         assert "--version" in argv
         return _CP(0, "pi 0.81.1")
 
-    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
+    monkeypatch.setattr("dswarm.solver.cli_driver.subprocess.run", fake_run)
     ok, detail = d.health_detail()
     assert ok is True and detail == ""
 
@@ -284,7 +285,7 @@ def test_pi_execute_argv_single_shot_json():
     argv = d.build_execute("DO THE THING", None)
     assert argv[0] == d.bin
     assert "--mode" in argv and argv[argv.index("--mode") + 1] == "json"
-    # worker-scoped session storage (relative → resolves under the worker cwd)
+    # worker-scoped session storage (relative 鈫?resolves under the worker cwd)
     assert "--session-dir" in argv
     assert argv[argv.index("--session-dir") + 1] == ".pi-sessions"
     # prompt is a positional arg, last (per docs/json.md: `pi --mode json "..."`)
@@ -294,11 +295,11 @@ def test_pi_execute_argv_single_shot_json():
 
 def test_pi_execute_provider_flag_from_env(monkeypatch):
     d = PiDriver()
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "anthropic")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "anthropic")
     argv = d.build_execute("GO", None)
     assert "--provider" in argv
     assert argv[argv.index("--provider") + 1] == "anthropic"
-    monkeypatch.delenv("MUTEKI_PI_PROVIDER")
+    monkeypatch.delenv("DSWARM_PI_PROVIDER")
     assert "--provider" not in d.build_execute("GO", None)
 
 
@@ -314,12 +315,12 @@ def test_pi_offline_denies_web_tools():
 
 def test_pi_resume_uses_session_id_or_continue():
     d = PiDriver()
-    # known session id → resume that session
+    # known session id 鈫?resume that session
     argv = d.build_resume("CONCLUDE", "019fce1e-44b4-7201-bbe8-9d44d5f61a48")
     assert argv[0] == d.bin and "--session" in argv
     assert argv[argv.index("--session") + 1] == "019fce1e-44b4-7201-bbe8-9d44d5f61a48"
     assert argv[-1] == "CONCLUDE"
-    # unknown session → continue the worker's most recent session
+    # unknown session 鈫?continue the worker's most recent session
     argv2 = d.build_resume("CONCLUDE", "")
     assert "-c" in argv2
     assert "--session" not in argv2
@@ -345,12 +346,14 @@ def test_pi_parse_accumulates_assistant_text_and_usage():
         '{"type":"turn_start"}',
         '{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"ls -la"}}',
         '{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"total 48\\nflag.txt"}]},"isError":false}',
+        '{"type":"message","message":{"role":"assistant","text":"plain message event"}}',
         '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"found it"},{"type":"text","text":"FOUND_FLAG=flag{abc}"}]}}',
         '{"type":"turn_end","message":{"role":"assistant","text":"wrapping up"},"toolResults":[]}',
         '{"type":"agent_end","messages":[{"role":"assistant","text":"final answer FOUND_FLAG=flag{abc}"}]}',
         '{"type":"agent_settled"}',
     ])
     res = d.parse(out, "")
+    assert "plain message event" in res.text
     assert "found it" in res.text
     assert "final answer" in res.text
     assert "FOUND_FLAG=flag{abc}" in res.text
@@ -374,20 +377,59 @@ def test_pi_parse_falls_back_to_raw_stdout():
 
 def test_pi_parse_stream_steps_shapes():
     d = PiDriver()
-    # tool start → tool step with the command
+    # tool start 鈫?tool step with the command
     steps = d.parse_stream_steps('{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"nmap -p 80 x"}}')
     assert steps == [StreamStep("tool", tool="bash", text="nmap -p 80 x")]
-    # tool end → tool_result step with raw = full output for the provenance gate
+    # tool end 鈫?tool_result step with raw = full output for the provenance gate
     steps = d.parse_stream_steps('{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"PORT STATE\\n80 open"}]},"isError":false}')
     assert len(steps) == 1 and steps[0].kind == "tool_result"
     assert steps[0].raw == "PORT STATE\n80 open" and steps[0].text == "PORT STATE\n80 open"
-    # message_end → one reasoning step per complete message
+    # message_end 鈫?one reasoning step per complete message
     steps = d.parse_stream_steps('{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"step one"}]}}')
+    assert steps == [StreamStep("reasoning", text="step one")]
+    # some pi json-mode versions only emit `message` events
+    steps = d.parse_stream_steps('{"type":"message","message":{"role":"assistant","text":"step one"}}')
     assert steps == [StreamStep("reasoning", text="step one")]
     # message_update deltas are NOT surfaced (would flood the deck)
     assert d.parse_stream_steps('{"type":"message_update","message":{},"assistantMessageEvent":{"type":"text_delta","delta":"x"}}') == []
     # non-JSON tolerated
     assert d.parse_stream_steps("not json") == []
+
+
+def test_is_stream_delta_filters_pi_protocol_lines_but_keeps_prose():
+    # run-3154 seq 83: a trailing pi RPC stream delta was recorded as a bogus fact.
+    # run-3155 seq 7: an `agent_end` with EMPTY messages/content was recorded too.
+    # Protocol envelopes are NOT worker prose and must be filtered out of the
+    # end-of-run summary.
+    for delta in [
+        '{"type":"session","version":3,"id":"sess-1"}',
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_start","message":{"role":"user","content":[]}}',
+        '{"type":"message_update","message":{},"assistantMessageEvent":{"type":"text_delta","delta":"x"}}',
+        '{"type":"toolcall_delta","toolCallId":"c1","delta":{"type":"text_delta","text":"curl"}}',
+        '{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"ls"}}',
+        '{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"real output"}]}}',
+        '{"type":"agent_settled"}',
+        # content-bearing types with NO actual prose are still protocol artifacts.
+        '{"type":"message_end","message":{"role":"assistant","content":[]}}',
+        '{"type":"turn_end","message":{"role":"assistant","content":[]}}',
+        '{"type":"agent_end","messages":[{"role":"assistant","content":[]}]}',
+        '{"type":"agent_end","messages":[]}',
+    ]:
+        assert cli_solver._is_stream_delta(delta), delta
+    # content-bearing events carry the assistant's actual text and are kept.
+    for prose in [
+        '{"type":"message","message":{"role":"assistant","text":"done"}}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}',
+        '{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}',
+        '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}',
+    ]:
+        assert not cli_solver._is_stream_delta(prose), prose
+    # plain worker prose and non-JSON lines are never deltas.
+    assert not cli_solver._is_stream_delta("flag{a1b2c3}")
+    assert not cli_solver._is_stream_delta("VERIFIED_FACT=admin password is x")
+    assert not cli_solver._is_stream_delta("")
 
 
 def test_pi_hello_ok_accepts_completed_turn():
@@ -397,7 +439,7 @@ def test_pi_hello_ok_accepts_completed_turn():
     assert d._hello_ok(_CP(0, "no events")) is False
 
 
-# ── offline / web-access toggle (clean eval hygiene) ─────────────────────────
+# 鈹€鈹€ offline / web-access toggle (clean eval hygiene) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def test_registry():
     assert set(DRIVERS) == {"pi"}
@@ -407,10 +449,10 @@ def test_registry():
 @pytest.mark.posix
 def test_kill_proc_tree_kills_setsid_escaped_orphan_and_reaps():
     """A worker child that setsid()'s out of the process group must STILL be
-    killed (killpg alone misses it → orphan leaks a slot/CPU/port), and the
+    killed (killpg alone misses it 鈫?orphan leaks a slot/CPU/port), and the
     parent must be reaped (no <defunct> zombie). Regression for the live-only
     worker-process leak seen in the run-0011 transcript."""
-    import os, signal, subprocess, sys, time
+    import os, subprocess, sys, time
     # parent (own session/group) spawns a setsid'd child that writes its pid and sleeps.
     parent_src = (
         "import os, time, subprocess\n"
@@ -449,7 +491,7 @@ def test_kill_proc_tree_kills_setsid_escaped_orphan_and_reaps():
     # the escaped orphan must be dead
     time.sleep(0.5)
     assert not _alive(cpid), "setsid-escaped orphan survived _kill_proc_tree"
-    # the parent must be reaped (poll() returns a code, not None → not a zombie)
+    # the parent must be reaped (poll() returns a code, not None 鈫?not a zombie)
     assert proc.poll() is not None, "parent not reaped (zombie)"
     try:
         os.unlink(cpid_file)
@@ -477,7 +519,7 @@ def test_driver_for_local_profile_injects_selected_model(monkeypatch):
     model must be used by the health probe and worker argv; otherwise an exhausted
     default model can falsely degrade the pi worker even when the profile's
     selected model is available."""
-    monkeypatch.setenv("MUTEKI_PI_BIN", "/usr/bin/pi")
+    monkeypatch.setenv("DSWARM_PI_BIN", "/usr/bin/pi")
     drv = driver_for({
         "id": "pi-sub-container",
         "name": "pi-sub-container",
@@ -507,7 +549,7 @@ def test_get_driver_unknown_name_raises_clear_error():
 def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
     """#5: a FILE-backed Credential Account (api_key_ref empty, secret in a file)
     must still get an auth header on the health probe. The old _api_key() only
-    handled env: refs and returned '' for file-backed → probe sent no auth header
+    handled env: refs and returned '' for file-backed 鈫?probe sent no auth header
     (false-negative health even though the live worker authenticates fine)."""
     seen = {}
 
@@ -534,7 +576,7 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
         "#5: file: api_key_ref must be read and injected for the pi endpoint probe"
 
     # (b) no ref, but the credential-injection *_API_KEY_FILE env is set (the
-    # container path) → still resolved.
+    # container path) 鈫?still resolved.
     seen.clear()
     monkeypatch.setenv("OPENAI_API_KEY_FILE", str(keyfile))
     drv2 = driver_for({
@@ -546,22 +588,22 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
         "#5: *_API_KEY_FILE env fallback must be read for the pi endpoint probe"
 
 
-# ── engine binary resolution (pin official, skip broken third-party) ──────────
+# 鈹€鈹€ engine binary resolution (pin official, skip broken third-party) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # A broken `@cometix/claude-code` repackage earlier on PATH crashes at load and
 # would silently degrade the swarm; the resolver must skip it and pin a runnable
 # official binary. These tests drive the resolver with fakes so they don't depend
 # on what's actually installed on the host.
 
 def test_resolve_prefers_env_override(monkeypatch):
-    from muteki.solver import cli_driver as mod
-    monkeypatch.setenv("MUTEKI_PI_BIN", "/custom/path/pi")
-    # env override wins outright — no PATH scan, no run probe
+    from dswarm.solver import cli_driver as mod
+    monkeypatch.setenv("DSWARM_PI_BIN", "/custom/path/pi")
+    # env override wins outright 鈥?no PATH scan, no run probe
     assert mod.resolve_engine_bin("pi") == "/custom/path/pi"
 
 
 def test_resolve_skips_known_bad_repackage(monkeypatch):
-    from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
+    from dswarm.solver import cli_driver as mod
+    monkeypatch.delenv("DSWARM_PI_BIN", raising=False)
     # no known-good location exists in this fake world
     monkeypatch.setattr(mod, "_KNOWN_GOOD", {"pi": []})
     # PATH has the broken repackage first, then a good one
@@ -574,8 +616,8 @@ def test_resolve_skips_known_bad_repackage(monkeypatch):
 
 
 def test_resolve_known_good_location_wins_over_path(monkeypatch):
-    from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
+    from dswarm.solver import cli_driver as mod
+    monkeypatch.delenv("DSWARM_PI_BIN", raising=False)
     good = "/blessed/pi"
     monkeypatch.setattr(mod, "_KNOWN_GOOD", {"pi": [good]})
     # WindowsPath normalizes separators (str() renders `\blessed\pi`), so
@@ -590,8 +632,8 @@ def test_resolve_known_good_location_wins_over_path(monkeypatch):
 
 
 def test_resolve_falls_back_to_bare_name_when_all_broken(monkeypatch):
-    from muteki.solver import cli_driver as mod
-    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
+    from dswarm.solver import cli_driver as mod
+    monkeypatch.delenv("DSWARM_PI_BIN", raising=False)
     monkeypatch.setattr(mod, "_KNOWN_GOOD", {"pi": []})
     monkeypatch.setattr(mod, "_which_all", lambda name: ["/bad/pi"])
     monkeypatch.setattr(mod, "_runs_ok", lambda p: False)  # nothing runs
@@ -600,13 +642,13 @@ def test_resolve_falls_back_to_bare_name_when_all_broken(monkeypatch):
 
 
 def test_looks_bad_flags_cometix():
-    from muteki.solver.cli_driver import _looks_bad
+    from dswarm.solver.cli_driver import _looks_bad
     assert _looks_bad("/x/node_modules/@cometix/repackage/cli.js") is True
     assert _looks_bad("/opt/homebrew/bin/pi") is False
 
 
 def test_driver_bin_is_cached(monkeypatch):
-    from muteki.solver import cli_driver as mod
+    from dswarm.solver import cli_driver as mod
     calls = []
     monkeypatch.setattr(mod, "resolve_engine_bin",
                         lambda name: calls.append(name) or f"/resolved/{name}")
@@ -617,7 +659,7 @@ def test_driver_bin_is_cached(monkeypatch):
     assert calls == ["pi"]  # resolved exactly once, then cached
 
 
-# ── output parsing ───────────────────────────────────────────────────────────
+# 鈹€鈹€ output parsing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def _cli_solver(challenge, **kw):
     spec = type("S", (), {"solver_id": "cli-1"})()
@@ -625,7 +667,7 @@ def _cli_solver(challenge, **kw):
 
 
 def test_cli_solver_offline_flag_threads_through():
-    # web_access=False on the solver → the built execute argv denies web tools.
+    # web_access=False on the solver 鈫?the built execute argv denies web tools.
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
     s = _cli_solver(ch, web_access=False, kb=False)
@@ -637,11 +679,11 @@ def test_cli_solver_offline_flag_threads_through():
 
 
 def test_cli_solver_kb_off_by_default_when_no_kb_configured():
-    # Out of the box (no MUTEKI_KB_MCP_NAME) the KB is inert regardless of kb=...:
+    # Out of the box (no DSWARM_KB_MCP_NAME) the KB is inert regardless of kb=...:
     # self.kb is False and the prompt teaches no KB tool.
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch, kb=True, engine="pi")
-    assert s.kb is False  # no KB configured → off even though kb=True was requested
+    assert s.kb is False  # no KB configured 鈫?off even though kb=True was requested
     assert "knowledge-base tool" not in s._build_prompt()
 
 
@@ -650,6 +692,98 @@ def test_cli_solver_kb_disabled_keeps_prompt_clean():
     s = _cli_solver(ch, kb=False)
     assert s.kb is False
     assert "knowledge-base tool" not in s._build_prompt()
+
+
+def test_ctf_web_bootstrap_prompt_injects_web_first_workflow():
+    ch = Challenge(
+        id="web-focus",
+        name="web-focus",
+        category="web",
+        target="http://challenge.local/",
+        description="Find the flag in the web app",
+        flag_format=r"flag\{.*?\}",
+    )
+    s = _cli_solver(ch, kb=False)
+
+    prompt = s._build_prompt()
+
+    assert "## CTF web focus / workflow" in prompt
+    assert "supplied HTTP(S) target" in prompt
+    assert "Do NOT spend time on broad host/port scans" in prompt
+    assert "SSH/SMB/Redis/MySQL/RPC" in prompt
+    assert "robots.txt" in prompt and "JS bundles" in prompt
+    assert "Probe web bug classes first" in prompt
+
+
+def test_ctf_web_focus_prompt_applies_to_explore_and_recon_scope():
+    ch = Challenge(id="web-focus", name="web-focus", category="web",
+                   target="http://challenge.local/", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+
+    s.mode = "explore"
+    s.intent_goal = "Map hidden API routes"
+    explore_prompt = s._build_explore_prompt()
+    assert "## CTF web focus / workflow" in explore_prompt
+    assert "Explore ONLY this direction" in explore_prompt
+
+    s.mode = "recon"
+    recon_prompt = s._build_prompt()
+    assert "CTF scope: do NOT run nmap" in recon_prompt
+    assert "Only inspect the supplied URL/port and the web application directly" in recon_prompt
+    assert "use PORT_OPEN only for an explicitly authorized, relevant targeted check" in recon_prompt
+
+
+def test_ctf_web_focus_prompt_not_injected_for_non_web_or_pentest():
+    crypto = Challenge(id="crypto", name="crypto", category="crypto",
+                       flag_format=r"flag\{.*?\}")
+    assert "## CTF web focus / workflow" not in _cli_solver(crypto, kb=False)._build_prompt()
+
+    pentest = Challenge(id="pt", name="pt", category="web", mode="pentest",
+                        goal="Assess the web app", flag_format=r"flag\{.*?\}")
+    assert "## CTF web focus / workflow" not in _cli_solver(pentest, kb=False)._build_prompt()
+
+
+def test_direction_prompt_block_injected_when_env_set(tmp_path, monkeypatch):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Direction: PWN. Use pwntools.", encoding="utf-8")
+    monkeypatch.setenv("DSWARM_DIRECTION_PROMPT", str(prompt))
+    ch = Challenge(id="pwn", name="pwn", category="pwn",
+                   flag_format=r"flag\{.*?\}")
+    built = _cli_solver(ch, kb=False)._build_prompt()
+    assert "## Direction tool & environment briefing" in built
+    assert "pwntools" in built
+
+
+def test_direction_prompt_block_empty_when_unset(monkeypatch):
+    monkeypatch.delenv("DSWARM_DIRECTION_PROMPT", raising=False)
+    ch = Challenge(id="web", name="web", category="web",
+                   flag_format=r"flag\{.*?\}")
+    built = _cli_solver(ch, kb=False)._build_prompt()
+    assert "Direction tool & environment briefing" not in built
+
+
+def test_explore_prompt_injects_direction_block(tmp_path, monkeypatch):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Direction: PWN. Use pwntools and gdb.", encoding="utf-8")
+    monkeypatch.setenv("DSWARM_DIRECTION_PROMPT", str(prompt))
+    ch = Challenge(id="pwn", name="pwn", category="pwn",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+    s.mode = "explore"
+    s.intent_goal = "Leak the canary"
+    built = s._build_explore_prompt()
+    assert "## Direction tool & environment briefing" in built
+    assert "pwntools" in built
+
+
+def test_web_direction_prompt_documents_no_non_web_port_drift():
+    prompt = (
+        Path(__file__).resolve().parents[1]
+        / "docker" / "worker-pi" / "directions" / "web" / "prompt.md"
+    )
+    text = prompt.read_text(encoding="utf-8")
+    assert "precise single-request probes over noisy full scans" in text
+    assert "port/service enumeration scoped to what the challenge text" in text
 
 
 def test_extract_flag_prefers_found_flag_marker():
@@ -668,7 +802,7 @@ def test_extract_flag_ignores_none_marker():
 def test_extract_flag_does_NOT_blind_scan_prose():
     # POLICY CHANGE (run-4305): we no longer blind-scan the transcript for a
     # flag_format-shaped token. A flag mentioned only in prose, with no FOUND_FLAG=
-    # marker, is NOT a claim — extracting it was the source of every false positive
+    # marker, is NOT a claim 鈥?extracting it was the source of every false positive
     # (run-1619/run-3613/run-4305). The flag is the worker's explicit claim only.
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch)
@@ -678,8 +812,8 @@ def test_extract_flag_does_NOT_blind_scan_prose():
 
 
 def test_extract_flag_ignores_prose_sentence_run_4305():
-    # the exact run-4305 shape: a reasoning sentence whose greedy {…} the old scan
-    # scooped up as a flag. No marker → None.
+    # the exact run-4305 shape: a reasoning sentence whose greedy {鈥 the old scan
+    # scooped up as a flag. No marker 鈫?None.
     ch = Challenge(id="t", name="t", category="crypto",
                    flag_format=r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
     s = _cli_solver(ch)
@@ -698,7 +832,7 @@ def test_gate_rejects_flag_not_in_output():
 
 def test_launder_still_rejects_grep_from_disk_steal():
     """#3: the run-11551 grep-from-disk launder MUST stay rejected. The worker reads
-    another run's persisted log/winner and restates the flag as its own — a READ action
+    another run's persisted log/winner and restates the flag as its own 鈥?a READ action
     next to an internal-storage filename, scanned over the whole output (the restate can
     be arbitrarily far from the read)."""
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
@@ -720,14 +854,14 @@ def test_launder_does_not_reject_genuine_flag_mentioning_path():
     real flags refused, operator stuck at a false 1/4)."""
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch)
-    # target serves a path literally named winner.json — no read action by the worker
+    # target serves a path literally named winner.json 鈥?no read action by the worker
     served = ("GET /winner.json HTTP/1.1 -> 200\n"
               "the response body contained flag{real_recovered}\n")
     assert s._flag_ok("flag{real_recovered}", served) is True
     # a forensics challenge whose artifact string mentions shared_graph.db, flag found
     forensic = ("strings dump mentions a file named shared_graph.db in the pcap\n"
                 "but the actual flag decoded from the payload is flag{from_pcap}\n")
-    # NOTE: this transcript DOES contain a read verb ("strings") — but it's reading the
+    # NOTE: this transcript DOES contain a read verb ("strings") 鈥?but it's reading the
     # CHALLENGE artifact, not internal storage. This is the residual edge the report
     # flags as acceptable (a read verb + an internal filename mention together is rare
     # in a genuine solve); we keep the conservative reject here to preserve the
@@ -735,7 +869,7 @@ def test_launder_does_not_reject_genuine_flag_mentioning_path():
     assert s._flag_ok("flag{from_pcap}", forensic) is False
 
 
-# ── multi-flag worker layer (Phase 2) ────────────────────────────────────────
+# 鈹€鈹€ multi-flag worker layer (Phase 2) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def test_extract_flags_all_markers_deduped():
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
@@ -762,7 +896,7 @@ def test_accept_flag_dedups_against_already_found():
     assert s._already_found == {"flag{a}", "flag{b}"}
 
 
-# ── flag provenance gate (run-75379) ──────────────────────────────────────────
+# 鈹€鈹€ flag provenance gate (run-75379) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # Three regressions: (a) a reasoning-only FOUND_FLAG that never appears in any tool
 # output is rejected; (b) a flag past char 600 of REAL command output is still
 # accepted (the gate sees the untruncated raw, not the deck-truncated chunk); (c) a
@@ -774,12 +908,12 @@ def _flag_solver():
 
 
 def test_reasoning_only_flag_is_rejected_run75379():
-    """(a) The exact run-75379 BUG①: a worker restates `FOUND_FLAG=flag{x}` in its
+    """(a) The exact run-75379 BUG鈶? a worker restates `FOUND_FLAG=flag{x}` in its
     REASONING (its own claim), and that value appears in NO tool output. The old live
     path passed the reasoning chunk to _stream_markers and gated the flag against the
-    SAME chunk (`flag in raw_output` where raw_output IS the claim) → trivially true →
+    SAME chunk (`flag in raw_output` where raw_output IS the claim) 鈫?trivially true 鈫?
     hallucinated flag laundered through prose. Now reasoning can't source a flag."""
-    from muteki.solver.cli_driver import StreamStep
+    from dswarm.solver.cli_driver import StreamStep
     s = _flag_solver()
     hallucination = ("I confirmed from the real output 2 flags. "
                      "FOUND_FLAG=flag{090099b7-e350-424a-9d68-b5310495403e}")
@@ -793,8 +927,8 @@ def test_reasoning_only_flag_is_rejected_run75379():
 
 def test_tool_result_flag_in_real_output_is_accepted_run75379():
     """The legitimate counterpart to (a): the SAME flag, when it appears in real
-    command output (a tool_result), IS accepted — provenance traces to evidence."""
-    from muteki.solver.cli_driver import StreamStep
+    command output (a tool_result), IS accepted 鈥?provenance traces to evidence."""
+    from dswarm.solver.cli_driver import StreamStep
     s = _flag_solver()
     real = "root@dc:~# type flag.txt\nFOUND_FLAG=flag{real-from-output}\n"
     asyncio.run(s._emit_step(StreamStep("tool_result", text=real, raw=real)))
@@ -802,12 +936,33 @@ def test_tool_result_flag_in_real_output_is_accepted_run75379():
     assert s._stream_accepted == ["flag{real-from-output}"]
 
 
+def test_tool_result_bare_flag_without_marker_is_accepted():
+    """The run-0863 shape: pi prints the flag directly at the end of curl output
+    without a FOUND_FLAG= marker. The live raw-output seam must gate and accept it,
+    instead of only showing 'live flag candidate in real output'."""
+    from dswarm.solver.cli_driver import StreamStep
+    s = _flag_solver()
+    real = "=== PAYLOAD ===\n...source dump...\nflag{ac1c0b43599e91b7af7e56f5ef2f05aa}\n"
+    asyncio.run(s._emit_step(StreamStep("tool_result", text=real, raw=real)))
+    assert s._already_found == {"flag{ac1c0b43599e91b7af7e56f5ef2f05aa}"}
+    assert s._stream_accepted == ["flag{ac1c0b43599e91b7af7e56f5ef2f05aa}"]
+
+
+def test_tool_result_css_brace_is_not_accepted_as_bare_flag():
+    from dswarm.solver.cli_driver import StreamStep
+    s = _flag_solver()
+    css = '<style>#app{position:fixed;top:0;left:0;width:100%;bottom:50px;overflow-y:auto;}</style>\n'
+    asyncio.run(s._emit_step(StreamStep("tool_result", text=css, raw=css)))
+    assert s._already_found == set()
+    assert s._stream_accepted == []
+
+
 def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
     """(b) the stream driver's hidden killer: the live tool_result chunk is
     truncated to 600 chars. A flag that appears PAST char 600 of a command's output is
     absent from the truncated `text`, but the gate must see the full `raw`. Without the
     raw-output gate this real flag would be silently dropped."""
-    from muteki.solver.cli_driver import StreamStep
+    from dswarm.solver.cli_driver import StreamStep
     s = _flag_solver()
     flag = "flag{past-the-600-char-cutoff}"
     # mimic exactly what the drivers now produce: text truncated to 600, raw full.
@@ -822,9 +977,9 @@ def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
 def test_nested_ssh_remote_stdout_flag_accepted_when_captured_run75379():
     """(c) Nested `ssh root@VPS 'cat flag.txt'`: the remote flag is in the REMOTE
     stdout, which the outer ssh forwards into the local tool output. When that output
-    is captured (StreamStep.raw), the flag is gateable and accepted — the run-75379
+    is captured (StreamStep.raw), the flag is gateable and accepted 鈥?the run-75379
     flag04 false-negative is fixed."""
-    from muteki.solver.cli_driver import StreamStep
+    from dswarm.solver.cli_driver import StreamStep
     s = _flag_solver()
     flag = "flag{ebca91d7-from-pivoted-dc}"
     # the outer ssh command's captured output = the remote host's stdout.
@@ -850,7 +1005,7 @@ def test_stream_markers_extracts_and_gates_from_flag_provenance():
     """Unit: when flag_provenance is given, flags are BOTH extracted from and gated
     against THAT corpus, not the (possibly truncated) display chunk. The FOUND_FLAG
     marker can sit past char 600 of `text`, so reading it out of `text` would miss it
-    entirely — it must come from the raw provenance."""
+    entirely 鈥?it must come from the raw provenance."""
     s = _flag_solver()
     # the display chunk has no marker at all; the raw provenance carries the real one
     # (e.g. the marker landed past the 600-char truncation point).
@@ -870,7 +1025,7 @@ def test_stream_markers_extracts_and_gates_from_flag_provenance():
 
 def test_surface_unverified_flags_emits_for_untraceable_claim_run75379():
     """A FOUND_FLAG the worker CLAIMED that traces to NO captured output is surfaced to
-    the operator as `flag_unverified` (not silently dropped, not auto-solved) — the
+    the operator as `flag_unverified` (not silently dropped, not auto-solved) 鈥?the
     nested-ssh false-negative guard."""
     s = _flag_solver()
     transcript = "FOUND_FLAG=flag{claimed-no-trace}\nI read it on the DC.\n"
@@ -881,7 +1036,7 @@ def test_surface_unverified_flags_emits_for_untraceable_claim_run75379():
     assert len(unv) == 1
     assert unv[0].payload.get("flag") == "flag{claimed-no-trace}"
     assert unv[0].payload.get("reason")   # operator-facing reason present
-    # an ACCEPTED flag is verified, not unverified — no event for it.
+    # an ACCEPTED flag is verified, not unverified 鈥?no event for it.
     s2 = _flag_solver()
     asyncio.run(s2._accept_flag("flag{accepted}"))
     asyncio.run(s2._surface_unverified_flags("FOUND_FLAG=flag{accepted}\n"))
@@ -903,10 +1058,10 @@ def test_persist_raw_tool_output_ring_trims_to_cap():
     assert "flag{freshest}" in s._provenance_corpus()
 
 
-# ── driver-level: tool_result carries untruncated raw (run-75379) ─────────────
+# 鈹€鈹€ driver-level: tool_result carries untruncated raw (run-75379) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def test_single_flag_prompt_has_no_multiflag_block():
-    # expected_flags=1 (default) → the prompt must NOT carry the multi-flag block,
+    # expected_flags=1 (default) 鈫?the prompt must NOT carry the multi-flag block,
     # keeping single-flag runs byte-identical.
     ch = Challenge(id="t", name="t", category="web")
     s = _cli_solver(ch)
@@ -931,7 +1086,7 @@ def test_expected_flags_helper_clamps():
                                  expected_flags=4))._expected_flags() == 4
 
 
-# ── external-USD cost accounting (shelled CLI bills in dollars) ───────────────
+# 鈹€鈹€ external-USD cost accounting (shelled CLI bills in dollars) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def test_add_external_usd_bumps_ledger_and_emits():
     events = []
@@ -978,7 +1133,7 @@ def test_add_external_usd_records_tokens_at_zero_cost():
     assert p["tokens"] == 27170 and p["input_tokens"] == 27140 and p["output_tokens"] == 30
 
 
-# ── blackboard collaboration lifecycle (OneNote board) ───────────────────────
+# 鈹€鈹€ blackboard collaboration lifecycle (OneNote board) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class _CaptureBus:
     def __init__(self): self.events = []
@@ -986,7 +1141,7 @@ class _CaptureBus:
 
 
 class _StubDriver:
-    """A CLI driver that returns a canned transcript — no subprocess."""
+    """A CLI driver that returns a canned transcript 鈥?no subprocess."""
     name = "pi"
     def __init__(self, text): self._text = text
     def new_session(self): return "sess-x"
@@ -1008,8 +1163,8 @@ def _worker_statuses(events):
 def _run_cli_solver(monkeypatch, transcript):
     """Run a CliSolver with the streaming runner stubbed to return `transcript`
     (CliSolver streams when a bus is present). Returns the bus + solver."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -1083,8 +1238,8 @@ def test_record_fact_db_failure_does_not_emit_blackboard_fact():
 
 
 def test_cli_solver_worker_status_reports_timeout(monkeypatch):
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
 
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
@@ -1128,8 +1283,8 @@ def test_cli_solver_worker_status_reports_timeout(monkeypatch):
 
 
 def test_cli_streaming_emits_busy_heartbeat_during_silent_turn(monkeypatch, tmp_path):
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
 
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
@@ -1180,7 +1335,7 @@ def test_cli_solver_worker_status_reports_asyncio_cancel(monkeypatch):
     assert statuses[-1].payload["reason"] == "cancelled"
 
 
-# ── Explore mode (one intent at a time) ──────────────────────────────────────
+# 鈹€鈹€ Explore mode (one intent at a time) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def test_cli_solver_explore_mode_produces_structured_facts():
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
@@ -1200,13 +1355,13 @@ def test_extract_structured_facts_parses_markers():
     text = (
         "probing /login ...\n"
         "VERIFIED_FACT=login form has no CSRF token\n"
-        "VERIFIED_FACT=admin:admin returns 302 → /dashboard\n"
+        "VERIFIED_FACT=admin:admin returns 302 鈫?/dashboard\n"
         "DEADEND=XSS on search param is sanitized server-side\n"
         "FOUND_FLAG=flag{easy}\n"
     )
     facts, deadends = s._extract_structured_facts(text)
     assert facts == ["login form has no CSRF token",
-                     "admin:admin returns 302 → /dashboard"]
+                     "admin:admin returns 302 鈫?/dashboard"]
     assert deadends == ["XSS on search param is sanitized server-side"]
 
 
@@ -1218,8 +1373,8 @@ def test_extract_structured_facts_empty_on_no_markers():
 
 
 def test_explore_emits_intent_claimed_and_structured_facts(monkeypatch):
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -1247,7 +1402,7 @@ def test_explore_emits_intent_claimed_and_structured_facts(monkeypatch):
 
 
 def test_explore_prompt_includes_intent_graph_neighborhood(tmp_path):
-    from muteki.swarm.shared_graph import SQLiteSharedGraph
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -1271,13 +1426,13 @@ def test_explore_prompt_includes_intent_graph_neighborhood(tmp_path):
 
 def test_explore_solved_concludes_intent_without_fact_seq(monkeypatch, tmp_path):
     """#13 regression: an explore worker that ACCEPTS a flag but records NO fact-seq
-    (only FOUND_FLAG, no VERIFIED_FACT → _last_fact_seq stays unset) must STILL conclude
+    (only FOUND_FLAG, no VERIFIED_FACT 鈫?_last_fact_seq stays unset) must STILL conclude
     its intent (status='done'). The solved branch used to be gated on `lfs is not None`,
     so such an intent stayed status='claimed'; its lease expired and the already-solved
     direction was re-dispatched (run-11190 churn). The other three exits already
-    concluded unconditionally — this was the last gated one."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    concluded unconditionally 鈥?this was the last gated one."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
 
     ch, g = _real_graph(tmp_path)
     g.propose_intent(actor="reason", intent_id="I-solve", goal="probe /admin")
@@ -1286,7 +1441,7 @@ def test_explore_solved_concludes_intent_without_fact_seq(monkeypatch, tmp_path)
 
     s = _cli_solver(ch, kb=False, shared_graph=g, mode="explore",
                     intent_goal="probe /admin", intent_id="I-solve")
-    # transcript has ONLY a flag — no VERIFIED_FACT → _last_fact_seq never set → lfs None
+    # transcript has ONLY a flag 鈥?no VERIFIED_FACT 鈫?_last_fact_seq never set 鈫?lfs None
     canned = lambda *a, **k: CliResult(text="FOUND_FLAG=flag{got_it}\n", session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", canned)
     monkeypatch.setattr(mod, "run_cli", canned)
@@ -1296,6 +1451,69 @@ def test_explore_solved_concludes_intent_without_fact_seq(monkeypatch, tmp_path)
     assert s._last_fact_seq <= 0, "test premise: no fact-seq was recorded"
     assert _intent_status(g, "I-solve") == "done", \
         "a solved explore intent with no fact-seq must still be concluded"
+
+
+def test_explore_tail_stream_delta_not_recorded_as_fact(monkeypatch, tmp_path):
+    """run-3157 seq 16: an explore worker whose only "output" is a pi stream
+    envelope (`{"type":"agent_settled"}`) must NOT record it as a candidate fact
+    — the tail-summary filter was only wired into the bootstrap path."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    ch, g = _real_graph(tmp_path)
+    g.propose_intent(actor="reason", intent_id="I-e", goal="probe /admin")
+    s = _cli_solver(ch, kb=False, shared_graph=g, mode="explore",
+                    intent_goal="probe /admin", intent_id="I-e", bus=_CaptureBus())
+    canned = lambda *a, **k: CliResult(text='{"type":"agent_settled"}', session="sess-x")
+    monkeypatch.setattr(mod, "run_cli_streaming", canned)
+    monkeypatch.setattr(mod, "run_cli", canned)
+    asyncio.run(s.run())
+    facts = [e for e in s.bus.events
+             if e.event_type is EventType.BLACKBOARD_DELTA
+             and e.payload.get("kind") == "fact_added"]
+    assert facts, "the explore worker should still record a (fallback) fact"
+    for e in facts:
+        assert "agent_settled" not in str(e.payload.get("fact", "")), e.payload
+    # the fallback fact is the honest "(no output)" tail, not a protocol line.
+    assert any("(no output)" in str(e.payload.get("fact", "")) for e in facts)
+
+
+def test_thinking_findings_backfilled_as_candidate_facts(monkeypatch, tmp_path):
+    """run-3155..3158: a recon/explore worker that gets cut off before writing
+    VERIFIED_FACT markers leaves the board nearly empty. Its analysis lives in the
+    persisted pi-session `thinking` blocks — the backfill mines those lines and
+    records them as CANDIDATE facts (never verified)."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    sess_dir = tmp_path / ".pi-sessions"
+    sess_dir.mkdir()
+    (sess_dir / "2026-01-01T00-00-00-000Z_sess-abc.jsonl").write_text(
+        "\n".join([
+            '{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The PHP app at http://127.0.0.1:80 is reachable via XXE/SSRF from the preview endpoint."}]}}',
+            '{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me fuzz harder with bigger wordlists."}]}}',
+            '{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Should I try SSTI next?"}]}}',
+            '{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"noise"}]}}',
+        ]),
+        encoding="utf-8",
+    )
+
+    ch, g = _real_graph(tmp_path)
+    g.propose_intent(actor="reason", intent_id="I-t", goal="recon")
+    s = _cli_solver(ch, kb=False, shared_graph=g, mode="explore",
+                    intent_goal="recon", intent_id="I-t", bus=_CaptureBus(),
+                    workdir=str(tmp_path))
+    canned = lambda *a, **k: CliResult(text="no structured markers", session="sess-abc")
+    monkeypatch.setattr(mod, "run_cli_streaming", canned)
+    monkeypatch.setattr(mod, "run_cli", canned)
+    asyncio.run(s.run())
+    facts = [str(e.payload.get("fact", "")) for e in s.bus.events
+             if e.event_type is EventType.BLACKBOARD_DELTA
+             and e.payload.get("kind") == "fact_added"]
+    joined = " | ".join(facts)
+    assert "XXE/SSRF" in joined, joined           # the real finding was mined
+    assert "fuzz harder" not in joined, joined    # filler/planning line skipped
+    assert "Should I try SSTI" not in joined      # question skipped
 
 
 def _open_or_claimed_ids(g):
@@ -1323,8 +1541,8 @@ def test_explore_conclude_fallback_fires_on_no_markers(monkeypatch):
     """If the main explore pass produces no structured markers, the conclude
     fallback fires (build_resume with EXPLORE_CONCLUDE_PROMPT) and the
     conclude output is parsed for markers."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -1347,13 +1565,13 @@ def test_explore_conclude_fallback_fires_on_no_markers(monkeypatch):
     assert "dead_end" in kinds
 
 
-# ── live streaming (the deck shows the worker working, not a dead pause) ──────
+# 鈹€鈹€ live streaming (the deck shows the worker working, not a dead pause) 鈹€鈹€鈹€鈹€鈹€鈹€
 
 @pytest.mark.posix
 def test_run_cli_streaming_fires_on_step_per_line(tmp_path):
     # end-to-end: a fake echo command emits two JSONL lines; on_step sees both,
     # and parse() builds the final result from the accumulated stdout.
-    from muteki.solver.cli_driver import run_cli_streaming, StreamStep
+    from dswarm.solver.cli_driver import run_cli_streaming, StreamStep
     d = PiDriver()
     line1 = '{"type":"assistant","message":{"content":[{"type":"text","text":"step one"}]}}'
     line2 = '{"type":"result","result":"FOUND_FLAG=flag{ok}","session_id":"z"}'
@@ -1368,7 +1586,7 @@ def test_run_cli_streaming_fires_on_step_per_line(tmp_path):
     assert res.session == "z"
 
 
-# ── dispatcher control: blackboard context + cancel + pause ───────────────────
+# 鈹€鈹€ dispatcher control: blackboard context + cancel + pause 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class _StubGraph:
     """A minimal SharedGraph stand-in: a fixed to_summary() + capture writes."""
@@ -1402,7 +1620,7 @@ def test_board_context_fallback_inlines_when_no_file_written():
 
 def test_flag_hint_token_mode_does_not_say_brace(monkeypatch):
     # run-11189: a token/collect challenge's prompt must NOT tell the worker the
-    # flag is shaped like flag{...} (it has none) — that suppresses FOUND_FLAG=.
+    # flag is shaped like flag{...} (it has none) 鈥?that suppresses FOUND_FLAG=.
     ch_tok = Challenge(id="t", name="ladder", category="misc", flag_format="token",
                        multi_flag=True, expected_flags=14)
     p = _cli_solver(ch_tok, kb=False)._build_prompt()
@@ -1441,7 +1659,7 @@ def test_flag_hint_uses_custom_wrapper_hint():
 
 def test_board_context_pointer_when_file_written():
     # When the loop HAS written the board file, the prompt carries a POINTER to
-    # ./.muteki_board.md (+ the bounded credential digest), NOT the full inline body.
+    # ./.dswarm_board.md (+ the bounded credential digest), NOT the full inline body.
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
     sg = _StubGraph("FACTS:\n- admin panel at /admin")
@@ -1449,26 +1667,26 @@ def test_board_context_pointer_when_file_written():
     s._board_file_written = True            # simulate the loop's per-turn write
     prompt = s._build_prompt()
     assert "Shared team board" in prompt
-    assert ".muteki_board.md" in prompt     # the pointer
+    assert ".dswarm_board.md" in prompt     # the pointer
     assert "READ IT FIRST" in prompt
-    assert 'python3 "$MUTEKI_BLACKBOARD_SCRIPT" read-review' in prompt
-    assert 'python3 "$MUTEKI_BLACKBOARD_SCRIPT" read-deadends' in prompt
-    assert 'python3 "$MUTEKI_BLACKBOARD_SCRIPT" read-facts' in prompt
-    assert 'python3 "$MUTEKI_BLACKBOARD_SCRIPT" write-fact "<fact>" --verified' in prompt
+    assert 'python3 "$DSWARM_BLACKBOARD_SCRIPT" read-review' in prompt
+    assert 'python3 "$DSWARM_BLACKBOARD_SCRIPT" read-deadends' in prompt
+    assert 'python3 "$DSWARM_BLACKBOARD_SCRIPT" read-facts' in prompt
+    assert 'python3 "$DSWARM_BLACKBOARD_SCRIPT" write-fact "<fact>" --verified' in prompt
     # the full inline fact body is NOT dumped into the prompt (it's in the file)
     assert "admin panel at /admin" not in prompt
 
 
 def test_board_context_empty_when_no_graph_or_empty_summary():
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
-    # no shared graph at all → no board section
+    # no shared graph at all 鈫?no board section
     assert "Shared team board" not in _cli_solver(ch, kb=False)._build_prompt()
-    # graph present but board empty → still no section (don't inject noise)
+    # graph present but board empty 鈫?still no section (don't inject noise)
     s = _cli_solver(ch, kb=False, shared_graph=_StubGraph("   "))
     assert "Shared team board" not in s._build_prompt()
 
 
-# ── Board file-handoff (DESIGN_board_file_handoff) ───────────────────────────
+# 鈹€鈹€ Board file-handoff (DESIGN_board_file_handoff) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # Full board written to a workdir file + pointer/digest in the prompt; the chain
 # is derived from VERIFIED fact TEXT (P2A), never from graph edges. These use a
 # REAL SQLiteSharedGraph so the file body / extraction is exercised end to end.
@@ -1476,8 +1694,8 @@ def test_board_context_empty_when_no_graph_or_empty_summary():
 import tempfile  # noqa: E402
 from pathlib import Path as _P  # noqa: E402
 
-from muteki.swarm.shared_graph import SQLiteSharedGraph  # noqa: E402
-from muteki.solver.workspace import materialize_shared_artifact  # noqa: E402
+from dswarm.swarm.shared_graph import SQLiteSharedGraph  # noqa: E402
+from dswarm.solver.workspace import materialize_shared_artifact  # noqa: E402
 
 
 def _real_graph(tmp_path, facts=(), deadends=()):
@@ -1500,8 +1718,8 @@ def test_write_board_file_full_untruncated(tmp_path):
     s = _cli_solver(ch, kb=False, shared_graph=g)
     wd = _P(tempfile.mkdtemp())
     assert s._write_board_file(wd) is True
-    body = (wd / ".muteki_board.md").read_text()
-    assert "muteki-team-board" in body            # sentinel
+    body = (wd / ".dswarm_board.md").read_text()
+    assert "dswarm-team-board" in body            # sentinel
     assert "Recovered credentials" in body         # P2A section on top
     assert "PW0aB" in body and "PW39aB" in body     # FIRST and LAST fact both present
     import shutil; shutil.rmtree(wd, ignore_errors=True)
@@ -1511,14 +1729,14 @@ def test_write_board_file_collision_does_not_clobber(tmp_path):
     ch, g = _real_graph(tmp_path, facts=[("cli-c", "ghost1 password PWaB1xyz works, whoami ghost1", True)])
     s = _cli_solver(ch, kb=False, shared_graph=g)
     wd = _P(tempfile.mkdtemp())
-    (wd / ".muteki_board.md").write_text("CHALLENGE DATA not a board")
+    (wd / ".dswarm_board.md").write_text("CHALLENGE DATA not a board")
     assert s._write_board_file(wd) is False          # refuses to clobber
-    assert "CHALLENGE DATA" in (wd / ".muteki_board.md").read_text()
+    assert "CHALLENGE DATA" in (wd / ".dswarm_board.md").read_text()
     import shutil; shutil.rmtree(wd, ignore_errors=True)
 
 
 def test_write_board_file_rewrites_own_file(tmp_path):
-    # our own board file (sentinel present) IS overwritten on the next turn → fresh.
+    # our own board file (sentinel present) IS overwritten on the next turn 鈫?fresh.
     ch, g = _real_graph(tmp_path, facts=[("cli-c", "ghost1 password PWaB1xyz works, whoami ghost1", True)])
     s = _cli_solver(ch, kb=False, shared_graph=g)
     wd = _P(tempfile.mkdtemp())
@@ -1526,7 +1744,7 @@ def test_write_board_file_rewrites_own_file(tmp_path):
     g.add_evidence(actor="cli-c", source="c",
                    fact="ghost2 password PWaB2xyz works, logged in as ghost2", verified=True)
     assert s._write_board_file(wd) is True           # overwrites own file
-    assert "ghost2:PWaB2xyz" in (wd / ".muteki_board.md").read_text()
+    assert "ghost2:PWaB2xyz" in (wd / ".dswarm_board.md").read_text()
     import shutil; shutil.rmtree(wd, ignore_errors=True)
 
 
@@ -1538,13 +1756,13 @@ def test_write_board_file_is_run_level_single_file_symlinked_to_workers(tmp_path
     wd2 = workspace / "workers" / "cli-pi-2"
     assert s._write_board_file(wd1) is True
     assert s._write_board_file(wd2) is True
-    root_board = workspace / ".muteki_board.md"
+    root_board = workspace / ".dswarm_board.md"
     assert root_board.exists()
-    assert (wd1 / ".muteki_board.md").is_symlink()
-    assert (wd2 / ".muteki_board.md").is_symlink()
-    assert (wd1 / ".muteki_board.md").resolve() == root_board
-    assert (wd2 / ".muteki_board.md").resolve() == root_board
-    assert root_board.stat().st_ino == (wd1 / ".muteki_board.md").resolve().stat().st_ino
+    assert (wd1 / ".dswarm_board.md").is_symlink()
+    assert (wd2 / ".dswarm_board.md").is_symlink()
+    assert (wd1 / ".dswarm_board.md").resolve() == root_board
+    assert (wd2 / ".dswarm_board.md").resolve() == root_board
+    assert root_board.stat().st_ino == (wd1 / ".dswarm_board.md").resolve().stat().st_ino
 
 
 def test_defect0_accept_flag_records_on_shared_graph(tmp_path):
@@ -1566,14 +1784,14 @@ def test_defect0_accept_flag_records_on_shared_graph(tmp_path):
 
 
 def test_defect1_solved_claim_downgraded_not_verified(tmp_path):
-    """P0 defect-1: a bare 'solved / 已解 / task complete' claim must NOT become a
+    """P0 defect-1: a bare 'solved / 宸茶В / task complete' claim must NOT become a
     VERIFIED evidence fact (run-42599: 28 solved-like verified facts poisoned the
     board). It's downgraded to an unverified candidate; only the flag gate decides
     completion."""
     ch, g = _real_graph(tmp_path)
     s = _cli_solver(ch, kb=False, shared_graph=g)
 
-    # a completion CLAIM with no flag → recorded UNVERIFIED (downgraded)
+    # a completion CLAIM with no flag 鈫?recorded UNVERIFIED (downgraded)
     asyncio.run(s._record_fact("the challenge is solved, task complete",
                                verified=True, artifact_id=""))
     snap = g.snapshot()
@@ -1581,20 +1799,20 @@ def test_defect1_solved_claim_downgraded_not_verified(tmp_path):
     assert claims and claims[-1]["verified"] is False, \
         "a solved-claim must be downgraded to unverified, not trusted as evidence"
 
-    # a 已解 claim (zh) likewise downgraded
-    asyncio.run(s._record_fact("已解，本来就不需要打 .154", verified=True, artifact_id=""))
+    # a 宸茶В claim (zh) likewise downgraded
+    asyncio.run(s._record_fact("宸茶В锛屾湰鏉ュ氨涓嶉渶瑕佹墦 .154", verified=True, artifact_id=""))
     zh = [e for e in g.events() if e["kind"] == "fact_added"][-1]
     assert zh["verified"] is False
 
-    # REAL evidence (no completion claim) stays verified — not over-broad
+    # REAL evidence (no completion claim) stays verified 鈥?not over-broad
     asyncio.run(s._record_fact("admin panel reachable at /admin, returns 200",
                                verified=True, artifact_id="art1"))
     real = [e for e in g.events() if e["kind"] == "fact_added"][-1]
     assert real["verified"] is True, "concrete evidence must stay verified"
 
-    # once this worker holds a real gated flag, its claims are earned → not downgraded
+    # once this worker holds a real gated flag, its claims are earned 鈫?not downgraded
     asyncio.run(s._accept_flag("flag{got_it}"))
-    asyncio.run(s._record_fact("challenge solved — flag recovered",
+    asyncio.run(s._record_fact("challenge solved 鈥?flag recovered",
                                verified=True, artifact_id="art2"))
     earned = [e for e in g.events() if e["kind"] == "fact_added"][-1]
     assert earned["verified"] is True
@@ -1602,14 +1820,14 @@ def test_defect1_solved_claim_downgraded_not_verified(tmp_path):
 
 def test_defect2_progress_block_reads_shared_graph(tmp_path):
     """P0 defect-2: multi-flag PROGRESS block reads N/total from the SHARED graph
-    (defect-0 made it the durable source) — so a worker sees flags a teammate found,
-    not just its own _already_found. Single-flag challenge → empty (byte-identical)."""
+    (defect-0 made it the durable source) 鈥?so a worker sees flags a teammate found,
+    not just its own _already_found. Single-flag challenge 鈫?empty (byte-identical)."""
     ch = Challenge(id="t", name="multi", category="web", points=0,
                    flag_format=r"flag\{.*?\}", expected_flags=3)
     _, g = _real_graph(tmp_path)
     s = _cli_solver(ch, kb=False, shared_graph=g)
 
-    # a teammate found one flag → it's on the shared graph, NOT this worker's set
+    # a teammate found one flag 鈫?it's on the shared graph, NOT this worker's set
     g.flag_found(actor="cli-sibling", flag="flag{one}")
     block = s._team_context_block()
     assert "3 flags" in block and "1/3 captured" in block and "2 remaining" in block
@@ -1631,17 +1849,17 @@ def test_defect2_single_flag_block_empty(tmp_path):
 
 def test_defect8_unbacked_evidence_downgraded_to_candidate(tmp_path):
     """P0 defect-8: a VERIFIED evidence fact with NO provenance artifact is an
-    unbacked assertion (the no-evidence hallucination) → downgraded to an unverified
+    unbacked assertion (the no-evidence hallucination) 鈫?downgraded to an unverified
     candidate. A fact WITH an artifact stays verified."""
     ch, g = _real_graph(tmp_path)
     s = _cli_solver(ch, kb=False, shared_graph=g)
 
-    # no artifact → downgraded
+    # no artifact 鈫?downgraded
     asyncio.run(s._record_fact("the database is sqlite", verified=True, artifact_id=""))
     no_art = [e for e in g.events() if e["kind"] == "fact_added"][-1]
     assert no_art["verified"] is False, "unbacked verified fact must be downgraded"
 
-    # with artifact → stays verified
+    # with artifact 鈫?stays verified
     asyncio.run(s._record_fact("admin:hunter2 logs in (HTTP 302 to /dashboard)",
                                verified=True, artifact_id="art-real"))
     art = [e for e in g.events() if e["kind"] == "fact_added"][-1]
@@ -1653,13 +1871,13 @@ def test_write_board_file_no_graph_returns_false():
                               flag_format=r"flag\{.*?\}"), kb=False)
     wd = _P(tempfile.mkdtemp())
     assert s._write_board_file(wd) is False
-    assert not (wd / ".muteki_board.md").exists()
+    assert not (wd / ".dswarm_board.md").exists()
     assert s._board_context() == ""                  # no dangling pointer
     import shutil; shutil.rmtree(wd, ignore_errors=True)
 
 
 def test_write_board_file_failure_falls_back_to_inline(tmp_path):
-    # if the write raises, _board_context must NOT emit a pointer — it inlines.
+    # if the write raises, _board_context must NOT emit a pointer 鈥?it inlines.
     ch, g = _real_graph(tmp_path, facts=[("cli-c", "ghost1 password PWaB1xyz works, whoami ghost1", True)])
     s = _cli_solver(ch, kb=False, shared_graph=g)
     # point the write at a path that can't be created (a file as a parent dir)
@@ -1667,7 +1885,7 @@ def test_write_board_file_failure_falls_back_to_inline(tmp_path):
     assert s._write_board_file(bad_parent / "sub") is False
     assert s._board_file_written is False
     prompt = s._build_prompt()
-    assert ".muteki_board.md" not in prompt          # NO dangling pointer
+    assert ".dswarm_board.md" not in prompt          # NO dangling pointer
     assert "Shared team board" in prompt             # but inline fallback present
     import os as _os; _os.remove(bad_parent)
 
@@ -1694,8 +1912,8 @@ def test_canonical_credentials_rejects_ssh_config_flags(tmp_path):
     # run-10070 regression: an SSH-options fact produced a false-positive
     # `ghost0:Authentication=no` row. SSH/config flag assignments are not passwords.
     facts = [
-        ("cli-c", "ghost0/ghost1 登录成功；除 -o PubkeyAuthentication=no -o "
-                  "StrictHostKeyChecking=no 外还需 IdentitiesOnly=yes", True),
+        ("cli-c", "ghost0/ghost1 鐧诲綍鎴愬姛锛涢櫎 -o PubkeyAuthentication=no -o "
+                  "StrictHostKeyChecking=no 澶栬繕闇€ IdentitiesOnly=yes", True),
         ("cli-c", "ghost1 login succeeds with password W3lc0m3T0Gh0st; whoami ghost1", True),
     ]
     ch, g = _real_graph(tmp_path, facts=facts)
@@ -1816,19 +2034,19 @@ def test_planner_gets_untruncated_summary(tmp_path):
     full = g.to_summary(max_evidence=10**9)
     assert "fact number 0 confirmed" in full          # earliest survives
     assert "fact number 29 confirmed" in full
-    capped = g.to_summary()                            # default 16 → early ones dropped
+    capped = g.to_summary()                            # default 16 鈫?early ones dropped
     assert "fact number 0 confirmed" not in capped
 
 
 def test_run_loop_writes_board_file_into_worker_cwd(monkeypatch, tmp_path):
     # END-TO-END: a real CliSolver.run() loop, real SQLiteSharedGraph pre-seeded
-    # with the unlock chain, explicit workdir. Assert .muteki_board.md actually
-    # lands in the worker's cwd with the credential chain — the full P1 wiring.
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    # with the unlock chain, explicit workdir. Assert .dswarm_board.md actually
+    # lands in the worker's cwd with the credential chain 鈥?the full P1 wiring.
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
 
     facts = [("cli-c", f"ghost{i} login succeeds with password PWvalue{i}; whoami ghost{i}",
-              True) for i in range(20)]   # 20 > old 16-cap → proves no truncation
+              True) for i in range(20)]   # 20 > old 16-cap 鈫?proves no truncation
     ch, g = _real_graph(tmp_path, facts=facts)
     wd = _P(tempfile.mkdtemp())
     bus = _CaptureBus()
@@ -1839,19 +2057,19 @@ def test_run_loop_writes_board_file_into_worker_cwd(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "run_cli", canned)
     asyncio.run(s.run())
 
-    board = wd / ".muteki_board.md"
+    board = wd / ".dswarm_board.md"
     assert board.exists(), "board file was not written into the worker cwd"
     body = board.read_text()
     assert "ghost0:PWvalue0" in body and "ghost19:PWvalue19" in body  # first+last, no truncation
-    assert "muteki-team-board" in body
+    assert "dswarm-team-board" in body
     import shutil; shutil.rmtree(wd, ignore_errors=True)
 
 
 def test_bootstrap_extracts_structured_facts(monkeypatch):
     # bug #1 fix: bootstrap workers now contribute structured facts/dead-ends to
     # the board AS THEY GO (via output markers), not just one end-of-run summary.
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -1894,14 +2112,14 @@ def test_cli_solver_cancel_sets_event_and_kills_procs():
 
 
 def test_on_proc_kills_immediately_if_already_cancelled():
-    # race: cancel fired before the subprocess registered → kill it on register.
+    # race: cancel fired before the subprocess registered 鈫?kill it on register.
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch, kb=False)
     s.cancel()                          # cancel BEFORE any proc exists
 
     class _FakeProc:
         # pid 999999 doesn't exist, so _signal_proc's os.getpgid() raises and it
-        # falls through to proc.kill() — matching the sibling test above. (pid=1 is
+        # falls through to proc.kill() 鈥?matching the sibling test above. (pid=1 is
         # init: as root os.killpg(getpgid(1), SIGKILL) is permitted and returns early,
         # so proc.kill() is never reached and the test fails ONLY when run as root.)
         def __init__(self): self.killed = False; self.pid = 999999
@@ -1918,7 +2136,7 @@ def test_run_cli_streaming_cancel_event_kills_process(tmp_path):
     # when the cancel_event fires mid-run (not left running until timeout).
     import threading
     import time
-    from muteki.solver.cli_driver import run_cli_streaming
+    from dswarm.solver.cli_driver import run_cli_streaming
 
     d = PiDriver()
     # a script that would run for 30s, emitting a line then sleeping
@@ -1941,14 +2159,14 @@ def test_run_cli_streaming_bare_timeout_kills_silent_process(tmp_path):
     """Finding #4 regression: a BARE call (no cancel/steer events) with a SILENT,
     long-running process must still hit the timeout and be killed. The watcher used to
     only start when cancel_event/steer_event was present, so this call had NO timeout
-    enforcement at all — and a zero-stdout process blocked `for line in proc.stdout`
+    enforcement at all 鈥?and a zero-stdout process blocked `for line in proc.stdout`
     forever. Uses a real subprocess sleep (NOT mocked) and a tiny timeout."""
     import time
-    from muteki.solver.cli_driver import run_cli_streaming
+    from dswarm.solver.cli_driver import run_cli_streaming
 
     d = PiDriver()
     t0 = time.time()
-    # `sleep 30` emits nothing on stdout — the only way out is the watcher's timeout.
+    # `sleep 30` emits nothing on stdout 鈥?the only way out is the watcher's timeout.
     res = run_cli_streaming(d, ["sleep", "30"], cwd=str(tmp_path),
                             timeout=1, on_step=lambda s: None)
     elapsed = time.time() - t0
@@ -1962,7 +2180,7 @@ def test_run_cli_streaming_does_not_hang_on_orphaned_stderr(tmp_path):
     exits. The streaming runner must not block forever in proc.stderr.read(), or the
     worker stays online and keeps its engine/profile lock."""
     import time
-    from muteki.solver.cli_driver import run_cli_streaming
+    from dswarm.solver.cli_driver import run_cli_streaming
 
     d = PiDriver()
     line = '{"type":"result","result":"FOUND_FLAG=flag{ok}","session_id":"z"}'
@@ -1995,7 +2213,7 @@ def test_run_cli_streaming_paused_time_excluded_from_timeout(tmp_path):
     once we clear the event, the now-running clock trips the timeout normally."""
     import threading
     import time
-    from muteki.solver.cli_driver import run_cli_streaming
+    from dswarm.solver.cli_driver import run_cli_streaming
 
     d = PiDriver()
     paused = threading.Event()
@@ -2008,10 +2226,10 @@ def test_run_cli_streaming_paused_time_excluded_from_timeout(tmp_path):
                             timeout=1, on_step=lambda s: None, paused_event=paused)
     elapsed = time.time() - t0
     # It DID eventually time out (after the freeze lifted), but only AFTER the paused
-    # window — proving the paused interval was excluded from the 1s budget.
+    # window 鈥?proving the paused interval was excluded from the 1s budget.
     assert res.timed_out is True
     assert elapsed >= 2.5, (
-        f"timeout fired during the freeze (elapsed {elapsed:.1f}s) — paused time was "
+        f"timeout fired during the freeze (elapsed {elapsed:.1f}s) 鈥?paused time was "
         "NOT excluded from the budget")
     assert elapsed < 8, f"timeout must still fire promptly after resume, took {elapsed:.1f}s"
 
@@ -2021,11 +2239,11 @@ def test_m9_owned_scratch_cleaned_on_cancel(tmp_path):
     CANCELLED mid-body (the in-method rmtree only ran on the no-flag fall-through;
     cancel/exception used to skip it and leak the dir)."""
     import asyncio
-    from muteki.models.solve_graph import Challenge
+    from dswarm.models.solve_graph import Challenge
 
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch, kb=False)
-    scratch = tmp_path / "muteki-cli-scratch"
+    scratch = tmp_path / "dswarm-cli-scratch"
     scratch.mkdir()
     (scratch / "junk.txt").write_text("x")
 
@@ -2047,10 +2265,10 @@ def test_m9_owned_scratch_cleaned_on_cancel(tmp_path):
 
 def test_m9_solved_winner_scratch_is_kept(tmp_path):
     """M9 guard: a SOLVED worker's scratch is its winner artifact (the swarm resumes
-    the session from it) — it must NOT be deleted when it's the returned workdir."""
+    the session from it) 鈥?it must NOT be deleted when it's the returned workdir."""
     import asyncio
-    from muteki.models.solve_graph import Challenge
-    from muteki.solver.types import SolveOutcome
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.solver.types import SolveOutcome
 
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     s = _cli_solver(ch, kb=False)
@@ -2095,7 +2313,7 @@ def test_on_proc_freezes_subprocess_registered_while_paused():
 def test_pause_resume_via_insight_bus_signals_process(monkeypatch):
     # bug #3 fix: a HITL pause GUIDANCE on the InsightBus reaches the live worker
     # and SIGSTOPs its subprocess; resume SIGCONTs it. We capture the signals.
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.swarm.insight_bus import InsightBus
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     bus_insight = InsightBus(challenge_id="t")
     s = _cli_solver(ch, kb=False, insight=bus_insight)
@@ -2106,7 +2324,7 @@ def test_pause_resume_via_insight_bus_signals_process(monkeypatch):
     s._live_procs.add(_FakeProc())
 
     signals = []
-    monkeypatch.setattr("muteki.solver.cli_solver.os.kill",
+    monkeypatch.setattr("dswarm.solver.cli_solver.os.kill",
                         lambda pid, sig: signals.append((pid, sig)))
 
     async def drive():
@@ -2122,11 +2340,28 @@ def test_pause_resume_via_insight_bus_signals_process(monkeypatch):
     assert s._paused is False  # ended resumed
 
 
+def test_stop_via_insight_bus_cancels_worker():
+    from dswarm.swarm.insight_bus import InsightBus
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    bus_insight = InsightBus(challenge_id="t")
+    s = _cli_solver(ch, kb=False, insight=bus_insight)
+    s._insight_inbox = bus_insight.subscribe(s.solver_id)
+    cancelled = []
+    s.cancel = lambda: cancelled.append(True)
+
+    async def drive():
+        await bus_insight.guidance("", action="stop", target="global")
+        s._drain_control()
+
+    asyncio.run(drive())
+    assert cancelled == [True]
+
+
 def test_live_markers_stream_to_board_and_insight_bus():
     # bug #1 (full fix): a VERIFIED_FACT= seen MID-RUN is pushed to the shared graph
     # AND broadcast on the InsightBus immediately, so a racing teammate sees it now.
-    from muteki.solver.cli_driver import StreamStep
-    from muteki.swarm.insight_bus import InsightBus, InsightKind
+    from dswarm.solver.cli_driver import StreamStep
+    from dswarm.swarm.insight_bus import InsightBus, InsightKind
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     sg = _StubGraph("")
     insight = InsightBus(challenge_id="t")
@@ -2154,8 +2389,8 @@ def test_live_markers_stream_to_board_and_insight_bus():
 
 
 def test_live_verified_fact_without_witness_is_candidate_only():
-    from muteki.solver.cli_driver import StreamStep
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.solver.cli_driver import StreamStep
+    from dswarm.swarm.insight_bus import InsightBus
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     sg = _StubGraph("")
     insight = InsightBus(challenge_id="t")
@@ -2171,8 +2406,8 @@ def test_live_verified_fact_without_witness_is_candidate_only():
 
 
 def test_worker_fact_witness_metadata_does_not_replace_witness_check():
-    from muteki.solver.cli_driver import StreamStep
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.solver.cli_driver import StreamStep
+    from dswarm.swarm.insight_bus import InsightBus
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     sg = _StubGraph("")
     insight = InsightBus(challenge_id="t")
@@ -2191,8 +2426,8 @@ def test_worker_fact_witness_metadata_does_not_replace_witness_check():
 
 
 def test_live_dead_end_marker_broadcasts_to_insight_bus():
-    from muteki.solver.cli_driver import StreamStep
-    from muteki.swarm.insight_bus import InsightBus, InsightKind
+    from dswarm.solver.cli_driver import StreamStep
+    from dswarm.swarm.insight_bus import InsightBus, InsightKind
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     sg = _StubGraph("")
     insight = InsightBus(challenge_id="t")
@@ -2208,9 +2443,9 @@ def test_live_dead_end_marker_broadcasts_to_insight_bus():
     assert "rate-limited" in got.text
 
 
-# ── Operator steering: multi-turn loop + guidance capture + target/standing ──
+# 鈹€鈹€ Operator steering: multi-turn loop + guidance capture + target/standing 鈹€鈹€
 # (HITL fusion: hint/redirect/focus reach a live worker via the
-#  next resume turn — headless CLIs can't take input mid-turn.)
+#  next resume turn 鈥?headless CLIs can't take input mid-turn.)
 
 def _steer_solver(**kw):
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
@@ -2221,7 +2456,7 @@ def _steer_solver(**kw):
 def test_drain_control_nonstanding_hint_does_not_steer_live_worker():
     """A normal operator hint is additive guidance, not an interrupt. It must be
     recorded for future prompts without killing the currently running worker."""
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.swarm.insight_bus import InsightBus
     insight = InsightBus(challenge_id="t")
     s = _steer_solver(insight=insight)
     s._insight_inbox = insight.subscribe(s.solver_id)
@@ -2235,21 +2470,21 @@ def test_drain_control_nonstanding_hint_does_not_steer_live_worker():
 def test_drain_control_nonstanding_hint_no_steer_without_active_turn():
     """The steer-kill is gated: a hint replayed from history (no turn running yet)
     must NOT steer-kill a not-yet-started subprocess (the run-40726 regression)."""
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.swarm.insight_bus import InsightBus
     insight = InsightBus(challenge_id="t")
     s = _steer_solver(insight=insight)
     s._insight_inbox = insight.subscribe(s.solver_id)
-    s._turn_active = False  # no subprocess turn → steer must be suppressed
+    s._turn_active = False  # no subprocess turn 鈫?steer must be suppressed
     asyncio.run(insight.guidance("try /admin", action="hint", target="global"))
     s._drain_control()
-    assert not s._steer_event.is_set()     # gated off — no premature kill
+    assert not s._steer_event.is_set()     # gated off 鈥?no premature kill
 
 
 def test_drain_control_redirect_sets_steer_event_no_buffer():
-    """A non-standing redirect ENDS the current pass (intent-level kill) — gated on
-    an active turn — and no longer buffers guidance (the swarm hands the new target
+    """A non-standing redirect ENDS the current pass (intent-level kill) 鈥?gated on
+    an active turn 鈥?and no longer buffers guidance (the swarm hands the new target
     to the next spawned worker)."""
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.swarm.insight_bus import InsightBus
     insight = InsightBus(challenge_id="t")
     s = _steer_solver(insight=insight)
     s._insight_inbox = insight.subscribe(s.solver_id)
@@ -2261,7 +2496,7 @@ def test_drain_control_redirect_sets_steer_event_no_buffer():
 
 
 def test_drain_control_standing_guidance_does_not_steer_live_worker():
-    from muteki.swarm.insight_bus import InsightBus
+    from dswarm.swarm.insight_bus import InsightBus
     insight = InsightBus(challenge_id="t")
     s = _steer_solver(insight=insight)
     s._insight_inbox = insight.subscribe(s.solver_id)
@@ -2309,18 +2544,18 @@ def test_standing_guidance_injected_into_prompt():
     assert "use VPS ssh root@1.2.3.4" in s2._build_explore_prompt()
 
 
-# ── SINGLE-SHOT migration (DESIGN_single_shot_migration.md, M-1) ──────────────
+# 鈹€鈹€ SINGLE-SHOT migration (DESIGN_single_shot_migration.md, M-1) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # The worker no longer lives across turns accumulating context. The three tests
 # below replace the retired multi-turn-loop tests (loops-on-guidance / respects-
 # max-turns / steered-continues): a worker now runs ONE execute pass; mid-run
-# operator guidance does NOT resume it (intent-level HITL → the NEXT spawned
+# operator guidance does NOT resume it (intent-level HITL 鈫?the NEXT spawned
 # worker absorbs it); the ONLY second subprocess call is the conclude fallback.
 def test_single_shot_buffered_guidance_does_not_resume(monkeypatch):
     """Migration: operator guidance dropped mid-run no longer resumes this live
     worker. The worker finishes its one execute pass; guidance reaches the next
     spawned worker, not a resume turn."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2329,7 +2564,7 @@ def test_single_shot_buffered_guidance_does_not_resume(monkeypatch):
 
     def fake_stream(driver, argv, **k):
         calls["n"] += 1
-        # operator drops guidance during the execute pass — recorded for the next
+        # operator drops guidance during the execute pass 鈥?recorded for the next
         # spawned worker (single-shot), must NOT trigger a resume of THIS worker.
         s._standing_guidance.append("try /admin")
         return CliResult(text="FOUND_FLAG=flag{got_it_first_pass}\n", session="sess-x")
@@ -2343,9 +2578,9 @@ def test_single_shot_buffered_guidance_does_not_resume(monkeypatch):
 
 def test_single_shot_one_conclude_fallback_on_timeout(monkeypatch):
     """Migration: a timeout without enough flags triggers AT MOST one conclude
-    fallback (the single-shot model) — exactly two subprocess calls, never a loop."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    fallback (the single-shot model) 鈥?exactly two subprocess calls, never a loop."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2366,10 +2601,10 @@ def test_single_shot_one_conclude_fallback_on_timeout(monkeypatch):
 
 
 def test_single_shot_cancel_skips_conclude(monkeypatch):
-    """Migration: a cancel (sibling won / stop) ends the worker immediately — no
+    """Migration: a cancel (sibling won / stop) ends the worker immediately 鈥?no
     conclude fallback, no resume."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2378,20 +2613,20 @@ def test_single_shot_cancel_skips_conclude(monkeypatch):
 
     def fake_stream(*a, **k):
         calls["n"] += 1
-        # cancelled AND timed_out: cancel must win → no conclude fallback.
+        # cancelled AND timed_out: cancel must win 鈫?no conclude fallback.
         return CliResult(text="killed\n", session="sess-x", cancelled=True, timed_out=True)
 
     monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
     monkeypatch.setattr(mod, "run_cli", fake_stream)
     asyncio.run(s.run())
-    assert calls["n"] == 1                         # cancelled → die now, no conclude
+    assert calls["n"] == 1                         # cancelled 鈫?die now, no conclude
 
 
 def test_single_shot_steer_skips_conclude_and_deadend(monkeypatch):
     """A steer ends this pass so the coordinator can spawn a guided worker. It must
     not resume into CONCLUDE or record a misleading no-output dead-end."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2411,8 +2646,8 @@ def test_single_shot_steer_skips_conclude_and_deadend(monkeypatch):
 
 
 def test_explore_steer_skips_conclude_and_deadend(monkeypatch):
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2435,11 +2670,11 @@ def test_explore_steer_skips_conclude_and_deadend(monkeypatch):
 
 def test_m4_no_flag_worker_exits_clean_without_deadend(monkeypatch):
     """M-4 (never-give-up at swarm layer): a single-shot worker that finds no flag
-    does NOT keep retrying or rationalize a false 'solved' — it exits cleanly after
+    does NOT keep retrying or rationalize a false 'solved' 鈥?it exits cleanly after
     its one pass, returns unsolved, and concludes a DEAD-END for the board. 'Give
     up' is now a clean swarm-level decision (re-bootstrap), not worker self-hypnosis."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2448,7 +2683,7 @@ def test_m4_no_flag_worker_exits_clean_without_deadend(monkeypatch):
 
     def fake_stream(*a, **k):
         calls["n"] += 1
-        # honest "couldn't crack it" — NO flag, NO false-solved claim.
+        # honest "couldn't crack it" 鈥?NO flag, NO false-solved claim.
         return CliResult(text="probed /admin, no auth bypass found\n", session="sess-x")
 
     monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
@@ -2466,8 +2701,8 @@ def test_m4_no_flag_worker_exits_clean_without_deadend(monkeypatch):
 
 
 def test_cancelled_turn_does_not_resume(monkeypatch):
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2481,7 +2716,7 @@ def test_cancelled_turn_does_not_resume(monkeypatch):
     monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
     monkeypatch.setattr(mod, "run_cli", fake_stream)
     asyncio.run(s.run())
-    assert calls["n"] == 1                        # cancelled → no resume
+    assert calls["n"] == 1                        # cancelled 鈫?no resume
 
 
 def test_hitl_cmd_url_sets_target_override():
@@ -2496,7 +2731,7 @@ def test_hitl_cmd_url_sets_target_override():
 def test_run_cli_streaming_steer_event_kills_and_flags():
     import threading
     import time as _t
-    from muteki.solver.cli_driver import run_cli_streaming, get_driver
+    from dswarm.solver.cli_driver import run_cli_streaming, get_driver
     drv = get_driver("pi")
     steer = threading.Event()
 
@@ -2511,7 +2746,7 @@ def test_run_cli_streaming_steer_event_kills_and_flags():
     assert _t.time() - t0 < 5                     # killed promptly, not at timeout
 
 
-# ── _extract_flag must not surface placeholders (run-1619 false-positive) ─────
+# 鈹€鈹€ _extract_flag must not surface placeholders (run-1619 false-positive) 鈹€鈹€鈹€鈹€鈹€
 def test_extract_flag_skips_placeholder_in_prose():
     ch = Challenge(id="t", name="t", category="web",
                    flag_format=r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
@@ -2525,7 +2760,7 @@ def test_extract_flag_picks_real_flag_over_placeholder():
     ch = Challenge(id="t", name="t", category="web",
                    flag_format=r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
     s = _cli_solver(ch)
-    # placeholder appears first, the real flag later — must return the real one
+    # placeholder appears first, the real flag later 鈥?must return the real one
     text = "looking for flag{...}\n...\nFOUND_FLAG=dalctf{r3al_one_h3re}"
     assert s._extract_flag(text) == "dalctf{r3al_one_h3re}"
 
@@ -2575,7 +2810,7 @@ def test_extract_need_request_preserves_worker_reported_kind():
 
 def test_stream_markers_uses_worker_reported_need_kind():
     import asyncio
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2589,10 +2824,10 @@ def test_stream_markers_uses_worker_reported_need_kind():
 
 def test_stream_markers_emits_hitl_request_on_need_input():
     """A NEED_INPUT= marker must surface a HITL_REQUEST event (the worker raising
-    its hand) + a need_input blackboard delta — the dead HITL_REQUEST path is now
+    its hand) + a need_input blackboard delta 鈥?the dead HITL_REQUEST path is now
     wired."""
     import asyncio
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2611,7 +2846,7 @@ def test_stream_markers_emits_hitl_request_on_need_input():
 
 def test_need_kind_field_is_separate_from_legacy_kind():
     import asyncio
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2625,7 +2860,7 @@ def test_need_kind_field_is_separate_from_legacy_kind():
 
 def test_need_kind_routes_dead_end_separately():
     import asyncio
-    from muteki.core.events import EventType
+    from dswarm.core.events import EventType
     bus = _CaptureBus()
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
@@ -2652,9 +2887,9 @@ def test_need_input_in_worker_prompts():
 def test_review_mode_parses_actions_but_never_accepts_flags(monkeypatch, tmp_path):
     """Review-Arbiter is a control worker: it may emit route/fact/intent actions,
     but it must not solve the run even if its transcript contains FOUND_FLAG."""
-    from muteki.solver import cli_solver as mod
-    from muteki.solver.cli_driver import CliResult
-    from muteki.swarm.shared_graph import SQLiteSharedGraph
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
@@ -2690,3 +2925,59 @@ def test_review_mode_parses_actions_but_never_accepts_flags(monkeypatch, tmp_pat
     assert "route_suppressed" not in kinds
     bb = _bb_kinds(bus.events)
     assert "review_proposal" in bb
+
+
+
+def test_candidate_fact_does_not_replace_verified_conclusion_pointer(tmp_path):
+    """A late marker-only candidate must not become a solved intent's evidence."""
+    import sqlite3
+
+    ch, graph = _real_graph(tmp_path)
+    solver = _cli_solver(ch, kb=False, shared_graph=graph)
+    solver._intent_id = "I-proof"
+    graph.propose_intent(actor="reason", intent_id="I-proof", goal="recover flag")
+    assert graph.claim_intent(worker=solver.solver_id, intent_id="I-proof")
+
+    verified_seq = asyncio.run(solver._record_fact(
+        "server command output exposes the FLAG environment variable",
+        verified=True, artifact_id="artifact-real",
+    ))
+    candidate_seq = asyncio.run(solver._record_fact(
+        "FLAG env var on server = flag{claimed} verified twice",
+        verified=False, artifact_id="artifact-marker-only",
+    ))
+    assert candidate_seq > verified_seq > 0
+    assert solver._last_fact_seq == verified_seq
+
+    solver._conclude_intent_db(
+        result="solved", to_fact_seq=solver._last_fact_seq,
+        result_detail="Verified flag accepted.",
+    )
+    with sqlite3.connect(graph.db_path) as conn:
+        row = conn.execute(
+            "SELECT to_fact_seq FROM intents WHERE intent_id='I-proof'"
+        ).fetchone()
+    assert row == (verified_seq,)
+    graph.close()
+
+
+def test_bootstrap_intent_lease_covers_execute_and_conclude_timeout(tmp_path):
+    import sqlite3
+    import time
+
+    ch, graph = _real_graph(tmp_path)
+    solver = _cli_solver(
+        ch, kb=False, shared_graph=graph, timeout=900, conclude_timeout=120,
+    )
+    solver._intent_id = "intent:long-worker"
+    before = time.time()
+    solver._record_intent_db("solve the whole challenge")
+
+    with sqlite3.connect(graph.db_path) as conn:
+        worker, lease_until = conn.execute(
+            "SELECT worker, lease_until FROM intents WHERE intent_id=?",
+            (solver._intent_id,),
+        ).fetchone()
+    assert worker == solver.solver_id
+    assert lease_until >= before + 900 + 120 + 55
+    graph.close()

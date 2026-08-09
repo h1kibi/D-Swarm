@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from muteki.solver.peek import ArtifactStore, peek
-from muteki.solver.result import Result
+from dswarm.solver.peek import ArtifactStore, peek
+from dswarm.solver.result import Result
 
 
 def test_result_output_sets_success_from_flag() -> None:

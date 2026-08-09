@@ -1,7 +1,7 @@
 """The chat() wall-clock guard: a stalled stream must not hang the caller."""
 import asyncio
 import pytest
-from muteki.core.llm import LLMClient, LLMResponse
+from dswarm.core.llm import LLMClient, LLMResponse
 
 
 async def test_overall_timeout_returns_not_hangs(monkeypatch):

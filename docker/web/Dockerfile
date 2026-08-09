@@ -1,4 +1,4 @@
-# muteki web control plane (FastAPI/uvicorn) — P2-v3 unified containerization.
+# dswarm web control plane (FastAPI/uvicorn) — P2-v3 unified containerization.
 #
 # This image runs the COORDINATOR (apps.web.server). It launches worker containers
 # as SIBLINGS on the HOST docker daemon via the bind-mounted /var/run/docker.sock,
@@ -6,7 +6,7 @@
 # SEPARATE service (docker/ui) — this image serves only /api.
 #
 # Build context = repo root (so the whole source tree is COPY-able):
-#   docker build -f docker/web/Dockerfile -t muteki-web .
+#   docker build -f docker/web/Dockerfile -t dswarm-web .
 # Usually built via docker-compose.yml at the repo root.
 
 FROM python:3.13-slim
@@ -17,9 +17,9 @@ ENV PYTHONUNBUFFERED=1 \
     # bind the control receiver on 0.0.0.0 (sibling workers reach it over the
     # compose network), and dial the receiver by the web service alias. compose
     # can override these, but bake sane defaults so the image is correct alone.
-    MUTEKI_IN_CONTAINER=1 \
-    MUTEKI_CONTROL_BIND=0.0.0.0 \
-    MUTEKI_CONTROL_HOST=web-api
+    DSWARM_IN_CONTAINER=1 \
+    DSWARM_CONTROL_BIND=0.0.0.0 \
+    DSWARM_CONTROL_HOST=web-api
 
 # docker CLI client ONLY + git/curl. We talk to the HOST daemon over the mounted
 # socket; no daemon runs here. NOTE: on Debian Trixie (python:3.13-slim) the
@@ -45,7 +45,7 @@ COPY . /app
 
 EXPOSE 8000
 # Bind 0.0.0.0 so the ui service (and the operator) can reach /api over the
-# compose network. Auth (P3) gates the surface; compose sets MUTEKI_WEB_PASSWORD.
-ENV MUTEKI_WEB_BIND=0.0.0.0
+# compose network. Auth (P3) gates the surface; compose sets DSWARM_WEB_PASSWORD.
+ENV DSWARM_WEB_BIND=0.0.0.0
 CMD ["uv", "run", "uvicorn", "apps.web.server:create_app", "--factory", \
      "--host", "0.0.0.0", "--port", "8000"]

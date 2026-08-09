@@ -376,7 +376,7 @@ export function GraphView({
         const cc = e.kind === "plans" && srcType === "fact" ? 1 : undefined;
         toAdd.push({ data: { id: e.id, source: e.source, target: e.target, kind: e.kind, ...(cc ? { cc } : {}) } });
       } else if (!seenEdges.current.has(e.id) && (!seenNodes.current.has(e.source) || !seenNodes.current.has(e.target))) {
-        console.warn("[muteki graph] cytoscape edge waiting for endpoint", {
+        console.warn("[dswarm graph] cytoscape edge waiting for endpoint", {
           edge: e,
           nodes: Array.from(seenNodes.current),
         });

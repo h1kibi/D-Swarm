@@ -1,8 +1,8 @@
-# Muteki Command Deck (web UI)
+# D-Swarm Command Deck (web UI)
 
 The web command deck — a **dumb subscriber** to the agent event stream. It never
 calls the solver core; it consumes the typed SSE event stream and POSTs HITL
-commands. The event schema (`lib/events.ts`, mirroring `muteki/core/events.py`)
+commands. The event schema (`lib/events.ts`, mirroring `dswarm/core/events.py`)
 is the only contract.
 
 ## The model: conversation-first, canvas only for spatial views
@@ -49,7 +49,7 @@ Or run them separately:
 uv run uvicorn apps.web.server:create_app --factory --port 8000   # backend (API only)
 cd apps/web/ui && npm install
 # point the browser straight at the backend (the Next dev proxy buffers SSE):
-NEXT_PUBLIC_MUTEKI_API=http://127.0.0.1:8000 npm run dev          # http://localhost:3001
+DSWARM_BACKEND=http://127.0.0.1:8000 npm run dev -- -p 3001  # http://localhost:3001
 # production: npm run build
 ```
 

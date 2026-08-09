@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ChatMessage, HitlRequest } from "@/lib/events";
 
 /**
- * ChatGPT/Claude-style conversation over the run. READ side: the agent's
+ * Chat-style conversation over the run. READ side: the agent's
  * reasoning / text / tool calls / insights / human-guidance echoes stream in as
  * bubbles. WRITE side: the operator types — plain text is a hint, or a slash
  * command (/redirect /pause /resume /focus /submit) — and it is delivered to the

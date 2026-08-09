@@ -51,7 +51,7 @@ def main() -> int:
                     help="per-challenge workspace root (default sessions/; "
                          "challenge dirs land under sessions/eval/)")
     ap.add_argument("--accounts", default=None,
-                    help="credential-account store root (default: env MUTEKI_ACCOUNTS_ROOT)")
+                    help="credential-account store root (default: env DSWARM_ACCOUNTS_ROOT)")
     ap.add_argument("--ingest-baseline", metavar="MD", default=None,
                     help="ingest measured rows from the old report markdown into --out")
     args = ap.parse_args()

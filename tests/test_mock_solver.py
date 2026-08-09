@@ -5,10 +5,10 @@ from pathlib import Path
 import pytest
 
 from examples.mock_solver import run_mock_solve
-from muteki.core.cost import CostController
-from muteki.core.event_bus import EventBus
-from muteki.core.events import EventType
-from muteki.core.session_store import SessionStore
+from dswarm.core.cost import CostController
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import EventType
+from dswarm.core.session_store import SessionStore
 
 
 async def test_mock_solve_emits_full_stream_and_replays(tmp_path: Path) -> None:

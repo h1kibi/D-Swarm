@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import threading
 
-import pytest
-
-from muteki.models.solve_graph import Challenge
-from muteki.swarm.shared_graph import SQLiteSharedGraph, SharedGraph, canonicalize_lane
+from dswarm.models.solve_graph import Challenge
+from dswarm.swarm.shared_graph import SQLiteSharedGraph, SharedGraph, canonicalize_lane
 
 
 def _chal() -> Challenge:
@@ -82,6 +80,106 @@ def test_add_evidence_records_intent_products(tmp_path):
         verified=True, intent_id="I-prod")
 
     assert g.intent_products("I-prod") == [f1, f2]
+    g.close()
+
+
+def test_add_evidence_does_not_create_orphan_intent_product(tmp_path):
+    """A race worker can report a local/default intent id before a coordinator
+    intent exists. The fact remains auditable, but its lineage must not point at a
+    nonexistent intent."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    fact_seq = g.add_evidence(
+        actor="cli-a", source="curl", fact="observed service",
+        verified=True, intent_id="recon-initial")
+
+    assert fact_seq > 0
+    assert g.intent_products("recon-initial") == []
+    event = g.events_since(0, kinds=["fact_added"])[0]
+    assert event["payload"].get("intent_id") is None
+    assert event["payload"].get("orphan_intent_id") == "recon-initial"
+    g.close()
+
+
+def test_add_evidence_stale_other_owner_intent_is_orphaned(tmp_path):
+    """run-3154 B/C: an unaccounted worker inherits the last CLOSED intent id even
+    though the intent is owned by another worker. The product edge must NOT land on
+    that intent; the fact stays auditable with orphan_intent_id."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I1", goal="first route")
+    assert g.claim_intent(worker="cli-pi-2", intent_id="I1") is True
+    g.conclude_intent(actor="cli-pi-2", intent_id="I1", result="dead_end")
+
+    # a stale worker (cli-pi-4, spawned after I1 closed) writes with I1 inherited.
+    f1 = g.add_evidence(actor="cli-pi-4", source="curl", fact="found admin hash",
+                        verified=True, intent_id="I1")
+    assert f1 > 0
+    assert g.intent_products("I1") == [], "closed/other-owner intent must not gain products"
+    ev = [e for e in g.events_since(0, kinds=["fact_added"]) if e["seq"] == f1][0]
+    assert ev["payload"].get("intent_id") is None
+    assert ev["payload"].get("orphan_intent_id") == "I1"
+    # the owner itself still attaches fine
+    f2 = g.add_evidence(actor="cli-pi-2", source="curl", fact="owned follow-up",
+                        verified=True, intent_id="I1")
+    assert f2 > 0
+    # only the owner's own product edge is counted (the orphan is excluded).
+    assert g.intent_products("I1") == [f2]
+    g.close()
+
+
+def test_add_evidence_coordinator_can_attach_to_any_intent(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-c", goal="route")
+    assert g.claim_intent(worker="cli-a", intent_id="I-c") is True
+    f = g.add_evidence(actor="coordinator", source="operator", fact="hint",
+                       verified=True, intent_id="I-c")
+    assert f > 0
+    assert g.intent_products("I-c") == [f]
+    g.close()
+
+
+def test_save_poc_stale_other_owner_intent_is_orphaned(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I2", goal="upload route")
+    assert g.claim_intent(worker="cli-pi-3", intent_id="I2") is True
+    g.conclude_intent(actor="cli-pi-3", intent_id="I2", result="dead_end")
+
+    g.save_poc(actor="cli-pi-5", poc_id="poc-stale", path="shared/x",
+               artifact_id="h", entry_command="python x.py", status="available",
+               intent_id="I2", name="x.py")
+    row = [p for p in g.pocs() if p["poc_id"] == "poc-stale"][0]
+    assert row["intent_id"] is None, "stale intent must not be recorded on the poc"
+    ev = [e for e in g.events_since(0, kinds=["poc_saved"])
+          if e["payload"].get("poc_id") == "poc-stale"][0]
+    assert ev["payload"].get("intent_id") is None
+    assert ev["payload"].get("orphan_intent_id") == "I2"
+    g.close()
+
+
+def test_flag_found_stale_other_owner_intent_is_orphaned(tmp_path):
+    """run-3156: an unaccounted worker's flag must NOT claim lineage to a stale,
+    closed intent owned by another worker (the flag itself still records, with
+    orphan_intent_id — mirroring the add_evidence/save_poc fence)."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I1", goal="first route")
+    assert g.claim_intent(worker="cli-pi-2", intent_id="I1") is True
+    g.conclude_intent(actor="cli-pi-2", intent_id="I1", result="dead_end")
+
+    seq = g.flag_found(actor="cli-pi-4", flag="flag{stale}",
+                       intent_id="I1")
+    assert seq > 0
+    ev = [e for e in g.events_since(0, kinds=["flag_found"])
+          if e["seq"] == seq][0]
+    assert ev["payload"].get("intent_id") is None
+    assert ev["payload"].get("orphan_intent_id") == "I1"
+    assert ev["payload"].get("flag") == "flag{stale}"
+    # the flag itself is still recorded (verified) — only the lineage is dropped.
+    assert ev["verified"] is True
+    # the OWNER still attaches its flag to the intent.
+    seq2 = g.flag_found(actor="cli-pi-2", flag="flag{owned}", intent_id="I1")
+    ev2 = [e for e in g.events_since(0, kinds=["flag_found"])
+           if e["seq"] == seq2][0]
+    assert ev2["payload"].get("intent_id") == "I1"
+    assert ev2["payload"].get("orphan_intent_id") is None
     g.close()
 
 
@@ -233,6 +331,31 @@ def test_atomic_intent_claim_single_winner(tmp_path):
     for t in threads:
         t.join()
     assert sum(1 for x in wins if x) == 1  # exactly one winner, zero TOCTOU
+    g.close()
+
+
+def test_same_owner_claim_renews_lease_without_duplicate_event(tmp_path):
+    import sqlite3
+
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-renew", goal="probe endpoint")
+    assert g.claim_intent(worker="w1", intent_id="I-renew", lease_s=10.0) is True
+    with sqlite3.connect(g.db_path) as conn:
+        first = conn.execute(
+            "SELECT lease_until FROM intents WHERE intent_id='I-renew'"
+        ).fetchone()[0]
+    assert g.claim_intent(worker="w1", intent_id="I-renew", lease_s=1000.0) is True
+    assert g.claim_intent(worker="w2", intent_id="I-renew", lease_s=1000.0) is False
+    with sqlite3.connect(g.db_path) as conn:
+        renewed = conn.execute(
+            "SELECT lease_until FROM intents WHERE intent_id='I-renew'"
+        ).fetchone()[0]
+        claim_events = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='intent_claimed' "
+            "AND json_extract(payload, '$.intent_id')='I-renew'"
+        ).fetchone()[0]
+    assert renewed > first
+    assert claim_events == 1
     g.close()
 
 
@@ -399,7 +522,7 @@ def test_conclude_intent(tmp_path):
 
 
 def test_result_code_predicates_are_shared():
-    from muteki.solver.result_codes import (
+    from dswarm.solver.result_codes import (
         RESULT_DEAD_END,
         RESULT_EXPLORED,
         RESULT_TIMED_OUT,
@@ -1047,4 +1170,26 @@ def test_compact_retires_barren_intents_keeps_facts(tmp_path):
     assert info["retired_intent_ids"] == ["I1"]  # productive (to_fact_seq) survives
     assert any(e.fact == "keep verified" for e in g.snapshot().evidence)
     assert len(g.compact_epochs()) == 1
+    g.close()
+
+
+def test_open_operator_intents_returns_only_open_operator_intents(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    info = g.add_operator_directive(action="hint", text="try CVE-2022-29078")
+    op_id = f"I-{info['directive_id']}"
+    g.propose_intent(
+        actor="operator", intent_id=op_id, goal="try CVE-2022-29078",
+        payload={"source": "operator_directive", "action": "hint",
+                 "directive_id": info["directive_id"],
+                 "worker_class": "shell_agent", "priority": "operator"},
+    )
+    # a normal reason intent is not an operator intent
+    g.propose_intent(actor="reason", intent_id="I-norm", goal="enumerate",
+                     payload={"worker_class": "shell_agent"})
+    ops = g.open_operator_intents()
+    assert [o["intent_id"] for o in ops] == [op_id]
+    assert ops[0]["worker_class"] == "shell_agent"
+    # a claimed operator intent is no longer listed
+    assert g.claim_intent(worker="cli-pi", intent_id=op_id) is True
+    assert g.open_operator_intents() == []
     g.close()

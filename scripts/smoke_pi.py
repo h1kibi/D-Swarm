@@ -1,7 +1,7 @@
 """P1 acceptance smoke: a REAL swarm run with a pi (deepseek) worker.
 
 - boots a local HTTP target whose index page contains the flag
-- runs the muteki coordinator (executor=cli, engines=["pi"])
+- runs the dswarm coordinator (executor=cli, engines=["pi"])
 - expects: worker curls the target, the flag passes the provenance gate,
   the run finishes solved with the flag on the shared graph
 """
@@ -16,13 +16,13 @@ from pathlib import Path
 
 sys.path.insert(0, r"C:\Projects\Agent-projects\ctf-swarm")
 
-from muteki.core.cost import CostController
-from muteki.core.event_bus import EventBus
-from muteki.core.llm import LLMClient
-from muteki.models.solve_graph import Challenge
-from muteki.sandbox.manager import SandboxManager
-from muteki.solver.result import ArtifactStore
-from muteki.swarm.swarm import Swarm
+from dswarm.core.cost import CostController
+from dswarm.core.event_bus import EventBus
+from dswarm.core.llm import LLMClient
+from dswarm.models.solve_graph import Challenge
+from dswarm.sandbox.manager import SandboxManager
+from dswarm.solver.result import ArtifactStore
+from dswarm.swarm.swarm import Swarm
 
 FLAG = "flag{smoke_pi_ok}"
 PORT = 18888
@@ -51,9 +51,9 @@ def start_target(root: Path) -> threading.Thread:
 
 
 async def main() -> int:
-    # Reason planner reads MUTEKI_DEEPSEEK_API_KEY; the host has DEEPSEEK_API_KEY.
-    os.environ.setdefault("MUTEKI_DEEPSEEK_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
-    if not os.environ["MUTEKI_DEEPSEEK_API_KEY"]:
+    # Reason planner reads DSWARM_DEEPSEEK_API_KEY; the host has DEEPSEEK_API_KEY.
+    os.environ.setdefault("DSWARM_DEEPSEEK_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
+    if not os.environ["DSWARM_DEEPSEEK_API_KEY"]:
         print("FATAL: no DEEPSEEK_API_KEY in environment")
         return 2
 

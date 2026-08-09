@@ -1,14 +1,20 @@
 /**
- * The typed event stream contract — mirrors muteki/core/events.py EventType +
+ * The typed event stream contract — mirrors dswarm/core/events.py EventType +
  * Event. The UI is a DUMB SUBSCRIBER (§3): it never calls the core, it only
  * consumes these events and POSTs HITL. Keep this enum in lockstep with Python.
  */
+
+import { emptyReasonLoop, foldReasonEvent, type ReasonLoopView } from "./reason";
+import { foldFindingUpserted, type PheromoneFindingView } from "./pheromone";
 
 export enum EventType {
   RUN_STARTED = "run.started",
   RUN_TITLED = "run.titled",
   RUN_FINISHED = "run.finished",
   RUN_REOPENED = "run.reopened",
+  RUN_QUEUED = "run.queued",
+  RUN_DISPATCHED = "run.dispatched",
+  RUN_CANCELLED = "run.cancelled",
   WORKER_STATUS = "worker.status",
   WORKER_FINISHED = "worker.finished",
   TEXT_MESSAGE_DELTA = "text.delta",
@@ -34,7 +40,7 @@ export enum EventType {
   WORKER_LIFECYCLE = "worker.lifecycle",
 }
 
-export interface MutekiEvent {
+export interface DSwarmEvent {
   event_type: EventType;
   seq: number;
   ts: number;
@@ -69,7 +75,7 @@ export interface WorkerRuntimeStatus {
 
 export type WorkerLaneRole = "worker" | "review";
 
-/** Per-solver derived view the deck renders (the "race" lanes). */
+/** Per-solver derived view the deck renders (the worker lanes). */
 export interface SolverLane {
   solverId: string;
   reasoning: string; // accumulated reasoning deltas (current step)
@@ -85,7 +91,7 @@ export interface SolverLane {
   intentId?: string;      // I: the intent this worker is executing
   tokensSpent?: number;   // I: running token total for this worker
   paused?: boolean;       // I: worker is paused (operator pause / lane wait)
-  session?: string; // live CLI session id — `claude -r <id>` / `codex exec resume <id>`
+  session?: string; // live CLI session id — used to build the worker resume command
   runtime?: WorkerRuntimeStatus;
 }
 
@@ -94,7 +100,7 @@ export interface SolverCost {
   usd: number;
   tokensIn: number;
   tokensOut: number;
-  engine?: string; // "claude" | "codex" | "cursor" | "deepseek" (best-effort)
+  engine?: string; // worker engine — pi-only kernel; legacy sessions may carry retired ids
 }
 
 export interface SolveGraphView {
@@ -135,7 +141,7 @@ export interface ContextGauge {
   limit: number;
 }
 
-/** A turn in the conversation transcript (ChatGPT/Claude-style view). The agent
+/** A turn in the conversation transcript (chat-style view). The agent
  *  side is derived from the event stream (reasoning/text/tool/insight); the human
  *  side is what the operator typed and the system echoes of HITL commands. */
 export type ChatRole = "agent" | "human" | "system";
@@ -342,6 +348,13 @@ export interface DeckState {
   graph: SolveGraphView;
   sharedGraph: SharedGraphView;
   reason: ReasonView;
+  // Phase 2: the reason scheduler's own loop (recon → cycles → intents), folded
+  // from actor="reason" blackboard deltas. Empty for legacy sessions.
+  reasonLoop: ReasonLoopView;
+  // Phase 5: experimental-Board findings with their immutable pheromone
+  // parameters, folded from actor="projector" finding_upserted deltas
+  // (arrival order). Empty for legacy sessions → every pheromone readout is N/A.
+  findings: PheromoneFindingView[];
   insights: string[];
   terminal: string[];
   chat: ChatMessage[];
@@ -354,12 +367,11 @@ export interface DeckState {
   lastCompactTs?: number;                   // H: timestamp of the last compaction
   gauge: ContextGauge;
   usd: number;
-  // cumulative token usage across all engines (deepseek API + claude/codex/cursor
-  // CLI workers). usd/tokensIn/tokensOut are the GLOBAL totals, derived by summing
+  // cumulative token usage across all agents (reason API + pi CLI workers).
+  // usd/tokensIn/tokensOut are the GLOBAL totals, derived by summing
   // costBySolver (the backend emits per-solver-scoped COST_UPDATE events carrying
   // each solver's running total, so we key by solver and re-sum — a single payload
-  // is never the global total). Shown next to the $ figure; cursor contributes
-  // tokens at $0 (subscription-backed).
+  // is never the global total). Shown next to the $ figure.
   tokensIn: number;
   tokensOut: number;
   // per-agent breakdown for the cost/token hover card: solverId → running totals.
@@ -372,6 +384,9 @@ export interface DeckState {
   startedAt?: number;
   finishedAt?: number;
   solved: boolean;
+  // true once a solved status was pushed to the chat, so RUN_FINISHED does not
+  // duplicate the same solved message.
+  solvedChatShown?: boolean;
   flag?: string;
   // multi-flag: every distinct flag collected (dedup, order). `flag` stays the
   // first for back-compat. expectedFlags drives the "collecting N/total" state.
@@ -389,17 +404,9 @@ export interface DeckState {
   outcomeDetail?: string;
   // pentest: why the engagement goal was judged met (from the goal_complete event).
   goalWhy?: string;
-  // set when the coordinator PAUSED waiting for operator input (a worker raised a
+  // set when the planner PAUSED waiting for operator input (a worker raised a
   // NEED_INPUT / env_down). Holds the outstanding ask(s). Cleared on resume.
   awaitingOperator?: string;
-  // race-scout layer: true while the front race round (3 engines in parallel,
-  // single-shot) is running, before the main coordinator loop. Drives the "racing" status pill.
-  racing?: boolean;
-  // engines dropped from THIS run's roster by a dispatch-time health-check failure
-  // (e.g. cursor headless auth lapsed → "Authentication required"). engine → reason.
-  // Lets the worker panel / engine bar show "cursor degraded: …" instead of the
-  // engine silently never appearing. Cleared per-engine on a recover event.
-  degradedEngines: Record<string, string>;
 }
 
 export function emptyDeck(runId: string): DeckState {
@@ -412,6 +419,8 @@ export function emptyDeck(runId: string): DeckState {
     graph: { evidence: [], hypotheses: [], deadEnds: [] },
     sharedGraph: { verified: [], candidates: [] },
     reason: { goalMet: false, intents: [], audit: [] },
+    reasonLoop: emptyReasonLoop(),
+    findings: [],
     insights: [],
     terminal: [],
     chat: [],
@@ -441,10 +450,10 @@ export function emptyDeck(runId: string): DeckState {
     started: false,
     finished: false,
     solved: false,
+    solvedChatShown: false,
     flags: [],
     expectedFlags: 1,
     multiFlag: false,
-    degradedEngines: {},
   };
 }
 
@@ -534,7 +543,7 @@ function addGraphEdge(m: GraphModel, source: string, target: string, kind: strin
       typeof console !== "undefined" &&
       (typeof process === "undefined" || process.env?.NODE_ENV !== "production")
     ) {
-      console.warn("[muteki graph] skipped edge with missing endpoint", {
+      console.warn("[dswarm graph] skipped edge with missing endpoint", {
         source, target, kind, nodes: m.nodes.map((n) => n.id),
       });
     }
@@ -598,7 +607,7 @@ function userPromptBubble(ch: Record<string, any> | undefined): string {
 }
 
 /** Fold one event into the deck state (pure-ish; mutates a draft copy). */
-export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
+export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
   const s: DeckState = {
     ...prev,
     lanes: { ...prev.lanes },
@@ -637,6 +646,7 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       const firstStart = !prev.started;
       s.started = true;
       s.finished = false;
+      s.solvedChatShown = false;
       if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
       s.challengeName = p.challenge?.name ?? s.challengeName;
       s.category = p.challenge?.category ?? s.category;
@@ -1039,22 +1049,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           break;
         }
         case "engine_degraded": {
-          // an engine was dropped from (or restored to) the run roster by a
-          // dispatch-time health check. Track engine → reason so the worker panel /
-          // engine bar can show "cursor degraded: Authentication required" instead
-          // of the engine silently never appearing. status="recovered" clears it.
+          // Retired-path tolerance (docs/07 §7.3): pre-pi sessions recorded
+          // dispatch-time engine health checks. Keep a neutral log line so old
+          // sessions still replay; no live UI surface reads this anymore.
           const eng = String(p.engine ?? "");
-          if (eng) {
-            const next = { ...s.degradedEngines };
-            if (p.status === "recovered") {
-              delete next[eng];
-              tlabel(`engine ${eng} recovered`);
-            } else {
-              next[eng] = String(p.reason ?? "unavailable");
-              tlabel(`engine ${eng} degraded: ${p.reason ?? "unavailable"}`);
-            }
-            s.degradedEngines = next;
-          }
+          tlabel(`engine ${eng || "?"} ${p.status === "recovered" ? "recovered" : `degraded: ${p.reason ?? "unavailable"}`}`);
           break;
         }
         case "phase_transition": {
@@ -1468,34 +1467,24 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           );
           break;
         }
-        case "race_started": {
-          // the front race-scout round started: N engines probe the whole challenge
-          // in parallel (single-shot) before the main coordinator loop. Show a status pill.
-          s.racing = true;
-          const engines = Array.isArray(p.engines) ? p.engines.join(", ") : "";
-          tlabel(`race scout started${engines ? `: ${engines}` : ""}`);
-          pushChat(s, { role: "system", kind: "status",
-            content: `Race scout — ${engines || "engines"} probing in parallel`,
-            ts: ev.ts, i18nKey: "sys.raceStarted", i18nVars: { engines } });
-          break;
-        }
+        case "race_started":
         case "race_concluded": {
-          // the race round ended: either it captured the flag (fast path) or its
-          // facts go to the main coordinator loop. Clear the pill; the run-level events narrate
-          // the outcome (solved / continuing).
-          s.racing = false;
-          const n = Number(p.flags ?? 0);
-          tlabel(`race scout concluded (${p.solved ? "flag" : `${n} flag(s)`})`);
-          if (!p.solved) {
-            pushChat(s, { role: "system", kind: "status",
-              content: "Race scout found no flag — handing facts to the planner",
-              ts: ev.ts, i18nKey: "sys.raceHandoff" });
-          }
+          // Retired path (docs/07 §7.3): pre-pi sessions opened with a parallel
+          // race-scout round. The events still fold into the blackboard log so the
+          // Decision Timeline can render its generic legacy marker — but no live
+          // state, pill, or chat line is driven by them anymore.
+          tlabel(`${actor} legacy execution activity`);
           break;
         }
         default:
           break;
       }
+      // Phase 2: fold the reason scheduler's own narration (actor="reason"
+      // deltas) into the reason-loop view. No-op (same reference) otherwise.
+      s.reasonLoop = foldReasonEvent(s.reasonLoop, ev);
+      // Phase 5: fold projector finding_upserted deltas (immutable pheromone
+      // parameters) into the findings view. No-op (same reference) otherwise.
+      s.findings = foldFindingUpserted(s.findings, ev);
       break;
     }
     case EventType.NODE_SUMMARIZED: {
@@ -1672,7 +1661,8 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           statusReason: p.solved ? "solved" : "finished",
         };
       }
-      if (p.solved) {
+      if (p.solved && !s.solvedChatShown) {
+        s.solvedChatShown = true;
         pushChat(s, { role: "system", kind: "status", content: `SOLVED — ${p.flag ?? ""}`, ts: ev.ts, i18nKey: "sys.solved", i18nVars: { flag: p.flag ?? "" } });
       }
       break;
@@ -1723,9 +1713,9 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       }
       if (ev.solver_id) {
         const l = lane(s, ev.solver_id);
-        // Don't let a run-level RUN_FINISHED (which the coordinator may emit with
+        // Don't let a run-level RUN_FINISHED (which the planner may emit with
         // p.solved=false even after a lane already solved) wipe a lane's solved
-        // boolean — preserve it with `|| l.solved` (mock/race/standby finishes).
+        // boolean — preserve it with `|| l.solved` (mock/standby finishes).
         const stillSolved = !!p.solved || l.solved;
         s.lanes[l.solverId] = {
           ...l,
@@ -1748,12 +1738,13 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
             : (l.statusReason && l.online === false ? l.statusReason : (finishReason || "finished")),
         };
       }
-      if (p.solved && s.flag) {
+      if (p.solved && s.flag && !s.solvedChatShown) {
+        s.solvedChatShown = true;
         pushChat(s, {
           role: "system", kind: "status", content: `SOLVED — ${p.flag ?? ""}`,
           ts: ev.ts, i18nKey: "sys.solved", i18nVars: { flag: p.flag ?? "" },
         });
-      } else if (p.solved) {
+      } else if (p.solved && !s.solvedChatShown) {
         pushChat(s, {
           role: "system", kind: "status",
           content: `Goal met — ${s.goalWhy ?? "engagement objective reached"}`,
@@ -1819,13 +1810,13 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
 }
 
 // ============================================================================
-// Derived selectors — coordinator ↔ worker split + run digest.
+// Derived selectors — planner ↔ worker split + run digest.
 //
-// The conversation-first deck renders the MAIN thread as operator ↔ COORDINATOR
-// (the DeepSeek `reason` actor: planning / auditing / verdicts) and pushes the
-// WORKER firehose (cli-claude / cli-codex / cursor shell loops) into secondary
-// panels + the right-column inspector. The split is by `solver_id`, so it needs
-// NO backend change — see AGENTS.md (reason = coordinator, cli-* = workers).
+// The deck splits the MAIN thread (operator ↔ planner — the `reason` actor:
+// planning / auditing / verdicts) from the WORKER firehose (pi CLI shell
+// loops), which lives in the secondary panels + the swarm inspector. The split
+// is by `solver_id`, so it needs NO backend change — "coordinator" stays in
+// COORDINATOR_IDS only so pre-pi sessions keep replaying (docs/07 §7.3).
 // ============================================================================
 
 /** solver_ids that are the COORDINATOR, not a shell worker. */
@@ -1932,7 +1923,7 @@ export function deadEndTexts(deck: DeckState): string[] {
  *  "progress" / "answer" turns and the quiet-meta strip WITHOUT any new event
  *  (computed purely from already-folded state). */
 export interface SwarmDigest {
-  phase: "draft" | "racing" | "running" | "collecting" | "paused" | "solved" | "goal_met" | "finished";
+  phase: "draft" | "running" | "collecting" | "paused" | "solved" | "goal_met" | "finished";
   verified: number;
   candidates: number;
   openIntents: number;
@@ -1981,13 +1972,11 @@ export function swarmDigest(deck: DeckState): SwarmDigest {
         ? "paused"
         : deck.flags.length > 0 && !deck.finished
           ? "collecting"
-          : deck.racing && !deck.finished
-            ? "racing"
-            : deck.outcomeReason === "goal_met"
-              ? "goal_met"
-              : deck.finished
-                ? "finished"
-                : "running";
+          : deck.outcomeReason === "goal_met"
+            ? "goal_met"
+            : deck.finished
+              ? "finished"
+              : "running";
   return {
     phase,
     verified: verified.length,

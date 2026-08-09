@@ -27,6 +27,9 @@
 每个题型独立镜像：
 
 ```text
+# BTFly stage images - build-time ONLY. The worker base Dockerfile extracts
+# the pi runtime + category skills from these; they are rebuilt by
+# ./docker/worker-pi/build-base.sh and removed again after ./build.sh.
 ctf-agent-pi-base:0.1.0
 ctf-agent-pi-web:0.1.0
 ctf-agent-pi-crypto:0.1.0
@@ -34,6 +37,16 @@ ctf-agent-pi-pwn:0.1.0
 ctf-agent-pi-reverse:0.1.0
 ctf-agent-pi-forensics:0.1.0
 ctf-agent-pi-misc:0.1.0
+
+# Runtime worker images (per-direction, from ./docker/worker-pi/build.sh):
+ctf-swarm-pi-base:0.2.0
+ctf-swarm-pi-web:0.2.0
+ctf-swarm-pi-pwn:0.2.0
+ctf-swarm-pi-rev:0.2.0
+ctf-swarm-pi-crypto:0.2.0
+ctf-swarm-pi-misc:0.2.0
+ctf-swarm-pi-forensics:0.2.0
+ctf-swarm-pi-aisec:0.2.0
 ```
 
 ### 容器配置

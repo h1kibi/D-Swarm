@@ -1,14 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { DeckState, EventType, MutekiEvent, emptyDeck, reduce } from "./events";
+import { DeckState, EventType, DSwarmEvent, emptyDeck, reduce } from "./events";
+import { readKey, writeKey, removeKey } from "./storage";
 
 /**
  * API base. Empty string = same-origin: `run.sh web` serves the production
- * Next UI and proxies /api to the FastAPI backend. NEXT_PUBLIC_MUTEKI_API is
+ * Next UI and proxies /api to the FastAPI backend. NEXT_PUBLIC_DSWARM_API is
  * still available for manual experiments that intentionally bypass that proxy.
  */
-export const API = process.env.NEXT_PUBLIC_MUTEKI_API || "";
+export const API = process.env.NEXT_PUBLIC_DSWARM_API || "";
 
 // ---------------------------------------------------------------------------
 // Auth (P3): single-password gate. The operator types a password once; the
@@ -16,25 +17,15 @@ export const API = process.env.NEXT_PUBLIC_MUTEKI_API || "";
 // every /api request. The password itself is never stored. SSE/WS connections
 // (which can't carry a header) use a one-time ticket minted via apiFetch.
 // ---------------------------------------------------------------------------
-const TOKEN_KEY = "muteki_auth_token";
+const TOKEN_KEY = "dswarm_auth_token";
 
 export function getToken(): string {
-  if (typeof window === "undefined") return "";
-  try {
-    return window.localStorage.getItem(TOKEN_KEY) || "";
-  } catch {
-    return "";
-  }
+  return readKey(TOKEN_KEY) || "";
 }
 
 export function setToken(token: string): void {
-  if (typeof window === "undefined") return;
-  try {
-    if (token) window.localStorage.setItem(TOKEN_KEY, token);
-    else window.localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* storage disabled — auth simply won't persist */
-  }
+  if (token) writeKey(TOKEN_KEY, token);
+  else removeKey(TOKEN_KEY);
 }
 
 // When a request comes back 401 the token is stale/missing; clear it and notify
@@ -90,7 +81,7 @@ export async function checkAuth(): Promise<{ authenticated: boolean; authRequire
   const res = await apiFetch("/api/auth/me");
   if (res.status === 401) return { authenticated: false, authRequired: true, inContainer: false };
   const data = await res.json().catch(() => ({} as any));
-  // in_container (P2-v3): the coordinator runs in a container → the deck must
+  // in_container (P2-v3): the control plane runs in a container → the deck must
   // force container mode and disable the "local" worker-isolation toggle.
   return { authenticated: true, authRequired: Boolean(data?.auth_required), inContainer: Boolean(data?.in_container) };
 }
@@ -129,6 +120,15 @@ export interface RunSummary {
   queue_position?: number | null;
   cancelled?: boolean;
   flag?: string | null;
+  // multi-flag progress (backend summary already sends these; the Run Fleet
+  // rows render "flags x/y" from them).
+  flags?: string[];
+  expected_flags?: number;
+  multi_flag?: boolean;
+  // HITL attention signal: a worker is waiting on an operator answer. Drives the
+  // Fleet "Needs Attention" filter + badge (docs/07 §5.2).
+  awaiting_help?: boolean;
+  help_text?: string;
   pinned: boolean;
   pinned_at?: number | null;
   archived: boolean;
@@ -174,7 +174,7 @@ export function useRun(runId: string) {
     // every EventType is a named SSE event; one generic handler folds them all
     const handler = (e: MessageEvent) => {
       try {
-        const ev = JSON.parse(e.data) as MutekiEvent;
+        const ev = JSON.parse(e.data) as DSwarmEvent;
         setDeck((prev) => reduce(prev, ev));
       } catch {
         /* ignore malformed frame */
@@ -285,11 +285,17 @@ export function useRun(runId: string) {
     async (text?: string) => {
       const body: Record<string, unknown> = {};
       if (text && text.trim()) body.challenge = { description: text.trim() };
-      await apiFetch(`/api/runs/${runId}/resolve`, {
+      const res = await apiFetch(`/api/runs/${runId}/resolve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      const result = await res.json().catch(() => ({} as any));
+      if (!res.ok || result?.ok === false) {
+        const detail = result?.detail ? String(result.detail) : "resolve failed";
+        throw new Error(`${detail}${res.status ? ` (${res.status})` : ""}`);
+      }
+      return result as { ok: boolean; queued?: boolean; position?: number | null };
     },
     [runId]
   );
@@ -411,27 +417,7 @@ export async function deleteRun(runId: string): Promise<boolean> {
   }
 }
 
-/** Open the run's workspace dir in the host file manager (operator-local). */
-export async function openWorkspace(runId: string): Promise<boolean> {
-  try {
-    const r = await apiFetch(`/api/runs/${runId}/open`, { method: "POST" });
-    const j = await r.json().catch(() => ({}));
-    return !!j.ok;
-  } catch {
-    return false;
-  }
-}
-
 // ── engine status ────────────────────────────────────────────────────────────
-
-/** Per-engine availability + health. */
-export interface EngineStatus {
-  engine: string;
-  bin: string;
-  available: boolean;
-  healthy?: boolean;
-  health_detail?: string;
-}
 
 /** Deep per-engine self-check result (FE-healthcheck-page). */
 export interface EngineHealth {
@@ -441,10 +427,10 @@ export interface EngineHealth {
   healthy: boolean;
   detail: string;
   backend?: string;
-  /** Where the bin path came from: "env" (pinned via MUTEKI_<E>_BIN), "known-good",
+  /** Where the bin path came from: "env" (pinned via DSWARM_<E>_BIN), "known-good",
    *  "path" (auto-discovered on PATH — may be the wrong version), or "fallback". */
   bin_source?: "env" | "known-good" | "path" | "fallback";
-  /** The env var that pins this engine's bin (e.g. MUTEKI_CLAUDE_BIN). */
+  /** The env var that pins this engine's bin (e.g. DSWARM_PI_BIN). */
   bin_env?: string;
 }
 
@@ -461,27 +447,6 @@ export async function getEngineHealth(backend: "local" | "container" = "local"):
   }
 }
 
-export function useEngines(pollMs = 300000): EngineStatus[] {
-  const [engines, setEngines] = useState<EngineStatus[]>([]);
-  const inFlight = useRef(false);
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
-      try {
-        const r = await apiFetch(`/api/engines`);
-        const j = await r.json();
-        if (alive) setEngines(j.engines ?? []);
-      } catch { /* offline — keep last */ }
-      finally { inFlight.current = false; }
-    };
-    load();
-    const id = setInterval(load, pollMs);
-    return () => { alive = false; clearInterval(id); };
-  }, [pollMs]);
-  return engines;
-}
 
 // ── rail folders (FE-session-folder) ────────────────────────────────────────
 
@@ -558,16 +523,12 @@ export interface WorkerSettings {
   start_workers: number;
   max_workers: number;
   worker_backend: "local" | "container";
-  race_scout: boolean;
-  race_timeout: number;
   wall_clock_budget: number;
-  race_engines: string[];
   max_total_workers: number;
   cost_budget_usd: number;
   stage_policy: {
     prepare: Record<string, unknown>;
-    race: { enabled: boolean; timeout: number; engines: string[] };
-    coordinator: {
+    coordinator?: {
       wall_clock_budget: number;
       review?: {
         enabled?: boolean;
@@ -588,6 +549,7 @@ export interface WorkerSettings {
         max_review_workers?: number;
       };
     };
+    reason?: Record<string, unknown>;
     budgets: { max_total_workers: number; cost_budget_usd: number };
   };
   llm_profiles: {
@@ -621,6 +583,7 @@ export interface WorkerSettings {
     max_review_running?: number;
     priority: number;
     model?: string;
+    image?: string;
     enabled: boolean;
   }[];
   overrides: Record<string, { engines: string[]; start_workers: number }>;
@@ -757,7 +720,7 @@ export async function fetchProfilesHealth(): Promise<ProfileHealth[]> {
 export async function testProfileHealth(profileId: string): Promise<ProfileHealth | null> {
   try {
     // A container deep-probe (docker run + real one-turn hello) can take ~60-120s
-    // on a cold cursor/codex start; cap it so "测试中…" can't hang forever (no
+    // on a cold container start; cap it so "测试中…" can't hang forever (no
     // client timeout was the reason the button spun indefinitely on a slow probe).
     const r = await apiFetch(`/api/settings/profiles/${encodeURIComponent(profileId)}/health`, {
       method: "POST",
@@ -913,7 +876,7 @@ export async function putRuntimeEnvironment(
 }
 
 /** Operator runtime control: add a worker for an engine to a LIVE run
- *  (omit engine → coordinator picks heterogeneity-aware). */
+ *  (omit engine → the backend planner picks). */
 export async function spawnWorker(runId: string, engine?: string): Promise<boolean> {
   try {
     const r = await apiFetch(`/api/runs/${runId}/workers`, {
@@ -938,6 +901,29 @@ export async function killWorker(runId: string, solverId: string): Promise<boole
     });
     const j = await r.json().catch(() => ({}));
     return !!j.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Run-id-parametrized HITL post — the batch Fleet controls (pause / resume /
+ * stop across a selection) fan out through this, one call per run, reusing the
+ * existing single-run API (docs/07 §5.2: no API change for batch ops).
+ */
+export async function sendRunHitl(
+  runId: string,
+  action: string,
+  text = "",
+  target = "global",
+): Promise<boolean> {
+  try {
+    const r = await apiFetch(`/api/runs/${runId}/hitl`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, action, text }),
+    });
+    return r.ok;
   } catch {
     return false;
   }

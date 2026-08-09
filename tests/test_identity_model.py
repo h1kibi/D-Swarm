@@ -8,7 +8,7 @@ legality rule.
 
 from __future__ import annotations
 
-from muteki.solver.identity_model import (
+from dswarm.solver.identity_model import (
     Credential,
     Seat,
     credential_id_for,
@@ -19,7 +19,7 @@ from muteki.solver.identity_model import (
     seat_to_legacy_profile,
     seats_to_legacy_profiles,
 )
-from muteki.solver.worker_profiles import resolve_seat_ref
+from dswarm.solver.worker_profiles import resolve_seat_ref
 
 
 # ── deterministic ids ────────────────────────────────────────────────────────

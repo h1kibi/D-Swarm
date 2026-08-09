@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "muteki-desktop",
-  "outputfilename": "muteki-desktop",
+  "name": "d-swarm-desktop",
+  "outputfilename": "d-swarm-desktop",
   "frontend:install": "node install.mjs",
   "frontend:build": "node build.mjs",
   "frontend:dir": "frontend",
@@ -13,8 +13,8 @@
   },
   "info": {
     "companyName": "ctf-swarm",
-    "productName": "Muteki Desktop",
-    "productVersion": "0.2.5",
+    "productName": "D-Swarm",
+    "productVersion": "0.3.0-rc.1",
     "copyright": "AGPL-3.0"
   }
 }

@@ -3,9 +3,9 @@
  * dynamic routes (/run/[id]), which `output: "export"` can't prerender (run ids
  * are not known at build time). `run.sh web` serves the UI as a production Next
  * server in the operator's environment, which handles dynamic routes natively;
- * `/api` is proxied to the FastAPI backend (default :8000; override MUTEKI_BACKEND).
+ * `/api` is proxied to the FastAPI backend (default :8000; override DSWARM_BACKEND).
  */
-const BACKEND = process.env.MUTEKI_BACKEND || "http://127.0.0.1:8000";
+const BACKEND = process.env.DSWARM_BACKEND || "http://127.0.0.1:8000";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

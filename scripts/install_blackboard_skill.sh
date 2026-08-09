@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the muteki-blackboard skill into the user-scope skill dirs used by the
+# Install the dswarm-blackboard skill into the user-scope skill dirs used by the
 # worker CLIs. Claude Code and Cursor read ~/.claude/skills; Codex reads
 # ~/.agents/skills. Idempotent: re-running overwrites with the latest source.
 #
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-SRC="skills/muteki-blackboard"
+SRC="skills/dswarm-blackboard"
 
 if [ ! -f "$SRC/SKILL.md" ]; then
   echo "ERROR: $SRC/SKILL.md not found (run from repo root)" >&2
@@ -20,14 +20,14 @@ fi
 
 install_to() {
   local dest="$1"
-  mkdir -p "$dest/muteki-blackboard"
-  cp "$SRC/SKILL.md" "$dest/muteki-blackboard/SKILL.md"
-  cp "$SRC/blackboard.py" "$dest/muteki-blackboard/blackboard.py"
-  chmod +x "$dest/muteki-blackboard/blackboard.py"
-  echo "  installed -> $dest/muteki-blackboard/"
+  mkdir -p "$dest/dswarm-blackboard"
+  cp "$SRC/SKILL.md" "$dest/dswarm-blackboard/SKILL.md"
+  cp "$SRC/blackboard.py" "$dest/dswarm-blackboard/blackboard.py"
+  chmod +x "$dest/dswarm-blackboard/blackboard.py"
+  echo "  installed -> $dest/dswarm-blackboard/"
 }
 
-echo "Installing muteki-blackboard skill:"
+echo "Installing dswarm-blackboard skill:"
 install_to "$HOME/.claude/skills"   # Claude Code + Cursor user scope
 install_to "$HOME/.agents/skills"   # Codex user scope
 echo "Done. Claude, Cursor, and Codex workers will discover it at user scope."

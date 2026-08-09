@@ -24,16 +24,16 @@ from apps.web.worker_config import (
     backend_for_profile,
     resolve_worker_backend,
 )
-from muteki.solver.credential_accounts import account_store_root
-from muteki.core.runtime_env import is_web_container
-from muteki.solver.worker_profiles import (
+from dswarm.solver.credential_accounts import account_store_root
+from dswarm.core.runtime_env import is_web_container
+from dswarm.solver.worker_profiles import (
     base_engine_for_profile,
     normalize_profile_roster,
     profile_uses_endpoint,
 )
 
 if TYPE_CHECKING:
-    from muteki.solver.profile_health import ProfileHealth
+    from dswarm.solver.profile_health import ProfileHealth
 
 Driver = Callable[[Run], Awaitable[None]]
 
@@ -68,7 +68,7 @@ def _missing_profile_accounts(
     pays max(timeout), not sum(timeout) (the "/start freezes" symptom)."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from muteki.solver.profile_health import evaluate_profile_health
+    from dswarm.solver.profile_health import evaluate_profile_health
 
     enabled = [
         p for p in worker_profiles if isinstance(p, dict) and p.get("enabled", True)
@@ -101,7 +101,96 @@ def _selected_profiles(engines: list[str], worker_profiles: list[dict]) -> list[
     return [by_name[n] for n in names if n in by_name]
 
 
+def _planner_llm_credentials(
+    *,
+    sessions_root: str | Path,
+    worker_profiles: list[dict],
+    planner_base: str,
+) -> tuple[str, str]:
+    """Resolve planner key/base_url without requiring DSWARM_DEEPSEEK_API_KEY.
+
+    The Reason planner is a host-side LLM call, not a worker container call.
+    Prefer the explicit env key for backward compatibility; when it is absent,
+    reuse the same registered credential account the pi worker would consume.
+    Returns (api_key, base_url); base_url is empty when the default DeepSeek
+    endpoint should be used.
+    """
+    from dswarm.solver.credential_accounts import CredentialAccountStore
+
+    store = CredentialAccountStore(account_store_root(sessions_root))
+    seen: set[str] = set()
+    candidates: list[Any] = []
+    for profile in worker_profiles:
+        if not isinstance(profile, dict):
+            continue
+        account_id = str(profile.get("credential_account") or "").strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            acct = store.inspect(account_id)
+            if acct is not None:
+                candidates.append(acct)
+    if "pi-main" not in seen:
+        seen.add("pi-main")
+        acct = store.inspect("pi-main")
+        if acct is not None:
+            candidates.append(acct)
+    for raw in store.list():
+        account_id = str(raw.get("account_id") or "").strip()
+        if not account_id or account_id in seen:
+            continue
+        seen.add(account_id)
+        acct = store.inspect(account_id)
+        if acct is not None:
+            candidates.append(acct)
+
+    planner_base_norm = planner_base.rstrip("/")
+    for acct in candidates:
+        if acct is None or not getattr(acct, "present", False):
+            continue
+        details = getattr(acct, "details", None) or {}
+        api_key = str(details.get("secret_value") or "").strip()
+        if not api_key:
+            continue
+        acct_base = str(details.get("base_url_value") or "").strip().rstrip("/")
+        mode = str(getattr(acct, "mode", "") or "")
+        if mode == "custom_endpoint":
+            if planner_base:
+                if acct_base != planner_base_norm:
+                    continue
+            elif not acct_base:
+                continue
+            return api_key, acct_base or planner_base_norm
+        return api_key, planner_base_norm or ""
+    return "", planner_base_norm or ""
+
+
+_LEGACY_SWARM_FIELDS = (
+    "cli_race",
+    "race_scout",
+    "race_timeout",
+    "race_engines",
+    "coordinator",
+    "cold_start",
+)
+
+
+def _reject_legacy_swarm_fields(body: dict[str, Any]) -> None:
+    present = [k for k in _LEGACY_SWARM_FIELDS if body.get(k) is not None]
+    stage = body.get("stage_policy")
+    if isinstance(stage, dict):
+        if isinstance(stage.get("race"), dict):
+            present.append("stage_policy.race")
+        if isinstance(stage.get("coordinator"), dict):
+            present.append("stage_policy.coordinator")
+    if present:
+        raise ValueError(
+            "legacy swarm fields are no longer supported: "
+            + ", ".join(present)
+        )
+
+
 def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
+    _reject_legacy_swarm_fields(body or {})
     # Real solving is the DEFAULT now — the deck launches the CLI executor swarm.
     # "mock" is opt-in (UI dev / e2e only).
     kind = (body or {}).get("kind", "swarm")
@@ -128,6 +217,18 @@ _CATEGORY_HINTS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 _DEFAULT_BRACE_FLAG_FORMAT = r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}"
+
+_URL_HINT_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _hint_matches(text: str, keyword: str) -> bool:
+    """Match prose hints without treating URL host fragments as keywords."""
+    if re.fullmatch(r"[a-z0-9]+", keyword):
+        return bool(re.search(
+            rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])",
+            text,
+        ))
+    return keyword in text
 
 
 def _clean_flag_wrapper(raw: Any) -> str:
@@ -176,14 +277,23 @@ def _infer_challenge(body: dict[str, Any]) -> dict[str, Any]:
         body["challenge"] = ch
         return body
     low = prompt.lower()
+    # Do not classify from arbitrary substrings inside a URL hostname. For
+    # example, zkv4nige-rsay-... contains ``rsa`` but is a web challenge.
+    # Keep the URL available as a web signal when no stronger prose hint exists.
+    hint_text = _URL_HINT_RE.sub(" ", low)
 
     if not ch.get("description"):
         ch["description"] = prompt
     if not ch.get("category"):
-        ch["category"] = next(
-            (cat for cat, kws in _CATEGORY_HINTS if any(k in low for k in kws)),
-            "misc",
+        category = next(
+            (cat for cat, kws in _CATEGORY_HINTS
+             if any(_hint_matches(hint_text, keyword) for keyword in kws)),
+            None,
         )
+        # A bare HTTP(S) target is presumptively web, but an explicit prose
+        # hint such as ``RSA oracle`` still wins because it was checked above
+        # against text outside the URL.
+        ch["category"] = category or ("web" if _URL_HINT_RE.search(low) else "misc")
     if not ch.get("target"):
         m = re.search(r"https?://[^\s\"'<>]+", prompt)
         if m:
@@ -251,12 +361,12 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         import tempfile
         from pathlib import Path
 
-        from muteki.models.solve_graph import Challenge
-        from muteki.sandbox.manager import SandboxManager
-        from muteki.solver.result import ArtifactStore
-        from muteki.solver.types import SolverConfig
-        from muteki.swarm.models import default_lineup
-        from muteki.swarm.swarm import Swarm
+        from dswarm.models.solve_graph import Challenge
+        from dswarm.sandbox.manager import SandboxManager
+        from dswarm.solver.result import ArtifactStore
+        from dswarm.solver.types import SolverConfig
+        from dswarm.swarm.models import default_lineup
+        from dswarm.swarm.swarm import Swarm
 
         ch = body.get("challenge", {})
         # attachments: local file paths for FILE-based tracks (crypto/rev/forensics
@@ -301,8 +411,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             scope=(ch.get("scope") or body.get("scope") or ""),
         )
         executor = body.get("executor", "cli")
-        cli_race = bool(body.get("cli_race", False))
         cli_engine = body.get("cli_engine", "pi")
+        reason_swarm = bool(body.get("reason_swarm", True))
         offline = bool(body.get("offline", False))
         web_access = not offline
         # offline implies NO KB (a clean black-box eval denies every external
@@ -310,11 +420,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # override either way. Default KB on only when online.
         kb = bool(body.get("kb", not offline))
         n = int(body.get("n_solvers", 2))
-        coordinator = bool(body.get("coordinator", True))
-        # engine roster: the pi direction profiles (pi-web/pwn/rev/crypto/misc/
-        # forensics/AIsec). Resolution order: explicit body.engines > the
-        # operator's per-category worker-config default (apps/web/worker_config.py)
-        # > the hardcoded pi roster.
+        # engine roster: a single all-in-one pi-worker profile. Resolution order:
+        # explicit body.engines > the operator's per-category worker-config default
+        # (apps/web/worker_config.py) > the hardcoded pi roster.
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
         engines = body.get("engines") or wc.get("engines") or DEFAULT_ENGINES
         runtime_profiles = body.get("runtime_profiles") or wc.get("runtime_profiles") or []
@@ -355,21 +463,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             stage_policy = copy.deepcopy(wc["stage_policy"])
         else:
             stage_policy = {
-                "race": {
-                    "enabled": bool(body["race_scout"]) if "race_scout" in body else bool(wc.get("race_scout", True)),
-                    "timeout": int(body.get("race_timeout", wc.get("race_timeout", 720))),
-                    "engines": body.get("race_engines") or wc.get("race_engines") or [],
-                },
                 "coordinator": {"wall_clock_budget": 0 if wall_clock_budget == float("inf") else int(wall_clock_budget)},
                 "budgets": {"max_total_workers": max_total_workers or 0,
                             "cost_budget_usd": cost_budget_usd or 0.0},
             }
-        if "race_scout" in body:
-            stage_policy.setdefault("race", {})["enabled"] = bool(body["race_scout"])
-        if "race_timeout" in body:
-            stage_policy.setdefault("race", {})["timeout"] = int(body["race_timeout"])
-        if "race_engines" in body:
-            stage_policy.setdefault("race", {})["engines"] = list(body.get("race_engines") or [])
         if "wall_clock_budget" in body:
             v = float(body["wall_clock_budget"] or 0)
             stage_policy.setdefault("coordinator", {})["wall_clock_budget"] = (
@@ -380,22 +477,6 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         if "cost_budget_usd" in body:
             stage_policy.setdefault("budgets", {})["cost_budget_usd"] = float(
                 body["cost_budget_usd"] or 0.0)
-        # race-scout layer (DESIGN_race_scout_layer.md): one parallel single-shot
-        # round in front of the main coordinator loop. Operator-configurable from the request:
-        #   race_scout (bool, default on) — whole-layer toggle
-        #   race_engines (list, default = engines) — which engines race (worker switch)
-        #   race_timeout (int, default 720s) — short per-worker recon timeout
-        race_scout = bool(body["race_scout"]) if "race_scout" in body else bool(wc.get("race_scout", True))
-        race_engines = body.get("race_engines") or wc.get("race_engines") or None  # None → defaults to the roster
-        # (the cursor-offline carve-out was removed with the cursor engine — with
-        #  the pi-only roster there is no race engine to special-case offline)
-        race_timeout = int(body.get("race_timeout", wc.get("race_timeout", 720)))
-        # cold_start (run-75379 BUG④): "继续做题"/standby relaunch sets this False so the
-        # coordinator skips the race-scout warmup and continues on the existing graph.
-        # Default True = a fresh run. The Swarm ALSO has a graph-state backstop, so a
-        # caller that omits this is still protected on a populated graph.
-        cold_start = bool(body["cold_start"]) if "cold_start" in body else True
-
         # worker execution backend: "local" (host subprocess) or "container" (each
         # worker in the run's Kali tool container). Request body wins, else config,
         # else env, else default — with the container_dockerexec alias, invalid
@@ -404,7 +485,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         worker_backend = resolve_worker_backend(
             request_backend=body.get("worker_backend"),
             config_backend=wc.get("worker_backend"),
-            env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+            env_backend=os.environ.get("DSWARM_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
         if mgr is not None and worker_profiles:
@@ -431,7 +512,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         if mgr is not None:
             root = mgr.workspace_dir(run.run_id)
         else:
-            root = Path(tempfile.mkdtemp(prefix="muteki-web-"))
+            root = Path(tempfile.mkdtemp(prefix="dswarm-web-"))
         # sbx is the sandbox root — sandbox.shutdown_all() rmtree's it at run end,
         # so NOTHING durable may live under it. arts + graph are SIBLINGS of sbx so
         # they persist (the shared_graph.db is the run's queryable fact graph).
@@ -448,15 +529,32 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # race needs none.
         llm_cm = None
         llm = None
-        if coordinator:
-            from muteki.core.llm import LLMClient
+        if reason_swarm:
+            from dswarm.core.llm import LLMClient
             try:
                 # planner endpoint override (DESIGN §2.2): base_url from the
-                # planner llm_profile (empty = default DeepSeek). Key stays in env.
+                # planner llm_profile (empty = default DeepSeek). The key comes
+                # from env first, then the registered worker account.
                 planner_base = str((llm_profiles.get("planner") or {}).get("base_url") or "").strip()
                 llm_kwargs: dict[str, Any] = {"cost": run.cost, "bus": run.bus}
+                env_key = os.environ.get("DSWARM_DEEPSEEK_API_KEY", "").strip()
+                account_key, account_base = (
+                    _planner_llm_credentials(
+                        sessions_root=mgr.sessions_root,
+                        worker_profiles=worker_profiles,
+                        planner_base=planner_base,
+                    )
+                    if mgr is not None
+                    else ("", "")
+                )
                 if planner_base:
                     llm_kwargs["base_url"] = planner_base
+                elif account_base:
+                    llm_kwargs["base_url"] = account_base
+                if env_key:
+                    llm_kwargs["api_key"] = env_key
+                elif account_key:
+                    llm_kwargs["api_key"] = account_key
                 llm_cm = LLMClient(**llm_kwargs)
                 llm = await llm_cm.__aenter__()
             except Exception:
@@ -466,8 +564,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 llm = None
 
         # §16 flywheel store (optional; recall prior + distill on solve)
-        from muteki.learning.distill import TemplateStore
-        knowledge = TemplateStore(root=os.environ.get("MUTEKI_KNOWLEDGE_DIR", "knowledge"))
+        from dswarm.learning.distill import TemplateStore
+        knowledge = TemplateStore(root=os.environ.get("DSWARM_KNOWLEDGE_DIR", "knowledge"))
 
         swarm = Swarm(
             challenge, default_lineup(n), llm=llm, sandbox=sandbox,
@@ -475,13 +573,11 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             config=SolverConfig(), run_id=run.run_id, knowledge=knowledge,
             hitl_inbox=run.hitl,  # HITL: human commands reach the solvers
             worker_cmds=run.worker_cmds,  # operator spawn/kill of specific engines
-            executor=executor, cli_engine=cli_engine, cli_race=cli_race,
+            executor=executor, cli_engine=cli_engine,
             engines=engines, start_workers=start_workers, max_workers=max_workers,
-            web_access=web_access, kb=kb, coordinator=coordinator,
+            web_access=web_access, kb=kb, reason_swarm=reason_swarm,
             graph_dir=graph_dir, worker_root=worker_root,
             wall_clock_budget=wall_clock_budget,
-            race_scout=race_scout, race_engines=race_engines,
-            race_timeout=race_timeout, cold_start=cold_start,
             max_total_workers=max_total_workers,
             cost_budget_usd=cost_budget_usd,
             stage_policy=stage_policy,
@@ -493,6 +589,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             credential_accounts_root=(
                 account_store_root(mgr.sessions_root) if mgr is not None else None
             ),
+            blackboard_token=getattr(run, "blackboard_token", ""),
         )
         try:
             out = await swarm.run()
@@ -555,7 +652,7 @@ def _standby_worker_env(
     account_root: Path | None,
     container: object | None,
 ) -> dict[str, str]:
-    from muteki.solver.credential_accounts import runtime_env_for_engine
+    from dswarm.solver.credential_accounts import runtime_env_for_engine
 
     env = runtime_env_for_engine(
         engine,
@@ -564,13 +661,13 @@ def _standby_worker_env(
         container=container is not None,
     ).env
     if profile:
-        env["MUTEKI_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
-        env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] = str(profile.get("credential_account") or "")
+        env["DSWARM_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
+        env["DSWARM_CREDENTIAL_ACCOUNT_ID"] = str(profile.get("credential_account") or "")
         if profile.get("model"):
-            env["MUTEKI_WORKER_MODEL"] = str(profile["model"])
+            env["DSWARM_WORKER_MODEL"] = str(profile["model"])
     if container is not None:
-        from muteki.swarm.swarm import _ensure_blackboard_skill_links
-        from muteki.solver.container_exec import _chown_tree_to_worker
+        from dswarm.swarm.swarm import _ensure_blackboard_skill_links
+        from dswarm.solver.container_exec import _chown_tree_to_worker
         home_host = root / "homes" / label
         home_host.mkdir(parents=True, exist_ok=True)
         _ensure_blackboard_skill_links(home_host)
@@ -621,13 +718,13 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         import json
         from pathlib import Path
 
-        from muteki.models.solve_graph import Challenge
-        from muteki.solver.cli_driver import driver_for
-        from muteki.solver.cli_solver import CliSolver
-        from muteki.solver.credential_accounts import account_store_root
-        from muteki.solver.result import ArtifactStore
-        from muteki.solver.types import SolverConfig
-        from muteki.swarm.shared_graph import SQLiteSharedGraph
+        from dswarm.models.solve_graph import Challenge
+        from dswarm.solver.cli_driver import driver_for
+        from dswarm.solver.cli_solver import CliSolver
+        from dswarm.solver.credential_accounts import account_store_root
+        from dswarm.solver.result import ArtifactStore
+        from dswarm.solver.types import SolverConfig
+        from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
         action = (cmd.get("action") or "ask").lower()
 
@@ -655,7 +752,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         ch = winner.get("challenge") or {}
         if not ch:
             try:
-                from muteki.core.events import EventType
+                from dswarm.core.events import EventType
                 async for ev in run.store.replay(run.run_id):
                     if ev.event_type == EventType.RUN_STARTED:
                         ch = (ev.payload or {}).get("challenge") or {}
@@ -691,7 +788,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         worker_backend = resolve_worker_backend(
             request_backend=None,
             config_backend=wc.get("worker_backend"),
-            env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+            env_backend=os.environ.get("DSWARM_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
         backend = (
@@ -707,11 +804,15 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         container = None
         account_root = account_store_root(mgr.sessions_root) if mgr is not None else None
         if backend == "container":
-            from muteki.solver.container_exec import ensure_container
+            from dswarm.solver.container_exec import (
+                ensure_container,
+                worker_image_for_profile,
+            )
             container = await asyncio.to_thread(
                 ensure_container,
                 run.run_id,
                 str(root),
+                image=worker_image_for_profile(profile, category=challenge.category),
                 network=str(runtime.get("network") or "bridge"),
                 memory=str(runtime.get("memory") or "") or None,
                 cpus=str(runtime.get("cpus") or "") or None,
@@ -753,7 +854,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             prior_flags = [f for f in prior_flags if f != flag]
 
         async def _emit_bb(kind: str, **fields: Any) -> None:
-            from muteki.core.events import (
+            from dswarm.core.events import (
                 Event, EventType, blackboard_delta_payload)
             await run.bus.emit(Event(
                 event_type=EventType.BLACKBOARD_DELTA, run_id=run.run_id,
@@ -771,7 +872,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 for iid in info.get("reopened", []):
                     await _emit_bb("intent_reopened", intent_id=iid)
                 await _emit_bb("flag_invalidated", flag=flag)
-                from muteki.core.events import Event, EventType
+                from dswarm.core.events import Event, EventType
                 # tell the rail this run is solving again (status → running)
                 await run.bus.emit(Event(
                     event_type=EventType.RUN_REOPENED, run_id=run.run_id,
@@ -784,7 +885,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             workdir = str(worker_root / f"standby-{transport}")
         Path(workdir).mkdir(parents=True, exist_ok=True)
         if container is not None:
-            from muteki.solver.container_exec import _chown_tree_to_worker
+            from dswarm.solver.container_exec import _chown_tree_to_worker
             _chown_tree_to_worker(workdir)
         solver_label = f"cli-{transport}-standby"
         home_label = _standby_home_label(
@@ -846,7 +947,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                     pass
             if container is not None:
                 try:
-                    from muteki.solver.container_exec import teardown_container
+                    from dswarm.solver.container_exec import teardown_container
                     await asyncio.to_thread(teardown_container, run.run_id, remove=True)
                 except Exception:
                     pass

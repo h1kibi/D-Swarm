@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -123,6 +125,7 @@ func errIf(c bool, s string) string {
 // startSupervisorDialing(...)`: it uses t.Errorf (goroutine-safe) not t.Fatal.
 func startSupervisorDialing(t *testing.T, host *fakeHost, runID, token string) {
 	t.Helper()
+	t.Setenv("DSWARM_WORKER_DRAIN_GRACE_SECONDS", "1")
 	ws := filepath.Join(t.TempDir(), "workspace")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
 		t.Errorf("mkdir workspace: %v", err)
@@ -135,6 +138,14 @@ func startSupervisorDialing(t *testing.T, host *fakeHost, runID, token string) {
 		return
 	}
 	s.serve(conn)
+}
+
+func fileSize(p string) int64 {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }
 
 func TestHelloHandshakeAndStartWorker(t *testing.T) {
@@ -234,6 +245,118 @@ func TestStopContPauseResume(t *testing.T) {
 	host.send(t, Request{Op: OpSignal, WorkerID: wid, Signal: "KILL"})
 }
 
+// TestDrainKillsSurvivingGrandchildren: when the worker's MAIN process exits
+// normally, its still-running grandchildren (an untimed background loop) must be
+// SIGKILLed after the drain grace instead of leaking.
+func TestDrainKillsSurvivingGrandchildren(t *testing.T) {
+	t.Setenv("DSWARM_WORKER_DRAIN_GRACE_SECONDS", "1")
+	marker := filepath.Join(t.TempDir(), "marker")
+	w, events, err := startWorker("t", &WorkerSpec{
+		Argv: []string{"sh", "-c",
+			fmt.Sprintf("while true; do date >> %s; sleep 0.1; done & echo hi; exit 0", marker)},
+		Cwd: "/tmp", TimeoutSec: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotExit := false
+	for ev := range events {
+		if ev.T == "exit" {
+			gotExit = true
+			break
+		}
+	}
+	if !gotExit {
+		t.Fatal("no exit frame")
+	}
+	// grace (1s) + margin so the SIGKILL has landed.
+	time.Sleep(2300 * time.Millisecond)
+	size1 := fileSize(marker)
+	time.Sleep(600 * time.Millisecond)
+	size2 := fileSize(marker)
+	if size2 != size1 {
+		t.Fatalf("grandchild still running after drain (marker grew %d -> %d)", size1, size2)
+	}
+	_ = syscall.Kill(-w.pgid, syscall.SIGKILL) // best-effort cleanup
+}
+
+// TestWallClockTimeoutKillsGroup: the supervisor's wall-clock cap SIGKILLs the
+// whole group, so a runaway command dies at the budget even without a per-command
+// timeout.
+func TestWallClockTimeoutKillsGroup(t *testing.T) {
+	t.Setenv("DSWARM_WORKER_DRAIN_GRACE_SECONDS", "1")
+	marker := filepath.Join(t.TempDir(), "marker")
+	_, events, err := startWorker("t", &WorkerSpec{
+		Argv: []string{"sh", "-c",
+			fmt.Sprintf("while true; do date >> %s; sleep 0.1; done", marker)},
+		Cwd: "/tmp", TimeoutSec: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exit Frame
+	for ev := range events {
+		if ev.T == "exit" {
+			exit = ev
+			break
+		}
+	}
+	if !exit.TimedOut {
+		t.Fatalf("expected timed_out exit, got %+v", exit)
+	}
+	size1 := fileSize(marker)
+	time.Sleep(600 * time.Millisecond)
+	size2 := fileSize(marker)
+	if size2 != size1 {
+		t.Fatalf("grandchild survived wall-clock timeout kill (marker grew %d -> %d)", size1, size2)
+	}
+}
+
+// TestSweepKillsDetachedGrandchild: a grandchild that setsid'd away from the
+// worker's pgid is invisible to the pgid drain; the orphan sweep's alive-time
+// descendant snapshot must still kill it after the worker exits.
+func TestSweepKillsDetachedGrandchild(t *testing.T) {
+	t.Setenv("DSWARM_WORKER_DRAIN_GRACE_SECONDS", "1")
+	marker := filepath.Join(t.TempDir(), "marker")
+	w, events, err := startWorker("t", &WorkerSpec{
+		Argv: []string{"sh", "-c",
+			fmt.Sprintf("setsid sh -c 'while true; do date >> %s; sleep 0.1; done' & echo hi; sleep 0.5; exit 0", marker)},
+		Cwd: "/tmp", TimeoutSec: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &supervisor{workers: map[string]*worker{"w": w}}
+	// Wait until the detached writer is actually running (it appends to the
+	// marker) before snapshotting descendants, so the sweep records it.
+	deadline := time.Now().Add(3 * time.Second)
+	for fileSize(marker) == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if fileSize(marker) == 0 {
+		t.Fatal("detached grandchild never started (marker missing)")
+	}
+	s.sweepOnce() // snapshot descendants while the worker is alive
+	gotExit := false
+	for ev := range events {
+		if ev.T == "exit" {
+			gotExit = true
+			break
+		}
+	}
+	if !gotExit {
+		t.Fatal("no exit frame")
+	}
+	s.sweepOnce() // kill the recorded detached descendant
+	time.Sleep(500 * time.Millisecond)
+	size1 := fileSize(marker)
+	time.Sleep(600 * time.Millisecond)
+	size2 := fileSize(marker)
+	if size2 != size1 {
+		t.Fatalf("detached grandchild survived the orphan sweep (marker grew %d -> %d)", size1, size2)
+	}
+}
+
 func TestHealth(t *testing.T) {
 	host := newFakeHost(t, "")
 	go startSupervisorDialing(t, host, "run-H", "")
@@ -280,7 +403,7 @@ func TestSeedWorkspaceDocsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &supervisor{workspace: ws, workers: map[string]*worker{}}
-	s.seedWorkspaceDocs() // /opt/muteki absent → must NOT clobber dst
+	s.seedWorkspaceDocs() // /opt/dswarm absent → must NOT clobber dst
 	got, _ := os.ReadFile(dst)
 	if string(got) != "worker-edited" {
 		t.Fatalf("seed clobbered worker-edited file: %q", got)

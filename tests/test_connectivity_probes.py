@@ -39,7 +39,7 @@ def test_llm_test_uses_request_body_base_url(monkeypatch):
         async def aclose(self):
             pass
 
-    import muteki.core.llm as llm_mod
+    import dswarm.core.llm as llm_mod
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
     res = asyncio.run(llm_test.test_llm_endpoint(
         which="planner", base_url="https://edited.endpoint.test/v1", model="edited-model"))
@@ -63,7 +63,7 @@ def test_llm_test_empty_content_still_ok(monkeypatch):
         async def aclose(self):
             pass
 
-    import muteki.core.llm as llm_mod
+    import dswarm.core.llm as llm_mod
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
     res = asyncio.run(llm_test.test_llm_endpoint(which="titler", model="m"))
     assert res["ok"] is True
@@ -80,7 +80,7 @@ def test_llm_test_chat_raises_is_not_ok(monkeypatch):
         async def aclose(self):
             pass
 
-    import muteki.core.llm as llm_mod
+    import dswarm.core.llm as llm_mod
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
     res = asyncio.run(llm_test.test_llm_endpoint(which="planner", model="m"))
     assert res["ok"] is False
@@ -95,7 +95,7 @@ def test_llm_test_empty_model_rejected():
 # ── account test (補強C-2) ───────────────────────────────────────────────────
 
 def _register_pi(tmp_path):
-    from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
+    from dswarm.solver.credential_accounts import CredentialAccountStore, account_store_root
     store = CredentialAccountStore(account_store_root(tmp_path))
     store.upsert_secret(account_id="pi-main", engine="pi", secret="tok-123")
     return store
@@ -123,7 +123,7 @@ def test_account_test_local_uses_account_env(tmp_path, monkeypatch):
     _register_pi(tmp_path)
     seen = {}
 
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     class _Drv:
         def health_detail(self, env=None):
@@ -131,7 +131,7 @@ def test_account_test_local_uses_account_env(tmp_path, monkeypatch):
             return True, ""
 
     monkeypatch.setattr(cli_driver, "driver_for", lambda profile: _Drv())
-    monkeypatch.setenv("MUTEKI_PI_PROVIDER", "deepseek")
+    monkeypatch.setenv("DSWARM_PI_PROVIDER", "deepseek")
     res = account_test.probe_account(
         engine="pi", account_id="pi-main",
         sessions_root=tmp_path, backend="local")
@@ -141,7 +141,7 @@ def test_account_test_local_uses_account_env(tmp_path, monkeypatch):
 
 
 def _register_endpoint(tmp_path, *, target="pi", base="https://api.deepseek.com/v1"):
-    from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
+    from dswarm.solver.credential_accounts import CredentialAccountStore, account_store_root
     store = CredentialAccountStore(account_store_root(tmp_path))
     store.upsert_secret(account_id="ds", engine="api", secret="sk-test-key",
                         base_url=base, target_engine=target)
@@ -153,7 +153,7 @@ def test_account_test_custom_endpoint_probes_directly_not_via_cli(tmp_path, monk
     wrong default model (which hangs against a third-party endpoint). We assert the
     CLI driver is NEVER invoked and the HTTP status classifies correctly."""
     _register_endpoint(tmp_path)
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     def _boom(*a, **k):
         raise AssertionError("driver_for must NOT be called for a custom-endpoint test")
@@ -222,9 +222,9 @@ def test_account_test_container_uses_docker_run_rm_not_local(tmp_path, monkeypat
         if args[:2] == ("image", "inspect"):
             return subprocess.CompletedProcess(args, 0, "", "")
         # the run --rm probe
-        return subprocess.CompletedProcess(args, 0, "MUTEKI_OK\n", "")
+        return subprocess.CompletedProcess(args, 0, "DSWARM_OK\n", "")
 
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
     monkeypatch.setattr(account_test, "_docker", fake_docker)
     monkeypatch.setattr(cli_driver, "driver_for", lambda profile: type(
         "D", (), {"health_detail": lambda self, env=None: (True, "")})())
@@ -237,7 +237,7 @@ def test_account_test_container_uses_docker_run_rm_not_local(tmp_path, monkeypat
     run = run_calls[0]
     assert "--rm" in run  # one-shot, not the long-lived ensure_container
     flat = " ".join(run)
-    assert "muteki_accounts" not in flat or "accounts" in flat  # projection mounted
+    assert "dswarm_accounts" not in flat or "accounts" in flat  # projection mounted
     # the bench tree must NEVER be mounted — only workspace + accounts projection
     assert "nyu_ctf_bench" not in flat and "bench" not in flat
 
@@ -263,7 +263,7 @@ def test_account_test_container_mount_unreadable_layer(tmp_path, monkeypatch):
     def fake_docker(*args, timeout=30.0):
         if args[:2] == ("image", "inspect"):
             return subprocess.CompletedProcess(args, 0, "", "")
-        return subprocess.CompletedProcess(args, 71, "MUTEKI_MOUNT_UNREADABLE\n", "")
+        return subprocess.CompletedProcess(args, 71, "DSWARM_MOUNT_UNREADABLE\n", "")
 
     monkeypatch.setattr(account_test, "_docker", fake_docker)
     res = account_test.probe_account(
@@ -277,7 +277,7 @@ def test_account_test_container_mount_unreadable_layer(tmp_path, monkeypatch):
 
 def test_engine_health_local_tags_backend(monkeypatch):
     """local self-check runs the host driver healthcheck and tags backend=local."""
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     monkeypatch.setattr(cli_driver.subprocess, "run",
                         lambda *a, **k: __import__("subprocess").CompletedProcess(a, 0, "pi 0.81.1\n", ""))
@@ -291,7 +291,7 @@ def test_engine_health_local_tags_backend(monkeypatch):
 def test_engine_health_local_profile_probe_uses_selected_model(tmp_path, monkeypatch):
     """Settings-panel TODO: global engine self-check must exercise the selected
     worker profile/model, not only the bare engine default."""
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     seen = []
 
@@ -322,7 +322,7 @@ def test_engine_health_local_profile_probe_uses_selected_model(tmp_path, monkeyp
 def test_engine_health_container_runs_in_container_not_host(monkeypatch):
     """container self-check uses `docker run --rm` against the worker image to
     verify the CLI launches INSIDE the container, NOT the host CLI (task #16)."""
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     calls = []
 
@@ -347,7 +347,7 @@ def test_engine_health_container_runs_in_container_not_host(monkeypatch):
 
 
 def test_engine_health_container_image_missing_is_unhealthy(monkeypatch):
-    import muteki.solver.cli_driver as cli_driver
+    import dswarm.solver.cli_driver as cli_driver
 
     def fake_run(argv, **kwargs):
         import subprocess as sp

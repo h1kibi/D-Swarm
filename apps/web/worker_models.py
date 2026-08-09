@@ -16,15 +16,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from muteki.solver.cli_driver import driver_for
-from muteki.solver.credential_accounts import (
+from dswarm.solver.cli_driver import driver_for
+from dswarm.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
     CredentialAccountStore,
     account_store_root,
     project_account_root,
     runtime_env_for_engine,
 )
-from muteki.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
+from dswarm.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
 
 
 ModelOption = dict[str, str]
@@ -143,7 +143,7 @@ def _worker_container_model_probe(
     selected model can complete one minimal turn.
     """
 
-    from muteki.solver.container_exec import (
+    from dswarm.solver.container_exec import (
         CONTAINER_WORKSPACE,
         WORKER_IMAGE,
         _HOST_DATA_ROOT,
@@ -189,7 +189,7 @@ def _worker_container_model_probe(
     tmp_base = None
     if _HOST_DATA_ROOT:
         tmp_base = os.path.join(
-            os.environ.get("MUTEKI_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT,
+            os.environ.get("DSWARM_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT,
             "_tmp",
             "model-tests",
         )
@@ -198,7 +198,7 @@ def _worker_container_model_probe(
         except OSError:
             tmp_base = None
 
-    with tempfile.TemporaryDirectory(prefix="muteki-model-test-", dir=tmp_base) as td:
+    with tempfile.TemporaryDirectory(prefix="dswarm-model-test-", dir=tmp_base) as td:
         workspace = os.path.join(td, "ws")
         projection = os.path.join(td, "accounts")
         os.makedirs(workspace, exist_ok=True)
@@ -241,7 +241,7 @@ def _worker_container_model_probe(
             + f"; exec timeout -s KILL {timeout_s}s {shlex.join(argv)} < /dev/null"
         )
 
-        network = (os.environ.get("MUTEKI_WORKER_NETWORK") or "bridge").strip() or "bridge"
+        network = (os.environ.get("DSWARM_WORKER_NETWORK") or "bridge").strip() or "bridge"
         run_cmd = [
             "run", "--rm", "--init",
             "--network", network,
@@ -317,7 +317,7 @@ def probe_worker_model(
     # selected profile/model in the worker image instead of shelling the host/web
     # filesystem. This spends one minimal model turn by design: the operator
     # explicitly clicked "test model".
-    from muteki.core.runtime_env import is_web_container
+    from dswarm.core.runtime_env import is_web_container
 
     if backend == "container" and is_web_container():
         return _worker_container_model_probe(

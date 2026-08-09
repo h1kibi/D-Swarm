@@ -1,6 +1,6 @@
 """Launchable TUI entrypoint:  `uv run python -m apps.tui [options]`.
 
-`apps/tui/app.py` only defines the `MutekiTUI` widget — it has no runner, so
+`apps/tui/app.py` only defines the `DSwarmTUI` widget — it has no runner, so
 `python -m apps.tui.app` just loads classes and exits. THIS module is the real
 launcher: it wires an EventBus + a background driver (mock or real swarm) to the
 TUI and runs it.
@@ -21,21 +21,21 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from muteki.core.cost import CostController
-from muteki.core.dotenv_boot import load_env
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType, hitl_response_payload
+from dswarm.core.cost import CostController
+from dswarm.core.dotenv_boot import load_env
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType, hitl_response_payload
 
-from apps.tui.app import MutekiTUI
+from apps.tui.app import DSwarmTUI
 
 load_env()  # pick up repo-root .env so --swarm finds the key (shell env wins)
 
 
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="python -m apps.tui",
-                                description="Project Muteki TUI command deck")
+                                description="Project D-Swarm TUI command deck")
     p.add_argument("--swarm", action="store_true",
-                   help="run the real solver swarm (needs MUTEKI_DEEPSEEK_API_KEY)")
+                   help="run the real solver swarm (needs DSWARM_DEEPSEEK_API_KEY)")
     p.add_argument("--key", default="",
                    help="NYU-bench challenge key to solve (with --swarm)")
     p.add_argument("--desc", default="", help="ad-hoc challenge description")
@@ -57,14 +57,14 @@ async def _swarm_driver(bus: EventBus, cost: CostController, run_id: str,
     import os
     import tempfile
 
-    from muteki.core.llm import LLMClient
-    from muteki.learning.distill import TemplateStore
-    from muteki.models.solve_graph import Challenge
-    from muteki.sandbox.manager import SandboxManager
-    from muteki.solver.result import ArtifactStore
-    from muteki.solver.types import SolverConfig
-    from muteki.swarm.models import default_lineup
-    from muteki.swarm.swarm import Swarm
+    from dswarm.core.llm import LLMClient
+    from dswarm.learning.distill import TemplateStore
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.sandbox.manager import SandboxManager
+    from dswarm.solver.result import ArtifactStore
+    from dswarm.solver.types import SolverConfig
+    from dswarm.swarm.models import default_lineup
+    from dswarm.swarm.swarm import Swarm
 
     challenge = Challenge(
         id=run_id, name=args.key or args.desc[:32] or run_id,
@@ -72,10 +72,10 @@ async def _swarm_driver(bus: EventBus, cost: CostController, run_id: str,
         target=args.target or None,
         flag_format=r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}",
     )
-    root = Path(tempfile.mkdtemp(prefix="muteki-tui-"))
+    root = Path(tempfile.mkdtemp(prefix="dswarm-tui-"))
     sandbox = SandboxManager(bus=bus, root=root / "sbx")
     arts = ArtifactStore(root=root / "arts")
-    knowledge = TemplateStore(root=os.environ.get("MUTEKI_KNOWLEDGE_DIR", "knowledge"))
+    knowledge = TemplateStore(root=os.environ.get("DSWARM_KNOWLEDGE_DIR", "knowledge"))
     async with LLMClient(cost=cost, bus=bus) as llm:
         swarm = Swarm(
             challenge, default_lineup(args.n_solvers), llm=llm, sandbox=sandbox,
@@ -115,7 +115,7 @@ async def _amain(args: argparse.Namespace) -> None:
             payload=hitl_response_payload(target, action, text=text),
         ))
 
-    app = MutekiTUI(bus, hitl=hitl, lineup=lineup, stop_on_finish=False)
+    app = DSwarmTUI(bus, hitl=hitl, lineup=lineup, stop_on_finish=False)
     try:
         await app.run_async()
     finally:

@@ -1,3 +1,3 @@
-module github.com/muteki/runtime-agent
+module github.com/dswarm/runtime-agent
 
 go 1.26

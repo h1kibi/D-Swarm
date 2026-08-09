@@ -25,9 +25,9 @@ import pytest
 from apps.web.run_manager import RunManager
 from apps.web.run_meta import RunMetaStore
 from apps.web.titler import _clean, fallback_title, generate_title
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType
-from muteki.models.solve_graph import Challenge
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType
+from dswarm.models.solve_graph import Challenge
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +107,20 @@ def test_worker_lane_header_compacts_tool_status():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "workerLanePresentation.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -202,6 +216,20 @@ def test_clipboard_copy_falls_back_after_async_clipboard_rejects():
           HTMLElement: FakeHTMLElement,
         }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "clipboard.js" }});
         const lib = sandbox.module.exports;
 
@@ -249,6 +277,20 @@ def test_worker_filter_chips_are_compact_scroll_rail():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "workers.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -265,7 +307,7 @@ def test_worker_filter_chips_are_compact_scroll_rail():
     activity = (UI_ROOT / "components" / "ActivityStream.tsx").read_text()
     lanes = (UI_ROOT / "components" / "WorkerLanes.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
     chipbar = (UI_ROOT / "components" / "ChipFilterBar.tsx").read_text()
     assert "ChipFilterBar" in activity
     assert "ChipFilterBar" in lanes
@@ -316,6 +358,20 @@ def test_worker_identity_uses_transport_not_name_substrings():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "workers.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -335,8 +391,8 @@ def test_worker_settings_redesigned_ia():
     the health self-check unification (per-profile readiness, single source of
     truth shared with the dispatch precheck).
 
-    CONTRACT: the panel is organised by INTENT tabs — roster · accounts · runtime
-    · budget · advanced — not the old flat profile table. Account readiness is
+    CONTRACT: the panel is organised by the docs/07 §6.4 pi-only groups —
+    runtime · pi · reasonswarm — not the old flat profile table. Account readiness is
     PER PROFILE with a three honest states badge (not the old per-engine
     "an account exists ⇒ green" inference that let a run die on profile_unhealthy
     while the page showed green). This pins the new shape so a future edit can't
@@ -344,10 +400,10 @@ def test_worker_settings_redesigned_ia():
     """
     src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     # ── intent tabs (the v2 left rail) ───────────────────────────────────────
-    for tab in ("tabRoster", "tabAccounts", "tabRuntime", "tabBudget", "tabAdvanced"):
+    for tab in ("tabRuntime", "tabPi", "tabReason"):
         assert f't("settings.{tab}")' in src, f"missing intent tab {tab}"
 
     # ── credential block CHANGES FACE by run environment ─────────────────────
@@ -408,11 +464,12 @@ def test_worker_settings_redesigned_ia():
     assert 't("settings.saveAndTest")' in src
     assert '"settings.saveAndTest"' in i18n
 
-    # ── codex one-click re-auth from the host ~/.codex (after `codex login`) ───
-    assert "importHostCodexAuth" in src and "importCodexFromHost" in src
-    assert 't("settings.importHostCodex")' in src
-    assert '"settings.importHostCodex"' in i18n
-    assert 'p.engine === "codex"' in src, "import-from-host must be gated to codex rows"
+        # ── pi-only roster: codex one-click re-auth from the host is gone ────────
+    assert "importHostCodexAuth" not in src
+    assert "importCodexFromHost" not in src
+    assert "settings.importHostCodex" not in src
+    assert "settings.importHostCodex" not in i18n
+    assert 'p.engine === "codex"' not in src
 
     # local-vs-container is explicit: tests run against the CURRENT run env and
     # say so (account test labels the backend; self-check probes the right env).
@@ -427,7 +484,7 @@ def test_worker_settings_redesigned_ia():
     assert "api_key_ref" not in src
 
     # i18n for the still-present notes
-    assert '"settings.credContainerWarn"' in i18n
+    assert '"settings.credLocalNote"' in i18n
     assert '"settings.reasonKeyNote"' in i18n
 
 
@@ -436,7 +493,7 @@ def test_custom_endpoint_account_form_binds_to_agent():
     undiscoverable account-id naming convention. The form gains an agent selector
     that auto-aligns the id and is persisted as target_engine."""
     src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     # the selector only shows for the custom-endpoint type, beside base_url
     assert 't("settings.accountTargetEngine")' in src
@@ -455,28 +512,12 @@ def test_custom_endpoint_account_form_binds_to_agent():
     assert '"settings.modeCustomEndpoint"' in i18n
 
 
-def test_run_inspector_renders_runtime_degraded_badge():
-    src = (UI_ROOT / "components" / "RunInspector.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
-    css = (UI_ROOT / "app" / "globals.css").read_text()
-    assert 'e.kind === "runtime_degraded"' in src
-    assert 'insp-runtime-degraded' in src
-    assert '"insp.run.runtimeDegraded"' in i18n
-    assert ".insp-runtime-degraded" in css
-
-
-def test_worker_settings_save_keeps_race_roster_in_sync_with_visible_roster():
-    """Saving the visible seat lineup must also update the race roster.
-
-    The settings UI does not expose a separate race-only subset. If save only
-    updates `engines`, an old `race_engines`/`stage_policy.race.engines` subset
-    can survive on disk and silently drop codex from new runs even though the
-    roster shows it enabled.
-    """
+def test_worker_settings_no_longer_emits_race_controls():
     src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
 
-    assert "race_engines: nextEngines" in src
-    assert "race: { enabled: raceScout, timeout: raceTimeout, engines: nextEngines }" in src
+    assert "race_engines: nextEngines" not in src
+    assert "race: { enabled: raceScout, timeout: raceTimeout, engines: nextEngines }" not in src
+    assert "settings.raceScout" not in src
 
 
 def test_events_reducer_tracks_poc_blackboard_lifecycle():
@@ -492,6 +533,20 @@ def test_events_reducer_tracks_poc_blackboard_lifecycle():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -528,6 +583,20 @@ def test_events_reducer_upserts_fact_and_dead_end_by_db_seq():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -565,6 +634,20 @@ def test_events_reducer_uses_intent_id_product_edge_and_branch_resolve():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -627,7 +710,7 @@ def test_blackboard_empty_guard_matches_rendered_node_inputs():
 
 def test_artifact_panel_exposes_architecture_side_panels():
     panel = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
-    inspector = (UI_ROOT / "components" / "RunInspector.tsx").read_text()
+    inspector = (UI_ROOT / "components" / "SwarmInspector.tsx").read_text()
     assert '"findings"' in panel
     assert '"credentials"' in panel
     assert '"pocs"' in panel
@@ -635,7 +718,7 @@ def test_artifact_panel_exposes_architecture_side_panels():
     assert '"directives"' in panel
     assert "CredentialsPanel" in panel
     assert "ReviewFindingsPanel" in panel
-    assert 'panelBtn("credentials"' in inspector
+    assert '"credentials"' in inspector
 
 
 def test_events_reducer_tracks_runtime_degraded_blackboard_delta():
@@ -651,6 +734,20 @@ def test_events_reducer_tracks_runtime_degraded_blackboard_delta():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -678,11 +775,11 @@ def test_dispatch_sends_per_run_budget_controls():
     src = (UI_ROOT / "app" / "page.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
-    assert "runOverrides.race_timeout = opts.raceTimeout" in src
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
+    assert "runOverrides.race_timeout" not in src
     assert "runOverrides.max_total_workers = opts.maxTotalWorkers" in src
     assert "runOverrides.cost_budget_usd = opts.costBudgetUsd" in src
-    assert "raceTimeout?: number" in convo
+    assert "raceTimeout?: number" not in convo
     assert 't("composer.maxTotalWorkers")' in convo
     assert "advancedOpen" in convo
     assert 'className="composer-advanced-panel"' in convo
@@ -694,7 +791,7 @@ def test_dispatch_sends_per_run_budget_controls():
 def test_collect_mode_does_not_force_token_flag_format():
     src = (UI_ROOT / "app" / "page.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     assert 'flagFormat?: "brace" | "token" | "custom"' in convo
     assert 'opts?.flagFormat === "token"' in src
@@ -706,11 +803,11 @@ def test_collect_mode_does_not_force_token_flag_format():
 def test_dispatch_threads_custom_flag_wrapper():
     src = (UI_ROOT / "app" / "page.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     assert 'flagFormat?: "brace" | "token" | "custom"' in convo
     assert "flagWrapper?: string" in convo
-    assert "muteki.flagWrapper" in convo
+    assert "dswarm.flagWrapper" in convo
     assert 't("composer.flagWrapperPlaceholder")' in convo
     assert "challenge.flag_format_wrapper = opts.flagWrapper" in src
     assert '"composer.flagFormatCustom"' in i18n
@@ -742,7 +839,7 @@ def test_per_run_zero_budget_values_are_preserved():
 
 def test_finished_run_does_not_render_rail_footer_as_disconnected():
     rail = (UI_ROOT / "components" / "ThreadRail.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
     assert "activeRun?.finished" in rail
     assert "rail.runFinished" in rail
     assert '"rail.runFinished"' in i18n
@@ -761,6 +858,20 @@ def test_events_reducer_tracks_operator_paused_blackboard_delta():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -802,6 +913,20 @@ def test_events_reducer_surfaces_standby_writeup_in_coordinator_thread():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -840,6 +965,20 @@ def test_events_reducer_labels_resolve_reopen_separately_from_false_positive():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -888,6 +1027,20 @@ def test_run_active_selector_closes_controls_after_terminal_flag_signal():
         }}).outputText;
         const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
         sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
         vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
         const lib = sandbox.module.exports;
         function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
@@ -915,10 +1068,59 @@ def test_run_active_selector_closes_controls_after_terminal_flag_signal():
     _run_ui_node(script)
 
 
+def test_worker_finished_and_run_finished_do_not_duplicate_solved_chat():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+// resolve relative TS imports (e.g. events.ts -> ./reason) inside the vm
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let deck = lib.emptyDeck("run-dedup");
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.RUN_STARTED, run_id: "run-dedup", ts: 1,
+          payload: {{ challenge: {{ name: "web", category: "web", expected_flags: 1, multi_flag: false }} }} }});
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.WORKER_FINISHED, run_id: "run-dedup", ts: 2,
+          solver_id: "cli-pi", payload: {{ solved: true, flag: "flag{{x}}", flags: ["flag{{x}}"] }} }});
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.WORKER_FINISHED, run_id: "run-dedup", ts: 3,
+          solver_id: "cli-pi-2", payload: {{ solved: true, flag: "flag{{x}}", flags: ["flag{{x}}"] }} }});
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.RUN_FINISHED, run_id: "run-dedup", ts: 4,
+          payload: {{ solved: true, flag: "flag{{x}}", flags: ["flag{{x}}"], expected_flags: 1, multi_flag: false }} }});
+
+        const solved = deck.chat.filter((m) => m.i18nKey === "sys.solved");
+        assert(solved.length === 1, "solved status must be emitted once, got " + solved.length);
+        assert(solved[0].i18nVars.flag === "flag{{x}}", "solved status should carry the flag");
+        """
+    )
+    _run_ui_node(script)
+
+
 def test_evidence_chain_is_compact_expandable_workbench():
     evidence = (UI_ROOT / "components" / "EvidenceChain.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     assert 'className="panel-scroll-wrap evidence-panel"' in evidence
     assert 'className="evi-toolbar"' in evidence
@@ -942,7 +1144,7 @@ def test_evidence_chain_is_compact_expandable_workbench():
 def test_graph_toolbar_solver_chips_use_shared_dropdown():
     graph = (UI_ROOT / "components" / "GraphView.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     assert "workerShortLabel" in graph
     assert 'className="graph-toolbar-actions"' in graph
@@ -987,28 +1189,12 @@ def test_graph_view_does_not_late_load_cytoscape_chunks():
     assert 'await import("cytoscape-dagre")' not in graph
 
 
-def test_conversation_top_badge_uses_paused_digest_state():
-    convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+def test_topbar_uses_paused_digest_state():
+    topbar = (UI_ROOT / "components" / "TopBar.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
-    assert 'digest.phase === "paused"' in convo
-    assert "runStateLabel" in convo
-    assert '"convo.paused"' in i18n
-
-
-def test_running_zero_worker_state_has_idle_copy():
-    convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
-
-    assert "hero.detail.runningIdle" in convo
-    assert '"hero.detail.runningIdle"' in i18n
-
-
-def test_single_flag_solved_detail_does_not_prefix_flag_twice():
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
-
-    assert '"hero.detail.solved": { zh: "{flag}", en: "{flag}" }' in i18n
-    assert '"common.copyFlagAria": { zh: "复制 {flag}", en: "Copy {flag}" }' in i18n
+    assert 'digest.phase === "paused"' in topbar
+    assert '"topbar.resume"' in i18n
 
 
 def test_favicon_route_exists():
@@ -1018,12 +1204,13 @@ def test_favicon_route_exists():
     src = route.read_text()
     assert "image/svg+xml" in src
     assert "Cache-Control" in src
+    assert "#ffffff" in src and "#0D5C45" in src
 
 
 def test_blackboard_worker_chips_wrap_when_expanded():
     blackboard = (UI_ROOT / "components" / "Blackboard.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
     assert "workerShortLabel" in blackboard
     assert 'className="bb-toolbar-main"' in blackboard
@@ -1061,17 +1248,9 @@ def test_worker_lane_detail_defaults_collapsed():
     assert "{isExpanded && (" in component
 
 
-def test_status_hero_exposes_flow_popover():
-    component = (UI_ROOT / "components" / "Conversation.tsx").read_text()
-    assert "function FlowPopover" in component
-    assert 'className="flow-popover"' in component
-    assert 'aria-label={t("flow.open")}' in component
-    assert "FLOW_STEPS" in component
-
-
 def test_settings_moved_to_rail_and_header_toggles_theme():
     rail = (UI_ROOT / "components" / "ThreadRail.tsx").read_text()
-    convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
+    topbar = (UI_ROOT / "components" / "TopBar.tsx").read_text()
     page = (UI_ROOT / "app" / "page.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
 
@@ -1080,36 +1259,19 @@ def test_settings_moved_to_rail_and_header_toggles_theme():
     assert "onOpenSettings" in rail
     assert '<Icon name="gear" size={14} />' in rail
     assert '<span>{t("settings.open")}</span>' not in rail
-    assert "onToggleTheme" in convo
-    assert "theme.toDark" in convo and "theme.toLight" in convo
-    assert "muteki.theme" in page
+    assert "onToggleTheme" in topbar
+    assert "theme.toDark" in topbar and "theme.toLight" in topbar
+    assert "dswarm.theme" in page
     assert ':root[data-theme="dark"]' in css
-
-
-def test_run_inspector_is_full_height_resizable_side_rail():
-    convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
-    inspector = (UI_ROOT / "components" / "RunInspector.tsx").read_text()
-    css = (UI_ROOT / "app" / "globals.css").read_text()
-
-    assert "convo-body" in convo
-    assert "convo-mainpane" in convo
-    assert "inspector-shell" in convo
-    assert "inspector-resizer" in convo
-    assert "muteki.runInspector.width" in convo
-    assert "sectionHeader" in inspector
-    assert "collapsedSections" in inspector
-    assert ".inspector-shell" in css
-    assert ".convo.has-inspector .convo-mainpane" in css
-    assert "var(--inspector-width" in css
 
 
 def test_artifact_panel_has_resizable_width_handle():
     page = (UI_ROOT / "app" / "page.tsx").read_text()
     panel = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
-    assert "muteki.artifact.width" in page
+    assert "dswarm.artifact.width" in page
     assert "onArtifactResize" in page
     assert "artifact-resizer" in panel
     assert "aria-valuenow={width}" in panel
@@ -1117,6 +1279,150 @@ def test_artifact_panel_has_resizable_width_handle():
     assert ".artifact-resizer" in css
     assert "body.artifact-resizing" in css
     assert "art.resizeCanvas" in i18n
+
+
+def test_phase4_command_center_layout():
+    """Phase 4 (docs/07 §5): the deck is a Command-center — TopBar with the
+    Stage Rail, Run Fleet left, Decision Timeline center, Live Swarm Inspector
+    right, persistent Operator Command Bar bottom. The conversation is demoted
+    to the draft/launch surface + one timeline event class."""
+    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    topbar = (UI_ROOT / "components" / "TopBar.tsx").read_text()
+    timeline = (UI_ROOT / "components" / "DecisionTimeline.tsx").read_text()
+    inspector = (UI_ROOT / "components" / "SwarmInspector.tsx").read_text()
+    opbar = (UI_ROOT / "components" / "OperatorBar.tsx").read_text()
+    rail = (UI_ROOT / "components" / "ThreadRail.tsx").read_text()
+    lib_timeline = (UI_ROOT / "lib" / "timeline.ts").read_text()
+    lib_fleet = (UI_ROOT / "lib" / "fleet.ts").read_text()
+    css = (UI_ROOT / "app" / "globals.css").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
+
+    # shell: TopBar / three columns / OperatorBar; Timeline replaces the
+    # conversation as the main axis once a run exists; Conversation renders
+    # ONLY the draft launch surface (its started-run branches were retired in
+    # Phase 6).
+    assert "cc-shell" in page and "cc-body" in page
+    assert "<TopBar" in page and "<DecisionTimeline" in page
+    assert "<SwarmInspector" in page and "<OperatorBar" in page
+    assert "showTimeline" in page and "<Conversation" in page
+    assert "deriveStage(deck)" in page
+
+    # top bar: brand + stage rail + flags + cost + pause/resume/stop — and no
+    # retired-path vocabulary (race / coordinator) anywhere in the chrome.
+    assert "<StageRail" in topbar and "D-Swarm" in topbar
+    assert "BrandMark" not in topbar
+    assert "topbar.pause" in topbar and "topbar.stop" in topbar
+    assert "race" not in topbar and "coordinator" not in topbar
+
+    # stage rail: eight stages, all i18n'd (no raw kernel enums).
+    for s in ("queued", "prepare", "recon", "reason", "dispatch", "execute", "review", "finalize"):
+        assert f'"stage.{s}"' in i18n
+    assert "stageAnchors" in lib_timeline and "stageRailStates" in lib_timeline
+
+    # decision timeline: cycle cards expand to audits + intents; chat is one
+    # event class; worker raw output stays collapsed behind a jump.
+    assert "buildTimeline" in timeline and "CycleCard" in timeline
+    assert "isTimelineChat" in lib_timeline
+    assert "directiveLifecycle" in lib_timeline
+    assert "timeline.openWorker" in timeline
+
+    # fleet: attention filter + compact mode + batch controls (stop confirms).
+    assert "filterFleet" in rail and "fleet-chip" in rail
+    assert "dswarm.fleet.compact" in rail
+    assert "runBatch" in rail and "fleet.confirmStop" in rail
+    assert "runNeedsAttention" in lib_fleet and "batchTargets" in lib_fleet
+
+    # inspector: workers / intents / panels tabs + HITL attention + kill control.
+    assert 'swarm.tab.${k}' in inspector and '["workers", "intents", "panels"]' in inspector
+    assert "HitlCard" in inspector and "swarm.killConfirm" in inspector
+
+    # operator bar: hint/redirect/focus + pause/resume/stop, semantics caption,
+    # composer focus contract for the command palette.
+    assert 'op.action.${a}' in opbar
+    assert '["hint", "redirect", "focus"]' in opbar and '["pause", "resume", "stop"]' in opbar
+    assert "op.note" in opbar and "op.scope" in opbar
+    assert "data-composer-input" in opbar
+
+    # styles + i18n parity anchors for the new regions.
+    assert ".stage-rail" in css and ".dectl" in css and ".opbar" in css
+    assert ".fleet-filters" in css and ".swarm" in css
+    assert '"timeline.cycle"' in i18n and '"directive.lifecycle.queued"' in i18n
+
+
+def test_phase5_worker_evidence_pheromone_views():
+    """Phase 5 (docs/07 §6.2/§6.3): worker card hierarchy, three independent
+    evidence dimensions (truth / pheromone / provenance), the kernel pheromone
+    formula + bands in a pure lib, cross-view links, N/A legacy degradation."""
+    pher = (UI_ROOT / "lib" / "pheromone.ts").read_text()
+    events = (UI_ROOT / "lib" / "events.ts").read_text()
+    evidence = (UI_ROOT / "components" / "EvidenceChain.tsx").read_text()
+    inspector = (UI_ROOT / "components" / "SwarmInspector.tsx").read_text()
+    timeline = (UI_ROOT / "components" / "DecisionTimeline.tsx").read_text()
+    artifact = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
+    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    crosslink = (UI_ROOT / "lib" / "crosslink.ts").read_text()
+    clock = (UI_ROOT / "lib" / "usePheromoneClock.ts").read_text()
+    css = (UI_ROOT / "app" / "globals.css").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
+
+    # data layer: kernel formula + bands + projector fold wired into the reducer.
+    assert "pheromoneStrength" in pher and "pheromoneBand" in pher
+    assert "foldFindingUpserted" in pher and 'p.actor !== "projector"' in pher
+    assert "Math.pow(0.5" in pher  # base × 2^(-age/half_life), clamp [0,1]
+    assert "findings: PheromoneFindingView[]" in events
+    assert "foldFindingUpserted(s.findings, ev)" in events
+
+    # evidence: three INDEPENDENT dimensions — pheromone has its own row and
+    # its own detail block; it is never merged into verified/confidence.
+    assert "PheromoneRow" in evidence and "evi-pher" in evidence
+    assert "pheromone.experimental" in evidence  # Experimental badge
+    assert "pheromone.base" in evidence and "pheromone.halfLife" in evidence
+    assert "pheromone.age" in evidence
+    assert "evidence.sortStrength" in evidence  # sort by strength
+    assert "evidence.filterKind" in evidence and "evidence.experimentalOnly" in evidence
+    # provenance links: worker / source event seq / owning intent.
+    assert "jumpToFactEvent" in evidence and "jumpToIntentDispatch" in evidence
+    assert "onOpenWorker" in evidence
+
+    # worker card hierarchy (§6.2 order): structured findings → intent &
+    # dispatch reason → provenance → reasoning → tool calls → tool results →
+    # raw output → artifacts → runtime diagnostics → controls.
+    order = [
+        '"swarm.sec.findings"', '"swarm.sec.intent"', '"swarm.sec.provenance"',
+        '"swarm.sec.reasoning"', '"swarm.sec.toolCalls"', '"swarm.sec.toolResults"',
+        '"swarm.sec.rawOutput"', '"swarm.sec.artifacts"', '"swarm.sec.runtime"',
+        '"swarm.sec.controls"',
+    ]
+    pos = [inspector.index(k) for k in order]
+    assert pos == sorted(pos)
+    # raw terminal output is collapsed by default but fully expandable.
+    assert '<details className="sw-raw">' in inspector
+    assert "aria-expanded={expanded}" in inspector
+
+    # cross-view links: timeline rows carry stable anchors; dispatch worker and
+    # fact provenance are clickable; the page wires evidence/worker jumps.
+    assert "id={`tl-${item.id}`}" in timeline
+    assert "onOpenEvidence" in timeline and "onOpenEvidence" in page
+    assert "onOpenWorker(item.fact.actor)" in timeline
+    assert "onOpenWorker(item.intent.workerId!)" in timeline
+    assert "onOpenWorker={onOpenWorker}" in artifact
+    assert "jumpToTimelineItem" in crosslink and "tl-flash" in crosslink
+
+    # live decay clock: low-frequency interval (>=5s), only while findings exist;
+    # finished/replayed runs freeze at finishedAt (replay virtual time).
+    assert "Math.max(5000" in clock and "deck.findings.length > 0" in clock
+    assert "pheromoneClockSec" in clock
+
+    # styles + i18n anchors for the new regions.
+    assert ".pher-fill.hot" in css and ".pher-fill.faint" in css
+    assert ".evi-pher" in css and ".tl-flash" in css and ".sw-worker-detail" in css
+    for key in (
+        '"pheromone.label"', '"pheromone.experimental"', '"pheromone.na"',
+        '"pheromone.base"', '"pheromone.halfLife"', '"pheromone.age"',
+        '"evidence.sortStrength"', '"evidence.filterKind"', '"evidence.experimentalOnly"',
+        '"swarm.sec.rawOutput"', '"swarm.sec.controls"',
+    ):
+        assert key in i18n
 
 
 # ---- RunMetaStore -----------------------------------------------------------
@@ -1404,7 +1710,7 @@ async def test_meta_sink_merges_mid_run_flag_found(tmp_path):
 
 async def test_swarm_driver_threads_attachments_and_offline_denies_kb(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     src = tmp_path / "flag.enc"
     src.write_text("xx")
@@ -1465,7 +1771,7 @@ async def test_swarm_driver_threads_attachments_and_offline_denies_kb(tmp_path, 
 
 async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     captured = {}
 
@@ -1501,7 +1807,7 @@ async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
 
 async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     captured = {}
 
@@ -1517,8 +1823,6 @@ async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_pa
     body = {
         "kind": "swarm",
         "challenge": {"description": "solve"},
-        "race_timeout": 111,
-        "race_engines": ["claude-sub-container"],
         "wall_clock_budget": 222,
         "max_total_workers": 9,
         "cost_budget_usd": 0.75,
@@ -1539,8 +1843,6 @@ async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_pa
         cost = None; flag = None
 
     await driver(FakeRun())
-    assert captured["race_timeout"] == 111
-    assert captured["race_engines"] == ["claude-sub-container"]
     assert captured["wall_clock_budget"] == 222
     assert captured["max_total_workers"] == 9
     assert captured["cost_budget_usd"] == 0.75
@@ -1551,7 +1853,7 @@ async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_pa
 
 async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     captured = {}
 
@@ -1569,7 +1871,6 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
         "engines": ["claude"],
         "start_workers": 1,
         "stage_policy": {
-            "race": {"enabled": True, "timeout": 720, "engines": ["claude"]},
             "coordinator": {"wall_clock_budget": 999},
             "budgets": {"max_total_workers": 42, "cost_budget_usd": 9.9},
         },
@@ -1577,7 +1878,6 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
     body = {
         "kind": "swarm",
         "challenge": {"description": "solve"},
-        "race_timeout": 90,
         "wall_clock_budget": 0,
         "max_total_workers": 0,
         "cost_budget_usd": 0,
@@ -1595,7 +1895,6 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
 
     await driver(FakeRun())
     policy = captured["stage_policy"]
-    assert policy["race"]["timeout"] == 90
     assert policy["coordinator"]["wall_clock_budget"] == 0
     assert policy["budgets"]["max_total_workers"] == 0
     assert policy["budgets"]["cost_budget_usd"] == 0.0
@@ -1603,7 +1902,7 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
 
 async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     captured = {}
 
@@ -1661,7 +1960,7 @@ async def test_swarm_driver_threads_expected_flags(tmp_path, monkeypatch):
     # challenge always defaulted to 1. body.expected_flags (and challenge.*) must
     # reach the Challenge so a ladder run stops only after collecting ALL flags.
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     cap = {}
 
@@ -1697,7 +1996,7 @@ async def test_swarm_driver_threads_expected_flags(tmp_path, monkeypatch):
 
 async def test_swarm_driver_threads_custom_flag_wrapper_as_prompt_hint(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     cap = {}
 
@@ -1736,7 +2035,7 @@ async def test_swarm_driver_threads_custom_flag_wrapper_as_prompt_hint(tmp_path,
 
 async def test_swarm_driver_does_not_inject_flag_hint_without_wrapper(tmp_path, monkeypatch):
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     cap = {}
 
@@ -1772,7 +2071,7 @@ async def test_swarm_driver_threads_multi_flag(tmp_path, monkeypatch):
     # v3: the multi_flag mode bit (collect vs single) must reach the Challenge so a
     # no-count collection run doesn't finish on the first flag.
     from apps.web import drivers
-    import muteki.swarm.swarm as sw
+    import dswarm.swarm.swarm as sw
 
     cap = {}
 
@@ -1814,7 +2113,7 @@ async def test_swarm_driver_threads_multi_flag(tmp_path, monkeypatch):
 # ---- CliSolver attachment staging ------------------------------------------
 
 def test_cli_solver_stages_attachments(tmp_path):
-    from muteki.solver.cli_solver import CliSolver
+    from dswarm.solver.cli_solver import CliSolver
     import json
 
     src = tmp_path / "src"
@@ -1851,7 +2150,7 @@ def test_cli_solver_staging_symlinks_not_copies(tmp_path):
     copies of the input (a coordinator spawning hundreds of workers turned a 67 KB
     misions.json into 246 copies = 15 MB). Each worker gets a SYMLINK to the one
     canonical upload, so the bytes live on disk once. Read-through is unchanged."""
-    from muteki.solver.cli_solver import CliSolver
+    from dswarm.solver.cli_solver import CliSolver
 
     up = tmp_path / "uploads"
     up.mkdir()
@@ -1897,7 +2196,7 @@ def test_cli_solver_container_staging_shares_one_copy(tmp_path):
     mount root (worker_root, which IS the bind mount) and give each worker a
     RELATIVE symlink `../<name>` so it resolves the same on host and in-container.
     """
-    from muteki.solver.cli_solver import CliSolver
+    from dswarm.solver.cli_solver import CliSolver
 
     up = tmp_path / "uploads"
     up.mkdir()
@@ -1943,3 +2242,36 @@ def test_cli_solver_container_staging_shares_one_copy(tmp_path):
     assert per_worker_bytes < 80_000, "5 links must be far smaller than one real copy"
     # no leftover staging temp files at the root
     assert not list((workspace / "inputs" / "objects").glob("*/*/.share.zip.staging.*"))
+
+
+def test_infer_challenge_ignores_rsa_inside_url_hostname():
+    from apps.web.drivers import _infer_challenge
+
+    body = _infer_challenge({
+        "prompt": (
+            "https://zkv4nige-rsay-tci1-c5ha-6a73560c31943-neptune.nepctf.com/ "
+            "a ctf web"
+        )
+    })
+
+    assert body["challenge"]["category"] == "web"
+
+
+def test_infer_challenge_keeps_explicit_crypto_hint_outside_url():
+    from apps.web.drivers import _infer_challenge
+
+    body = _infer_challenge({
+        "prompt": "https://example.test/ RSA oracle challenge"
+    })
+
+    assert body["challenge"]["category"] == "crypto"
+
+
+def test_worker_settings_exposes_profile_image():
+    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
+    assert "settings.profileImage" in src
+    assert "image: ev.target.value" in src
+    assert '"settings.profileImage"' in i18n
+    assert "settings.runtimeImages" in src
+    assert '"settings.runtimeImages"' in i18n

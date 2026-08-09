@@ -1,4 +1,4 @@
-// runtime-agent — muteki's in-container Runtime Control Plane supervisor.
+// runtime-agent — dswarm's in-container Runtime Control Plane supervisor.
 //
 // It is the container's PID1 (ENTRYPOINT). It does NOT listen on any port. At startup
 // it DIALS the host's control receiver (host.docker.internal:<port>), sends a Hello
@@ -23,13 +23,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
-const agentVersion = "muteki-runtime-agent/2"
+const agentVersion = "dswarm-runtime-agent/2"
 
 var startedAt = time.Now()
 
@@ -46,13 +47,16 @@ type supervisor struct {
 
 	mu      sync.Mutex
 	workers map[string]*worker
+	// exited workers retained briefly so the orphan sweep can kill grandchildren
+	// that outlive the worker (including setsid-detached descendants).
+	deadWorkers []*worker
 	seq     int
 }
 
 func main() {
 	connect := flag.String("connect", "", "host control receiver host:port to dial (e.g. host.docker.internal:9100). Required.")
 	runID := flag.String("run-id", "", "this run's id, sent in the Hello frame")
-	tokenPath := flag.String("token", "", "path to the per-run token file (default: /run/muteki/control/token)")
+	tokenPath := flag.String("token", "", "path to the per-run token file (default: /run/dswarm/control/token)")
 	tokenInline := flag.String("token-value", "", "the per-run token directly (overrides --token file)")
 	workspace := flag.String("workspace", "/home/kali/workspace", "worker workspace (mount target)")
 	// kept for backward-compat with the baked ENTRYPOINT (--sock ... is ignored now).
@@ -77,7 +81,7 @@ func main() {
 	} else {
 		tp := *tokenPath
 		if tp == "" {
-			tp = "/run/muteki/control/token"
+			tp = "/run/dswarm/control/token"
 		}
 		s.token = s.readToken(tp)
 	}
@@ -94,7 +98,7 @@ func main() {
 
 	// Bootstrap the workspace tool-awareness files (坑 A): the host bind-mounts an
 	// (initially empty) workspace over /home/kali/workspace, shadowing anything baked
-	// there. We cp the baked /opt/muteki/{AGENTS,CLAUDE}.md in AFTER the mount so the
+	// there. We cp the baked /opt/dswarm/{AGENTS,CLAUDE}.md in AFTER the mount so the
 	// CLIs auto-read them. Idempotent — never clobber a worker-modified copy.
 	s.seedWorkspaceDocs()
 
@@ -122,7 +126,7 @@ func main() {
 	// receiver a moment after `docker run`). The connection is the lifeline; if it
 	// drops, the run is over (the host treats a dropped connection as degraded), so
 	// we exit and let `docker rm -f` clean up rather than silently re-dialing forever.
-	conn := s.dialHost(*connect, 60*time.Second)
+	conn := s.dialHost(*connect, envSeconds("DSWARM_CONTROL_LINK_DEADLINE", 60))
 	if conn == nil {
 		log.Fatalf("could not reach host control receiver at %s", *connect)
 	}
@@ -130,8 +134,12 @@ func main() {
 	log.Printf("connected to host %s (run_id=%s, token=%v, workspace=%s)",
 		*connect, s.runID, s.token != "", s.workspace)
 
+	go s.sweepLoop()
 	s.serve(conn)
-	log.Printf("control connection closed; exiting")
+	log.Printf("control connection closed; draining workers and exiting")
+	s.killAllGraceful()
+	waitDrain(30 * time.Second)
+	log.Printf("exiting")
 }
 
 // dialHost dials the host receiver and completes the Hello handshake. Returns the
@@ -257,6 +265,12 @@ func (s *supervisor) opStartWorker(req *Request) {
 			ev.WorkerID = id
 			s.send(ev)
 		}
+		// Retain the exited worker for the orphan sweep (kills grandchildren that
+		// survived the drain, including setsid-detached descendants) before it
+		// drops out of the live registry.
+		s.mu.Lock()
+		s.deadWorkers = append(s.deadWorkers, w)
+		s.mu.Unlock()
 		// drop from registry after a grace so a late Status still sees terminal state.
 		time.Sleep(30 * time.Second)
 		s.mu.Lock()
@@ -331,7 +345,7 @@ func (s *supervisor) chownWorkspaceRoot() {
 
 func (s *supervisor) seedWorkspaceDocs() {
 	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
-		src := filepath.Join("/opt/muteki", name)
+		src := filepath.Join("/opt/dswarm", name)
 		dst := filepath.Join(s.workspace, name)
 		if _, err := os.Stat(dst); err == nil {
 			continue // already present (worker may have edited it) — don't clobber
@@ -370,6 +384,215 @@ func (s *supervisor) killAll() {
 	for _, w := range ws {
 		w.signal("KILL")
 	}
+}
+
+// killAllGraceful SIGTERMs every worker's process group, waits the drain grace,
+// then SIGKILLs whatever remains. Used on host-link loss so workers get a chance
+// to finish in-flight commands before the container goes away.
+func (s *supervisor) killAllGraceful() {
+	s.mu.Lock()
+	ws := make([]*worker, 0, len(s.workers))
+	for _, w := range s.workers {
+		ws = append(ws, w)
+	}
+	s.mu.Unlock()
+	for _, w := range ws {
+		w.signalTree(syscall.SIGTERM)
+	}
+	time.Sleep(drainGrace())
+	for _, w := range ws {
+		w.signalTree(syscall.SIGKILL)
+	}
+}
+
+// waitDrain waits for in-flight worker process-group drains, bounded.
+func waitDrain(bound time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		drainWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(bound):
+	}
+}
+
+// sweepLoop periodically reaps processes still running in EXITED workers'
+// process groups, plus detached descendants (children that setsid'd away from
+// the pgid). Belt-and-suspenders on top of the per-exit drain.
+func (s *supervisor) sweepLoop() {
+	interval := envSeconds("DSWARM_WORKER_SWEEP_SECONDS", 30)
+	for {
+		time.Sleep(interval)
+		s.sweepOnce()
+	}
+}
+
+// sweepOnce records descendants of LIVE workers (so their lineage survives
+// reparenting after exit), then SIGKILLs every live member of an EXITED worker's
+// pgid plus its recorded detached descendants. Dead workers are retained for a
+// bounded window so late-detached children are still caught.
+func (s *supervisor) sweepOnce() {
+	snap := procSnapshot()
+	now := time.Now()
+	const retention = 5 * time.Minute
+
+	s.mu.Lock()
+	var alive []*worker
+	var dead []*worker
+	for _, w := range s.workers {
+		st, _, _, _, _ := w.status()
+		if st == "running" {
+			alive = append(alive, w)
+		} else {
+			dead = append(dead, w)
+		}
+	}
+	dead = append(dead, s.deadWorkers...)
+	kept := s.deadWorkers[:0]
+	for _, w := range s.deadWorkers {
+		if now.Sub(w.exitedAt) <= retention {
+			kept = append(kept, w)
+		}
+	}
+	s.deadWorkers = kept
+	s.mu.Unlock()
+
+	for _, w := range alive {
+		if w.cmd != nil && w.cmd.Process != nil {
+			recordDescendants(w, w.cmd.Process.Pid, snap, now, retention)
+		}
+	}
+	for _, w := range dead {
+		w.signalTree(syscall.SIGKILL) // any member still in the pgid
+		killRecordedDescendants(w, now, retention)
+	}
+}
+
+// procSnapshot returns pid -> ppid for every process visible in /proc. Linux
+// only; on other platforms it returns an empty map (sweep becomes a no-op).
+func procSnapshot() map[int]int {
+	out := map[int]int{}
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return out
+	}
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		stat, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// comm may contain spaces/parens; ppid is the field after the closing ')'.
+		s := string(stat)
+		i := strings.LastIndexByte(s, ')')
+		if i < 0 || i+2 >= len(s) {
+			continue
+		}
+		fields := strings.Fields(s[i+2:])
+		if len(fields) < 2 {
+			continue
+		}
+		if ppid, err := strconv.Atoi(fields[1]); err == nil {
+			out[pid] = ppid
+		}
+	}
+	return out
+}
+
+// recordDescendants snapshots a LIVE worker's process descendants into w.desc
+// (first-seen timestamps) so the orphan sweep can kill them after the worker
+// exits even if they detached from the pgid (setsid) and were re-parented.
+func recordDescendants(w *worker, root int, snap map[int]int, now time.Time, retention time.Duration) {
+	pids := descendantSet(root, snap)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.desc == nil {
+		w.desc = map[int]procRef{}
+	}
+	for pid := range pids {
+		if _, ok := w.desc[pid]; !ok {
+			w.desc[pid] = procRef{seen: now, startTicks: procStartTicks(pid)}
+		}
+	}
+	for pid, ref := range w.desc {
+		if now.Sub(ref.seen) > retention {
+			delete(w.desc, pid)
+		}
+	}
+}
+
+// killRecordedDescendants SIGKILLs every still-live recorded descendant of an
+// exited worker. Each pid is verified against its recorded /proc starttime first
+// (a recycled PID must not be killed), and a pid that already exited is skipped.
+func killRecordedDescendants(w *worker, now time.Time, retention time.Duration) {
+	w.mu.Lock()
+	pids := make([]int, 0, len(w.desc))
+	for pid, ref := range w.desc {
+		if now.Sub(ref.seen) <= retention {
+			pids = append(pids, pid)
+		}
+	}
+	w.mu.Unlock()
+	for _, pid := range pids {
+		if syscall.Kill(pid, 0) == nil && procStartTicks(pid) == w.desc[pid].startTicks {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
+// procStartTicks returns the process's starttime (clock ticks since boot) from
+// /proc/<pid>/stat field 22; -1 if unreadable.
+func procStartTicks(pid int) int64 {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return -1
+	}
+	s := string(stat)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+2 >= len(s) {
+		return -1
+	}
+	fields := strings.Fields(s[i+2:])
+	// fields[0]=state, [1]=ppid, [2]=pgrp, [3]=session, [4]=tty_nr, [5]=tpgid,
+	// [6]=flags, [7]=minflt, [8]=cminflt, [9]=majflt, [10]=cmajflt, [11]=utime,
+	// [12]=stime, [13]=cutime, [14]=cstime, [15]=priority, [16]=nice, [17]=num_threads,
+	// [18]=itrealvalue, [19]=starttime  -> index 19.
+	if len(fields) < 20 {
+		return -1
+	}
+	n, err := strconv.ParseInt(fields[19], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// descendantSet returns the set of descendant pids of root (BFS over the ppid
+// table snapshot).
+func descendantSet(root int, snap map[int]int) map[int]bool {
+	children := map[int][]int{}
+	for pid, ppid := range snap {
+		if ppid > 0 {
+			children[ppid] = append(children[ppid], pid)
+		}
+	}
+	out := map[int]bool{}
+	stack := append([]int(nil), children[root]...)
+	for len(stack) > 0 {
+		pid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if out[pid] {
+			continue
+		}
+		out[pid] = true
+		stack = append(stack, children[pid]...)
+	}
+	return out
 }
 
 func reapOrphans() {

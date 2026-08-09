@@ -2,7 +2,7 @@
 
 Covers the reasoning-model handling and streaming tool-call reassembly that the
 meta-executor depends on. A separate live smoke test (test_llm_live.py) hits the
-real endpoint when MUTEKI_DEEPSEEK_API_KEY is set.
+real endpoint when DSWARM_DEEPSEEK_API_KEY is set.
 """
 
 import asyncio
@@ -11,10 +11,10 @@ import json
 import httpx
 import pytest
 
-from muteki.core.cost import CostController
-from muteki.core.event_bus import EventBus
-from muteki.core.events import EventType
-from muteki.core.llm import LLMClient
+from dswarm.core.cost import CostController
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import EventType
+from dswarm.core.llm import LLMClient
 
 
 def _sse(chunks: list[dict]) -> bytes:

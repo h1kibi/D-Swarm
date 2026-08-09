@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from muteki.core.session_store import SessionStore
+from dswarm.core.session_store import SessionStore
 
 
 def _write(root: Path, run_id: str, events: list[dict]) -> None:

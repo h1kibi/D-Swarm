@@ -1,6 +1,6 @@
 """Coverage for SolveGraph mutation + the load-bearing to_summary()."""
 
-from muteki.models.solve_graph import (
+from dswarm.models.solve_graph import (
     Challenge,
     HypothesisStatus,
     SolveGraph,
@@ -107,7 +107,7 @@ def test_to_summary_backcompat_when_ungated() -> None:
 def test_attachments_surface_in_summary() -> None:
     """Player-facing files must appear in to_summary() so the agent reads them
     (the keystone fix — they were previously invisible)."""
-    from muteki.models.solve_graph import Challenge, SolveGraph
+    from dswarm.models.solve_graph import Challenge, SolveGraph
     ch = Challenge(id="c", name="codereview", category="web",
                    description="find the bug", attachments=["/x/app.py", "/x/Dockerfile"])
     s = SolveGraph(challenge=ch).to_summary()

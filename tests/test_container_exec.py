@@ -2,7 +2,7 @@
 
 ONE long-lived container per run. The DEFAULT transport is the rcp Runtime Control
 Plane (an in-container supervisor the host drives over a Unix socket); a legacy
-host-side `docker exec` transport is kept behind MUTEKI_WORKER_BACKEND=
+host-side `docker exec` transport is kept behind DSWARM_WORKER_BACKEND=
 container_dockerexec as an emergency fallback. The live paths were validated
 end-to-end against a real container; these lock in the host→container translation
 logic a regression could silently break: cwd mapping, argv binary translation, the
@@ -18,10 +18,11 @@ import signal
 
 import pytest
 
-import muteki.solver.container_exec as cx
-from muteki.solver.container_exec import (
+import dswarm.solver.container_exec as cx
+from dswarm.solver.container_exec import (
     CONTAINER_WORKSPACE,
     CONTAINER_CONTROL_DIR,
+    LEGACY_CONTAINER_CONTROL_DIR,
     ContainerHandle,
     _containerize_argv,
     _ContainerProc,
@@ -31,13 +32,13 @@ from muteki.solver.container_exec import (
     run_cli_container,
     runtime_execs_for_run,
 )
-from muteki.solver.cli_driver import CliResult
+from dswarm.solver.cli_driver import CliResult
 
 
-def _handle(ws="/run/sessions/abc/workspace", container="muteki-run-nyu_2021q-x",
+def _handle(ws="/run/sessions/abc/workspace", container="dswarm-run-nyu_2021q-x",
             mode="dockerexec"):
     return ContainerHandle(run_id="nyu:2021q-x", host_workspace=ws,
-                           container=container, image="snowywar/muteki-worker:latest",
+                           container=container, image="snowywar/dswarm-worker:latest",
                            network="host", mode=mode)
 
 
@@ -63,12 +64,12 @@ def test_to_container_path_maps_account_mount():
     h = ContainerHandle(
         run_id="run-x",
         host_workspace="/run/ws",
-        container="muteki-run-x",
+        container="dswarm-run-x",
         account_root="/run/sessions/_secrets/accounts",
     )
     assert (
         h.to_container_path("/run/sessions/_secrets/accounts/claude-main/CLAUDE_CODE_OAUTH_TOKEN")
-        == "/run/muteki/accounts/claude-main/CLAUDE_CODE_OAUTH_TOKEN"
+        == "/run/dswarm/accounts/claude-main/CLAUDE_CODE_OAUTH_TOKEN"
     )
 
 
@@ -104,9 +105,32 @@ def test_worker_image_installs_blackboard_skill_for_all_engine_user_scopes():
     assert "blackboard.SKILL.md" in build_sh
     assert "blackboard.py" in build_sh
     assert "/usr/local/bin/blackboard.py" in dockerfile
-    assert "/home/kali/.claude/skills/muteki-blackboard" in dockerfile
-    assert "/home/kali/.agents/skills/muteki-blackboard" in dockerfile
-    assert "/opt/muteki/muteki-blackboard/SKILL.md" in dockerfile
+    assert "/home/kali/.claude/skills/dswarm-blackboard" in dockerfile
+    assert "/home/kali/.agents/skills/dswarm-blackboard" in dockerfile
+    assert "/opt/dswarm/dswarm-blackboard/SKILL.md" in dockerfile
+
+
+
+
+def test_pi_worker_image_bakes_gateway_models_json():
+    """Container pi workers select --provider ctf-gateway, so the image must
+    expose ctf-gateway through models.json (extensions alone are not enough for
+    all pi startup/list-models paths)."""
+    import json
+
+    repo = os.path.dirname(os.path.dirname(__file__))
+    dockerfile = open(os.path.join(repo, "docker", "worker-pi", "Dockerfile"), encoding="utf-8").read()
+    build_sh = open(os.path.join(repo, "docker", "worker-pi", "build.sh"), encoding="utf-8").read()
+    models_path = os.path.join(repo, "docker", "worker-pi", "pi-config", "models.json")
+    models = json.load(open(models_path, encoding="utf-8"))
+
+    assert "models.json" in dockerfile
+    assert "missing pi-config/models.json" in build_sh
+    provider = models["providers"]["ctf-gateway"]
+    assert provider["baseUrl"] == "$DSWARM_GATEWAY_URL"
+    assert provider["apiKey"] == "$DSWARM_TASK_TOKEN"
+    assert provider["authHeader"] is True
+    assert {m["id"] for m in provider["models"]} >= {"deepseek-v4-flash", "deepseek-v4-pro"}
 
 
 def test_worker_images_wrap_package_managers_with_auto_sudo():
@@ -115,7 +139,7 @@ def test_worker_images_wrap_package_managers_with_auto_sudo():
     repo = os.path.dirname(os.path.dirname(__file__))
     for rel in ("docker/worker/Dockerfile", "docker/worker-slim/Dockerfile"):
         dockerfile = open(os.path.join(repo, rel), encoding="utf-8").read()
-        assert "muteki-auto-sudo" in dockerfile
+        assert "dswarm-auto-sudo" in dockerfile
         assert "/usr/local/bin/apt-get" in dockerfile
         assert "/usr/local/bin/apt" in dockerfile
         assert "/usr/local/bin/dpkg" in dockerfile
@@ -125,23 +149,23 @@ def test_worker_images_wrap_package_managers_with_auto_sudo():
 # ── legacy docker exec command shape (_DockerExecBackend fallback) ────────────
 
 def test_exec_argv_targets_the_run_container_with_cwd_and_sentinel():
-    h = _handle("/run/ws", container="muteki-run-nyu_2021q-x")
+    h = _handle("/run/ws", container="dswarm-run-nyu_2021q-x")
     cmd = _DockerExecBackend._exec_argv(
         h, ["/host/claude", "-p"], container_cwd=CONTAINER_WORKSPACE,
         env=None, driver_name="claude", tag="deadbeef", timeout=720)
     joined = " ".join(cmd)
     assert cmd[0] == "docker" and cmd[1] == "exec"
     # exec INTO the run's single long-lived container (not a fresh per-worker run)
-    assert "muteki-run-nyu_2021q-x" in cmd
+    assert "dswarm-run-nyu_2021q-x" in cmd
     assert "--rm" not in cmd  # exec, not run --rm
     # cwd is the worker's dir inside the bind-mounted workspace
     assert "-w" in cmd and CONTAINER_WORKSPACE in cmd
     assert "nyu_ctf_bench" not in joined
     # argv[0] translated to the bare container command (inside the sh -c string)
     assert "claude -p" in joined and "/host/claude" not in joined
-    # per-worker kill sentinel rides in the cmdline ($0) + MUTEKI_WTAG env
-    assert "MUTEKI_WTAG=deadbeef" in cmd
-    assert "muteki_wtag_deadbeef" in cmd
+    # per-worker kill sentinel rides in the cmdline ($0) + DSWARM_WTAG env
+    assert "DSWARM_WTAG=deadbeef" in cmd
+    assert "dswarm_wtag_deadbeef" in cmd
     # the wall-clock cap is container-side timeout -s KILL, stdin from /dev/null,
     # and NO setsid (worker must stay the exec foreground)
     assert "exec timeout -s KILL 720s" in joined
@@ -154,17 +178,17 @@ def test_exec_argv_passes_only_whitelisted_env():
     cmd = _DockerExecBackend._exec_argv(
         h, ["/host/pi"], container_cwd=CONTAINER_WORKSPACE,
         env={
-            "MUTEKI_X": "1",
+            "DSWARM_X": "1",
             "ANTHROPIC_Y": "2",
             "HOME": "/leak",
             "PATH": "/leak",
-            "DEEPSEEK_API_KEY_FILE": "/run/muteki/accounts/pi-main/API_KEY",
+            "DEEPSEEK_API_KEY_FILE": "/run/dswarm/accounts/pi-main/API_KEY",
             "DEEPSEEK_API_KEY": "plain-secret",
         },
         driver_name="pi", tag="t1", timeout=600)
-    assert "MUTEKI_X=1" in cmd
+    assert "DSWARM_X=1" in cmd
     assert "ANTHROPIC_Y=2" in cmd
-    assert "DEEPSEEK_API_KEY_FILE=/run/muteki/accounts/pi-main/API_KEY" in cmd
+    assert "DEEPSEEK_API_KEY_FILE=/run/dswarm/accounts/pi-main/API_KEY" in cmd
     assert "DEEPSEEK_API_KEY=plain-secret" in cmd
     # host HOME/PATH must NOT be forwarded (the container has its own)
     assert "HOME=/leak" not in cmd
@@ -177,15 +201,15 @@ def test_exec_argv_expands_api_key_files_inside_container():
     cmd = _DockerExecBackend._exec_argv(
         h, ["/host/codex"], container_cwd=CONTAINER_WORKSPACE,
         env={
-            "OPENAI_API_KEY_FILE": "/run/muteki/accounts/deepseek-main/API_KEY",
+            "OPENAI_API_KEY_FILE": "/run/dswarm/accounts/deepseek-main/API_KEY",
             "OPENAI_BASE_URL": "https://api.deepseek.example/v1",
-            "ANTHROPIC_API_KEY_FILE": "/run/muteki/accounts/anthropic-main/API_KEY",
+            "ANTHROPIC_API_KEY_FILE": "/run/dswarm/accounts/anthropic-main/API_KEY",
         },
         driver_name="codex", tag="api", timeout=600)
     joined = " ".join(cmd)
-    assert "OPENAI_API_KEY_FILE=/run/muteki/accounts/deepseek-main/API_KEY" in cmd
+    assert "OPENAI_API_KEY_FILE=/run/dswarm/accounts/deepseek-main/API_KEY" in cmd
     assert "OPENAI_BASE_URL=https://api.deepseek.example/v1" in cmd
-    assert "ANTHROPIC_API_KEY_FILE=/run/muteki/accounts/anthropic-main/API_KEY" in cmd
+    assert "ANTHROPIC_API_KEY_FILE=/run/dswarm/accounts/anthropic-main/API_KEY" in cmd
     assert 'cat "$OPENAI_API_KEY_FILE"' in joined
     assert 'cat "$ANTHROPIC_API_KEY_FILE"' in joined
     assert "deepseek-secret" not in joined
@@ -218,14 +242,14 @@ def _fake_docker_factory(calls):
 @pytest.mark.posix
 def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch, tmp_path):
     calls = []
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     monkeypatch.setattr(ce, "_docker", _fake_docker_factory(calls))
     monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
     # rcp mode waits for the supervisor — stub that out (no real container).
     monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
     # stub the receiver so the test doesn't bind the real control port; capture the
     # token it registers.
-    import muteki.solver.control_receiver as cr
+    import dswarm.solver.control_receiver as cr
     expected = {}
     class _FakeRcv:
         def expect(self, run_id, token): expected[run_id] = token
@@ -251,17 +275,18 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     assert handle.mode == "rcp"
     # reverse-connect: control dir mounted (carries token) + token written +
     # supervisor told to --connect host.docker.internal --run-id, + --add-host.
-    control_dir = ws / ".muteki_control"
+    control_dir = ws / ".dswarm_control"
     assert f"source={control_dir},target={CONTAINER_CONTROL_DIR}" in joined
+    assert f"source={control_dir},target={LEGACY_CONTAINER_CONTROL_DIR}" in joined
     assert handle.control_dir == str(control_dir)
     assert handle.token and (control_dir / "token").read_text() == handle.token
     assert (control_dir / "token").stat().st_mode & 0o777 == 0o600
     assert "--connect" in run_call and "--run-id" in run_call and "run-x" in run_call
     assert "host.docker.internal:host-gateway" in joined  # Linux dial-back
     # workspace + account projection mounts (unchanged from before).
-    projection = ws / ".muteki_accounts"
+    projection = ws / ".dswarm_accounts"
     assert handle.account_root == str(projection)
-    assert f"source={projection},target=/run/muteki/accounts" in joined
+    assert f"source={projection},target=/run/dswarm/accounts" in joined
     assert f"source={ws},target={CONTAINER_WORKSPACE}" in joined
     assert "--tmpfs" in run_call and "/tmp:rw,exec,size=2g" in run_call
     assert "--network bridge" in joined
@@ -279,7 +304,7 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
 
 @pytest.mark.posix
 def test_chown_tree_to_worker_noop_when_not_root(monkeypatch, tmp_path):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     f = tmp_path / "graph" / "shared_graph.db"
     f.parent.mkdir(parents=True)
     f.write_text("db")
@@ -291,10 +316,10 @@ def test_chown_tree_to_worker_noop_when_not_root(monkeypatch, tmp_path):
 
 
 def test_worker_uid_gid_detects_image_kali_user(monkeypatch):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     ce._WORKER_ID_CACHE.clear()
-    monkeypatch.delenv("MUTEKI_WORKER_UID", raising=False)
-    monkeypatch.delenv("MUTEKI_WORKER_GID", raising=False)
+    monkeypatch.delenv("DSWARM_WORKER_UID", raising=False)
+    monkeypatch.delenv("DSWARM_WORKER_GID", raising=False)
     calls = []
 
     def fake_docker(*args, **kwargs):
@@ -313,10 +338,10 @@ def test_worker_uid_gid_detects_image_kali_user(monkeypatch):
 
 
 def test_worker_uid_gid_env_override_skips_image_probe(monkeypatch):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     ce._WORKER_ID_CACHE.clear()
-    monkeypatch.setenv("MUTEKI_WORKER_UID", "2000")
-    monkeypatch.setenv("MUTEKI_WORKER_GID", "2001")
+    monkeypatch.setenv("DSWARM_WORKER_UID", "2000")
+    monkeypatch.setenv("DSWARM_WORKER_GID", "2001")
     monkeypatch.setattr(ce, "_docker", lambda *a, **k: (_ for _ in ()).throw(AssertionError(a)))
 
     assert ce._worker_uid_gid("worker:override-test") == (2000, 2001)
@@ -324,7 +349,7 @@ def test_worker_uid_gid_env_override_skips_image_probe(monkeypatch):
 
 @pytest.mark.posix
 def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     (tmp_path / "graph").mkdir()
     (tmp_path / "graph" / "shared_graph.db").write_text("db")
     (tmp_path / "winner.json").write_text("{}")
@@ -345,12 +370,12 @@ def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
 
 @pytest.mark.posix
 def test_chown_tree_to_worker_does_not_follow_skill_symlinks(monkeypatch, tmp_path):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     target = tmp_path / "image-skill"
     target.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    link = home / "muteki-blackboard"
+    link = home / "dswarm-blackboard"
     link.symlink_to(target, target_is_directory=True)
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(ce, "_worker_uid_gid", lambda image=ce.WORKER_IMAGE: (1234, 1235))
@@ -371,11 +396,11 @@ def test_ensure_container_chowns_workspace_to_worker(monkeypatch, tmp_path):
     # End to end through ensure_container: a pre-existing root-owned board DB under
     # the workspace gets chowned to the worker uid before the container comes up.
     calls = []
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     monkeypatch.setattr(ce, "_docker", _fake_docker_factory(calls))
     monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
     monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
-    import muteki.solver.control_receiver as cr
+    import dswarm.solver.control_receiver as cr
     class _FakeRcv:
         def expect(self, run_id, token): pass
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
@@ -399,8 +424,8 @@ def test_ensure_container_rcp_upgrades_none_network_to_bridge(monkeypatch, tmp_p
     # CLI flags, not network). Regression: this was dropped once and every offline
     # container run silently degraded to local.
     calls = []
-    import muteki.solver.container_exec as ce
-    import muteki.solver.control_receiver as cr
+    import dswarm.solver.container_exec as ce
+    import dswarm.solver.control_receiver as cr
     monkeypatch.setattr(ce, "_docker", _fake_docker_factory(calls))
     monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
     monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
@@ -417,7 +442,7 @@ def test_ensure_container_rcp_upgrades_none_network_to_bridge(monkeypatch, tmp_p
 
 def test_ensure_container_dockerexec_appends_sleep_infinity(monkeypatch, tmp_path):
     calls = []
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     monkeypatch.setattr(ce, "_docker", _fake_docker_factory(calls))
     monkeypatch.setattr(ce, "_USE_DOCKEREXEC", True)
     ws = tmp_path / "run" / "workspace"
@@ -427,7 +452,7 @@ def test_ensure_container_dockerexec_appends_sleep_infinity(monkeypatch, tmp_pat
     assert run_call[-2:] == ("sleep", "infinity")
     assert "--tmpfs" in run_call and "/tmp:rw,exec,size=2g" in run_call
     assert handle.mode == "dockerexec"
-    assert "/run/muteki/control" not in " ".join(run_call)
+    assert "/run/dswarm/control" not in " ".join(run_call)
 
 
 # ── signal routing ────────────────────────────────────────────────────────────
@@ -443,11 +468,11 @@ def _fake_popen():
 @pytest.mark.posix
 def test_legacy_container_signal_maps_to_pkill_actions(monkeypatch):
     calls = []
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
     monkeypatch.setattr(
         ce, "_docker",
         lambda *a, **k: calls.append(a) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
-    proc = _ContainerProc("muteki-run-test", "tagX", _fake_popen())
+    proc = _ContainerProc("dswarm-run-test", "tagX", _fake_popen())
     proc._container_signal(signal.SIGSTOP)
     proc._container_signal(signal.SIGCONT)
     proc._container_signal(signal.SIGKILL)
@@ -456,14 +481,14 @@ def test_legacy_container_signal_maps_to_pkill_actions(monkeypatch):
     assert "-CONT" in sigs   # SIGCONT → pkill -CONT
     assert "-KILL" in sigs   # SIGKILL → pkill -KILL
     for a in calls:
-        assert "muteki-run-test" in a
-        assert "muteki_wtag_tagX" in a
+        assert "dswarm-run-test" in a
+        assert "dswarm_wtag_tagX" in a
 
 
 @pytest.mark.posix
 def test_rcp_proc_signal_maps_to_control_ops():
     # the rcp proc routes STOP/CONT/KILL to the link's Signal op (worker-scoped).
-    import muteki.solver.control_client as cc
+    import dswarm.solver.control_client as cc
     sent = []
     class _FakeLink:
         def signal(self, worker_id, name, **k): sent.append((worker_id, name))
@@ -480,7 +505,7 @@ def test_rcp_proc_signal_maps_to_control_ops():
 def test_signal_proc_prefers_container_routing():
     # the solver's _signal_proc must route through _container_signal when present
     # (so a container worker's pause/kill goes into the container, not the host).
-    from muteki.solver.cli_solver import CliSolver
+    from dswarm.solver.cli_solver import CliSolver
     seen = []
     class _CP:
         pid = 999
@@ -492,7 +517,7 @@ def test_signal_proc_prefers_container_routing():
 # ── run dispatch: rcp (default) vs legacy docker-exec ─────────────────────────
 
 def test_run_cli_container_rcp_dispatch_records_runtime_status(monkeypatch):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
 
     class Driver:
         name = "codex"
@@ -509,11 +534,11 @@ def test_run_cli_container_rcp_dispatch_records_runtime_status(monkeypatch):
         r = CliResult(text="ok")
         r.runtime_status = {"backend": "container_rcp", "status": "finished", "rc": 0}
         return r
-    import muteki.solver.control_client as cc
+    import dswarm.solver.control_client as cc
     monkeypatch.setattr(cc, "run_cli_rcp", fake_run_cli_rcp)
 
     handle = ContainerHandle(run_id="nyu:rcp", host_workspace="/run/ws",
-                             container="muteki-run-rcp", mode="rcp", token="tk")
+                             container="dswarm-run-rcp", mode="rcp", token="tk")
     res = run_cli_container(Driver(), ["/host/codex", "exec"], handle=handle,
                             cwd="/run/ws", timeout=30, env={})
     assert res.text == "ok"
@@ -526,8 +551,42 @@ def test_run_cli_container_rcp_dispatch_records_runtime_status(monkeypatch):
     assert runtime_execs_for_run("nyu:rcp")[-1]["exec_id"] == res.runtime_status["exec_id"]
 
 
+def test_run_cli_container_rcp_retries_after_dead_supervisor(monkeypatch):
+    from dswarm.solver.control_client import ControlError
+    import dswarm.solver.control_client as cc
+
+    class Driver:
+        name = "codex"
+        def parse(self, out, err):
+            return CliResult(text=out)
+
+    monkeypatch.setattr(cx, "_ensure_alive", lambda handle: None)
+    recovered: list = []
+    monkeypatch.setattr(cx, "_recover_run_container", lambda handle: recovered.append(handle.run_id))
+
+    calls: list = []
+
+    def fake_run_cli_rcp(driver, argv, *, run_id, container_cwd, timeout, env=None):
+        calls.append(run_id)
+        if len(calls) == 1:
+            raise ControlError(f"control link for run {run_id} is down")
+        r = CliResult(text="ok-after-recover")
+        r.runtime_status = {"backend": "container_rcp", "status": "finished", "rc": 0}
+        return r
+
+    monkeypatch.setattr(cc, "run_cli_rcp", fake_run_cli_rcp)
+
+    handle = ContainerHandle(run_id="nyu:rcp2", host_workspace="/run/ws",
+                             container="dswarm-run-rcp2", mode="rcp", token="tk")
+    res = run_cli_container(Driver(), ["/host/codex", "exec"], handle=handle,
+                            cwd="/run/ws", timeout=30, env={})
+    assert len(calls) == 2  # first raised ControlError, retry succeeded
+    assert recovered == ["nyu:rcp2"]
+    assert res.text == "ok-after-recover"
+
+
 def test_run_cli_container_dockerexec_dispatch(monkeypatch):
-    import muteki.solver.container_exec as ce
+    import dswarm.solver.container_exec as ce
 
     class Driver:
         name = "codex"
@@ -543,7 +602,7 @@ def test_run_cli_container_dockerexec_dispatch(monkeypatch):
     monkeypatch.setattr(ce, "_oom_kill_count", lambda container: 0)
     monkeypatch.setattr(ce.subprocess, "run", lambda *a, **k: R())
 
-    handle = _handle("/run/ws", container="muteki-run-runtime", mode="dockerexec")
+    handle = _handle("/run/ws", container="dswarm-run-runtime", mode="dockerexec")
     res = run_cli_container(
         Driver(), ["/host/codex", "exec"], handle=handle,
         cwd="/run/ws", timeout=30, env={})
@@ -551,14 +610,14 @@ def test_run_cli_container_dockerexec_dispatch(monkeypatch):
     assert res.text == "ok"
     assert res.runtime_status["backend"] == "container"
     assert res.runtime_status["status"] == "finished"
-    assert res.runtime_status["container"] == "muteki-run-runtime"
+    assert res.runtime_status["container"] == "dswarm-run-runtime"
 
 
 # ── P2-v3 BLOCKER-c: host-path translation for sibling-container mounts ────────
 
 @pytest.mark.posix
 def test_mount_source_identity_on_bare_host(monkeypatch):
-    # No MUTEKI_HOST_DATA_ROOT → identity (abspath), the historical behaviour.
+    # No DSWARM_HOST_DATA_ROOT → identity (abspath), the historical behaviour.
     monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "")
     monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "")
     assert _mount_source("/some/abs/path") == "/some/abs/path"
@@ -567,24 +626,24 @@ def test_mount_source_identity_on_bare_host(monkeypatch):
 @pytest.mark.posix
 def test_mount_source_identity_mirror(monkeypatch):
     # host root == container root (path mirrored at the SAME path) → identity.
-    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
-    monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/opt/muteki/data")
-    assert _mount_source("/opt/muteki/data/run-x/ws") == "/opt/muteki/data/run-x/ws"
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/dswarm/data")
+    monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/opt/dswarm/data")
+    assert _mount_source("/opt/dswarm/data/run-x/ws") == "/opt/dswarm/data/run-x/ws"
 
 
 @pytest.mark.posix
 def test_mount_source_remaps_container_prefix_to_host(monkeypatch):
     # container data root differs from host root → remap the prefix so the HOST
     # daemon binds the real host path, not the (nonexistent) in-container path.
-    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/dswarm/data")
     monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/app/data")
-    assert _mount_source("/app/data/run-x/ws") == "/opt/muteki/data/run-x/ws"
-    assert _mount_source("/app/data") == "/opt/muteki/data"
+    assert _mount_source("/app/data/run-x/ws") == "/opt/dswarm/data/run-x/ws"
+    assert _mount_source("/app/data") == "/opt/dswarm/data"
 
 
 @pytest.mark.posix
 def test_mount_source_outside_root_passes_through(monkeypatch):
-    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/dswarm/data")
     monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/app/data")
     # not under the mirrored root → pass through (best effort)
     assert _mount_source("/elsewhere/x") == "/elsewhere/x"

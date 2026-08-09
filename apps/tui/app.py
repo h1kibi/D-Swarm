@@ -19,8 +19,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType
 
 # callback(target, action, text) for HITL commands the user types
 HitlSink = Callable[[str, str, str], Awaitable[None]]
@@ -88,7 +88,7 @@ def format_event(ev: Event) -> Optional[str]:
     return None
 
 
-class MutekiTUI(App):
+class DSwarmTUI(App):
     CSS = """
     #status { dock: top; height: 1; background: $panel; color: $text; }
     #transcript { height: 1fr; border: round $primary; }

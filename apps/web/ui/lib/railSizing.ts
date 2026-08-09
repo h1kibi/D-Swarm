@@ -1,7 +1,7 @@
 export const RAIL_WIDTH_DEFAULT = 264;
 export const RAIL_WIDTH_MIN = 220;
 export const RAIL_WIDTH_MAX = 420;
-export const RAIL_WIDTH_STORAGE_KEY = "muteki.threadRail.width";
+export const RAIL_WIDTH_STORAGE_KEY = "dswarm.threadRail.width";
 
 export function railWidthMax(viewportWidth?: number): number {
   if (!viewportWidth || viewportWidth <= 0) return RAIL_WIDTH_MAX;

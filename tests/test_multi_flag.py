@@ -12,9 +12,9 @@ import asyncio
 
 import pytest
 
-from muteki.models.solve_graph import Challenge
-from muteki.swarm.insight_bus import InsightBus, InsightKind
-from muteki.swarm.swarm import Swarm
+from dswarm.models.solve_graph import Challenge
+from dswarm.swarm.insight_bus import InsightBus, InsightKind
+from dswarm.swarm.swarm import Swarm
 
 
 # ── InsightBus: flag set, not single-flag lock ───────────────────────────────
@@ -175,8 +175,8 @@ def test_run_summary_carries_flags() -> None:
 # ── shared-graph snapshot (Phase 5) ──────────────────────────────────────────
 
 def _shared_graph(tmp_path, expected_flags=2):
-    from muteki.swarm.shared_graph import SQLiteSharedGraph
-    from muteki.solver.result import ArtifactStore
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+    from dswarm.solver.result import ArtifactStore
     ch = Challenge(id="c", name="n", category="web", expected_flags=expected_flags)
     return SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=ch,
                                   artifacts=ArtifactStore(root=tmp_path / "arts"))
@@ -263,7 +263,7 @@ def test_rejected_flag_stays_rejected_when_refound_after_reopen(tmp_path) -> Non
 def test_solvegraph_add_flag_refuses_rejected_value() -> None:
     """SolveGraph.add_flag is the in-memory gate: once a value is rejected it can't be
     re-added, even on a fresh graph that replays flag_found after the rejection."""
-    from muteki.models.solve_graph import SolveGraph
+    from dswarm.models.solve_graph import SolveGraph
     g = SolveGraph(challenge=Challenge(id="c", name="n", category="web"))
     assert g.add_flag("flag{a}") is True
     g.reject_flag("flag{a}")
@@ -281,8 +281,8 @@ def test_solvegraph_add_flag_refuses_rejected_value() -> None:
 # ── distill (Phase 5) ────────────────────────────────────────────────────────
 
 def test_distill_sanitizes_all_flags() -> None:
-    from muteki.learning.distill import distill
-    from muteki.models.solve_graph import SolveGraph
+    from dswarm.learning.distill import distill
+    from dswarm.models.solve_graph import SolveGraph
     g = SolveGraph(challenge=Challenge(id="c", name="n", category="web",
                                        expected_flags=2))
     g.add_flag("flag{secret1}")
@@ -299,7 +299,7 @@ def test_run_reopened_per_flag_drops_only_the_bad_one() -> None:
     # mark_false emits RUN_REOPENED{flag: bad}; the sink must drop ONLY that flag
     # from run.flags, keeping the survivors (per-flag, not wipe-all).
     from apps.web.run_manager import RunManager
-    from muteki.core.events import Event, EventType
+    from dswarm.core.events import Event, EventType
     import asyncio
 
     async def go():

@@ -10,6 +10,7 @@ import {
 } from "@xyflow/react";
 import { BlackboardView } from "@/lib/events";
 import { useT } from "@/lib/i18n";
+import { readKey, writeKey, removeKey } from "@/lib/storage";
 import { workerColor as engineColor, workerInitial, workerShortLabel } from "@/lib/workers";
 import { Icon, type IconName } from "@/components/Icon";
 import { CopyText } from "@/components/CopyText";
@@ -196,7 +197,7 @@ function FlagNode({ data }: NodeProps<Node<NodeData>>) {
   );
 }
 
-// meta = coordinator notes (review findings / directives / pocs / routes /
+// meta = planner notes (review findings / directives / pocs / routes /
 // branches). Rendered as a small dot carrying the kind's icon, tinted by tone;
 // full title + text live in the hover tooltip. Keeps the board a field of points.
 function MetaNode({ data, selected }: NodeProps<Node<NodeData>>) {
@@ -417,7 +418,7 @@ function flattenToFlow(rawBb: BlackboardView, opts: FlowOpts): { nodes: Node<Nod
     deadByIntent.set(owner.id, arr);
   });
 
-  // loose nodes (orphan facts with no owning intent + coordinator meta notes) pack
+  // loose nodes (orphan facts with no owning intent + planner meta notes) pack
   // into a compact dot grid in a narrow left "loose" lane, not a tall card column.
   const LOOSE_COLS = 6;
   const LOOSE_CELL = 26;
@@ -621,16 +622,16 @@ interface LayoutState {
   free: Record<string, XY>;     // orphan nodes (flag, meta) → absolute
 }
 const emptyLayout = (): LayoutState => ({ groups: {}, children: {}, free: {} });
-const layoutKey = (runId: string) => `muteki.bb.layout.v3.${runId || "default"}`;
+const layoutKey = (runId: string) => `dswarm.bb.layout.v3.${runId || "default"}`;
 function loadLayout(runId: string): LayoutState {
   try {
-    const raw = JSON.parse(localStorage.getItem(layoutKey(runId)) || "null");
+    const raw = JSON.parse(readKey(layoutKey(runId)) || "null");
     if (raw && raw.groups && raw.children && raw.free) return raw as LayoutState;
   } catch { /* fall through */ }
   return emptyLayout();
 }
 function saveLayout(runId: string, s: LayoutState) {
-  try { localStorage.setItem(layoutKey(runId), JSON.stringify(s)); } catch { /* quota / private mode */ }
+  writeKey(layoutKey(runId), JSON.stringify(s));
 }
 // overlay a stored position onto a node by its kind. No record → keep the masonry
 // position the layout computed.
@@ -827,7 +828,7 @@ function Canvas({ bb, runId }: { bb: BlackboardView; runId: string }) {
 
   const resetLayout = useCallback(() => {
     posRef.current = emptyLayout();
-    try { localStorage.removeItem(layoutKey(runId)); } catch { /* ignore */ }
+    removeKey(layoutKey(runId));
     const flow = flattenToFlow(bb, buildOpts());
     setNodes(flow.nodes);
     pendingFit.current = true; // re-fit once re-measured (gated effect handles timing)

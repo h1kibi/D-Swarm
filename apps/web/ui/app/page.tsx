@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRun, useRunList, useFolders, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, openWorkspace, createFolder, renameFolder, deleteFolder, SavedFile } from "@/lib/useRun";
+import { useRun, useRunList, useFolders, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
 import { I18nProvider } from "@/lib/i18n";
@@ -15,22 +15,31 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { BtwPanel } from "@/components/BtwPanel";
 import { ToastLane, useToasts } from "@/components/Toast";
 import type { ArtifactView } from "@/components/ArtifactPanel";
+import { TopBar } from "@/components/TopBar";
+import { DecisionTimeline } from "@/components/DecisionTimeline";
+import { SwarmInspector } from "@/components/SwarmInspector";
+import { OperatorBar } from "@/components/OperatorBar";
+import { deriveStage } from "@/lib/timeline";
+import type { Stage } from "@/lib/normalize";
+import type { BatchAction } from "@/lib/fleet";
 import { clampRailWidth, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_STORAGE_KEY } from "@/lib/railSizing";
+import { readKey, writeKey } from "@/lib/storage";
 import { useDeckMotion } from "@/lib/useDeckMotion";
 
 /**
- * Muteki Command Deck — conversation-first shell.
+ * D-Swarm Command Deck — Command-center shell (docs/07 §5, Phase 4).
  *
- * The three pillars are NOT stacked. The spine is a ChatGPT/Claude conversation
- * (task dispatch is conversational); artifact panels are reserved for the two
- * spatial views: fact graph and blackboard. The run summary lives in the home
- * workspace instead of a separate statistics page.
+ * The conversation is NO LONGER the spine. The layout is:
  *
- *   ThreadRail (run list) │ Conversation (spine) │ ArtifactPanel (graph/blackboard)
+ *   TopBar (brand · run/target · Stage Rail · flags · cost · connection · controls)
+ *   Run Fleet (left) │ Decision Timeline (center) │ Live Swarm Inspector (right)
+ *   Operator Command Bar (persistent bottom)
  *
  * The deck stays a dumb subscriber (§3): dispatch POSTs /start with the prose
- * prompt (the swarm infers category/target/solvers), commands POST /hitl, and
- * everything else folds back from the run's SSE stream.
+ * prompt, commands POST /hitl, and everything else folds back from the run's
+ * SSE stream. A not-yet-dispatched DRAFT still gets the conversational
+ * welcome/composer (that surface is how a run is launched); once a run exists,
+ * the Decision Timeline takes over the center.
  */
 
 // A draft is a local, not-yet-dispatched conversation. It never hits the backend
@@ -40,7 +49,7 @@ const isDraft = (id: string) => id.startsWith("draft-");
 type ThemeMode = "light" | "dark";
 const ARTIFACT_WIDTH_MIN = 360;
 const ARTIFACT_WIDTH_MAX = 960;
-const ARTIFACT_WIDTH_STORAGE_KEY = "muteki.artifact.width";
+const ARTIFACT_WIDTH_STORAGE_KEY = "dswarm.artifact.width";
 
 function artifactWidthMax(viewportWidth?: number): number {
   if (!viewportWidth || viewportWidth <= 0) return ARTIFACT_WIDTH_MAX;
@@ -139,6 +148,12 @@ function Deck() {
   // dispatch() can put them on challenge.attachments. Lives at this level (not
   // in the Composer) so it survives into dispatch and resets on run switch.
   const [attachments, setAttachments] = useState<SavedFile[]>([]);
+  // Phase 4 shell state: right-column inspector visibility, Stage Rail →
+  // Decision Timeline jump target, and the Operator Command Bar's target.
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [stageJump, setStageJump] = useState<{ stage: Stage; nonce: number } | null>(null);
+  const [opTarget, setOpTarget] = useState("global");
+  const [opFocusNonce, setOpFocusNonce] = useState(0);
 
   const runs = useRunList(4000, listBump);
   const folders = useFolders(8000, listBump);
@@ -150,7 +165,7 @@ function Deck() {
 
   useEffect(() => {
     try {
-      const saved = window.localStorage.getItem("muteki.theme");
+      const saved = readKey("dswarm.theme");
       if (saved === "dark" || saved === "light") {
         setTheme(saved);
         return;
@@ -164,7 +179,7 @@ function Deck() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try {
-      window.localStorage.setItem("muteki.theme", theme);
+      writeKey("dswarm.theme", theme);
     } catch {
       // theming should still work for this session
     }
@@ -173,7 +188,7 @@ function Deck() {
   const toggleTheme = () => setTheme((cur) => (cur === "dark" ? "light" : "dark"));
 
   // Operator command → swarm. Wraps sendHitl so the otherwise-silent "生成复盘"
-  // (writeup) command gives immediate feedback: the coordinator takes seconds to
+  // (writeup) command gives immediate feedback: the planner takes seconds to
   // produce the report and it lands as a normal chat bubble, so without this the
   // button looked dead. Every other command path is untouched (pass-through).
   const onCommand = useCallback(
@@ -194,7 +209,7 @@ function Deck() {
 
   useEffect(() => {
     try {
-      const raw = window.localStorage.getItem(ARTIFACT_WIDTH_STORAGE_KEY);
+      const raw = readKey(ARTIFACT_WIDTH_STORAGE_KEY);
       const parsed = raw ? Number(raw) : NaN;
       setArtifactWidth(clampArtifactWidth(Number.isFinite(parsed) ? parsed : artifactWidthDefault(window.innerWidth), window.innerWidth));
     } catch {
@@ -207,7 +222,7 @@ function Deck() {
   useEffect(() => {
     if (!artifactWidthReady) return;
     try {
-      window.localStorage.setItem(ARTIFACT_WIDTH_STORAGE_KEY, String(artifactWidth));
+      writeKey(ARTIFACT_WIDTH_STORAGE_KEY, String(artifactWidth));
     } catch {
       // localStorage may be blocked; resizing should still work for this session.
     }
@@ -215,7 +230,7 @@ function Deck() {
 
   useEffect(() => {
     try {
-      const raw = window.localStorage.getItem(RAIL_WIDTH_STORAGE_KEY);
+      const raw = readKey(RAIL_WIDTH_STORAGE_KEY);
       const parsed = raw ? Number(raw) : NaN;
       if (Number.isFinite(parsed)) setRailWidth(clampRailWidth(parsed, window.innerWidth));
     } catch {
@@ -228,7 +243,7 @@ function Deck() {
   useEffect(() => {
     if (!railWidthReady) return;
     try {
-      window.localStorage.setItem(RAIL_WIDTH_STORAGE_KEY, String(railWidth));
+      writeKey(RAIL_WIDTH_STORAGE_KEY, String(railWidth));
     } catch {
       // localStorage may be blocked; resizing should still work for this session.
     }
@@ -371,8 +386,8 @@ function Deck() {
     setAttachments((prev) => prev.filter((f) => f.path !== path));
 
   // Dispatch the REAL swarm conversationally: one prose prompt → /start. The
-  // backend infers category/target from the prompt and races the shelled CLI
-  // workers (claude + codex). The flag still only counts if it traces to real
+  // backend infers category/target from the prompt and dispatches the shelled
+  // pi CLI workers. The flag still only counts if it traces to real
   // execution output (provenance gate).
   const dispatch = async (prompt: string, opts?: DispatchOpts) => {
     setSelected(null);
@@ -419,11 +434,9 @@ function Deck() {
     // "local" = host subprocess).
     const worker_backend = opts?.containerMode ? "container" : "local";
     const runOverrides: Record<string, unknown> = {};
-    if (opts?.raceTimeout) runOverrides.race_timeout = opts.raceTimeout;
     if (opts?.wallClockBudget != null) runOverrides.wall_clock_budget = opts.wallClockBudget;
     if (opts?.maxTotalWorkers != null) runOverrides.max_total_workers = opts.maxTotalWorkers;
     if (opts?.costBudgetUsd != null) runOverrides.cost_budget_usd = opts.costBudgetUsd;
-    if (opts?.raceEngines?.length) runOverrides.race_engines = opts.raceEngines;
     // attachments: absolute paths the backend saved; the worker stages them into
     // its cwd. Filtered server-side to existing paths, so a stale one is harmless.
     try {
@@ -453,6 +466,7 @@ function Deck() {
     setArtifactOpen(false);
     setSelected(null);
     setAttachments([]);
+    setOpTarget("global");
     setRunId(id);
   };
 
@@ -524,21 +538,47 @@ function Deck() {
     }
   };
 
+  // Fleet batch control (§5.2): the rail already confirmed (for stop) and
+  // filtered eligibility; here we fan out the existing single-run HITL API —
+  // no batch endpoint, no history deletion.
+  const onBatch = async (action: BatchAction, runIds: string[]) => {
+    const results = await Promise.all(runIds.map((id) => sendRunHitl(id, action)));
+    const okCount = results.filter(Boolean).length;
+    if (okCount > 0) {
+      pushToast({
+        msg: t("toast.batchDone", { n: okCount, action: t(`fleet.batch.${action}`) }),
+        variant: okCount === runIds.length ? "success" : "info",
+      });
+    }
+    if (okCount < runIds.length) toastFail();
+    bump();
+  };
+
   const openArtifact = (view: ArtifactView) => {
     setArtifactView(view);
     setArtifactOpen(true);
-    setRailCollapsed(true);
   };
 
-  // Roster mini-row click → open the Worker 详情 panel focused on that worker.
-  // Bump the nonce so re-clicking the same row re-seeds the lanes filter.
+  // Roster/inspector worker click → open the Worker 详情 panel focused on that
+  // worker. Bump the nonce so re-clicking the same row re-seeds the lanes filter.
   const onOpenWorker = (id: string) => {
     setFocusedWorker((prev) => ({ id, nonce: (prev?.nonce ?? 0) + 1 }));
     openArtifact("workers");
   };
 
-  // operator runtime worker control (BE-worker-management): add/kill an engine on
-  // the LIVE run. Best-effort; the coordinator drains the command next tick and the
+  // Inspector worker card "Redirect" → seed the Operator Command Bar with that
+  // worker as the target and focus its input (the bar sends via onCommand).
+  const onRedirectWorker = (id: string) => {
+    setOpTarget(`solver:${id}`);
+    setOpFocusNonce((n) => n + 1);
+  };
+
+  // Stage Rail click → scroll the Decision Timeline to that stage's anchor.
+  const onJumpStage = (stage: Stage) =>
+    setStageJump((prev) => ({ stage, nonce: (prev?.nonce ?? 0) + 1 }));
+
+  // operator runtime worker control (BE-worker-management): add/kill a worker on
+  // the LIVE run. Best-effort; the planner drains the command next tick and the
   // worker lifecycle events (worker_spawned / worker_killed) fold back over SSE.
   const onSpawnWorker = async (engine?: string) => {
     if (!runId) return;
@@ -552,71 +592,119 @@ function Deck() {
     if (ok) pushToast({ msg: t("toast.workerKilled"), variant: "info", icon: "cpu" });
     else toastFail();
   };
-  // reveal the run's workspace dir in the host file manager (real backend run only).
-  const onOpenWorkspace = () => { if (runId && !isDraft(runId)) openWorkspace(runId); };
+
+  // Do not let a failed recovery become an unhandled promise rejection or look
+  // like a successful "swarm relaunched" event. The backend now rejects before
+  // RUN_REOPENED for configuration failures; surface that detail in the same
+  // action-feedback lane as the other operator controls.
+  const onResolve = async () => {
+    try {
+      await resolve();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "";
+      pushToast({
+        msg: detail ? `${t("toast.dispatchFailed")}：${detail}` : t("toast.dispatchFailed"),
+        variant: "error",
+      });
+    }
+  };
+
+  const showTimeline = deck.started || loading;
 
   return (
-    <div ref={shellRef} className="shell motion-root">
+    <div ref={shellRef} className="shell cc-shell motion-root">
       <a href="#main-conversation" className="skip-link">{t("a11y.skipToMain")}</a>
-      <ThreadRail
-        collapsed={railCollapsed}
-        width={railWidth}
-        runs={runs}
-        folders={folders}
-        activeRunId={runId}
-        draftActive={isDraft(runId)}
+      <TopBar
+        deck={deck}
         connected={connected}
-        onNew={onNewSolve}
-        onSelect={onSelectRun}
-        onAction={onRailAction}
-        onResize={onRailResize}
-        onOpenSettings={() => setShowSettings(true)}
+        running={running}
+        stageInfo={deriveStage(deck)}
+        inspectorOpen={inspectorOpen}
+        onToggleRail={() => setRailCollapsed((v) => !v)}
+        onToggleInspector={() => setInspectorOpen((v) => !v)}
+        onJumpStage={onJumpStage}
+        onCommand={onCommand}
+        onResolve={onResolve}
+        onOpenBtw={() => setBtwOpen(true)}
+        theme={theme}
+        onToggleTheme={toggleTheme}
       />
-      <main id="main-conversation" className="main motion-shell-piece" aria-label={t("a11y.main")}>
-        <Conversation
-          deck={deck}
-          running={running}
-          loading={loading}
+      <div className="cc-body">
+        <ThreadRail
+          collapsed={railCollapsed}
+          width={railWidth}
+          runs={runs}
+          folders={folders}
+          activeRunId={runId}
+          draftActive={isDraft(runId)}
           connected={connected}
-          onCommand={onCommand}
-          onResolve={resolve}
-          onDispatch={dispatch}
-          attachments={attachments}
-          onAddFiles={addFiles}
-          onRemoveFile={removeFile}
-          artifactOpen={artifactOpen}
-          artifactView={artifactView}
-          onOpenArtifact={openArtifact}
-          onToggleRail={() => setRailCollapsed((v) => !v)}
-          theme={theme}
-          onToggleTheme={toggleTheme}
-          onSpawnWorker={onSpawnWorker}
-          onKillWorker={onKillWorker}
-          onOpenWorker={onOpenWorker}
-          onOpenWorkspace={onOpenWorkspace}
-          onHitlAnswered={() => pushToast({ msg: t("hitl.answered"), variant: "success" })}
-          onOpenBtw={() => setBtwOpen(true)}
+          onNew={onNewSolve}
+          onSelect={onSelectRun}
+          onAction={onRailAction}
+          onResize={onRailResize}
+          onOpenSettings={() => setShowSettings(true)}
+          onBatch={onBatch}
         />
-        <ArtifactPanel
-          open={artifactOpen}
-          width={artifactWidth}
-          view={artifactView}
-          deck={deck}
-          running={running}
-          loading={loading}
-          selected={selected}
-          onSelect={setSelected}
-          onView={setArtifactView}
-          onClose={() => setArtifactOpen(false)}
-          onResize={onArtifactResize}
-          minWidth={ARTIFACT_WIDTH_MIN}
-          maxWidth={artifactWidthMax(winW)}
-          defaultWidth={artifactWidthDefault(winW)}
-          onSpawnWorker={onSpawnWorker}
-          onKillWorker={onKillWorker}
-          focusWorker={focusedWorker}
-        />
-      </main>
+        <main id="main-conversation" className="main motion-shell-piece" aria-label={t("a11y.main")}>
+          {showTimeline ? (
+            <DecisionTimeline
+              deck={deck}
+              loading={loading}
+              jump={stageJump}
+              onOpenWorker={onOpenWorker}
+              onOpenEvidence={() => openArtifact("evidence")}
+            />
+          ) : (
+            <Conversation
+              onDispatch={dispatch}
+              attachments={attachments}
+              onAddFiles={addFiles}
+              onRemoveFile={removeFile}
+            />
+          )}
+          <ArtifactPanel
+            open={artifactOpen}
+            width={artifactWidth}
+            view={artifactView}
+            deck={deck}
+            running={running}
+            loading={loading}
+            selected={selected}
+            onSelect={setSelected}
+            onView={setArtifactView}
+            onClose={() => setArtifactOpen(false)}
+            onResize={onArtifactResize}
+            minWidth={ARTIFACT_WIDTH_MIN}
+            maxWidth={artifactWidthMax(winW)}
+            defaultWidth={artifactWidthDefault(winW)}
+            onSpawnWorker={onSpawnWorker}
+            onKillWorker={onKillWorker}
+            focusWorker={focusedWorker}
+            onOpenWorker={onOpenWorker}
+          />
+        </main>
+        {deck.started && inspectorOpen && (
+          <SwarmInspector
+            deck={deck}
+            running={running}
+            onOpenWorker={onOpenWorker}
+            onRedirectWorker={onRedirectWorker}
+            onKillWorker={onKillWorker}
+            onOpenArtifact={openArtifact}
+            onCommand={onCommand}
+            onHitlAnswered={() => pushToast({ msg: t("hitl.answered"), variant: "success" })}
+          />
+        )}
+      </div>
+      <OperatorBar
+        started={deck.started}
+        running={running}
+        solvers={Object.keys(deck.lanes)}
+        target={opTarget}
+        onTargetChange={setOpTarget}
+        focusNonce={opFocusNonce}
+        onCommand={onCommand}
+      />
       <ToastLane toasts={toasts} onDismiss={dismissToast} />
       <WorkerSettings open={showSettings} onClose={() => setShowSettings(false)} />
       <CommandPalette

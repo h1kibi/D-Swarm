@@ -1,13 +1,15 @@
 {
-  "name": "muteki-command-deck",
-  "version": "0.2.5",
+  "name": "d-swarm-command-deck",
+  "version": "0.3.0-rc.1",
   "private": true,
-  "description": "Project Muteki web command deck — a conversation-first frontend over the agent SSE stream with a live fact graph, blackboard, worker dock, and HITL controls.",
+  "description": "D-Swarm web command deck — a conversation-first frontend over the agent SSE stream with a live fact graph, blackboard, worker dock, and HITL controls.",
   "scripts": {
-    "dev": "next dev -p 3001",
+    "dev": "next dev",
     "build": "next build",
-    "start": "next start -p 3001",
-    "lint": "next lint"
+    "start": "next start",
+    "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
@@ -19,13 +21,16 @@
     "cytoscape-dagre": "^2.5.0",
     "next": "^14.2.5",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.21.8",
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "vitest": "^4.1.10"
   }
 }

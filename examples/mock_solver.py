@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from muteki.core.cost import CostController
-from muteki.core.event_bus import EventBus
-from muteki.core.events import (
+from dswarm.core.cost import CostController
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import (
     Event,
     EventType,
     blackboard_delta_payload,
@@ -24,8 +24,8 @@ from muteki.core.events import (
     tool_result_payload,
     worker_status_payload,
 )
-from muteki.core.session_store import SessionStore
-from muteki.models.solve_graph import Challenge, HypothesisStatus, SolveGraph
+from dswarm.core.session_store import SessionStore
+from dswarm.models.solve_graph import Challenge, HypothesisStatus, SolveGraph
 
 # small inter-event pacing so the evolving graph + chat actually animate in the
 # UI (and so HITL commands have a window to land mid-run). 0 in headless tests.

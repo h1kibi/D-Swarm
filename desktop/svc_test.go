@@ -59,6 +59,47 @@ func TestServiceStartHealthAndStop(t *testing.T) {
 	}
 }
 
+func TestServiceReusesHealthyExistingService(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	// A missing binary proves Start adopted the healthy endpoint rather than
+	// spawning a second process. The adopted service must also survive Stop.
+	svc := &Service{
+		Name:          "existing",
+		Argv:          []string{"definitely-not-a-real-binary-xyz"},
+		HealthURL:     srv.URL,
+		ReuseExisting: true,
+	}
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("Start should adopt healthy service: %v", err)
+	}
+	if st := svc.Status(); st.State != StateRunning {
+		t.Fatalf("expected running adopted service, got %s", st.State)
+	}
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("Stop adopted service: %v", err)
+	}
+	if st := svc.Status(); st.State != StateStopped {
+		t.Fatalf("expected stopped state after releasing adopted service, got %s", st.State)
+	}
+}
+
+func TestUiServicePassesPortOnlyAsRuntimeArgument(t *testing.T) {
+	dev := UiService(`C:\repo`, 4321, 8765, "dev")
+	if got := strings.Join(dev.Argv, " "); got != "npm.cmd run dev -- -p 4321" {
+		t.Fatalf("unexpected dev argv: %q", got)
+	}
+	for _, mode := range []string{"", "prod", "unexpected"} {
+		svc := UiService(`C:\repo`, 4321, 8765, mode)
+		if got := strings.Join(svc.Argv, " "); got != "npm.cmd run start -- -p 4321" {
+			t.Fatalf("mode %q should use production argv, got %q", mode, got)
+		}
+	}
+}
+
 func TestServiceHealthTimeoutMarksError(t *testing.T) {
 	// a health URL that never answers → Start must fail and mark error.
 	dir := t.TempDir()
@@ -129,20 +170,36 @@ func TestRepoRootResolution(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("MUTEKI_REPO_ROOT", "")
-	if got := RepoRoot("", root); got != root {
-		t.Fatalf("cwd resolution failed: %s", got)
+	uiDir := filepath.Join(root, "apps", "web", "ui")
+	if err := os.MkdirAll(uiDir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	// explicit env wins
-	t.Setenv("MUTEKI_REPO_ROOT", "/elsewhere")
-	if got := RepoRoot("", root); got != "/elsewhere" {
-		t.Fatalf("env override failed: %s", got)
+	if err := os.WriteFile(filepath.Join(uiDir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	// exe walk-up: <root>/desktop/build/bin/exe → root
-	t.Setenv("MUTEKI_REPO_ROOT", "")
-	bin := filepath.Join(root, "desktop", "build", "bin", "muteki.exe")
-	if got := RepoRoot(bin, filepath.Join(root, "desktop")); got != root {
-		t.Fatalf("exe walk-up failed: %s", got)
+	t.Setenv("DSWARM_REPO_ROOT", "")
+	if got, err := RepoRoot("", filepath.Join(root, "desktop")); err != nil || got != root {
+		t.Fatalf("cwd ancestor resolution failed: root=%q err=%v", got, err)
+	}
+	// explicit environment override wins only when it is a valid checkout.
+	t.Setenv("DSWARM_REPO_ROOT", root)
+	if got, err := RepoRoot("", t.TempDir()); err != nil || got != root {
+		t.Fatalf("env override failed: root=%q err=%v", got, err)
+	}
+	// exe walk-up: <root>/desktop/build/bin/exe → root.
+	t.Setenv("DSWARM_REPO_ROOT", "")
+	bin := filepath.Join(root, "desktop", "build", "bin", "d-swarm-desktop.exe")
+	if got, err := RepoRoot(bin, t.TempDir()); err != nil || got != root {
+		t.Fatalf("exe walk-up failed: root=%q err=%v", got, err)
+	}
+	// Never silently return a non-repository cwd: doing so starts Next in an
+	// invalid directory and can make Watchpack scan the Windows drive root.
+	if _, err := RepoRoot("", t.TempDir()); err == nil {
+		t.Fatal("expected an error when no valid D-Swarm checkout exists")
+	}
+	t.Setenv("DSWARM_REPO_ROOT", filepath.Join(root, "desktop"))
+	if _, err := RepoRoot("", root); err == nil {
+		t.Fatal("expected invalid DSWARM_REPO_ROOT to fail clearly")
 	}
 }
 

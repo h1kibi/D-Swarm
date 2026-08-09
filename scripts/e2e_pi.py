@@ -1,11 +1,11 @@
-"""End-to-end: run a REAL pi (deepseek) worker through muteki's
+"""End-to-end: run a REAL pi (deepseek) worker through dswarm's
 run_cli_streaming + PiDriver path — the exact code path a swarm worker uses."""
 import sys
 import threading
 
 sys.path.insert(0, r"C:\Projects\Agent-projects\ctf-swarm")
 
-from muteki.solver.cli_driver import PiDriver, run_cli_streaming, StreamStep
+from dswarm.solver.cli_driver import PiDriver, run_cli_streaming, StreamStep
 
 d = PiDriver()
 print("bin:", d.bin, flush=True)

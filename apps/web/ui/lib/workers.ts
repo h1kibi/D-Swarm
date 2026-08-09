@@ -4,8 +4,8 @@
  * Colour is keyed by ENGINE (not a hash of the id) so the same engine always
  * reads the same colour across the deck, matching the command-deck mockup:
  *   pi = cyan · reason/deepseek = amber.
- * The DeepSeek `reason` actor is the coordinator (see lib/events.ts split), so
- * it gets the amber coordinator colour rather than a worker hue.
+ * The `reason` actor is the planner (see lib/events.ts split), so
+ * it gets the amber planner colour rather than a worker hue.
  */
 
 // literal hexes (mirror the :root --eng-* tokens) — used directly in inline styles
@@ -13,7 +13,7 @@
 // light-theme palette in app/globals.css :root (pushed deeper so they read on white).
 const ENGINE_COLOR: Record<string, string> = {
   pi: "#0891b2", // --cyan
-  reason: "#b45309", // --amber (coordinator)
+  reason: "#b45309", // --amber (planner)
   deepseek: "#b45309",
   verifier: "#ca8a04", // --gold (deeper than --gold body token for chip contrast)
 };

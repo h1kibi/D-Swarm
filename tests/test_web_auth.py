@@ -1,7 +1,7 @@
 """P3 web auth: unit tests for the token/password/ticket primitives, plus
 integration tests of the FastAPI gate (middleware + login/ticket + SSE/WS).
 
-The gate is enforced iff MUTEKI_WEB_PASSWORD is set. With no password and a
+The gate is enforced iff DSWARM_WEB_PASSWORD is set. With no password and a
 loopback bind, the deck behaves exactly as before (open). A non-loopback bind
 with no password is a refuse-to-start misconfiguration.
 """

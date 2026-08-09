@@ -32,16 +32,20 @@ import { Icon, IconName } from "@/components/Icon";
 /**
  * Global worker config — ONE config reused by every solve (no per-run /
  * per-worker layer). Redesign v2 (DESIGN_settings_redesign): the panel is a
- * modal with a LEFT tab rail + RIGHT content area, organised by user intent
- * rather than backend structure:
+ * modal with a LEFT tab rail + RIGHT content area, organised by the docs/07 §6.4
+ * pi-only groups (only groups with a real backend settings API exist here):
  *
- *   Roster    — who dispatches: engine + name + model (the SOLE model entry
- *               point) + an enabled toggle (config kept when off) + a per-card
- *               readiness chain; expand for race / capacity / priority / delete.
- *   Accounts  — one credential per dispatched engine; hard blocker in container.
- *   Runtime   — backend (container/local) + network mode + worker-image health.
- *   Budget    — scheduling + budgets; review is one toggle that reveals its form.
- *   Advanced  — reasoning models (planner/titler) + engine self-check.
+ *   Runtime    — execution mode: backend (container/local) + network mode +
+ *               worker-image health, plus concurrency / timeout / budgets.
+ *   Pi         — the worker roster (profile + name + model, the SOLE model
+ *               entry point, enabled toggle, per-card readiness chain; expand
+ *               for capacity / priority / image / delete) and the credential
+ *               accounts each profile binds (secret-masked, test connection).
+ *   ReasonSwarm — the planner: review dispatch policy, reasoning models
+ *               (planner/titler) + endpoint test, and the engine self-check.
+ *
+ * (The §6.4 "Board — Experimental" group has no backend settings surface, so
+ * it is intentionally absent rather than invented.)
  *
  * A persistent config-health bar surfaces cross-tab fatal dependencies (missing
  * account, capacity shortfall) and deep-links to the failing control. Edits live
@@ -55,20 +59,23 @@ type WorkerProfile = WS["worker_profiles"][number];
 type AccountType = "pi" | "api";
 type Backend = "local" | "container";
 type NetworkMode = "bridge" | "host" | "none";
-type Tab = "roster" | "accounts" | "runtime" | "budget" | "advanced";
+type Tab = "runtime" | "pi" | "reason";
 type Severity = "ok" | "amber" | "red";
 
 const BASE_ENGINES = ["pi"] as const;
+// Kernel role vocabulary (apps/web/worker_config.py _ordinary_worker_roles) —
+// "race" is the historical name of an ordinary dispatch-seat role in stored
+// configs; it is data, not a user-visible race mode, and must stay for compat.
 const ORDINARY_PROFILE_ROLES = new Set(["race", "bootstrap", "explore", "respond"]);
 // env var + default that govern the container worker image (server-side:
-// muteki/solver/container_exec.py WORKER_IMAGE). Surfaced in the Runtime tab so
+// dswarm/solver/container_exec.py WORKER_IMAGE). Surfaced in the Runtime tab so
 // the operator knows what to set; documented in .env.example.
-const WORKER_IMAGE_ENV = "MUTEKI_WORKER_IMAGE";
-const WORKER_IMAGE_DEFAULT = "ghcr.io/fishcodetech/muteki-worker:latest";
+const WORKER_IMAGE_ENV = "DSWARM_WORKER_IMAGE";
+const WORKER_IMAGE_DEFAULT = "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1";
 
 // prefer the human-readable label; fall back to name/id. After the identity
-// migration a profile's id/name is an opaque seat id (seat_claude_ab12cd), so
-// without the label the UI would show that instead of e.g. "claude-local".
+// migration a profile's id/name is an opaque seat id (seat_pi_ab12cd), so
+// without the label the UI would show that instead of e.g. "pi-local".
 const profileName = (p: WorkerProfile): string => (p as { label?: string }).label || p.name || p.id;
 const profileRefName = (p: WorkerProfile): string => p.name || p.id || profileName(p);
 const isEnabled = (p: WorkerProfile): boolean => p.enabled !== false;
@@ -153,15 +160,15 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   const [imageStatus, setImageStatus] = useState<WorkerImageStatus | null>(null);
   const [imageLoading, setImageLoading] = useState(false);
   const [pulling, setPulling] = useState(false);
-  const [raceScout, setRaceScout] = useState(true);
-  const [raceTimeout, setRaceTimeout] = useState(720);
   const [reviewEnabled, setReviewEnabled] = useState(true);
-  const [reviewEngine, setReviewEngine] = useState("pi-web");
+  const [reviewEngine, setReviewEngine] = useState("pi-worker");
   const [reviewTimeout, setReviewTimeout] = useState(420);
   const [reviewMaxConcurrent, setReviewMaxConcurrent] = useState(1);
   const [reviewCandidateThreshold, setReviewCandidateThreshold] = useState(5);
   const [reviewFallback, setReviewFallback] = useState(false);
-  const [reviewPolicy, setReviewPolicy] = useState<NonNullable<WS["stage_policy"]["coordinator"]["review"]>>({});
+  const [reviewPolicy, setReviewPolicy] = useState<
+    NonNullable<NonNullable<WS["stage_policy"]["coordinator"]>["review"]>
+  >({});
   const [wallClockBudget, setWallClockBudget] = useState(0);
   const [maxTotalWorkers, setMaxTotalWorkers] = useState(0);
   const [costBudgetUsd, setCostBudgetUsd] = useState(0);
@@ -231,12 +238,10 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
       setStartWorkers(c.start_workers);
       setMaxWorkers(c.max_workers);
       setWorkerBackend(c.worker_backend ?? "container");
-      setRaceScout(c.race_scout ?? true);
-      setRaceTimeout(c.race_timeout ?? 720);
       const rv = c.stage_policy?.coordinator?.review ?? {};
       setReviewPolicy(rv);
       setReviewEnabled(rv.enabled ?? true);
-      setReviewEngine(rv.engine ?? "pi-web");
+      setReviewEngine(rv.engine ?? "pi-worker");
       setReviewTimeout(rv.timeout ?? 420);
       setReviewMaxConcurrent(rv.max_concurrent ?? 1);
       setReviewCandidateThreshold(rv.candidate_spike_threshold ?? 5);
@@ -395,7 +400,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     }
   }, [derivedMaxWorkers, maxWorkers, selectedCapacity, startWorkers]);
 
-  // ── config-health bar severity (Codex hard rule) ────────────────────────────
+  // ── config-health bar severity (hard rule) ────────────────────────────
   //   red   = a run cannot start OR an enabled profile cannot execute
   //   amber = runnable but degraded / risky / needs attention
   //   ok    = valid + actionable
@@ -558,21 +563,14 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     // 2) the rest of the roster + budgets + models
     const res = await putWorkerSettings({
       engines: nextEngines,
-      // The settings UI does not expose a separate race-only subset. Keep the
-      // race roster aligned with the visible enabled seats so a stale hidden
-      // subset cannot silently drop an engine from dispatch.
-      race_engines: nextEngines,
       start_workers: nextStartWorkers,
       max_workers: nextMaxWorkers,
       worker_backend: workerBackend,
-      race_scout: raceScout,
-      race_timeout: raceTimeout,
       wall_clock_budget: wallClockBudget,
       max_total_workers: maxTotalWorkers,
       cost_budget_usd: costBudgetUsd,
       stage_policy: {
         prepare: {},
-        race: { enabled: raceScout, timeout: raceTimeout, engines: nextEngines },
         coordinator: {
           wall_clock_budget: wallClockBudget,
           review: {
@@ -636,7 +634,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   // Pre-fill the account form for a specific engine and bring it into view (used
   // by the per-card "configure account →" deep-link and the Accounts blocker).
   const prefillAccount = (engine: "pi") => {
-    setTab("accounts");
+    setTab("pi");
     setEditingAccount(null);
     setAccountType(engine);
     setAccountApiEngine(engine);
@@ -834,12 +832,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     mark();
   };
 
-  const toggleInstanceRace = (id: string) => {
-    setWorkerProfiles((prev) => prev.map((p) => (p.id === id ? { ...p, race: !p.race } : p)));
-    mark();
-  };
-
-  // Enable / disable a card WITHOUT deleting it (Codex P0). Enabling also makes
+  // Enable / disable a card WITHOUT deleting it. Enabling also makes
   // sure the profile is in the dispatch roster; disabling drops it from the
   // roster (by name) but keeps the profile + all its tuned fields.
   const toggleInstanceEnabled = (id: string) => {
@@ -868,13 +861,11 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   // Rail order — and the default-open tab — follow the setup dependency chain:
   // you must decide WHERE workers run before you know which credentials are
   // needed, before you can configure a runnable worker. So the panel opens on
-  // Runtime (the first step), then accounts → roster → budget → advanced.
+  // Runtime (the first step), then Pi (roster + accounts), then ReasonSwarm.
   const tabs: { id: Tab; icon: IconName; label: string; sev?: Severity }[] = [
     { id: "runtime", icon: "cpu", label: t("settings.tabRuntime"), sev: "ok" },
-    { id: "accounts", icon: "lock", label: t("settings.tabAccounts"), sev: acctSev },
-    { id: "roster", icon: "layers", label: t("settings.tabRoster"), sev: rosterSev },
-    { id: "budget", icon: "target", label: t("settings.tabBudget"), sev: budgetSev },
-    { id: "advanced", icon: "gear", label: t("settings.tabAdvanced") },
+    { id: "pi", icon: "layers", label: t("settings.tabPi"), sev: rosterSev === "red" || acctSev === "red" ? "red" : rosterSev === "amber" || acctSev === "amber" ? "amber" : "ok" },
+    { id: "reason", icon: "gear", label: t("settings.tabReason") },
   ];
 
   return (
@@ -896,13 +887,13 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
             {dirty ? t("settings.healthDraft") : t("settings.healthActive")}
           </span>
           <span className="ws2-health-sep" aria-hidden>|</span>
-          <button type="button" className="ws2-seg" onClick={() => setTab("roster")}>
+          <button type="button" className="ws2-seg" onClick={() => setTab("pi")}>
             {dot(rosterSev)}
             {rosterSev === "ok" ? t("settings.healthRosterOk")
               : enabledProfiles.length === 0 ? t("settings.healthRosterEmpty")
                 : t("settings.healthRosterBlocked", { n: blockedProfiles.length })}
           </button>
-          <button type="button" className="ws2-seg" onClick={() => setTab("accounts")}>
+          <button type="button" className="ws2-seg" onClick={() => setTab("pi")}>
             {dot(acctSev)}
             {acctSev === "ok" ? t("settings.healthAcctOk")
               : acctSev === "red" ? t("settings.healthAcctMissing", {
@@ -920,7 +911,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
               ? t("settings.healthRuntimeContainer", { net: networkLabel(networkMode) })
               : t("settings.healthRuntimeLocal")}
           </button>
-          <button type="button" className="ws2-seg" onClick={() => setTab("budget")}>
+          <button type="button" className="ws2-seg" onClick={() => setTab("runtime")}>
             {dot(budgetSev)}
             {budgetSev === "amber" ? t("settings.healthBudgetInf") : t("settings.healthBudgetCap")}
           </button>
@@ -947,11 +938,11 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
           </nav>
 
           <div className="ws2-content">
-            {/* ── ROSTER ─────────────────────────────────────────────────── */}
-            {tab === "roster" && (
+            {/* ── PI · ROSTER ─────────────────────────────────────────────────── */}
+            {tab === "pi" && (
               <section>
                 <div className="ws-section-head">
-                  <h3>{t("settings.tabRoster")}</h3>
+                  <h3>{t("settings.secRoster")}</h3>
                   <span>{t("settings.rosterHint")}</span>
                 </div>
                 {workerProfiles.length === 0 ? (
@@ -968,7 +959,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                         <span className={`ws2-stepn ${workerBackend === "container" ? "now" : "done"}`}>{workerBackend === "container" ? "2" : <Icon name="check" size={11} />}</span>
                         <span>{workerBackend === "container" ? t("settings.emptyStep2") : t("settings.emptyStep2Local")}
                           {workerBackend === "container" && (
-                            <button type="button" className="ws-jump" onClick={() => setTab("accounts")}>{t("settings.emptyGoAccounts")}</button>
+                            <button type="button" className="ws-jump" onClick={() => setTab("pi")}>{t("settings.emptyGoAccounts")}</button>
                           )}
                         </span>
                       </li>
@@ -1083,13 +1074,6 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                         {open && (
                           <div className="ws2-expand">
                             <label className="ws2-xf">
-                              <span>{t("settings.composerRace")}</span>
-                              <button type="button" className={`ws2-toggle sm ${p.race ? "on" : ""}`}
-                                onClick={() => toggleInstanceRace(p.id)} role="switch" aria-checked={!!p.race}>
-                                <span className="ws2-knob" />
-                              </button>
-                            </label>
-                            <label className="ws2-xf">
                               <span>{t("settings.composerMaxRunning")}</span>
                               <input type="number" min={1} value={p.max_running ?? 1}
                                 onChange={(ev) => updateProfile(p.id, { max_running: Math.max(1, Number(ev.target.value) || 1) })} />
@@ -1103,6 +1087,15 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                               <span>{t("settings.profilePriority")}</span>
                               <input type="number" min={0} value={p.priority ?? (i + 1) * 10} readOnly title={t("settings.composerPriority")} />
                             </label>
+                            <label className="ws2-xf">
+                              <span>{t("settings.profileImage")}</span>
+                              <input
+                                value={p.image ?? ""}
+                                placeholder={t("settings.profileImagePlaceholder")}
+                                spellCheck={false}
+                                onChange={(ev) => updateProfile(p.id, { image: ev.target.value })}
+                              />
+                            </label>
                             <div className="ws2-xf-actions">
                               <span className="ws-card-test">
                                 {minfo && !minfo.testing && (
@@ -1115,9 +1108,6 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                                   <Icon name="plug" size={12} /> {minfo?.testing ? t("settings.testing") : t("settings.testModel")}
                                 </button>
                               </span>
-                              <button type="button" className="ws-mini-btn danger" onClick={() => removeInstance(p.id)}>
-                                <Icon name="x" size={12} /> {t("settings.composerRemove")}
-                              </button>
                             </div>
                           </div>
                         )}
@@ -1126,22 +1116,14 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                   })}
                 </ol>
 
-                <div className="ws-add-row">
-                  {BASE_ENGINES.map((e) => (
-                    <button key={e} type="button" className="ws-add-btn"
-                      onClick={() => addInstance(e)} title={t("settings.composerAddTitle")}>
-                      <span className="ws-add-plus" aria-hidden>+</span> {e}
-                    </button>
-                  ))}
-                </div>
               </section>
             )}
 
-            {/* ── ACCOUNTS ───────────────────────────────────────────────── */}
-            {tab === "accounts" && (
+            {/* ── PI · ACCOUNTS ───────────────────────────────────────────────── */}
+            {tab === "pi" && (
               <section>
                 <div className="ws-section-head">
-                  <h3>{t("settings.tabAccounts")} <span className="ws-tag">{backendLabel}</span></h3>
+                  <h3>{t("settings.secCredentials")} <span className="ws-tag">{backendLabel}</span></h3>
                   <span>{t("settings.testsAgainst")} {backendLabel}</span>
                 </div>
                 <p className="ws2-sub">{workerBackend === "container" ? t("settings.acctSub") : t("settings.credLocalNote")}</p>
@@ -1430,15 +1412,37 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                       <code className="ws2-env">{WORKER_IMAGE_ENV}</code>
                       {t("settings.imgEnvNote", { default: WORKER_IMAGE_DEFAULT })}
                     </p>
+                    <div style={{ marginTop: 14 }}>
+                      <div className="ws2-sub" style={{ marginBottom: 4 }}>
+                        <strong>{t("settings.runtimeImages")}</strong>
+                      </div>
+                      <p className="ws2-sub" style={{ marginBottom: 6 }}>
+                        {t("settings.runtimeImagesHint")}
+                      </p>
+                      {workerProfiles.map((p) => (
+                        <div key={p.id} style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "4px 0",
+                          borderBottom: "1px solid var(--border, rgba(128,128,128,.25))",
+                        }}>
+                          <span style={{ minWidth: 110 }}>{p.name || p.id}</span>
+                          <code style={{ overflowWrap: "anywhere" }}>
+                            {p.image || t("settings.runtimeImagesDefault")}
+                          </code>
+                        </div>
+                      ))}
+                    </div>
                   </>
                 )}
               </section>
             )}
 
-            {/* ── BUDGET ─────────────────────────────────────────────────── */}
-            {tab === "budget" && (
+            {/* ── RUNTIME · BUDGET ─────────────────────────────────────────────────── */}
+            {tab === "runtime" && (
               <section>
-                <div className="ws-section-head"><h3>{t("settings.tabBudget")}</h3><span>{t("settings.secSchedule")}</span></div>
+                <div className="ws-section-head"><h3>{t("settings.secSchedule")}</h3></div>
                 <p className="ws2-sub">{t("settings.budgetSub")}</p>
                 <div className="ws-grid">
                   <div className="ws-field">
@@ -1453,18 +1457,6 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                     <input type="number" value={maxWorkers} readOnly disabled
                       className="ws2-derived" title={t("settings.maxWorkersDerived")} />
                     <span className="ws-field-hint">{t("settings.maxWorkersDerived")}</span>
-                  </div>
-                  <div className="ws-field">
-                    <label>{t("settings.raceScout")}</label>
-                    <select value={raceScout ? "1" : "0"} onChange={(e) => { setRaceScout(e.target.value === "1"); mark(); }}>
-                      <option value="1">{t("settings.enabled")}</option>
-                      <option value="0">{t("settings.disabled")}</option>
-                    </select>
-                  </div>
-                  <div className="ws-field">
-                    <label>{t("settings.raceTimeout")}</label>
-                    <input type="number" min={1} value={raceTimeout}
-                      onChange={(e) => { setRaceTimeout(Math.max(1, parseInt(e.target.value) || 720)); mark(); }} />
                   </div>
                   <div className="ws-field">
                     <label>{t("settings.wallClockBudget")}</label>
@@ -1483,6 +1475,16 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                   </div>
                 </div>
 
+              </section>
+            )}
+
+            {/* ── REASONSWARM ───────────────────────────────────────────────── */}
+            {tab === "reason" && (
+              <section>
+                <div className="ws-section-head">
+                  <h3>{t("settings.secReview")}</h3>
+                  <span>{t("settings.secReviewHint")}</span>
+                </div>
                 <div className="ws2-review">
                   <div className="ws2-review-head">
                     <button type="button" className={`ws2-toggle ${reviewEnabled ? "on" : ""}`}
@@ -1529,12 +1531,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                     </div>
                   )}
                 </div>
-              </section>
-            )}
 
-            {/* ── ADVANCED ───────────────────────────────────────────────── */}
-            {tab === "advanced" && (
-              <section>
                 <div className="ws-section-head">
                   <h3>{t("settings.advReasoning")}</h3>
                   <span>{t("settings.reasonHint")}</span>
@@ -1585,7 +1582,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                     {health.map((h) => {
                       const isLocal = (h.backend ?? workerBackend) === "local";
                       const unpinned = isLocal && h.bin_source && h.bin_source !== "env";
-                      const envVar = h.bin_env || `MUTEKI_${h.engine.toUpperCase()}_BIN`;
+                      const envVar = h.bin_env || `DSWARM_${h.engine.toUpperCase()}_BIN`;
                       return (
                         <div key={h.engine} className={`ws-sc-row ${h.healthy ? "ok" : "bad"}`}>
                           <div className="ws-sc-top">

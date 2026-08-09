@@ -4,26 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { useT } from "@/lib/i18n";
 import { apiFetch } from "@/lib/useRun";
+import { BtwMessageBody } from "@/components/btwMarkdown";
+import {
+  applyBtwAnswerFrame,
+  btwErrorBannerText,
+  type BtwAnswerState,
+} from "@/components/btwStream";
 
-/**
- * BTW side-query worker — a right-side drawer for read-only Q&A over a run.
- *
- * The operator asks quick questions ("summarize progress", "which worker is on
- * which line", ...) and gets a streamed answer from a one-shot side worker. It
- * never joins the swarm, consumes no max-worker slot, and writes no graph/cost
- * state; the worker process dies after the turn or on disconnect.
- *
- * Multi-turn: the transcript lives ONLY in this component's local state. It is
- * sent with each request so every turn can cold-start a fresh worker without
- * losing conversational context. Closing the drawer (Esc / backdrop / button)
- * drops the whole transcript — nothing is
- * persisted server-side. Switching runs clears it (different runs' contexts
- * must not mix).
- *
- * Open/close is OWNED by page.tsx (same pattern as CommandPalette) so a single
- * global Esc handler arbitrates layering. This component is a pure modal: it
- * renders nothing when `open` is false.
- */
+/**\n * BTW side-query worker — a right-side drawer for read-only Q&A over a run.\n *\n * The operator asks quick questions (summarize progress, which worker is on\n * which line, ...) and gets a bounded read-only answer. Normal turns do not\n * start a shell worker; explicit deep-audit turns may use the isolated one-shot\n * worker path. BTW never joins the swarm, consumes no max-worker slot, or writes\n * graph/cost state.\n *\n * Multi-turn: the transcript lives ONLY in this component's local state and is\n * sent with each request so the fixed observer model can retain conversational\n * context. Closing the drawer (Esc / backdrop / button) drops the whole\n * transcript — nothing is persisted server-side. Switching runs clears it\n * (different runs' contexts must not mix).\n *\n * Open/close is OWNED by page.tsx (same pattern as CommandPalette) so a single\n * global Esc handler arbitrates layering. This component is a pure modal: it\n * renders nothing when `open` is false.\n */
 
 export interface BtwPanelProps {
   open: boolean;
@@ -50,7 +38,9 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string>("");
+  const [workerStatus, setWorkerStatus] = useState<string>("");
   const abortRef = useRef<AbortController | null>(null);
+  const requestSeqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   // Switching runs clears the transcript — never mix contexts across runs.
@@ -58,6 +48,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
     setTurns([]);
     setInput("");
     setError("");
+    setWorkerStatus("");
   }, [runId]);
 
   // Auto-scroll the conversation to the bottom as deltas stream in.
@@ -90,19 +81,32 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
       const q = question.trim();
       if (!q || streaming || !runId) return;
       setError("");
-      // cancel any prior in-flight stream (defensive — limiter cancels server-side too)
+      setWorkerStatus("正在整理只读证据…");
       if (abortRef.current) abortRef.current.abort();
       const ctrl = new AbortController();
       abortRef.current = ctrl;
-
+      const requestId = ++requestSeqRef.current;
       const transcript = turns;
-      setTurns((prev) => [
-        ...prev,
-        { role: "user", content: q },
-        { role: "assistant", content: "" },
-      ]);
+
+      // Do not create an empty assistant bubble up front. A failed/empty request
+      // must become an explicit answer, never a blank turn that looks like no reply.
+      setTurns((prev) => [...prev, { role: "user", content: q }]);
       setInput("");
       setStreaming(true);
+
+      const upsertAssistant = (content: string) => {
+        if (requestSeqRef.current !== requestId) return;
+        setTurns((prev) => {
+          const next = prev.slice();
+          const last = next[next.length - 1];
+          if (last && last.role === "assistant") {
+            next[next.length - 1] = { role: "assistant", content };
+          } else {
+            next.push({ role: "assistant", content });
+          }
+          return next;
+        });
+      };
 
       try {
         const resp = await apiFetch(`/api/runs/${runId}/btw`, {
@@ -113,58 +117,70 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
         });
         if (!resp.ok || !resp.body) {
           const txt = await resp.text().catch(() => "");
-          setError(`请求失败 (${resp.status}): ${txt.slice(0, 160)}`);
-          setStreaming(false);
+          const message = `请求失败 (${resp.status}): ${txt.slice(0, 160)}`;
+          setError(message);
+          upsertAssistant(`观察员暂时无法回答：${message}`);
           return;
         }
         const reader = resp.body.getReader();
         const dec = new TextDecoder();
         let buf = "";
-        let acc = "";
+        let answerState: BtwAnswerState = { content: "", final: false, error: "" };
+
+        const consumeFrame = (frame: string) => {
+          const m = frame.match(/^data: (.+)$/s);
+          if (!m) return;
+          let obj: any;
+          try {
+            obj = JSON.parse(m[1]);
+          } catch {
+            return;
+          }
+          if (obj.status) setWorkerStatus(String(obj.status).slice(0, 160));
+          // `final` is authoritative. Any provisional delta is replaced, so
+          // lifecycle echoes or a late complete message cannot duplicate text.
+          const previous = answerState;
+          answerState = applyBtwAnswerFrame(answerState, obj);
+          if (answerState.content !== previous.content) {
+            upsertAssistant(answerState.content);
+          }
+          if (answerState.error) {
+            // An error frame is also promoted into the assistant bubble by the
+            // state reducer. Only show a separate banner when it contains
+            // additional information; otherwise the same message appears twice.
+            setError(btwErrorBannerText(answerState.content, answerState.error));
+            setWorkerStatus("");
+          }
+          if (obj.done) setWorkerStatus("");
+        };
+
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
           buf += dec.decode(value, { stream: true });
-          // sse-starlette emits CRLF CRLF between frames; tolerate both.
           const frames = buf.split(/\r?\n\r?\n/);
           buf = frames.pop() || "";
-          for (const frame of frames) {
-            const m = frame.match(/^data: (.+)$/s);
-            if (!m) continue;
-            let obj: any;
-            try {
-              obj = JSON.parse(m[1]);
-            } catch {
-              continue;
-            }
-            if (obj.delta) {
-              acc += obj.delta;
-              const captured = acc;
-              setTurns((prev) => {
-                const next = prev.slice();
-                const last = next[next.length - 1];
-                if (last && last.role === "assistant") {
-                  next[next.length - 1] = { role: "assistant", content: captured };
-                }
-                return next;
-              });
-            }
-            if (obj.error) {
-              setError(String(obj.error).slice(0, 300));
-            }
-            if (obj.done) {
-              // stream end marker
-            }
-          }
+          for (const frame of frames) consumeFrame(frame);
+        }
+        if (buf.trim()) consumeFrame(buf);
+        if (!answerState.final && !answerState.content.trim()) {
+          const message = "观察员未返回任何回答；没有启动深度 worker。";
+          setError(message);
+          upsertAssistant(message);
         }
       } catch (e: any) {
         if (e?.name === "AbortError") {
           // silent — operator closed / re-asked
         } else {
-          setError(String(e?.message || e).slice(0, 300));
+          const message = String(e?.message || e).slice(0, 300);
+          setError(message);
+          upsertAssistant(`观察员暂时无法回答：${message}`);
         }
       } finally {
-        setStreaming(false);
+        if (requestSeqRef.current === requestId) {
+          setStreaming(false);
+          setWorkerStatus("");
+        }
         if (abortRef.current === ctrl) abortRef.current = null;
       }
     },
@@ -219,11 +235,16 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
             <div key={i} className={`btw-msg btw-${turn.role}`}>
               <div className="btw-msg-role">{turn.role === "user" ? "你" : "观察员"}</div>
               <div className="btw-msg-body">
-                {turn.content || (turn.role === "assistant" && streaming ? "…" : "")}
+                <BtwMessageBody
+                  role={turn.role}
+                  content={turn.content}
+                  streaming={streaming}
+                />
               </div>
             </div>
           ))}
-          {error && <div className="btw-error">{error}</div>}
+          {workerStatus && <div className="btw-status" role="status">{workerStatus}</div>}
+          {error && <div className="btw-error" role="alert">{error}</div>}
           {overCap && (
             <div className="btw-error">transcript 过长，建议关闭抽屉重新开始。</div>
           )}

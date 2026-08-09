@@ -1,4 +1,4 @@
-module muteki/desktop
+module dswarm/desktop
 
 go 1.26
 

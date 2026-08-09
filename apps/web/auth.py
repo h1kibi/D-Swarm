@@ -9,7 +9,7 @@ and inject operator commands.
 
 This module adds a single-password gate in front of `/api`:
 
-  * The operator sets MUTEKI_WEB_PASSWORD.
+  * The operator sets DSWARM_WEB_PASSWORD.
   * The browser POSTs it to /api/auth/login and gets back a short-lived,
     HMAC-signed session token (the password itself is never stored client-side).
   * Every /api request carries `Authorization: Bearer <token>`; the middleware
@@ -36,23 +36,23 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Env knobs
 # ---------------------------------------------------------------------------
-#   MUTEKI_WEB_PASSWORD     the operator login password. If set, auth is ENFORCED
+#   DSWARM_WEB_PASSWORD     the operator login password. If set, auth is ENFORCED
 #                           on every /api route (even on loopback).
-#   MUTEKI_WEB_BIND         the bind host run.sh passes to uvicorn (it is also
+#   DSWARM_WEB_BIND         the bind host run.sh passes to uvicorn (it is also
 #                           exported to the process env so create_app can see it;
 #                           uvicorn's --host is NOT visible to the app otherwise).
 #                           Used for the fail-fast: a non-loopback bind with no
 #                           password set is a refuse-to-start misconfiguration.
-#   MUTEKI_WEB_TOKEN_TTL    session-token lifetime in seconds (default 12h).
-#   MUTEKI_WEB_AUTH_SECRET  optional explicit HMAC signing secret. If unset, a
+#   DSWARM_WEB_TOKEN_TTL    session-token lifetime in seconds (default 12h).
+#   DSWARM_WEB_AUTH_SECRET  optional explicit HMAC signing secret. If unset, a
 #                           secret is derived from the password (stable across
 #                           restarts so existing tokens survive a reboot) — or,
 #                           if there is no password, a random per-process secret.
 
-PASSWORD_ENV = "MUTEKI_WEB_PASSWORD"
-BIND_ENV = "MUTEKI_WEB_BIND"
-TTL_ENV = "MUTEKI_WEB_TOKEN_TTL"
-SECRET_ENV = "MUTEKI_WEB_AUTH_SECRET"
+PASSWORD_ENV = "DSWARM_WEB_PASSWORD"
+BIND_ENV = "DSWARM_WEB_BIND"
+TTL_ENV = "DSWARM_WEB_TOKEN_TTL"
+SECRET_ENV = "DSWARM_WEB_AUTH_SECRET"
 
 DEFAULT_TTL_S = 12 * 3600
 
@@ -77,7 +77,7 @@ def is_loopback_host(host: Optional[str]) -> bool:
     """
     h = (host or "").strip().lower()
     # strip optional IPv6 brackets and a trailing :port a user might pass in
-    # MUTEKI_WEB_BIND (e.g. "[::1]:8000" or "127.0.0.1:8000"). A bare IPv6 like
+    # DSWARM_WEB_BIND (e.g. "[::1]:8000" or "127.0.0.1:8000"). A bare IPv6 like
     # "::1" has multiple colons and no brackets — don't mistake its last colon
     # for a port separator.
     if h.startswith("[") and "]" in h:
@@ -92,12 +92,12 @@ def _derive_secret(password: str) -> bytes:
 
     Deriving from the password (rather than a random per-process key) means
     issued tokens survive a backend restart, and rotating the password
-    invalidates all old tokens for free. A dedicated MUTEKI_WEB_AUTH_SECRET
+    invalidates all old tokens for free. A dedicated DSWARM_WEB_AUTH_SECRET
     overrides this when an operator wants to rotate the password without logging
     everyone out (or vice-versa).
     """
     return hashlib.sha256(
-        b"muteki-web-auth-v1\x00" + password.encode("utf-8")).digest()
+        b"dswarm-web-auth-v1\x00" + password.encode("utf-8")).digest()
 
 
 @dataclass

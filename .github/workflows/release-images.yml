@@ -1,27 +1,32 @@
 name: release-images
 
-# Build the four muteki images and push them to GitHub Container Registry (GHCR).
+# Build the dswarm control-plane and worker images and push them to GitHub
+# Container Registry (GHCR).
 #
 # Images (all under ghcr.io/<owner>/...):
-#   muteki-web          — FastAPI control plane          (docker/web/Dockerfile,  context = repo root)
-#   muteki-ui           — Next command deck              (docker/ui/Dockerfile,   context = apps/web/ui)
-#   muteki-worker-slim  — ubuntu base + 3 CLIs + agent   (docker/worker-slim,     needs cross-compiled runtime_agent)
-#   muteki-worker       — Kali base + full pentest kit   (docker/worker,          heavy: ~kali + 2.6G knowledges)
+#   dswarm-web            — FastAPI control plane        (docker/web/Dockerfile,  context = repo root)
+#   dswarm-ui             — Next command deck            (docker/ui/Dockerfile,   context = apps/web/ui)
+#   dswarm-worker-slim    — ubuntu base + CLI + agent    (docker/worker-slim,     needs cross-compiled runtime_agent)
+#   dswarm-worker-pi      — all-in-one Kali pi worker    (docker/worker-kali/base/Dockerfile, context = repo root)
 #
 # Auth: the built-in GITHUB_TOKEN with packages:write — no PAT, no Docker Hub.
 # Triggers:
-#   - release published  → tag images with the release tag (e.g. v0.0.1) + latest
+#   - release published  → tag images with the release tag (e.g. v0.0.1); latest only for stable releases
 #   - workflow_dispatch  → manual run for testing the pipeline inside the private repo
-#                          (optionally skip the slow Kali worker via the input)
+#                          (optionally skip the slow Kali pi worker via the input)
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
-      build_kali_worker:
-        description: "Also build the heavy Kali muteki-worker image"
+      build_worker_pi:
+        description: "Also build the heavy Kali dswarm-worker-pi image"
         type: boolean
         default: true
+      prerelease:
+        description: "Treat this manual run as a pre-release (skip latest tags)"
+        type: boolean
+        default: false
       tag:
         description: "Image tag to push (defaults to the git ref name)"
         type: string
@@ -52,10 +57,19 @@ jobs:
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          PRERELEASE="false"
+          if [ "${{ github.event_name }}" = "release" ] && [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "Resolved image namespace: $OWNER"
           echo "Resolved tag: $TAG"
+          echo "Pre-release: $PRERELEASE"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -66,17 +80,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push muteki-web
+      - name: Build & push dswarm-web
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/web/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:latest
-          cache-from: type=gha,scope=muteki-web
-          cache-to: type=gha,scope=muteki-web,mode=max
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-web:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha,scope=dswarm-web
+          cache-to: type=gha,scope=dswarm-web,mode=max
+
+      - name: Push latest alias (stable releases only)
+        if: steps.tag.outputs.prerelease != 'true'
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-web:latest" \
+            "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-web:${{ steps.tag.outputs.tag }}"
 
   ui:
     runs-on: ubuntu-latest
@@ -91,8 +111,17 @@ jobs:
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          PRERELEASE="false"
+          if [ "${{ github.event_name }}" = "release" ] && [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Pre-release: $PRERELEASE"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -103,7 +132,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push muteki-ui
+      - name: Build & push dswarm-ui
         uses: docker/build-push-action@v6
         with:
           context: apps/web/ui
@@ -111,14 +140,20 @@ jobs:
           push: true
           # The Next standalone server freezes the /api proxy target at build time.
           # Bake the compose service alias so the composed stack works out of the box;
-          # a non-compose deployment overrides NEXT/MUTEKI_BACKEND at its own build.
+          # a non-compose deployment overrides NEXT/DSWARM_BACKEND at its own build.
           build-args: |
-            MUTEKI_BACKEND=http://web-api:8000
+            DSWARM_BACKEND=http://web-api:8000
           tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:latest
-          cache-from: type=gha,scope=muteki-ui
-          cache-to: type=gha,scope=muteki-ui,mode=max
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-ui:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha,scope=dswarm-ui
+          cache-to: type=gha,scope=dswarm-ui,mode=max
+
+      - name: Push latest alias (stable releases only)
+        if: steps.tag.outputs.prerelease != 'true'
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-ui:latest" \
+            "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-ui:${{ steps.tag.outputs.tag }}"
 
   # ── worker images: cross-compile the Go runtime_agent, stage context, build ───
   worker-slim:
@@ -134,8 +169,17 @@ jobs:
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          PRERELEASE="false"
+          if [ "${{ github.event_name }}" = "release" ] && [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Pre-release: $PRERELEASE"
 
       - uses: actions/setup-go@v5
         with:
@@ -155,8 +199,8 @@ jobs:
           file "$ctx/runtime_agent" || true
           echo ">> staging AGENTS.md + blackboard skill"
           cp docker/worker/AGENTS.md "$ctx/AGENTS.md"
-          cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
-          cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
+          cp skills/dswarm-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
+          cp skills/dswarm-blackboard/blackboard.py "$ctx/blackboard.py"
           chmod +x "$ctx/blackboard.py"
 
       - uses: docker/setup-buildx-action@v3
@@ -168,7 +212,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push muteki-worker-slim
+      - name: Build & push dswarm-worker-slim
         uses: docker/build-push-action@v6
         with:
           context: docker/worker-slim
@@ -178,17 +222,22 @@ jobs:
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
           tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker-slim:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker-slim:latest
-          cache-from: type=gha,scope=muteki-worker-slim
-          cache-to: type=gha,scope=muteki-worker-slim,mode=max
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-slim:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha,scope=dswarm-worker-slim
+          cache-to: type=gha,scope=dswarm-worker-slim,mode=max
 
-  worker:
+      - name: Push latest alias (stable releases only)
+        if: steps.tag.outputs.prerelease != 'true'
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-slim:latest" \
+            "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-slim:${{ steps.tag.outputs.tag }}"
+
+  worker-pi:
     runs-on: ubuntu-latest
-    # The Kali image is large (kali-linux-headless + ~2.6G knowledges/pocs/templates).
-    # Skip it on a manual run when the operator unchecks the input; always build on a
-    # real release.
-    if: ${{ github.event_name == 'release' || github.event.inputs.build_kali_worker == 'true' }}
+    # The all-in-one Kali pi image is large; skip it on a manual run when the
+    # operator unchecks the input, always build on a real release.
+    if: ${{ github.event_name == 'release' || github.event.inputs.build_worker_pi == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -209,8 +258,17 @@ jobs:
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          PRERELEASE="false"
+          if [ "${{ github.event_name }}" = "release" ] && [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRERELEASE="true"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Pre-release: $PRERELEASE"
 
       - uses: actions/setup-go@v5
         with:
@@ -222,16 +280,13 @@ jobs:
       - name: Stage build context (cross-compile runtime_agent + copy skill files)
         run: |
           set -euo pipefail
-          ctx=docker/worker
+          ctx=docker/worker-kali
           echo ">> cross-compiling runtime_agent (linux/amd64, static)"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
               -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
           file "$ctx/runtime_agent" || true
-          echo ">> staging blackboard skill"
-          cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
-          cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
-          chmod +x "$ctx/blackboard.py"
+          echo ">> worker-kali build context staged (pi-config + skills copied at build)"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -242,19 +297,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push muteki-worker (Kali)
+      - name: Build & push dswarm-worker-pi (Kali)
         uses: docker/build-push-action@v6
         with:
-          context: docker/worker
-          file: docker/worker/Dockerfile
+          context: .
+          file: docker/worker-kali/base/Dockerfile
           platforms: linux/amd64
           push: true
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
           tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:latest
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-pi:${{ steps.tag.outputs.tag }}
           # GHA cache has a 10G/repo cap; the Kali image alone can exceed it, so use a
           # registry-side cache image instead (does not count against the GHA cache).
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-pi:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-pi:buildcache,mode=max
+
+      - name: Push latest alias (stable releases only)
+        if: steps.tag.outputs.prerelease != 'true'
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-pi:latest" \
+            "${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/dswarm-worker-pi:${{ steps.tag.outputs.tag }}"

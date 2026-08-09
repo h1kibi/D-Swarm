@@ -1,4 +1,4 @@
-"""The provenance + format flag-acceptance gate (muteki.solver.gate).
+"""The provenance + format flag-acceptance gate (dswarm.solver.gate).
 
 This replaces the old test_verifier_gate.py: the standalone gate.flag_ok is now
 the ONE acceptance check every executor shares. A flag counts only if it (a)
@@ -9,8 +9,8 @@ cannot be laundered through prose or a side channel.
 
 from __future__ import annotations
 
-from muteki.solver import gate
-from muteki.solver.result import ArtifactStore
+from dswarm.solver import gate
+from dswarm.solver.result import ArtifactStore
 
 FMT = r"flag\{[^}]{1,200}\}"
 
@@ -166,6 +166,112 @@ def test_prefixed_real_flags_not_dropped_by_bare_rule():
         assert gate.is_placeholder_flag(f) is False, f
 
 
+def test_prefixed_code_template_with_dollar_vars_is_placeholder():
+    # run-3154: a PHP gadget class template `test{$readflag,$f,$key}` matched the
+    # loose default flag_format and appeared verbatim in output — it is NOT a flag.
+    for p in ["test{$readflag,$f,$key}", "flag{$readflag}", "flag{$cmd}",
+              "flag{$_GET['x']}"]:
+        assert gate.is_placeholder_flag(p) is True, p
+        assert gate.flag_ok(p, f"recovered {p} from output",
+                            flag_format=LOOSE, artifacts=None) is False, p
+
+
+def test_prefixed_real_flag_with_dollar_literal_kept():
+    # a `$` used as a LITERAL (double-dollar, no variable deref) is genuine flag
+    # content and must survive the code-template rule.
+    for f in ["shellmates{1T_W4S_4_qu1T3_3s4y_expl01tabL3_$$Rf}",
+              "flag{100$$}", "flag{a$$b}"]:
+        assert gate.is_placeholder_flag(f) is False, f
+
+
+def test_run_3156_test_placeholder_flags_rejected():
+    """run-3156: a recon worker quoted dev-harness / template flags from the
+    target source and the loose default flag_format auto-solved the run."""
+    for f in ["NEPCTF{local_test_flag_12345}", "NEPCTF{test_flag}",
+              "flag{local_test_flag}", "flag{fake_flag}", "flag{dummy_flag}",
+              "flag{sample_flag}", "flag{example_flag}", "flag{testflag}"]:
+        assert gate.is_placeholder_flag(f) is True, f
+        assert gate.flag_ok(f, f"found {f} verbatim in source",
+                            flag_format=LOOSE, artifacts=None) is False, f
+
+
+# ── default flag-identification rule (operator spec) ──────────────────────────
+def test_default_rule_accepts_structured_real_flags():
+    """HIGH confidence: `prefix{payload}` — prefix 3-10 alnum, payload 10-60 of
+    letters/digits/_/-/a few specials, no spaces — is accepted. The legacy loose
+    default regex (what web/TUI dispatch emits) resolves to this rule too."""
+    for fmt in [LOOSE, "", None]:
+        for f in ["dalctf{7h4t_w45_3xp3n5Iv3_4f}",
+                  "csawctf{d0nt_smuggl3_Fla6s_!}",
+                  "HTB{1f9b0765ee03e69aa1822fa7f0027d35}",
+                  "NepCTF{real_flag_value_42}",
+                  "shellmates{1T_W4S_4_qu1T3_3s4y_expl01tabL3_$$Rf}",
+                  "abc{payload_123}",                          # prefix = 3
+                  "ABCDEFGHIJ{payload_123}"]:                  # prefix = 10
+            # boundary payload lengths: exactly 10 and exactly 60 are accepted
+            for body in ["a" * 10, "b" * 60]:
+                assert gate.flag_ok(f"flag{{{body}}}",
+                                    f"recovered flag{{{body}}} from output",
+                                    flag_format=fmt, artifacts=None) is True, (body, fmt)
+            assert gate.flag_ok(f, f"recovered {f} from target output",
+                                flag_format=fmt, artifacts=None) is True, (f, fmt)
+    # the pydantic Challenge default `flag\{.*?\}` is a SEPARATE permissive regex
+    # (literal `flag{` prefix), not the structured default rule.
+    assert gate.flag_ok("flag{seen_in_output}", "flag{seen_in_output}",
+                        flag_format=r"flag\{.*?\}", artifacts=None) is True
+    assert gate.flag_ok("dalctf{7h4t_w45_3xp3n5Iv3_4f}", "dalctf{7h4t_w45_3xp3n5Iv3_4f}",
+                        flag_format=r"flag\{.*?\}", artifacts=None) is False
+
+
+def test_default_rule_rejects_templates_and_out_of_range_bodies():
+    """Anything outside the structured rule is rejected at the format gate:
+    template literals, bare braces, too-short / too-long payloads, out-of-range
+    prefixes, and spaces/newlines inside the body."""
+    for f in ["T0{class,test}", "test{$readflag,$f,$key}", "{uuid}",
+              "flag{...}", "flag{a}", "flag{real}", "flag{x}",
+              "ab{payload_123}",                              # prefix = 2
+              "ABCDEFGHIJK{payload_123}",                     # prefix = 11
+              "flag{hello  world}",                           # CONSECUTIVE spaces
+              "flag{hello\nworld}"]:                          # newline in body
+        # boundary payload lengths: 9 and 61 are outside the 10-60 rule
+        for body in ["c" * 9, "d" * 61]:
+            assert gate.flag_ok(f"flag{{{body}}}",
+                                f"found flag{{{body}}} verbatim in source",
+                                flag_format=LOOSE, artifacts=None) is False, body
+        assert gate.flag_ok(f, f"found {f} verbatim in source",
+                            flag_format=LOOSE, artifacts=None) is False, f
+    # a single space inside the payload is legal per the rule ("no CONSECUTIVE
+    # spaces or newlines") — real CTF flags like `flag{H1570rY 12'N7 ...}` carry it.
+    assert gate.flag_ok("flag{hello world}", "found flag{hello world} in output",
+                        flag_format=LOOSE, artifacts=None) is True
+    assert gate.flag_ok("flag{H1570rY 12 N7 k1ND 70 7h053 wh0 Pl4Y g0d}",
+                        "flag{H1570rY 12 N7 k1ND 70 7h053 wh0 Pl4Y g0d}",
+                        flag_format=LOOSE, artifacts=None) is True
+
+
+def test_default_rule_bare_hash_requires_flag_context():
+    """MEDIUM confidence (rule 2b): a bare 32/64-hex hash is a flag ONLY when the
+    surrounding output carries a flag-context clue (flag.txt / .flag / `cat
+    /flag`); otherwise it is a plain hash and rejected."""
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    # no flag context → plain hash → rejected
+    assert gate.flag_ok(md5, f"checksum {md5} of the downloaded blob",
+                        flag_format=LOOSE, artifacts=None) is False
+    assert gate.flag_ok(sha, f"sha256sum {sha} of the package",
+                        flag_format=LOOSE, artifacts=None) is False
+    # flag context + provenance → accepted
+    assert gate.flag_ok(md5, f"cat /flag\n{md5}",
+                        flag_format=LOOSE, artifacts=None) is True
+    assert gate.flag_ok(sha, f"flag.txt content: {sha}",
+                        flag_format=LOOSE, artifacts=None) is True
+    assert gate.flag_ok(md5, f"root@box:~# cat /flag\n{md5}",
+                        flag_format=LOOSE, artifacts=None) is True
+    # non-hex bare tokens are never accepted under the default rule
+    assert gate.flag_ok("not_a_hash_token", "cat /flag\nnot_a_hash_token",
+                        flag_format=LOOSE, artifacts=None) is False
+
+
 def test_gate_rejects_name_template_run_3613():
     # run-3613: claude described main.js (`icon={name}.ico`) and the blind scan
     # grabbed the URL template {name} as the flag.
@@ -198,10 +304,17 @@ def test_bare_brace_comma_sets_are_placeholders():
         assert gate.is_placeholder_flag(p) is True, p
 
 
-def test_prefixed_flag_with_comma_still_accepted():
-    # the comma rule is scoped to BARE braces — a prefixed flag is never touched.
-    for f in ["flag{a,b,c}", "dalctf{list,of,things}"]:
-        assert gate.is_placeholder_flag(f) is False, f
+def test_prefixed_flag_with_comma_is_template_literal():
+    """run-3156: `T0{class,test}` (a comma-separated template literal the worker
+    quoted from source) auto-solved the run. A comma-separated brace body is a
+    code/template LIST, never a single opaque flag token — even with a prefix.
+    Zero-false-flags bar: rejecting a comma-bearing real flag (a rare false
+    negative) is preferred to auto-solving on a quoted template."""
+    for f in ["T0{class,test}", "flag{a,b,c}", "dalctf{list,of,things}",
+              "NepCTF{class,test,id,name}"]:
+        assert gate.is_placeholder_flag(f) is True, f
+        assert gate.flag_ok(f, f"recovered {f} from output",
+                            flag_format=LOOSE, artifacts=None) is False, f
 
 
 def test_gate_rejects_blocked_hosts_set_run_1763():
@@ -255,8 +368,12 @@ def test_brace_mode_unchanged_by_token_addition(tmp_path):
     # a bare token is STILL rejected under a brace format (no regression).
     out = "ghost1 password is W3lc0m3T0Gh0st"
     assert gate.flag_ok("W3lc0m3T0Gh0st", out, flag_format=LOOSE, artifacts=None) is False
-    assert gate.flag_ok("flag{real_win}", "got flag{real_win}", flag_format=LOOSE,
-                        artifacts=None) is True
+    # a real brace flag is accepted under the default rule (payload within 10-60).
+    assert gate.flag_ok("flag{real_winnable_flag_42}", "got flag{real_winnable_flag_42}",
+                        flag_format=LOOSE, artifacts=None) is True
+    # a short payload (below the default rule's 10-char floor) is rejected.
+    assert gate.flag_ok("flag{real_win}", "got flag{real_win}",
+                        flag_format=LOOSE, artifacts=None) is False
 
 
 def test_looks_like_real_token_unit():

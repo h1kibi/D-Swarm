@@ -176,7 +176,7 @@ function CredentialsPanel({ runId }: { runId: string }) {
  * The secondary-panel canvas. Opens beside the conversation (replacing the
  * inspector column) and shows ONE detail view at a time: the live fact-graph,
  * the collaborative blackboard, the rich worker lanes, the raw activity stream,
- * or the evidence chain. The main coordinator conversation is never displaced.
+ * or the evidence chain. The Decision Timeline is never displaced.
  */
 export function ArtifactPanel({
   open,
@@ -196,6 +196,7 @@ export function ArtifactPanel({
   onSpawnWorker,
   onKillWorker,
   focusWorker,
+  onOpenWorker,
 }: {
   open: boolean;
   width: number;
@@ -215,6 +216,8 @@ export function ArtifactPanel({
   onKillWorker: (id: string) => void;
   // seed the WorkerLanes focus filter to a single worker (roster row click).
   focusWorker?: { id: string; nonce: number } | null;
+  // evidence-card provenance click → jump to that worker's detail (Phase 5).
+  onOpenWorker?: (id: string) => void;
 }) {
   const t = useT();
   const [resizing, setResizing] = useState(false);
@@ -340,7 +343,7 @@ export function ArtifactPanel({
               ) : view === "timeline" ? (
                 <ActivityStream deck={deck} />
               ) : view === "evidence" ? (
-                <EvidenceChain deck={deck} />
+                <EvidenceChain deck={deck} onOpenWorker={onOpenWorker} />
               ) : view === "findings" ? (
                 <ReviewFindingsPanel deck={deck} />
               ) : view === "credentials" ? (

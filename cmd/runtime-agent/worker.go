@@ -12,6 +12,27 @@ import (
 	"time"
 )
 
+// drainWG tracks in-flight worker process-group drains (normal-exit cleanup). The
+// supervisor waits for them before exiting so a host-link loss / `docker stop`
+// doesn't leave a worker's grandchildren running.
+var drainWG sync.WaitGroup
+
+// envSeconds parses a positive integer env var as seconds; falls back to def.
+func envSeconds(name string, def int) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return time.Duration(def) * time.Second
+}
+
+// drainGrace is how long an exited worker's process group is given to finish
+// in-flight commands (SIGTERM) before the supervisor SIGKILLs whatever survives.
+func drainGrace() time.Duration {
+	return envSeconds("DSWARM_WORKER_DRAIN_GRACE_SECONDS", 5)
+}
+
 // worker is one forked CLI agent the supervisor manages. Because the supervisor
 // forks it directly (vs the old host-side `docker exec`), it owns the real PID and
 // puts the worker in its OWN process group (Setpgid) — so a STOP/CONT/KILL hits the
@@ -31,6 +52,19 @@ type worker struct {
 	signalled int
 	timedOut  bool
 	oom       bool
+	exitedAt  time.Time
+	// desc: first-seen references (time + /proc starttime) of the worker's process
+	// descendants, snapshotted by the orphan sweep while the worker is alive
+	// (survives reparenting after exit for setsid-detached grandchildren). The
+	// starttime guards against PID reuse before the sweep kills. Guarded by w.mu.
+	desc map[int]procRef
+}
+
+// procRef pins a descendant pid to the process instance that was recorded, so a
+// recycled PID (reused after the original exited) is never killed by mistake.
+type procRef struct {
+	seen       time.Time
+	startTicks int64
 }
 
 // uid/gid of the kali user the worker runs as. Resolved once at startup. The
@@ -222,10 +256,22 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 		w.oom = oom
 		timedOut := w.timedOut && !oom // an OOM that races the timer is an OOM
 		w.timedOut = timedOut
+		w.exitedAt = time.Now()
 		w.mu.Unlock()
 
 		events <- Frame{T: "exit", Rc: rc, OOM: oom, TimedOut: timedOut, Signalled: sig}
 		close(events)
+
+		// Normal exit: give the process group a grace period to finish in-flight
+		// commands (SIGTERM), then SIGKILL whatever survives. Without this an
+		// untimed grandchild (ffuf / route fuzzer) leaks past the worker and keeps
+		// hammering the target (observed in run-3154). A wall-clock timeout already
+		// SIGKILLed the group via the timer, so there is nothing to drain there.
+		drainWG.Add(1)
+		go func() {
+			defer drainWG.Done()
+			w.drainAndKill(timedOut)
+		}()
 	}()
 
 	return w, events, nil
@@ -241,6 +287,24 @@ func (w *worker) signalTree(sig syscall.Signal) {
 	if w.cmd != nil && w.cmd.Process != nil {
 		_ = w.cmd.Process.Signal(sig)
 	}
+}
+
+// drainAndKill SIGTERMs the worker's process group, waits the drain grace, then
+// SIGKILLs whatever survives. Best-effort: safe after the main process exited
+// (children are re-parented but keep their pgid, so -pgid still reaches them).
+// A wall-clock timeout already SIGKILLed the group, so it returns immediately.
+func (w *worker) drainAndKill(wallClockTimedOut bool) {
+	if wallClockTimedOut {
+		return
+	}
+	grace := drainGrace()
+	w.signalTree(syscall.SIGTERM)
+	// Nothing left in the group (worker had no surviving children) — no wait.
+	if w.pgid > 0 && syscall.Kill(-w.pgid, 0) != nil {
+		return
+	}
+	time.Sleep(grace)
+	w.signalTree(syscall.SIGKILL)
 }
 
 func (w *worker) signal(name string) error {

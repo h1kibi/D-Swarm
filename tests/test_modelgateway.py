@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from muteki.solver.modelgateway import ModelGateway, _Handler
+from dswarm.solver.modelgateway import ModelGateway, _Handler
 
 
 # ── fake upstream (OpenAI-compatible, records the Authorization header) ──────
@@ -62,7 +62,7 @@ class _FakeUpstream:
 @pytest.fixture()
 def upstream(monkeypatch, tmp_path):
     up = _FakeUpstream()
-    monkeypatch.setattr("muteki.solver.modelgateway._UPSTREAM_BASE",
+    monkeypatch.setattr("dswarm.solver.modelgateway._UPSTREAM_BASE",
                         f"http://127.0.0.1:{up.port}")
     # isolated gateway instance per test
     gw = ModelGateway(host="127.0.0.1", port=0)

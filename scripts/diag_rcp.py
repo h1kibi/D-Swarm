@@ -9,13 +9,13 @@ import time
 
 sys.path.insert(0, r"C:\Projects\Agent-projects\ctf-swarm")
 
-from muteki.solver.control_receiver import ControlReceiver, DEFAULT_CONTROL_PORT
+from dswarm.solver.control_receiver import ControlReceiver, DEFAULT_CONTROL_PORT
 
 RUN_ID = "diag-rcp"
 WORKSPACE = r"C:\Projects\Agent-projects\ctf-swarm\sessions\diag-rcp\workspace"
 ACCOUNTS_HOST = r"C:\Projects\Agent-projects\ctf-swarm\sessions\diag-rcp\accounts"
 os.makedirs(os.path.join(WORKSPACE, "workers", "cli-pi"), exist_ok=True)
-os.makedirs(os.path.join(WORKSPACE, ".muteki_control"), exist_ok=True)
+os.makedirs(os.path.join(WORKSPACE, ".dswarm_control"), exist_ok=True)
 os.makedirs(os.path.join(ACCOUNTS_HOST, "pi-main"), exist_ok=True)
 with open(os.path.join(ACCOUNTS_HOST, "pi-main", "API_KEY"), "w") as f:
     f.write(os.environ.get("DEEPSEEK_API_KEY", "") + "\n")
@@ -30,20 +30,20 @@ step(f"receiver listening (expect port {DEFAULT_CONTROL_PORT})")
 # 2. register token + start the supervisor container
 import secrets
 token = secrets.token_hex(16)
-with open(os.path.join(WORKSPACE, ".muteki_control", "token"), "w") as f:
+with open(os.path.join(WORKSPACE, ".dswarm_control", "token"), "w") as f:
     f.write(token)
 ControlReceiver.instance().expect(RUN_ID, token)
 step("token registered; starting supervisor container")
 
-name = "muteki-run-" + RUN_ID
+name = "dswarm-run-" + RUN_ID
 subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 r = subprocess.run([
     "docker", "run", "-d", "--name", name, "--network", "bridge",
     "--add-host", "host.docker.internal:host-gateway",
     "--mount", f"type=bind,source={WORKSPACE},target=/home/kali/workspace",
-    "--mount", f"type=bind,source={os.path.join(WORKSPACE, '.muteki_control')},target=/run/muteki/control",
-    "--mount", f"type=bind,source={ACCOUNTS_HOST},target=/run/muteki/accounts",
-    "ctf-swarm-pi-web:0.1.0",
+    "--mount", f"type=bind,source={os.path.join(WORKSPACE, '.dswarm_control')},target=/run/dswarm/control",
+    "--mount", f"type=bind,source={ACCOUNTS_HOST},target=/run/dswarm/accounts",
+    "ctf-swarm-pi:0.2.0",
     "--connect", f"host.docker.internal:{DEFAULT_CONTROL_PORT}",
     "--run-id", RUN_ID,
 ], capture_output=True, text=True, timeout=60)
@@ -61,8 +61,8 @@ spec = {
     "cwd": "/home/kali/workspace/workers/cli-pi",
     "env": {
         "HOME": "/home/kali/workspace/homes/cli-pi",
-        "MUTEKI_PI_PROVIDER": "deepseek",
-        "DEEPSEEK_API_KEY_FILE": "/run/muteki/accounts/pi-main/API_KEY",
+        "DSWARM_PI_PROVIDER": "deepseek",
+        "DEEPSEEK_API_KEY_FILE": "/run/dswarm/accounts/pi-main/API_KEY",
     },
     "timeout_sec": 30,
     "tag": "diag",

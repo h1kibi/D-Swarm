@@ -19,12 +19,12 @@ import asyncio
 
 import pytest
 
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType
-from muteki.models.solve_graph import Challenge
-from muteki.solver.cli_solver import (
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.cli_solver import (
     CliSolver, _parse_lockout_seconds, _looks_like_verifier_output)
-from muteki.swarm.insight_bus import Insight, InsightBus, InsightKind
+from dswarm.swarm.insight_bus import Insight, InsightBus, InsightKind
 
 
 def _challenge(*, rate_limited: bool) -> Challenge:

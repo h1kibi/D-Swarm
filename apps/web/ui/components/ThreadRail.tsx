@@ -6,19 +6,32 @@ import { RunSummary, RunStatus, Folder } from "@/lib/useRun";
 import { useLang, useT, type Lang } from "@/lib/i18n";
 import { Icon, type IconName } from "@/components/Icon";
 import { clampRailWidth, railWidthMax, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN, RAIL_WIDTH_MAX } from "@/lib/railSizing";
+import {
+  FLEET_FILTERS,
+  batchTargets,
+  filterFleet,
+  fleetCounts,
+  flagProgress,
+  runNeedsAttention,
+  sortFleet,
+  toggleSelection,
+  type BatchAction,
+  type FleetFilter,
+  type FleetSort,
+} from "@/lib/fleet";
+import { readKey, writeKey } from "@/lib/storage";
 
 /**
- * Left thread rail — ChatGPT/Claude-style conversation list.
+ * Left Run Fleet (docs/07 §5.2) — the thread rail upgraded to a high-density
+ * run-management column: status filters (All / Active / Needs Attention /
+ * Queued / Paused / Solved / Failed / Archived), a compact row mode, per-row
+ * flag progress + HITL-pending badges, and batch pause/resume/stop over a
+ * checkbox selection (fanned out to the single-run API by the page; batch stop
+ * confirms and never deletes history).
  *
- * Sections: Pinned · Recent · (optional) Archived. The active draft is shown
- * separately at the top via `draftActive` (it has no backend row yet).
- *
- * Core interaction rules:
- *  - Clicking a row only SELECTS it (highlight + accent bar). It never reorders
- *    or hoists the row.
- *  - Pinning is the ONLY way a row enters the Pinned section, via the row's ⋯ menu.
- *  - Running rows show a spinner in place; they don't auto-hoist.
- *  - Archived rows are hidden behind a toggle.
+ * Legacy behavior kept: search, folders (drag-and-drop), pin/archive/rename/
+ * delete, and the Pinned / Recent / Archived sections. Clicking a row only
+ * SELECTS it — it never reorders or hoists.
  */
 
 type RailAction =
@@ -44,6 +57,7 @@ export function ThreadRail({
   onAction,
   onResize,
   onOpenSettings,
+  onBatch,
 }: {
   collapsed: boolean;
   width: number;
@@ -60,10 +74,28 @@ export function ThreadRail({
   onAction: (a: RailAction) => void | Promise<Folder | null | void>;
   onResize: (width: number) => void;
   onOpenSettings: () => void;
+  // Fleet batch control (§5.2): fan out pause/resume/stop to the selected runs.
+  onBatch: (action: BatchAction, runIds: string[]) => void;
 }) {
   const t = useT();
   const { lang } = useLang();
   const [showArchived, setShowArchived] = useState(false);
+  // Fleet state (§5.2): status filter, within-section sort, compact density,
+  // and the batch-selection mode. Compact persists across sessions.
+  const [filter, setFilter] = useState<FleetFilter>("all");
+  const [sort, setSort] = useState<FleetSort>("attention");
+  const [compact, setCompact] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    setCompact(readKey("dswarm.fleet.compact") === "1");
+  }, []);
+  const toggleCompact = () =>
+    setCompact((v) => {
+      writeKey("dswarm.fleet.compact", v ? "0" : "1");
+      return !v;
+    });
+  const toggleSelect = (runId: string) => setSelected((prev) => toggleSelection(prev, runId));
   const activeRun = runs.find((r) => r.run_id === activeRunId);
   const activeFinished = !draftActive && !!activeRun?.finished;
   // A not-yet-dispatched draft has no backend run, so no SSE stream is opened by
@@ -191,8 +223,11 @@ export function ThreadRail({
     return hay.includes(q);
   };
   const matched = q ? runs.filter(matchesQuery) : runs;
+  // Fleet filter (§5.2) narrows every section at once; chips show live counts.
+  const counts = fleetCounts(matched);
+  const scoped = filterFleet(matched, filter);
 
-  const pinned = matched
+  const pinned = scoped
     .filter((r) => r.pinned && !r.archived)
     .sort((a, b) => (b.pinned_at ?? 0) - (a.pinned_at ?? 0));
   // Sort: a RUNNING run always floats to the top of its section (the operator
@@ -203,14 +238,31 @@ export function ThreadRail({
     if (ar !== br) return br - ar;
     return (b.order ?? 0) - (a.order ?? 0);
   };
-  const liveRuns = matched.filter((r) => !r.pinned && !r.archived);
+  const liveRuns = scoped.filter((r) => !r.pinned && !r.archived);
   const folderIds = new Set(folders.map((f) => f.id));
   // a run with a folder_id whose folder was deleted falls back to top-level.
   const inFolder = (r: RunSummary, fid: string) => r.folder_id === fid;
-  const ungrouped = liveRuns
-    .filter((r) => !r.folder_id || !folderIds.has(r.folder_id))
-    .sort(byCreationOrder);
-  const archived = matched.filter((r) => r.archived).sort(byCreationOrder);
+  // within-section ordering: the default "attention" floats needs-attention
+  // runs above the legacy running-first order; other sorts come from lib/fleet.
+  const sectionSort = (items: RunSummary[]): RunSummary[] =>
+    sort === "attention"
+      ? [...items].sort((a, b) =>
+          Number(runNeedsAttention(b)) - Number(runNeedsAttention(a)) || byCreationOrder(a, b))
+      : sortFleet(items, sort);
+  const ungrouped = sectionSort(
+    liveRuns.filter((r) => !r.folder_id || !folderIds.has(r.folder_id)),
+  );
+  const archived = sectionSort(scoped.filter((r) => r.archived));
+  // batch action eligibility comes from lib/fleet (pause: live only, resume:
+  // paused only, stop: anything not terminal — never a delete).
+  const batchable = (action: BatchAction): string[] => batchTargets(runs, selected, action);
+  const runBatch = (action: BatchAction) => {
+    const ids = batchable(action);
+    if (!ids.length) return;
+    if (action === "stop" && !window.confirm(t("fleet.confirmStop", { n: ids.length }))) return;
+    onBatch(action, ids);
+    setSelected(new Set());
+  };
   // When searching, surface archived hits automatically so a match isn't hidden
   // behind the collapsed Archived toggle, and detect a genuinely empty result so
   // we can show a "no matches" state instead of a bare blank rail.
@@ -240,6 +292,10 @@ export function ThreadRail({
     active: r.run_id === activeRunId,
     menuOpen: menuFor === r.run_id,
     renaming: renaming === r.run_id,
+    compact,
+    selectMode,
+    selected: selected.has(r.run_id),
+    onToggleSelect: () => toggleSelect(r.run_id),
     onSelect: () => onSelect(r.run_id),
     onToggleMenu: () => setMenuFor((cur) => (cur === r.run_id ? null : r.run_id)),
     onCloseMenu: () => setMenuFor(null),
@@ -264,7 +320,7 @@ export function ThreadRail({
     >
       <div className="rail-body">
         <div className="rail-top">
-          <span className="brand">無敵 <em>Muteki</em></span>
+          <span className="brand"><span>D-Swarm</span></span>
         </div>
         <button className="newsolve" onClick={onNew}>{t("rail.newSolve")}</button>
 
@@ -288,6 +344,78 @@ export function ThreadRail({
             ><Icon name="x" size={13} /></button>
           )}
         </div>
+
+        <div className="fleet-filters" role="group" aria-label={t("fleet.title")}>
+          {FLEET_FILTERS.map((f) => (
+            <button
+              key={f}
+              type="button"
+              className={`fleet-chip ${filter === f ? "on" : ""} ${f === "attention" && counts.attention > 0 ? "has-attn" : ""}`}
+              aria-pressed={filter === f}
+              onClick={() => setFilter(f)}
+            >
+              {t(`fleet.filter.${f}`)}
+              {counts[f] > 0 && <span className="fleet-chip-n">{counts[f]}</span>}
+            </button>
+          ))}
+        </div>
+
+        <div className="fleet-tools">
+          <select
+            className="fleet-sort"
+            value={sort}
+            onChange={(e) => setSort(e.target.value as FleetSort)}
+            title={t("fleet.sortTitle")}
+            aria-label={t("fleet.sortTitle")}
+          >
+            <option value="attention">{t("fleet.sort.attention")}</option>
+            <option value="newest">{t("fleet.sort.newest")}</option>
+            <option value="oldest">{t("fleet.sort.oldest")}</option>
+            <option value="name">{t("fleet.sort.name")}</option>
+          </select>
+          <span className="spacer" />
+          <button
+            type="button"
+            className={`fleet-tool ${compact ? "on" : ""}`}
+            onClick={toggleCompact}
+            title={t(compact ? "fleet.comfort" : "fleet.compact")}
+            aria-label={t(compact ? "fleet.comfort" : "fleet.compact")}
+            aria-pressed={compact}
+          ><Icon name="rows" size={14} /></button>
+          <button
+            type="button"
+            className={`fleet-tool ${selectMode ? "on" : ""}`}
+            onClick={() => { setSelectMode((v) => !v); setSelected(new Set()); }}
+            title={t(selectMode ? "fleet.selectDone" : "fleet.selectMode")}
+            aria-label={t(selectMode ? "fleet.selectDone" : "fleet.selectMode")}
+            aria-pressed={selectMode}
+          ><Icon name="check" size={14} /></button>
+        </div>
+
+        {selectMode && (
+          <div className="fleet-batch" role="group" aria-label={t("fleet.selectMode")}>
+            <span className="fleet-batch-n">{t("fleet.selected", { n: selected.size })}</span>
+            <button type="button" onClick={() => setSelected(new Set(scoped.map((r) => r.run_id)))}>
+              {t("fleet.selectAll")}
+            </button>
+            <button type="button" onClick={() => setSelected(new Set())} disabled={selected.size === 0}>
+              {t("fleet.clearSelection")}
+            </button>
+            <span className="spacer" />
+            <button type="button" onClick={() => runBatch("pause")} disabled={batchable("pause").length === 0}>
+              {t("fleet.batch.pause")}
+            </button>
+            <button type="button" onClick={() => runBatch("resume")} disabled={batchable("resume").length === 0}>
+              {t("fleet.batch.resume")}
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => runBatch("stop")}
+              disabled={batchable("stop").length === 0}
+            >{t("fleet.batch.stop")}</button>
+          </div>
+        )}
 
         <div
           className="rail-scroll"
@@ -316,7 +444,7 @@ export function ThreadRail({
         )}
 
         {folders.map((f) => {
-          const items = liveRuns.filter((r) => inFolder(r, f.id)).sort(byCreationOrder);
+          const items = sectionSort(liveRuns.filter((r) => inFolder(r, f.id)));
           // While searching, hide folders that contain no match so results aren't
           // buried under empty folder headers. (Drag-and-drop targets are moot mid-search.)
           if (searching && items.length === 0) return null;
@@ -394,9 +522,9 @@ export function ThreadRail({
         )}
 
         {archived.length > 0 && (
-          // While searching, reveal matching archived runs inline (don't bury a hit
-          // behind the collapsed toggle); otherwise keep the manual show/hide.
-          searching ? (
+          // While searching (or on the Archived fleet filter), reveal matching
+          // archived runs inline; otherwise keep the manual show/hide.
+          searching || filter === "archived" ? (
             <>
               <div className="rail-sec">{t("rail.archived")}</div>
               <div className="thread">
@@ -464,6 +592,10 @@ function RailRow({
   archived,
   menuOpen,
   renaming,
+  compact,
+  selectMode,
+  selected,
+  onToggleSelect,
   onSelect,
   onToggleMenu,
   onCloseMenu,
@@ -483,6 +615,10 @@ function RailRow({
   archived?: boolean;
   menuOpen: boolean;
   renaming: boolean;
+  compact?: boolean;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
   onSelect: () => void;
   onToggleMenu: () => void;
   onCloseMenu: () => void;
@@ -498,6 +634,8 @@ function RailRow({
 }) {
   const name = run.name || t("rail.newSolveItem");
   const when = relTime(run.updated_at, lang);
+  const fp = flagProgress(run);
+  const attention = runNeedsAttention(run);
   const cls = [
     "thread-item",
     "motion-rail-item",
@@ -506,6 +644,8 @@ function RailRow({
     archived ? "is-archived" : "",
     dragging ? "dragging" : "",
     menuOpen ? "menu-open" : "",
+    compact ? "compact" : "",
+    attention ? "needs-attention" : "",
   ].filter(Boolean).join(" ");
   const suppressRowDragRef = useRef(false);
   const shouldSuppressRowDrag = (target: EventTarget | null) => {
@@ -544,6 +684,16 @@ function RailRow({
       onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !renaming) { e.preventDefault(); onSelect(); } }}
     >
       <StatusIcon status={run.status} t={t} />
+      {selectMode && (
+        <input
+          type="checkbox"
+          className="fleet-check"
+          checked={!!selected}
+          aria-label={t("fleet.selectRun", { name })}
+          onClick={(e) => e.stopPropagation()}
+          onChange={() => onToggleSelect?.()}
+        />
+      )}
       <div className="nm-wrap">
         {renaming ? (
           <RenameInput initial={run.name} onCommit={onCommitRename} onCancel={onCancelRename} />
@@ -555,6 +705,14 @@ function RailRow({
               <span className="st">{t(`rail.status.${run.status}`)}</span>
               {run.status === "queued" && run.queue_position != null && (
                 <span className="st" title={t("rail.status.queued")}>#{run.queue_position}</span>
+              )}
+              {fp && (
+                <span className="st fleet-flags" title={t("fleet.flagsTitle")}>
+                  <Icon name="flag" size={11} /> {fp.got}/{fp.need}
+                </span>
+              )}
+              {attention && (
+                <span className="fleet-attn" title={t("fleet.hitl")} aria-label={t("fleet.hitl")}>!</span>
               )}
               {when && <span className="when" title={absTime(run.updated_at)}>{when}</span>}
             </span>

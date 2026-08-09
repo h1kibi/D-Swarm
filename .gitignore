@@ -23,6 +23,7 @@ docker/worker-pi/blackboard.SKILL.md
 # copied from the Kali context + skills/). Unlike the Kali context's AGENTS.md (which
 # is hand-maintained + tracked), the slim AGENTS.md is a build-time copy → ignore it.
 docker/worker-slim/runtime_agent
+docker/worker-kali/runtime_agent
 docker/worker-slim/AGENTS.md
 docker/worker-slim/blackboard.py
 docker/worker-slim/blackboard.SKILL.md
@@ -39,6 +40,14 @@ artifacts/
 sessions/
 eval_runs/
 knowledge/
+
+# Local dev/runtime cruft at the repo root: backend process logs, the pi CLI
+# session store, and stray scratch output dirs.
+backend.log*
+.pi-sessions/
+\$out/
+desktop/*.exe
+.uv-cache/
 
 # pytest / tooling caches
 .pytest_cache/

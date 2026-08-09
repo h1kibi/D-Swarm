@@ -14,10 +14,10 @@ import asyncio
 
 import pytest
 
-from muteki.core.event_bus import EventBus
-from muteki.core.events import Event, EventType
-from muteki.models.solve_graph import Challenge
-from muteki.solver.cli_solver import CliSolver
+from dswarm.core.event_bus import EventBus
+from dswarm.core.events import Event, EventType
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.cli_solver import CliSolver
 
 
 def _token_challenge() -> Challenge:
@@ -162,7 +162,7 @@ async def test_tool_command_text_does_not_register_a_flag():
         exactly how the hallucinated flag02 got laundered through prose (run-75379), so
         reasoning is now allow_flags=False.
     Only a tool_result (real output) sources a flag."""
-    from muteki.solver.cli_driver import StreamStep
+    from dswarm.solver.cli_driver import StreamStep
 
     bus = EventBus()
     seen = await _flag_events(bus)
@@ -225,7 +225,7 @@ async def test_anti_launder_does_not_false_reject_own_cwd():
     sessions/<run>/workspace/workers/<id>/ and reads its board/attachments there; a
     crypto/forensics solve may write its result to a local file in cwd. A flag that
     appears in such cwd output is a REAL recovery and must register — only reads of
-    muteki/agent INTERNAL storage (other runs' .jsonl logs, the engine history dirs,
+    dswarm/agent INTERNAL storage (other runs' .jsonl logs, the engine history dirs,
     process-title harvesting) are rejected."""
     bus = EventBus()
     seen = await _flag_events(bus)
@@ -237,6 +237,52 @@ async def test_anti_launder_does_not_false_reject_own_cwd():
         "/Users/x/ccb/sessions/run-test-stream/workspace/workers/cli-pi-test/"
         f"out.txt:\nFOUND_FLAG={real}\n")
     assert real in seen, "a flag in the worker's own cwd output must register"
+
+
+@pytest.mark.asyncio
+async def test_final_marker_gated_against_raw_output_only():
+    """A final reply may contain infra prose about shared_graph.db/read. The
+    flag marker must still be accepted when the value is in raw command output;
+    the final reply must not be part of the anti-launder provenance corpus."""
+    bus = EventBus()
+    seen = await _flag_events(bus)
+    sv = _solver(bus)
+
+    flag = "bl_f1a1d1d0d0c0b0a090807060504030201"
+    raw_output = f"success page: 厉害了！{flag}\n"
+    final_reply = (
+        f"**FOUND_FLAG=`{flag}`**\n"
+        "Blackboard infra note: shared_graph.db reads fail over the 9p mount.\n"
+    )
+    await sv._stream_markers(final_reply, flag_provenance=raw_output)
+
+    assert flag in seen
+    assert flag in sv._stream_accepted
+
+
+@pytest.mark.asyncio
+async def test_live_flag_candidate_is_announced_but_not_accepted():
+    from dswarm.solver.cli_driver import StreamStep
+
+    bus = EventBus()
+    seen: list[str] = []
+
+    async def _sink(ev: Event) -> None:
+        if ev.event_type == EventType.REASONING_DELTA:
+            seen.append(str((ev.payload or {}).get("text") or ""))
+
+    bus.add_sink(_sink)
+    sv = _solver(bus)
+    flag = "flag{candidate-not-yet-claimed}"
+    await sv._emit_step(StreamStep(
+        "tool_result",
+        text=flag,
+        raw=flag,
+    ))
+
+    assert any("live flag candidate in real output" in text for text in seen)
+    assert flag not in sv._already_found
+    assert sv._stream_accepted == []
 
 
 @pytest.mark.asyncio
@@ -318,7 +364,7 @@ async def test_flag_strips_trailing_markdown_and_prose():
 def _graph_solver(bus: EventBus, tmp_path, *, shared_graph=None, label="cli-fresh"):
     """A CliSolver wired to a real SQLiteSharedGraph, brace flag_format so plain
     flag{...} values are acceptable (the token strength floor would reject them)."""
-    from muteki.swarm.shared_graph import SQLiteSharedGraph
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
     ch = Challenge(
         id="run-75379", name="reject-respawn", category="web",
         flag_format=r"flag\{[^}]+\}", multi_flag=True, expected_flags=4)

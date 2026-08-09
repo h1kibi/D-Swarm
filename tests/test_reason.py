@@ -7,11 +7,11 @@ from dataclasses import dataclass
 
 import pytest
 
-from muteki.models.solve_graph import Challenge, SolveGraph
-from muteki.solver.reason import (
+from dswarm.models.solve_graph import Challenge, SolveGraph
+from dswarm.solver.reason import (
     Intent, build_reason_prompt, parse_reason_reply, run_reason, dispatch_intents,
 )
-from muteki.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
 
 @dataclass
@@ -112,6 +112,20 @@ def test_parse_preserves_lane_metadata():
     assert r.intents[0].to_payload()["risk_class"] == "destructive"
 
 
+def test_parse_reason_reply_parses_direction():
+    result = parse_reason_reply(
+        '{"goal_met": false, "intents": ['
+        '{"id": "I1", "goal": "crack key", "direction": "crypto"},'
+        '{"id": "I2", "goal": "weird", "direction": "unclear"},'
+        '{"id": "I3", "goal": "rev it", "direction": "reverse"},'
+        '{"id": "I4", "goal": "nonsense", "direction": "quantum"}]}'
+    )
+    assert result.intents[0].direction == "crypto"
+    assert result.intents[1].direction == ""      # unclear → category fallback
+    assert result.intents[2].direction == "rev"   # reverse category → rev dir
+    assert result.intents[3].direction == ""      # unknown → category fallback
+
+
 def test_audit_flags_unverified_fact():
     reply = ('{"goal_met":false,'
              '"intents":[{"id":"I1","goal":"VERIFY the claimed key before using it"}],'
@@ -131,6 +145,17 @@ def test_prompt_includes_summary_and_candidate_section():
     msgs = build_reason_prompt(summary)
     assert "Candidates / needs verification" in msgs[1]["content"]
     assert "[UNVERIFIED]" in msgs[1]["content"]
+
+
+def test_reason_prompt_steers_ctf_web_away_from_non_web_port_drift():
+    msgs = build_reason_prompt("Challenge: web-focus [web]\nGoal: Solve web-focus [web]")
+    system = msgs[0]["content"]
+
+    assert "In CTF web mode" in system
+    assert "default to web-application discovery/exploitation" in system
+    assert "Do NOT propose broad host/port scanning" in system
+    assert "non-web" in system and "service exploitation" in system
+    assert "host_scan" in system and "verified web output" in system
 
 
 def test_run_reason_end_to_end():
@@ -160,7 +185,7 @@ def test_run_reason_prompt_includes_fact_index_for_model_pinning():
 def test_dispatch_intents_to_shared_graph(tmp_path):
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="crypto"))
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     res = ReasonResult(goal_met=False,
                        intents=[Intent("I1", "crack xor"), Intent("I2", "find header")],
                        audit_notes=[])
@@ -186,7 +211,7 @@ def test_dispatch_intents_unique_id_survives_round_reuse(tmp_path):
     I1 collided with round 1's and was dropped (0 proposed → Explore starves). Now a
     DIFFERENT goal under the same raw id is a distinct intent; the SAME goal is still
     correctly deduped."""
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     # round 1: I1 = "probe /login"
@@ -209,7 +234,7 @@ def test_dispatch_drops_near_duplicate_of_open_intent(tmp_path):
     proposed as a new intent — the goal-hash id only catches byte-identical goals,
     so 'Submit the L1 flag to the dashboard' would otherwise re-propose as new
     against an open 'Request the operator to submit L1 flag to dashboard'."""
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     r1 = dispatch_intents(g, ReasonResult(
@@ -233,7 +258,7 @@ def test_dispatch_drops_near_duplicate_of_open_intent(tmp_path):
 
 
 def test_dispatch_drops_llm_marked_duplicate(tmp_path):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     g.propose_intent(actor="reason", intent_id="I-old",
@@ -251,7 +276,7 @@ def test_dispatch_drops_llm_marked_duplicate(tmp_path):
 
 
 def test_dispatch_semantic_mode_does_not_apply_character_fallback(tmp_path):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     g.propose_intent(actor="reason", intent_id="I-old",
@@ -270,7 +295,7 @@ def test_dispatch_semantic_mode_does_not_apply_character_fallback(tmp_path):
 
 
 def test_dispatch_fallback_duplicate_only_when_semantic_unavailable(tmp_path):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     g.propose_intent(actor="reason", intent_id="I-old",
@@ -287,7 +312,7 @@ def test_dispatch_fallback_duplicate_only_when_semantic_unavailable(tmp_path):
 
 
 def test_dispatch_starvation_valve_allows_one_when_wall_empty(tmp_path):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
 
@@ -304,7 +329,7 @@ def test_dispatch_starvation_valve_allows_one_when_wall_empty(tmp_path):
 
 
 def test_dispatch_starvation_valve_uses_dispatchable_not_claimed_goals(tmp_path):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     g.propose_intent(actor="reason", intent_id="I-held",
@@ -325,7 +350,7 @@ def test_dispatch_starvation_valve_uses_dispatchable_not_claimed_goals(tmp_path)
 
 
 def test_dispatch_route_dedupes_plain_intents_but_exempts_review(tmp_path):
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     g.propose_intent(
@@ -352,7 +377,7 @@ def test_dispatch_route_dedupes_plain_intents_but_exempts_review(tmp_path):
 def test_dispatch_dedupes_two_wordings_within_one_batch(tmp_path):
     """Reason sometimes emits two wordings of one direction in a SINGLE round; the
     second must drop against the first proposed this batch (not just the board)."""
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     out = dispatch_intents(g, ReasonResult(
@@ -368,7 +393,7 @@ def test_dispatch_allows_distinct_directions_not_overpruned(tmp_path):
     """Guard against the run-7349 failure shape: the near-duplicate filter must NOT
     be so aggressive it collapses genuinely distinct directions (which would starve
     Explore). Four clearly-different goals must ALL propose."""
-    from muteki.solver.reason import ReasonResult
+    from dswarm.solver.reason import ReasonResult
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
                                challenge=Challenge(id="t", name="t", category="web"))
     out = dispatch_intents(g, ReasonResult(

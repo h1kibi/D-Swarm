@@ -1,0 +1,280 @@
+"""The provenance + format flag-acceptance gate (§11.2).
+
+This is the ONE hardcoded gate that decides whether a flag the model CLAIMS is
+real. It is intentionally NOT a pluggable verifier (§8): a flag counts only if it
+(a) matches the challenge's flag format AND (b) is traceable to real execution
+output — either it appears verbatim in the raw output, or in the content of a
+saved artifact referenced by that output. The model cannot launder a hallucinated
+flag through a Result dict or any other side channel.
+
+Extracted to a standalone module so every executor (CLI workers, and historically
+the code-driven solver) shares byte-identical acceptance logic instead of one
+borrowing the other's method.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+def referenced_artifacts(text: str) -> list[str]:
+    """Artifact ids referenced in `text` (e.g. 'artifact_deadbeef12')."""
+    return re.findall(r"artifact[_ ]?([0-9a-f]{8,})", text)
+
+
+# Inner-body tokens that mean "a flag goes here", not an actual flag. The model
+# writes these in prose ("scanning pages for flag{...}", "FOUND_FLAG=<flag>") and
+# a blind format-scan would otherwise grab them. Matched against the {...} body,
+# case-insensitively, after stripping surrounding punctuation/whitespace.
+_PLACEHOLDER_BODIES = {
+    # ellipsis / underscore fills
+    "...", "…", "..", ".", "____", "___", "__", "_",
+    # the word "flag" itself and obvious "put a flag here" phrasings
+    "flag", "the flag", "flag here", "your flag here", "your_flag_here",
+    "the_flag", "flag_here", "flag_goes_here", "flaghere",
+    # unambiguous template tokens (these are never real flag content)
+    "uuid", "xxx", "xxxx", "xxxxx", "redacted", "redacted_flag",
+    "todo", "tbd", "placeholder", "your_flag",
+    # dev/test-harness placeholder flags (run-3156: a worker quoted
+    # `NEPCTF{local_test_flag_12345}` from the target source and it auto-solved)
+    "test_flag", "local_test_flag", "testflag", "flag_test",
+    "fake_flag", "dummy_flag", "sample_flag", "example_flag",
+}
+# NOTE: deliberately NOT here — words that COULD be a real flag body:
+# real, value, example, sample, x, na. Rejecting those would drop genuine flags
+# like flag{real} / flag{example_solved}. Placeholders are caught by the template
+# tokens above + the all-punctuation / no-alphanumeric / empty-body rules.
+# An angle-bracket template like <flag> / <the flag> / <...> is always a placeholder.
+_ANGLE_PLACEHOLDER = re.compile(r"^<[^>]{0,30}>$")
+# Phrase markers that mean "a test/placeholder flag goes here" even when embedded
+# in a longer body — e.g. `NEPCTF{local_test_flag_12345}` (run-3156) is a dev
+# harness placeholder quoted from source, not a real flag. Single words like
+# `test`/`local` alone are deliberately NOT matched (a real flag body could
+# contain them as substrings); the phrase is unambiguous.
+_TEST_MARKER_RE = re.compile(
+    r"(?:local_?test|test_?flag|fake_?flag|dummy_?flag|sample_?flag|"
+    r"example_?flag|placeholder_?flag|your_?flag|redacted_?flag)",
+    re.IGNORECASE,
+)
+
+
+def is_placeholder_flag(flag: str) -> bool:
+    """True if `flag` is a template/placeholder the model echoed rather than a real
+    recovered flag — e.g. `flag{...}`, `{uuid}`, `<flag>`, `flag{FLAG}`,
+    `flag{your_flag_here}`. These are the recurring false-positive shape (run-1619
+    `flag{...}`, run-0405 `{uuid}`): they match a loose flag_format and, being
+    quoted from the worker's own prose, trivially satisfy the "appears in output"
+    provenance check — so the gate must reject them explicitly."""
+    f = (flag or "").strip()
+    if not f:
+        return True
+    if _ANGLE_PLACEHOLDER.match(f):
+        return True
+    # UNCLOSED angle template: `FOUND_FLAG=<the flag>` (the prompt's own example)
+    # extracts to the bare token `<the` — no closing `>`, so the regex above can't
+    # match it, yet it's obviously the model echoing the template. Any token that
+    # STARTS with `<` and has no closing `>` is a truncated placeholder, never a
+    # real flag (flag formats are flag{...}/HTB{...}/bare tokens — none begin with
+    # a bare `<`). Keep it tight: only when the opening `<` is at position 0.
+    if f.startswith("<") and ">" not in f:
+        return True
+    m = re.search(r"\{([^}]*)\}", f)
+    # an empty / whitespace-only brace body (flag{}, flag{ }) is a placeholder
+    if m is not None and not m.group(1).strip():
+        return True
+    # BARE braces with NO prefix — `{name}`, `{uuid}`, `{1,2,66,67,68}` — are code
+    # templates / variable references the worker quoted from prose, NOT flags. Every
+    # real flag in history carries a prefix (dalctf{ / HTB{ / flag{ / csawctf{ …);
+    # the only prefix-less {...} ever accepted were all false positives. So a {...}
+    # whose prefix (text before the first `{`) is empty is a placeholder UNLESS its
+    # body already looks like a recovered flag (mixed case + digits, leet, multi-word
+    # with separators) — that guard keeps the rule from ever dropping a genuine flag
+    # that happens to lack a prefix.
+    if m is not None and not f[:m.start()].strip():
+        inner = m.group(1).strip()
+        # a comma-separated set/list body — `{1,2,66,67,68}`,
+        # `{127.0.0.1, localhost, 0.0.0.0, ::1}` — is a code literal the worker
+        # quoted (a Python set, a BLOCKED_HOSTS list), NOT a flag. Real flags are a
+        # single token; they don't render as comma-separated collections. This holds
+        # even when the body has letters+digits (run-1763 fooled the looks_real
+        # guard below precisely because `127`/`localhost` look "real").
+        if "," in inner:
+            return True
+        # Bare brace bodies that look like code expressions are not flags. The
+        # run-0835 false positive was the literal f-string source
+        # `{out3[i:j].decode()}`: it has letters+digits, so the old "looks_real"
+        # guard let it through even though the punctuation clearly comes from a
+        # Python expression, not a recovered token.
+        if re.search(r"[\[\]().:=+*/%$\\`'\"<>]", inner):
+            return True
+        looks_real = (
+            len(inner) >= 8
+            and bool(re.search(r"[0-9]", inner))
+            and bool(re.search(r"[A-Za-z]", inner))
+        )
+        if not looks_real:
+            return True
+    body = (m.group(1) if m else f).strip().strip("`'\"<>").strip()
+    # A brace body carrying a shell/PHP/JS VARIABLE DEREFERENCE is a code template
+    # the worker quoted, never a recovered flag — run-3154's PHP gadget
+    # `test{$readflag,$f,$key}` matched the loose default flag_format and appeared
+    # verbatim in output, so without this rule it would have been accepted. The
+    # `(?<!\$)` guard keeps REAL flags whose body uses `$` as a literal (e.g.
+    # shellmates{...$$Rf} — `$$` is not a variable deref) untouched.
+    if re.search(r"(?<!\$)\$[A-Za-z0-9_]+", body):
+        return True
+    # run-3156: `NEPCTF{local_test_flag_12345}` (dev-harness placeholder quoted
+    # from the target source) auto-solved the run. Phrase markers are never real
+    # flag content.
+    if _TEST_MARKER_RE.search(body):
+        return True
+    # run-3156: `T0{class,test}` — a comma-separated template literal — also
+    # auto-solved. A comma-separated brace body is a code/template LIST, never a
+    # single opaque flag token, even when it carries a prefix. Zero-false-flags
+    # bar: a false solve is worse than a missed solve on a comma-bearing flag.
+    if m is not None and "," in body:
+        return True
+    low = body.lower()
+    if low in _PLACEHOLDER_BODIES:
+        return True
+    # Truncated flag summaries such as `flag{16fc0d69-...}` / `flag{abc…}` are
+    # just human shorthand for a known flag. They can pass both the loose brace
+    # regex and the self-referential provenance check because the shorthand appears
+    # in the worker's own prose, so reject any brace body containing ellipsis.
+    if "..." in body or "…" in body:
+        return True
+    # all-ellipsis / all-underscore / all-dots bodies (e.g. "....", "______")
+    if body and re.fullmatch(r"[.…_\-\s]+", body):
+        return True
+    # a body with no alphanumerics at all carries no real content
+    if body and not re.search(r"[A-Za-z0-9]", body):
+        return True
+    return False
+
+
+# Sentinel flag_format for challenges whose "flag" is a bare token, NOT a
+# brace-wrapped string — e.g. a Bandit-style ladder where each level's flag IS the
+# next level's password (W3lc0m3T0Gh0st), or any platform that hands back a raw
+# secret. The operator sets flag_format="token" at dispatch. We CANNOT just drop the
+# format check (that reopens the hallucinated-flag hole); instead the token branch
+# swaps the brace-format match for a STRENGTH floor while keeping provenance +
+# placeholder intact.
+TOKEN_FLAG_FORMAT = "token"
+
+# ── default flag-identification rule (operator-specified, D-Swarm) ─────────────
+# HIGH confidence (rule 1): `prefix{payload}` — prefix 3-10 alphanumeric
+# (case-insensitive by construction), payload 10-60 chars of letters/digits/
+# `_`/`-`/a few specials; single spaces legal, no CONSECUTIVE spaces or newlines.
+# UUID bodies (`flag{<uuid>}`) satisfy this (rule 2a is subsumed). Everything the
+# default used to accept via the loose `[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}` now
+# goes through this rule, so a quoted code/template literal (`T0{class,test}`,
+# `test{$readflag,$f,$key}`, a bare `{uuid}`) is rejected at the format gate
+# instead of auto-solving the run.
+_DEFAULT_FLAG_FORMAT = (
+    r"[A-Za-z0-9]{3,10}\{"
+    # single spaces are legal in real CTF flags (e.g. `flag{H1570rY 12'N7 ...}`);
+    # the spec bans CONSECUTIVE spaces and any newline — enforced via lookahead.
+    r"(?!.*(?:\s{2,}|\n))"
+    r"[A-Za-z0-9_\-@!$.#%&+=?^~' ]{10,60}"
+    r"\}"
+)
+_LEGACY_DEFAULT_FLAG_FORMAT = r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}"
+# MEDIUM confidence (rule 2b): a BARE hash (no prefix) — 32-hex MD5 / 64-hex
+# SHA-256 — is a flag ONLY when the surrounding output carries a flag context
+# clue (a `flag.txt` / `.flag` path or a `cat /flag` command), otherwise it is a
+# plain hash and rejected.
+_BARE_HASH_RE = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{64})")
+_FLAG_CONTEXT_RE = re.compile(
+    r"flag\.txt|(?:^|[\s\"'<>])/?flag\b|\.flag\b|cat\s+(?:/)?flag\b",
+    re.IGNORECASE,
+)
+
+
+def is_default_flag_format(flag_format: str) -> bool:
+    """True when `flag_format` is (or resolves to) the default flag-identification
+    rule — an explicit default sentinel or the legacy loose brace regex the
+    web/TUI drivers emit. Any other value is a deliberate operator override and
+    keeps the exact-regex contract.
+
+    The pydantic Challenge default `flag\\{.*?\\}` is deliberately NOT mapped: it
+    is only produced by direct Challenge() construction (tests/standalone), never
+    by the web/TUI dispatch, and its literal `flag{` prefix already rejects the
+    template false-positive shapes (`T0{class,test}`, `test{$readflag}`, `{uuid}`).
+    Mapping it would change the semantics of every short-flag unit test without
+    any production effect."""
+    return flag_format in (None, "", "brace", "custom", "auto",
+                           _DEFAULT_FLAG_FORMAT, _LEGACY_DEFAULT_FLAG_FORMAT)
+
+
+def _looks_like_real_token(flag: str) -> bool:
+    """A bare-token flag is acceptable only if it's a strong, deliberate secret —
+    not a common word or a stray number a confused worker quoted from prose. Require
+    length >= 8 and either (letters AND digits) or an explicit separator (_-.), which
+    real level passwords / recovered secrets have and English words don't."""
+    f = (flag or "").strip().strip("`'\"")
+    if len(f) < 8:
+        return False
+    # shell / regex metacharacters mean this came from a COMMAND or a search
+    # PATTERN the worker typed, not a recovered secret. A real bare-token flag is an
+    # opaque secret (bl_<hex>, a level password) — it never contains pipes, globs,
+    # redirects, quantifiers, or command separators. Reject them outright
+    # (run-11550: a worker grepping `FOUND_FLAG=bl_|VERIFIED_FACT=.*L4|...` leaked the
+    # grep pattern as a "token" that otherwise passed the strength floor below).
+    if re.search(r"[|*?;&$()<>{}\[\]\\^!`]", f):
+        return False
+    has_alpha = bool(re.search(r"[A-Za-z]", f))
+    has_digit = bool(re.search(r"[0-9]", f))
+    has_sep = bool(re.search(r"[_\-.]", f))
+    # all-whitespace / sentence-like (contains spaces) is prose, not a token
+    if re.search(r"\s", f):
+        return False
+    return has_alpha and (has_digit or has_sep)
+
+
+def flag_ok(flag: str, raw_output: str, *, flag_format: str, artifacts: Any) -> bool:
+    """True iff `flag` matches the format contract AND is NOT a placeholder template
+    AND is traceable to real output: present verbatim in `raw_output`, or in the
+    content of an artifact referenced by it. `artifacts` is an ArtifactStore (must
+    expose read_text(aid)).
+
+    Three format contracts:
+      - the DEFAULT flag-identification rule (see is_default_flag_format) — the
+        structured `prefix{payload}` rule (prefix 3-10 alnum, payload 10-60 of
+        letters/digits/_/-/a few specials), plus a bare 32/64-hex hash accepted
+        only under a flag-context clue (flag.txt / .flag / `cat /flag`);
+      - a custom `flag_format` regex — `flag` must match it verbatim;
+      - the `TOKEN_FLAG_FORMAT` sentinel ("token") — for bare-token challenges, the
+        brace match is replaced by a strength floor (_looks_like_real_token), so a
+        recovered secret like W3lc0m3T0Gh0st is accepted while a quoted common word is
+        not. Provenance + placeholder checks are UNCHANGED in all modes — the moat
+        (a flag must trace to real output, never laundered through prose) holds.
+
+    The placeholder check is the fix for the recurring false positive where a worker
+    that did NOT solve still gets marked solved because it mentioned `flag{...}`/
+    `{uuid}` in its prose and a loose flag_format + the self-referential "appears in
+    output" check let it through."""
+    if flag_format == TOKEN_FLAG_FORMAT:
+        if not _looks_like_real_token(flag):
+            return False
+    elif is_default_flag_format(flag_format):
+        # MEDIUM confidence (rule 2b): a bare hash is a flag only with a
+        # flag-context clue in the surrounding output; otherwise it's a plain
+        # hash and rejected.
+        if _BARE_HASH_RE.fullmatch(flag):
+            if not _FLAG_CONTEXT_RE.search(raw_output or ""):
+                return False
+        # HIGH confidence (rules 1 + 2a): the structured `prefix{payload}` shape.
+        elif not re.fullmatch(_DEFAULT_FLAG_FORMAT, flag):
+            return False
+    elif not re.search(flag_format, flag):
+        return False
+    if is_placeholder_flag(flag):
+        return False
+    if flag in raw_output:
+        return True
+    for aid in referenced_artifacts(raw_output):
+        txt = (artifacts.read_text(aid) if artifacts is not None else "") or ""
+        if flag in txt:
+            return True
+    return False

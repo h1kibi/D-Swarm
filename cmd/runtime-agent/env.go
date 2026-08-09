@@ -7,7 +7,7 @@ import (
 
 // baseEnv is the minimal environment a worker starts with before the host's overlay.
 // We keep it small and deterministic; the host passes the engine-specific vars
-// (MUTEKI_*, ANTHROPIC_*, OPENAI_*, DEEPSEEK_*, HOME) explicitly.
+// (DSWARM_*, ANTHROPIC_*, OPENAI_*, DEEPSEEK_*, HOME) explicitly.
 func baseEnv() map[string]string {
 	env := map[string]string{
 		"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

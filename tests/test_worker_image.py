@@ -9,6 +9,7 @@ from __future__ import annotations
 import subprocess
 
 import apps.web.worker_image as wi
+from dswarm.solver.container_exec import worker_image_for_profile
 
 
 def _fake(returncode=0, stdout="", stderr=""):
@@ -74,3 +75,31 @@ def test_green_unknown_version_when_no_expected(monkeypatch):
     # no expected version → informational only, still green if pulled
     assert s["version"]["status"] == "unknown"
     assert s["overall"] == "green"
+
+
+def test_worker_image_for_profile_uses_profile_image(monkeypatch):
+    monkeypatch.delenv("DSWARM_WORKER_IMAGE", raising=False)
+    monkeypatch.delenv("DSWARM_AGENT_IMAGE_PI_WEB", raising=False)
+    image = worker_image_for_profile(
+        {"name": "pi-web", "image": "my-web:1"},
+        category="web",
+    )
+    assert image == "my-web:1"
+
+
+def test_worker_image_for_profile_env_overrides_profile(monkeypatch):
+    monkeypatch.delenv("DSWARM_WORKER_IMAGE", raising=False)
+    monkeypatch.setenv("DSWARM_AGENT_IMAGE_PI_WEB", "env-web:1")
+    image = worker_image_for_profile(
+        {"name": "pi-web", "image": "my-web:1"},
+        category="web",
+    )
+    assert image == "env-web:1"
+
+
+def test_worker_image_for_profile_falls_back_to_category(monkeypatch):
+    monkeypatch.delenv("DSWARM_WORKER_IMAGE", raising=False)
+    monkeypatch.delenv("DSWARM_CATEGORY_IMAGE_CRYPTO", raising=False)
+    image = worker_image_for_profile(None, category="crypto")
+    # category fallback now resolves to the direction image
+    assert image == "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"

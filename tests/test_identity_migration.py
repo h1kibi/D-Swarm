@@ -106,7 +106,7 @@ def test_worker_profiles_rename_cascades_foreign_keys(tmp_path):
 
 # 4) inflight legacy-name alias still resolves a seat ref
 def test_inflight_legacy_name_alias_resolves(tmp_path):
-    from muteki.solver.worker_profiles import resolve_seat_ref
+    from dswarm.solver.worker_profiles import resolve_seat_ref
     st = _store(tmp_path, LEGACY_CONFIG)
     cfg = st.get()
     seats = cfg["seats"]
@@ -121,7 +121,7 @@ def test_api_keeps_legacy_fields_additive(tmp_path):
     st = _store(tmp_path, LEGACY_CONFIG)
     cfg = st.get()
     # old + new coexist in the same payload
-    for legacy in ("worker_profiles", "engines", "race_engines", "stage_policy"):
+    for legacy in ("worker_profiles", "engines", "stage_policy"):
         assert legacy in cfg
     for new in ("seats", "credentials", "environments", "seat_alias"):
         assert new in cfg
@@ -177,7 +177,7 @@ def test_race_false_survives_migration(tmp_path):
 
 # 10) binding fields are additive (don't break old health consumers)
 def test_health_binding_fields_are_additive():
-    from muteki.solver.profile_health import ProfileHealth
+    from dswarm.solver.profile_health import ProfileHealth
     h = ProfileHealth(
         profile_id="p", engine="pi", backend="container", status="ok",
         layer=None, blocker=None, detail="ok", model="", account_id="pi-main",
@@ -194,8 +194,8 @@ def test_profile_health_route_accepts_old_name_and_new_seat_id(tmp_path, monkeyp
     from apps.web.server import create_app
     from apps.web.run_manager import RunManager
 
-    monkeypatch.setattr("muteki.core.runtime_env.is_web_container", lambda: False)
-    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
+    monkeypatch.setattr("dswarm.core.runtime_env.is_web_container", lambda: False)
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
 
     st = _store(tmp_path, LEGACY_CONFIG, accounts=_ACCOUNTS)
     # force the new-schema-on-disk persistence (mirrors a real UI save)
@@ -227,3 +227,59 @@ def test_container_system_inherit_rejected_on_save(tmp_path):
                           "kind": "system_inherit", "secret_ref": ""}],
             environments=[{"id": "docker-web", "label": "Docker", "backend": "container"}],
         )
+
+
+# 12) direction seats map to their direction worker image in the legacy projection
+def test_seat_to_legacy_profile_sets_direction_image():
+    from dswarm.solver.identity_model import seat_to_legacy_profile
+    from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, direction_image
+
+    cred = {"id": "cred_pi_1", "kind": "engine_key", "secret_ref": "pi-main", "engine": "pi"}
+    env = {"id": "docker-web", "backend": "container"}
+
+    def flat(label: str, sid: str = "seat_pi_000001") -> dict:
+        return seat_to_legacy_profile(
+            {"id": sid, "label": label, "engine": "pi",
+             "credential_id": "cred_pi_1", "environment_id": "docker-web",
+             "roles": ["recon", "explore"]},
+            cred, env,
+        )
+
+    # label carries the direction (the UI "Agent" name)
+    assert flat("pi-web")["image"] == direction_image("web")
+    assert flat("pi-rev")["image"] == direction_image("rev")
+    # id may itself be the direction profile id
+    assert flat("pi-web", sid="pi-web")["image"] == direction_image("web")
+    # case-insensitive (prefix and direction: Pi-Web / pi-AIsec)
+    assert flat("Pi-Web")["image"] == direction_image("web")
+    assert flat("pi-AIsec")["image"] == direction_image("aisec")
+    # generic / non-direction seats keep the base image
+    assert flat("pi-worker")["image"] == DEFAULT_WORKER_IMAGE
+    assert flat("custom-agent")["image"] == DEFAULT_WORKER_IMAGE
+
+
+# 13) a new-shape config with direction seats projects direction images store-wide
+def test_new_shape_direction_seats_project_to_direction_images(tmp_path):
+    from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, direction_image
+
+    wc = WorkerConfigStore(root=tmp_path)
+    wc.set_identity_model(
+        credentials=[{"id": "cred_pi_main", "kind": "engine_key",
+                      "secret_ref": "pi-main", "engine": "pi"}],
+        environments=[{"id": "docker-web", "backend": "container", "label": "Docker web"}],
+        seats=[
+            {"id": "seat_pi_web_1", "label": "pi-web", "engine": "pi",
+             "credential_id": "cred_pi_main", "environment_id": "docker-web",
+             "roles": ["recon", "explore", "review"], "race": True, "enabled": True},
+            {"id": "seat_pi_pwn_1", "label": "pi-pwn", "engine": "pi",
+             "credential_id": "cred_pi_main", "environment_id": "docker-web",
+             "roles": ["recon", "explore", "review"], "race": True, "enabled": True},
+            {"id": "seat_pi_gen", "label": "pi-worker", "engine": "pi",
+             "credential_id": "cred_pi_main", "environment_id": "docker-web",
+             "roles": ["recon", "explore", "review"], "race": True, "enabled": True},
+        ],
+    )
+    by_id = {p["id"]: p for p in wc.get()["worker_profiles"]}
+    assert by_id["seat_pi_web_1"]["image"] == direction_image("web")
+    assert by_id["seat_pi_pwn_1"]["image"] == direction_image("pwn")
+    assert by_id["seat_pi_gen"]["image"] == DEFAULT_WORKER_IMAGE

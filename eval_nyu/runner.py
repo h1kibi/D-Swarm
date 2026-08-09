@@ -315,7 +315,7 @@ def _gateway_usage_summary(out_root: Path) -> "tuple[int, float]":
 # ── the swarm run (one engine, one challenge) ────────────────────────────────
 
 def _build_challenge_model(ch: EvalChallenge, *, workdir: Path) -> Any:
-    from muteki.models.solve_graph import Challenge
+    from dswarm.models.solve_graph import Challenge
     attachments = []
     for f in ch.files:
         src = Path(f)
@@ -352,12 +352,12 @@ async def run_challenge(
 ) -> EvalResult:
     """One engine on one challenge. Mirrors scripts/smoke_pi_container.py's
     verified swarm wiring (single engine, no race scout → clean attribution)."""
-    from muteki.core.cost import CostController
-    from muteki.core.event_bus import EventBus
-    from muteki.core.llm import LLMClient
-    from muteki.sandbox.manager import SandboxManager
-    from muteki.solver.result import ArtifactStore
-    from muteki.swarm.swarm import Swarm
+    from dswarm.core.cost import CostController
+    from dswarm.core.event_bus import EventBus
+    from dswarm.core.llm import LLMClient
+    from dswarm.sandbox.manager import SandboxManager
+    from dswarm.solver.result import ArtifactStore
+    from dswarm.swarm.swarm import Swarm
 
     t0 = time.time()
     root = out_root / ch.challenge_id
@@ -400,7 +400,7 @@ async def run_challenge(
             snap = {}
         # teardown the run container whatever happened (mirrors the smoke script)
         try:
-            from muteki.solver.container_exec import teardown_container
+            from dswarm.solver.container_exec import teardown_container
             teardown_container(f"eval-{ch.challenge_id}", remove=True)
         except Exception:
             pass

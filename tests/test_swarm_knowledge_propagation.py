@@ -16,11 +16,11 @@ import asyncio
 
 import pytest
 
-from muteki.core.event_bus import EventBus
-from muteki.models.solve_graph import Challenge
-from muteki.solver.cli_solver import CliSolver
-from muteki.swarm.insight_bus import Insight, InsightBus, InsightKind
-from muteki.swarm.shared_graph import SQLiteSharedGraph
+from dswarm.core.event_bus import EventBus
+from dswarm.models.solve_graph import Challenge
+from dswarm.solver.cli_solver import CliSolver
+from dswarm.swarm.insight_bus import Insight, InsightBus, InsightKind
+from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
 
 def _graph(tmp_path) -> SQLiteSharedGraph:
@@ -82,7 +82,7 @@ def test_p1b_bootstrap_intent_lands_in_db_so_board_sees_it(tmp_path):
 
 def test_p1c_attempted_directions_inlined_into_prompt(tmp_path):
     """P1-C: the already-attempted directions must be INLINED into the prompt, not
-    only in the .muteki_board.md file a headless worker may skip. Verifies the
+    only in the .dswarm_board.md file a headless worker may skip. Verifies the
     ruled-out digest renders in the board-context prompt block."""
     g = _graph(tmp_path)
     g.propose_intent(actor="reason", intent_id="intent:x",
@@ -128,7 +128,7 @@ def test_p1_escape_valve_productive_direction_not_deduped(tmp_path):
 def test_p5_gist_fallback_never_cuts_a_flag_in_half():
     """P5: fallback_summary must keep a flag/credential WHOLE even past the char cap
     — operator saw 'flag2{9f23aa1' (cut). A half-flag label is worse than a long one."""
-    from muteki.solver.summarizer import fallback_summary
+    from dswarm.solver.summarizer import fallback_summary
     raw = ("[pi] the secret table holds "
            "flag2{9f23aa16-33e7-11f1-9508-7e92a294591d} on host 192.168.1.123")
     out = fallback_summary(raw, max_chars=40)
@@ -166,7 +166,7 @@ async def test_p0_static_flag_reused_across_runs_accepted():
     seen = []
 
     async def _sink(ev):
-        from muteki.core.events import EventType
+        from dswarm.core.events import EventType
         if ev.event_type == EventType.BLACKBOARD_DELTA and (ev.payload or {}).get("kind") == "flag_found":
             seen.append((ev.payload or {}).get("flag"))
     bus.add_sink(_sink)
@@ -278,7 +278,7 @@ def test_resume_used_once_session_is_established():
     """The flip side: once a turn really produced output, _mark_session_if_live flips
     the guard and a later resume turn legitimately uses `--session <sid>` (keeps
     context)."""
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver.cli_driver import CliResult
     bus = EventBus()
     sv = _worker(bus)
     # a turn that produced real output seats the session
@@ -294,7 +294,7 @@ def test_resume_used_once_session_is_established():
 def test_zero_token_turn_does_not_establish_session():
     """A turn that 0-token-died (the exact failure mode) must NOT mark the session
     established — otherwise the next resume would walk straight back into the trap."""
-    from muteki.solver.cli_driver import CliResult
+    from dswarm.solver.cli_driver import CliResult
     bus = EventBus()
     sv = _worker(bus)
     sv._mark_session_if_live(CliResult(text="", output_tokens=0, session=None))
