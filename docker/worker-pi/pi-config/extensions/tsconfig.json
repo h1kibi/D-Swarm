@@ -9,10 +9,13 @@
     "noEmit": true,
     "skipLibCheck": true,
     "allowJs": false,
-    "baseUrl": ".",
     "paths": {
-      "@earendil-works/pi-coding-agent": ["types/pi-coding-agent.d.ts"],
-      "typebox": ["types/typebox.d.ts"]
+      "@earendil-works/pi-coding-agent": [
+        "./types/pi-coding-agent.d.ts"
+      ],
+      "typebox": [
+        "./types/typebox.d.ts"
+      ]
     }
   },
   "include": ["./*.ts", "./types/**/*.d.ts"]

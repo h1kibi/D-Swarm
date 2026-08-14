@@ -41,6 +41,10 @@ def test_llm_test_uses_request_body_base_url(monkeypatch):
 
     import dswarm.core.llm as llm_mod
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    # The probe runs an auth pre-check before constructing the (mocked) client;
+    # pin a placeholder key so the test never depends on ambient credentials.
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-placeholder-key")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     res = asyncio.run(llm_test.test_llm_endpoint(
         which="planner", base_url="https://edited.endpoint.test/v1", model="edited-model"))
     assert res["ok"] is True
@@ -65,6 +69,8 @@ def test_llm_test_empty_content_still_ok(monkeypatch):
 
     import dswarm.core.llm as llm_mod
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-placeholder-key")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     res = asyncio.run(llm_test.test_llm_endpoint(which="titler", model="m"))
     assert res["ok"] is True
 
@@ -82,6 +88,8 @@ def test_llm_test_chat_raises_is_not_ok(monkeypatch):
 
     import dswarm.core.llm as llm_mod
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-placeholder-key")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     res = asyncio.run(llm_test.test_llm_endpoint(which="planner", model="m"))
     assert res["ok"] is False
     assert "401" in res["detail"]

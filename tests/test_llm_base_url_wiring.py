@@ -81,6 +81,12 @@ def test_planner_forwards_base_url(monkeypatch):
         pass
 
     monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    # Pin a placeholder planner key: build_driver only constructs the (mocked)
+    # LLMClient when the resolved endpoint has_api_key — without it the test
+    # would depend on ambient credentials (test_planner_forwards_base_url is a
+    # base-URL wiring test, not a credential test).
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-placeholder-key")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
     from apps.web.drivers import build_driver
     from apps.web.run_manager import RunManager
@@ -90,15 +96,15 @@ def test_planner_forwards_base_url(monkeypatch):
         mgr = RunManager(sessions_root=td)
         driver = build_driver({
             "prompt": "solve me",
-            "engines": ["local-claude"],
+            "engines": ["local-pi"],
             # local runtime → no credential account required (host login),
             # so build_driver reaches the coordinator LLMClient construction.
             "worker_backend": "local",
             "runtime_profiles": [{"id": "local", "backend": "local"}],
             "worker_profiles": [{
-                "id": "local-claude", "name": "local-claude",
-                "engine": "claude", "transport": "claude_code",
-                "credential_mode": "subscription", "credential_account": "claude-main",
+                "id": "local-pi", "name": "local-pi",
+                "engine": "pi", "transport": "pi_cli",
+                "credential_mode": "subscription", "credential_account": "pi-main",
                 "runtime": "local", "enabled": True,
             }],
             "llm_profiles": {

@@ -146,12 +146,14 @@ def check_dockerfile_copy_only_ts() -> list[str]:
 
 
 def find_tsc() -> str | None:
+    # TS_BIN (explicit override, e.g. TS6 CI) → repo-local → PATH.
+    # PATH is checked LAST so a global/other-project tsc cannot shadow the
+    # repo's pinned version — a stray TS6 on PATH made the self-test
+    # machine-dependent (TS5101 on this repo's older config, skip/pass
+    # elsewhere).
     env_bin = os.environ.get("TS_BIN", "").strip()
     if env_bin:
         return env_bin
-    on_path = shutil.which("tsc")
-    if on_path:
-        return on_path
     is_windows = os.name == "nt"
     candidates = [
         REPO_ROOT / "apps" / "web" / "ui" / "node_modules" / ".bin" / "tsc.cmd",
@@ -163,6 +165,9 @@ def find_tsc() -> str | None:
             continue
         if candidate.is_file():
             return str(candidate)
+    on_path = shutil.which("tsc")
+    if on_path:
+        return on_path
     return None
 
 
