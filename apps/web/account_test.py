@@ -21,20 +21,11 @@ red status is actionable.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-from dswarm.solver.credential_accounts import (
-    CONTAINER_ACCOUNTS_ROOT,
-    project_account_root,
-)
-
-# in-container worker binary per engine — mirrors container_exec._CONTAINER_BIN.
-_CONTAINER_BIN = {
-    "pi": "pi",
-}
+from apps.web.http_utils import project_probe_result
 
 
 def _result(ok: bool, detail: str, layer: Optional[str] = None) -> dict[str, Any]:
@@ -108,10 +99,9 @@ def probe_account(
     h = evaluate_profile_health(
         profile, backend=backend, sessions_root=sessions_root, depth="auth"
     )
-    out: dict[str, Any] = {"ok": h.ok, "detail": h.detail}
-    if h.layer:
-        out["layer"] = h.layer
-    return out
+    return project_probe_result(
+        h, fields=("detail", "layer"), include_ok=True, omit_none=True
+    )
 
 
 def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[str, Any]:
@@ -168,118 +158,3 @@ def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[s
     tail = (r.stderr or "").strip().splitlines()
     detail = f"端点探测失败（HTTP {code or '?'}）" + (f": {tail[-1][:80]}" if tail else "")
     return _result(False, detail, layer="auth")
-
-
-def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    # encoding=utf-8/errors=replace (P2-v3): decode docker output as UTF-8, not the
-    # host locale codepage (Windows cp936 would corrupt non-ASCII output).
-    return subprocess.run(["docker", *args], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
-
-
-def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, Any]:
-    """Real one-shot `docker run --rm` test of the container plumbing.
-
-    Mounts ONLY the account projection (never the bench tree) + a throwaway empty
-    workspace, then runs the engine's in-container liveness probe. Layers:
-      image  → worker image missing / docker unavailable
-      mount  → container uid can't read the projected credential
-      cli    → engine binary won't launch in the container
-    """
-    from dswarm.solver.container_exec import (
-        WORKER_IMAGE,
-        _CATEGORY_IMAGES,
-        CONTAINER_WORKSPACE,
-        _HOST_DATA_ROOT,
-        _mount_source,
-    )
-
-    # Probe the image the workers will ACTUALLY run. Dispatch picks the worker
-    # image per challenge CATEGORY (worker_image_for_category → the route-A
-    # ctf-swarm-pi-<cat> images); the old hardcoded WORKER_IMAGE (upstream
-    # ghcr.io/fishcodetech/dswarm-worker:latest) is NOT installed on route-A
-    # hosts, so the plumbing probe false-failed every profile before any worker
-    # spawned ("镜像缺失或不可用"). Prefer the first locally-present category
-    # image (any of them proves the same plumbing: supervisor image + account
-    # mount + engine CLI), fall back to the upstream default.
-    image = WORKER_IMAGE
-    try:
-        for cand in _CATEGORY_IMAGES.values():
-            r = _docker("image", "inspect", cand, timeout=20)
-            if r.returncode == 0:
-                image = cand
-                break
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        # docker missing/busy — the explicit probe below reports the layer.
-        pass
-
-    # 1) docker reachable + image present.
-    try:
-        r = _docker("image", "inspect", image, timeout=20)
-    except FileNotFoundError:
-        return _result(False, "docker 不可用（未安装或 daemon 未运行）", layer="image")
-    except subprocess.TimeoutExpired:
-        return _result(False, "docker image inspect 超时", layer="image")
-    if r.returncode != 0:
-        return _result(False, f"镜像缺失或不可用: {image}", layer="image")
-
-    # 2) project the account store into a throwaway, container-readable dir.
-    #    P2-v3 BLOCKER-c: the sibling probe container is launched by the HOST
-    #    daemon, so the temp dir must live somewhere the host can see. /tmp inside
-    #    the web container is invisible to the host — root the temp dir under the
-    #    mirrored data root instead. On a bare host (_HOST_DATA_ROOT unset) this is
-    #    the normal system temp dir.
-    import tempfile
-    _tmp_base = None
-    if _HOST_DATA_ROOT:
-        _tmp_base = os.path.join(os.environ.get("DSWARM_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT,
-                                 "_tmp", "account-tests")
-        try:
-            os.makedirs(_tmp_base, exist_ok=True)
-        except OSError:
-            _tmp_base = None
-    with tempfile.TemporaryDirectory(prefix="dswarm-acct-test-", dir=_tmp_base) as td:
-        workspace = os.path.join(td, "ws")
-        projection = os.path.join(td, "accounts")
-        os.makedirs(workspace, exist_ok=True)
-        try:
-            project_account_root(root, projection)
-        except OSError as exc:
-            return _result(False, f"凭据投影失败: {str(exc)[:120]}", layer="mount")
-
-        bin_path = _CONTAINER_BIN.get(engine, engine)
-        # in-container probe: the credential file must be READABLE at the mount
-        # path (catches #15 uid-mismatch) AND the engine binary must launch
-        # (--version is the cheap liveness check; a full authed turn would spend
-        # quota + need network, out of scope for a plumbing test).
-        cred_path = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}"
-        script = (
-            f"test -r {cred_path} || {{ echo DSWARM_MOUNT_UNREADABLE; exit 71; }}; "
-            f"{bin_path} --version >/dev/null 2>&1 || {{ echo DSWARM_CLI_FAIL; exit 72; }}; "
-            "echo DSWARM_OK"
-        )
-        run_cmd = [
-            "run", "--rm", "--init",
-            "--network", "none",  # plumbing test needs no network
-            # the image ENTRYPOINT is the runtime supervisor (a long-running daemon);
-            # a one-shot probe must override it with a shell, else `-lc <script>` is
-            # passed as args to the supervisor and the probe hangs / errors.
-            "--entrypoint", "bash",
-            "--mount",
-            f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
-            "--mount",
-            f"type=bind,source={_mount_source(projection)},target={CONTAINER_ACCOUNTS_ROOT}",
-            image, "-lc", script,
-        ]
-        try:
-            run = _docker(*run_cmd, timeout=60)
-        except subprocess.TimeoutExpired:
-            return _result(False, "容器探测超时（>60s）", layer="cli")
-        out = (run.stdout or "") + (run.stderr or "")
-        if "DSWARM_MOUNT_UNREADABLE" in out or run.returncode == 71:
-            return _result(False, "容器内无法读取凭据（uid 不匹配或挂载失败）", layer="mount")
-        if "DSWARM_CLI_FAIL" in out or run.returncode == 72:
-            return _result(False, f"容器内 {engine} CLI 无法启动", layer="cli")
-        if run.returncode != 0:
-            return _result(False, f"容器探测失败: {out.strip()[:160]}", layer="cli")
-        return _result(True, "容器内凭据可读、CLI 可启动（已验证镜像+挂载+HOME隔离）")

@@ -100,6 +100,12 @@ def _requires_account(profile: dict[str, Any], *, backend: str) -> bool:
       - a keyed mode with NO usable system login needs one.
     A bare subscription on the host with a present system login does NOT.
     """
+    # Provider-backed profiles resolve credentials from the central LLM provider
+    # registry, not the legacy CredentialAccountStore.  In particular, a stale
+    # credential_account (for example a deleted account named "yintu") must not
+    # make an otherwise valid provider binding unhealthy.
+    if str(profile.get("provider_ref") or "").strip():
+        return False
     auth = str(profile.get("credential_mode") or profile.get("auth") or "subscription")
     explicit_endpoint = bool(profile.get("base_url") or profile.get("api_key_ref"))
     system_login_ok = (
@@ -138,12 +144,14 @@ def evaluate_profile_health(
     backend: str,
     sessions_root: str | Path,
     depth: Depth = "auth",
+    llm_providers: list[dict[str, Any]] | None = None,
 ) -> ProfileHealth:
     """The single source of truth. NEVER raises — every failure is a verdict."""
     engine = base_engine_for_profile(profile)
     pid = str(profile.get("name") or profile.get("id") or engine)
     model = str(profile.get("model") or "").strip()
     account_id = str(profile.get("credential_account") or "")
+    provider_ref = str(profile.get("provider_ref") or "").strip()
     root = account_store_root(sessions_root)
 
     def mk(status: Status, *, layer: str | None = None,
@@ -162,6 +170,65 @@ def evaluate_profile_health(
     # rather than implying it was checked and passed.
     if not profile.get("enabled", True):
         return mk("disabled", detail="profile disabled")
+
+    # Provider-backed workers use the central provider registry and its separate
+    # secret store.  Keep this branch before legacy account resolution so a stale
+    # credential_account cannot shadow provider_ref.
+    if provider_ref:
+        from dswarm.solver.llm_providers import (
+            LLMProviderSecretStore, provider_secret_root, resolve_llm_provider,
+        )
+
+        provider_store = LLMProviderSecretStore(provider_secret_root(sessions_root))
+        resolved_provider = resolve_llm_provider(
+            provider_ref, llm_providers or [], secret_store=provider_store,
+        )
+        if resolved_provider is None:
+            why = f"LLM 提供商 {provider_ref} 未配置"
+            return mk("blocked", layer="binding", blocker=why, detail=why,
+                      binding_kind="provider_missing",
+                      effective_credential_id=provider_ref)
+        if not resolved_provider.base_url:
+            why = f"LLM 提供商 {provider_ref} 缺少 Base URL"
+            return mk("blocked", layer="binding", blocker=why, detail=why,
+                      binding_kind="provider_invalid",
+                      effective_credential_id=provider_ref)
+        if not resolved_provider.has_api_key:
+            why = f"LLM 提供商 {provider_ref} 缺少 API Key"
+            return mk("blocked", layer="binding", blocker=why, detail=why,
+                      binding_kind="provider_secret_missing",
+                      effective_credential_id=provider_ref)
+        if _ORDER[depth] < _ORDER["auth"]:
+            return mk("ok", detail=f"provider {provider_ref} binding ok",
+                      binding_kind="provider", effective_credential_id=provider_ref)
+        if backend == "container" and _ORDER[depth] < _ORDER["auth"]:
+            return mk("ok", detail="provider plumbing deferred to worker container",
+                      binding_kind="provider", effective_credential_id=provider_ref)
+
+        from dswarm.solver.endpoint_probe import probe_endpoint
+        endpoint_profile = {
+            **profile,
+            "base_url": resolved_provider.base_url,
+            "wire_api": resolved_provider.wire_api,
+            "auth_mode": resolved_provider.auth_mode,
+            "auth_header": resolved_provider.auth_header,
+            "auth_prefix": resolved_provider.auth_prefix,
+        }
+        try:
+            result = probe_endpoint(
+                endpoint_profile, api_key=resolved_provider.api_key,
+                validate_model=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return mk("auth_failed", layer="auth", detail=str(exc)[:160],
+                      binding_kind="provider", effective_credential_id=provider_ref)
+        ok = bool(result.get("ok"))
+        return mk(
+            "ok" if ok else "auth_failed",
+            layer=None if ok else "auth",
+            detail=str(result.get("detail") or ("provider endpoint ok" if ok else "provider endpoint unhealthy")),
+            binding_kind="provider", effective_credential_id=provider_ref,
+        )
 
     store = CredentialAccountStore(root)
     requires = _requires_account(profile, backend=backend)
@@ -238,8 +305,19 @@ def evaluate_profile_health(
     # container=False ALWAYS — see module docstring. The probe is a host
     # subprocess; an in-container overlay would point at paths that don't exist
     # on the host.
+    endpoint_profile = bool(profile.get("base_url"))
+    credential_kwargs: dict[str, Any] = {}
+    if endpoint_profile:
+        credential_kwargs["env"] = {
+            **os.environ,
+            "DSWARM_PI_PROVIDER": "dswarm-worker",
+        }
     overlay = runtime_env_for_engine(
-        engine, account_root=root, account_id=effective_account_id or None, container=False
+        engine,
+        account_root=root,
+        account_id=effective_account_id or None,
+        container=False,
+        **credential_kwargs,
     ).env
     env = {**os.environ, **overlay}
     try:
@@ -264,11 +342,11 @@ def _probe_container_plumbing(
     """Container plumbing probe: image present + credential mount readable + CLI
     launches. Returns (ok, layer, detail). NEVER spends model quota.
 
-    The docker mechanics are owned by apps.web.account_test._probe_container; this
+    The docker mechanics are owned by dswarm.solver.container_probe; this
     delegates to it and maps its dict result into the (ok, layer, detail) tuple
     the kernel works in, so there is still exactly one docker-run implementation.
     """
-    from apps.web.account_test import _probe_container
+    from dswarm.solver.container_probe import _probe_container
 
     res = _probe_container(engine=engine, account_id=account_id, root=root)
     return bool(res.get("ok")), res.get("layer"), str(res.get("detail") or "")

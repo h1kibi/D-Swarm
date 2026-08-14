@@ -51,6 +51,7 @@ EV_INTENT_PROPOSED = "intent_proposed"
 EV_INTENT_CLAIMED = "intent_claimed"
 EV_INTENT_CONCLUDED = "intent_concluded"
 EV_FLAG_FOUND = "flag_found"
+EV_FLAG_UNVERIFIED = "flag_unverified"  # claimed FOUND_FLAG that failed provenance; never accepted
 EV_FLAG_INVALIDATED = "flag_invalidated"  # multi-flag: a false-positive flag is removed
 EV_POC_SAVED = "poc_saved"
 EV_POC_CLAIMED = "poc_claimed"
@@ -98,6 +99,29 @@ _FACT_STATES = {
     FACT_STATE_UNRESOLVED, FACT_STATE_CHALLENGED, FACT_STATE_REVALIDATED,
     FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED,
 }
+
+
+def _is_runtime_infra_fact_text(text: object) -> bool:
+    """Facts synthesized from worker/LLM CLI failures are not challenge evidence.
+
+    Older runs could append stderr such as ``Unknown provider "dswarm-worker"``
+    as ``fact_added`` before the CLI runtime-failure path learned to short-circuit.
+    The event log remains append-only for audit, but derived board/planner views must
+    suppress these infrastructure facts so Reason/Reviewer do not chase the local
+    worker configuration as if it were a CTF clue.
+    """
+    s = str(text or "").strip().lower()
+    if not s:
+        return False
+    if "worker cli/runtime failed before producing solver output" in s:
+        return True
+    if "profile_incompatible offline eval cannot use custom endpoint profile" in s:
+        return True
+    if "unknown provider" in s and "dswarm-worker" in s and "--list-models" in s:
+        return True
+    if "endpoint probe failed:" in s and ("curl:" in s or "requested url returned error" in s):
+        return True
+    return False
 
 # A/J: intent dispatch_state — orthogonal to status (open/claimed/done).
 # active  → claimable + visible to planner/workers (the default)
@@ -250,6 +274,11 @@ class SharedGraph(Protocol):
     def flag_found(self, *, actor: str, flag: str,
                    artifact_id: Optional[str] = None,
                    intent_id: Optional[str] = None) -> int: ...
+
+    def flag_unverified(self, *, actor: str, flag: str, reason: str = "",
+                        artifact_id: Optional[str] = None,
+                        intent_id: Optional[str] = None,
+                        context: str = "") -> int: ...
 
     def propose_intent(self, *, actor: str, intent_id: str, goal: str,
                        payload: Optional[dict] = None,
@@ -405,6 +434,8 @@ class SharedGraph(Protocol):
 
     def invalidated_flags(self) -> set[str]: ...
 
+    def unverified_flags(self) -> list[dict]: ...
+
     def events(self) -> list[dict]: ...
     def events_since(self, after_seq: int, kinds: Optional[list[str]] = None) -> list[dict]: ...
     async def subscribe_events(self, after_seq: int = 0,
@@ -421,6 +452,11 @@ class SharedGraph(Protocol):
     def open_goal_texts(self) -> list[str]: ...
 
     def dispatchable_goal_texts(self) -> list[str]: ...
+
+    def dispatchable_intents(self, *, now: Optional[float] = None) -> list[dict]: ...
+
+    def annotate_intent_lane(self, *, intent_id: str, lane_key: str,
+                             risk_class: str = "") -> bool: ...
 
     def open_route_hashes(self) -> list[str]: ...
 
@@ -964,9 +1000,8 @@ class SQLiteSharedGraph:
                 return True
         return False
 
-    def flag_found(self, *, actor: str, flag: str,
-                   artifact_id: Optional[str] = None,
-                   intent_id: Optional[str] = None) -> int:
+    def _flag_intent_payload(self, *, actor: str, flag: str,
+                             intent_id: Optional[str] = None) -> dict:
         payload = {"flag": flag}
         iid = (intent_id or "").strip()
         if iid:
@@ -984,9 +1019,44 @@ class SQLiteSharedGraph:
                 payload["intent_id"] = iid
             else:
                 payload["orphan_intent_id"] = iid
+        return payload
+
+    def flag_found(self, *, actor: str, flag: str,
+                   artifact_id: Optional[str] = None,
+                   intent_id: Optional[str] = None) -> int:
+        payload = self._flag_intent_payload(actor=actor, flag=flag, intent_id=intent_id)
         return self._append(EV_FLAG_FOUND, actor, payload,
                             artifact_id=artifact_id, verified=True,
                             dedupe_key=f"flag::{flag}")
+
+    def flag_unverified(self, *, actor: str, flag: str, reason: str = "",
+                        artifact_id: Optional[str] = None,
+                        intent_id: Optional[str] = None,
+                        context: str = "") -> int:
+        """Append an untrusted flag claim that failed the hard provenance gate.
+
+        This is deliberately NOT EV_FLAG_FOUND and snapshot().flags ignores it. The
+        event exists so Reviewer can audit possible worker hallucinations and, if
+        useful, propose verifier reproduction work. Acceptance remains exclusively in
+        the hard flag gate.
+        """
+        clean_flag = str(flag or "").strip()
+        if not clean_flag:
+            return -1
+        payload = self._flag_intent_payload(actor=actor, flag=clean_flag, intent_id=intent_id)
+        payload.update({
+            "claim_state": "unverified",
+            "status": "unverified",
+            "reason": (reason or "").strip()[:1200],
+        })
+        ctx = (context or "").strip()
+        if ctx:
+            payload["context"] = ctx[:2000]
+        key_src = f"{self.challenge.id}\0{actor}\0{clean_flag}\0{payload.get('intent_id') or payload.get('orphan_intent_id') or ''}"
+        key = hashlib.sha1(key_src.encode("utf-8", "ignore")).hexdigest()
+        return self._append(EV_FLAG_UNVERIFIED, actor, payload,
+                            artifact_id=artifact_id, verified=False, confidence=0.0,
+                            dedupe_key=f"flag-unverified::{key}")
 
     # ── review-arbiter events/state ────────────────────────────────────
     _ROUTE_STOPWORDS = {
@@ -1382,6 +1452,8 @@ class SQLiteSharedGraph:
         out: list[dict] = []
         for seq, verified in rows:
             seq = int(seq)
+            if seq not in texts:
+                continue
             st = states.get(seq, {})
             state = st.get("state", FACT_STATE_UNRESOLVED)
             if st.get("retired") or state in _FACT_TERMINAL_STATES:
@@ -1406,6 +1478,8 @@ class SQLiteSharedGraph:
         out: list[dict] = []
         for seq, verified in rows:
             seq = int(seq)
+            if seq not in texts:
+                continue
             st = states.get(seq, {})
             if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
                 continue
@@ -2967,6 +3041,39 @@ class SQLiteSharedGraph:
                 out.add(bad)
         return out
 
+    def unverified_flags(self) -> list[dict]:
+        """Append-only flag claims that failed provenance; never accepted flags."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, ts, actor, payload, artifact_id FROM events "
+                "WHERE challenge_id=? AND kind=? ORDER BY seq",
+                (self.challenge.id, EV_FLAG_UNVERIFIED),
+            ).fetchall()
+        out: list[dict] = []
+        invalid = self.invalidated_flags()
+        for seq, ts, actor, payload, aid in rows:
+            try:
+                p = dict(json.loads(payload) or {})
+            except Exception:
+                p = {}
+            flag = str(p.get("flag") or "").strip()
+            if not flag:
+                continue
+            out.append({
+                "seq": int(seq),
+                "ts": float(ts or 0),
+                "actor": actor or "",
+                "flag": flag,
+                "status": "invalidated" if flag in invalid else str(p.get("status") or "unverified"),
+                "claim_state": str(p.get("claim_state") or "unverified"),
+                "reason": str(p.get("reason") or ""),
+                "intent_id": str(p.get("intent_id") or ""),
+                "orphan_intent_id": str(p.get("orphan_intent_id") or ""),
+                "artifact_id": aid or p.get("artifact_id") or "",
+                "context": str(p.get("context") or ""),
+            })
+        return out
+
     def events(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
@@ -3067,6 +3174,8 @@ class SQLiteSharedGraph:
             p = e["payload"]
             if e["kind"] == EV_FACT_ADDED:
                 seq = int(e["seq"])
+                if _is_runtime_infra_fact_text(p.get("fact", "")):
+                    continue
                 st = fact_states.get(seq, {})
                 if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
                     continue  # A: rejected/merged/superseded facts leave the view
@@ -3122,13 +3231,15 @@ class SQLiteSharedGraph:
 
     def _fact_seq_map(self) -> dict[str, int]:
         """Map fact text → event seq for the most recent facts."""
+        active = self._active_fact_seq_set()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT seq, json_extract(payload, '$.fact') "
                 "FROM events WHERE kind=? ORDER BY seq",
                 (EV_FACT_ADDED,),
             ).fetchall()
-        return {text: seq for seq, text in rows if text}
+        return {text: seq for seq, text in rows
+                if text and int(seq) in active}
 
     def _fact_text_by_seq(self, *, include_retired: bool = False) -> dict[int, str]:
         with self._lock:
@@ -3141,7 +3252,9 @@ class SQLiteSharedGraph:
         return {
             int(seq): str(text)
             for seq, text in rows
-            if text and (active is None or int(seq) in active)
+            if text
+            and not _is_runtime_infra_fact_text(text)
+            and (active is None or int(seq) in active)
         }
 
     def _fact_review_map(self) -> dict[int, str]:
@@ -3163,12 +3276,15 @@ class SQLiteSharedGraph:
         states = self._fact_state_map()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT seq FROM events WHERE challenge_id=? AND kind=?",
+                "SELECT seq, json_extract(payload, '$.fact') "
+                "FROM events WHERE challenge_id=? AND kind=?",
                 (self.challenge.id, EV_FACT_ADDED),
             ).fetchall()
         out: set[int] = set()
-        for (seq_raw,) in rows:
+        for seq_raw, fact_text in rows:
             seq = int(seq_raw)
+            if _is_runtime_infra_fact_text(fact_text):
+                continue
             st = states.get(seq, {})
             if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
                 continue
@@ -3496,6 +3612,7 @@ class SQLiteSharedGraph:
                                       limit: Optional[int] = None,
                                       exclude_giveup_products: bool = False) -> list[int]:
         states = self._fact_state_map()
+        active = self._active_fact_seq_set()
         blocked = self._giveup_product_fact_seqs() if exclude_giveup_products else set()
         sql = "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? ORDER BY seq DESC"
         params: list[Any] = [self.challenge.id, EV_FACT_ADDED]
@@ -3507,7 +3624,7 @@ class SQLiteSharedGraph:
         out: list[int] = []
         for seq_raw, raw_verified in rows:
             seq = int(seq_raw)
-            if seq in blocked:
+            if seq not in active or seq in blocked:
                 continue
             st = states.get(seq, {})
             state = st.get("state", FACT_STATE_UNRESOLVED)
@@ -3676,6 +3793,8 @@ class SQLiteSharedGraph:
             verified_lines: list[str] = []
             candidate_lines: list[str] = []
             for seq, source, fact, verified, confidence in rows:
+                if _is_runtime_infra_fact_text(fact):
+                    continue
                 st = fact_states.get(int(seq), {})
                 if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
                     continue
@@ -3771,15 +3890,74 @@ class SQLiteSharedGraph:
         starvation valve needs this narrower view to avoid treating a stale live claim
         as available work.
         """
-        now = time.time()
+        return [str(row.get("goal") or "")
+                for row in self.dispatchable_intents()
+                if row.get("goal")]
+
+    def dispatchable_intents(self, *, now: Optional[float] = None) -> list[dict]:
+        """Intent rows that can be dispatched without exposing storage internals.
+
+        The coordinator needs more than goal text (route, direction, resource, lane),
+        but it must not know whether the graph backend is SQLite, HTTP, or another
+        event-sourced adapter. Claimed intents are dispatchable only after their
+        lease expires; verifier/review housekeeping stays behind flag-bearing work.
+        """
+        if now is None:
+            now = time.time()
+        cols = (
+            "intent_id", "goal", "worker_class", "direction", "route_hash",
+            "branch_id", "priority", "lane_key", "risk_class", "resource_key",
+        )
         with self._lock:
             rows = self._conn.execute(
-                "SELECT goal FROM intents WHERE dispatch_state='active' "
-                "AND (status='open' OR (status='claimed' AND lease_until IS NOT NULL "
-                "AND lease_until < ?)) ORDER BY priority DESC, created_seq",
-                (now,),
+                "SELECT intent_id, goal, worker_class, direction, route_hash, branch_id, "
+                "priority, lane_key, risk_class, resource_key FROM intents "
+                "WHERE challenge_id=? AND dispatch_state='active' AND (status='open' "
+                "   OR (status='claimed' AND lease_until IS NOT NULL "
+                "       AND lease_until < ?)) "
+                "ORDER BY CASE WHEN worker_class IN ('verifier','review') "
+                "         THEN 1 ELSE 0 END, priority DESC, created_seq",
+                (self.challenge.id, float(now)),
             ).fetchall()
-        return [str(r[0]) for r in rows if r[0]]
+        out: list[dict] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            item["intent_id"] = str(item.get("intent_id") or "")
+            item["goal"] = str(item.get("goal") or "")
+            item["worker_class"] = str(item.get("worker_class") or "code")
+            item["direction"] = str(item.get("direction") or "")
+            item["route_hash"] = str(item.get("route_hash") or "")
+            item["branch_id"] = str(item.get("branch_id") or "")
+            item["priority"] = int(item.get("priority") or 0)
+            item["lane_key"] = str(item.get("lane_key") or "")
+            item["risk_class"] = str(item.get("risk_class") or "")
+            item["resource_key"] = str(item.get("resource_key") or "")
+            out.append(item)
+        return out
+
+    def annotate_intent_lane(self, *, intent_id: str, lane_key: str,
+                             risk_class: str = "") -> bool:
+        """Backfill derived lane metadata on an intent if it is still blank.
+
+        This updates only the materialized ``intents`` projection, not the append-only
+        event log. The guard preserves explicit lane metadata already supplied by
+        Reason/review proposals while letting older/vague intents gain dispatch
+        serialization hints through the graph API.
+        """
+        iid = (intent_id or "").strip()
+        lane = self.normalize_lane_key(lane_key)
+        if not iid or not lane:
+            return False
+        risk = _clean_lane_risk(risk_class or lane.split(":", 1)[0])
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE intents SET lane_key=?, risk_class=? "
+                "WHERE challenge_id=? AND intent_id=? "
+                "AND (lane_key IS NULL OR lane_key='')",
+                (lane, risk, self.challenge.id, iid),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def open_route_hashes(self) -> list[str]:
         with self._lock:
@@ -4206,6 +4384,28 @@ class SQLiteSharedGraph:
                 "these — those directions are DONE):\n"
                 f"{lines}\n")
 
+
+    def _unverified_flags_block(self) -> str:
+        claims = self.unverified_flags()[-40:]
+        if not claims:
+            return ""
+        lines = []
+        for c in claims:
+            bits = [f"#{c.get('seq')}", str(c.get("flag") or "")]
+            actor = str(c.get("actor") or "")
+            if actor:
+                bits.append(f"actor={actor}")
+            iid = str(c.get("intent_id") or c.get("orphan_intent_id") or "")
+            if iid:
+                bits.append(f"intent={iid}")
+            status = str(c.get("status") or "unverified")
+            reason = str(c.get("reason") or "").strip()
+            if reason:
+                bits.append(f"reason={reason[:180]}")
+            lines.append("  - " + " | ".join(bits) + f" | status={status}")
+        return ("\n## Unverified flag claims (NOT accepted; audit for hallucination or "
+                "dispatch verifier reproduction only)\n" + "\n".join(lines) + "\n")
+
     def _credential_block(self, creds: "Optional[list[dict]]" = None) -> str:
         """The canonical credential / unlock-chain section (also used standalone as
         the inline prompt digest). Empty string when no creds qualify."""
@@ -4275,6 +4475,7 @@ class SQLiteSharedGraph:
             self._brief_block(),
             self.to_summary(max_evidence=10**9, max_dead_ends=10**9),
             self._captured_flags_block(),
+            self._unverified_flags_block(),
             self._review_state_block(),
             self._open_intents_block(),
             self._poc_block(limit=80),

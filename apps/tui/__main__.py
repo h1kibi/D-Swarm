@@ -81,7 +81,7 @@ async def _swarm_driver(bus: EventBus, cost: CostController, run_id: str,
             challenge, default_lineup(args.n_solvers), llm=llm, sandbox=sandbox,
             bus=bus, cost=cost, artifacts=arts, config=SolverConfig(),
             run_id=run_id, knowledge=knowledge,
-            executor="cli", cli_race=True,
+            executor="cli",
         )
         try:
             await swarm.run()

@@ -32,6 +32,8 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dswarm.solver.endpoint_probe import probe_endpoint
 from typing import Any, Callable, Optional
 
 from dswarm.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
@@ -825,12 +827,16 @@ class EndpointDriver(CliDriver):
         src = env if env is not None else os.environ
         ref = str(self.profile.get("api_key_ref") or "").strip()
         if ref.startswith("env:"):
-            return src.get(ref[4:], "")
+            value = src.get(ref[4:], "").strip()
+            if value:
+                return value
         if ref.startswith("file:"):
             try:
-                return Path(ref[5:]).read_text(encoding="utf-8").strip()
+                value = Path(ref[5:]).read_text(encoding="utf-8").strip()
+                if value:
+                    return value
             except OSError:
-                return ""
+                pass
         # No explicit ref → fall back to the env the Credential Account injection
         # sets for this transport: <PROVIDER>_API_KEY_FILE (file-backed) or the
         # bare <PROVIDER>_API_KEY (env-backed). pi's endpoint workers read the
@@ -848,39 +854,13 @@ class EndpointDriver(CliDriver):
         base_url = str(self.profile.get("base_url") or "").strip()
         if not base_url:
             return self.base.health_detail(env=env)
-        key = self._api_key(env)
-        # Mirror how the live worker authenticates (runtime_env_for_engine): give
-        # the probe ITS OWN credential env so parallel probes don't clobber each
-        # other's key material.
-        probe_env = env
-        if key and not (env or {}).get("OPENAI_API_KEY"):
-            probe_env = {**os.environ, **(env or {}), "OPENAI_API_KEY": key}
-        argv = [
-            "curl", "-fsS", "-X", "POST", "--max-time", "20",
-            "-H", "Content-Type: application/json",
-        ]
-        if key:
-            argv += ["-H", f"Authorization: Bearer {key}"]
-        model = str(self.profile.get("model") or "").strip()
-        body = json.dumps({
-            "model": model or "gpt-5-mini",
-            "input": "OK",
-            "max_output_tokens": 1,
-        })
-        argv += ["--data", body, self._endpoint_probe_url()]
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
-                               env=probe_env)
-        except FileNotFoundError:
-            return False, "curl binary not found"
-        except subprocess.TimeoutExpired:
-            return False, "endpoint probe timed out"
-        except Exception as exc:  # noqa: BLE001
-            return False, str(exc)[:160]
-        if r.returncode == 0:
-            return True, ""
-        tail = (r.stderr or r.stdout or "").strip().splitlines()
-        return False, "endpoint probe failed" + (f": {tail[-1][:120]}" if tail else "")
+        result = probe_endpoint(
+            self.profile,
+            api_key=self._api_key(env),
+            validate_model=True,
+        )
+        return bool(result.get("ok")), str(result.get("detail") or "endpoint probe failed")
+
 
 
 def driver_for(profile_or_name: str | dict[str, Any]) -> CliDriver:
@@ -1047,17 +1027,6 @@ def engine_health(backend: str = "local",
     if profile_rows:
         from dswarm.solver.credential_accounts import runtime_env_for_engine
 
-        def _insert_model(argv: list[str], model: str) -> list[str]:
-            model = (model or "").strip()
-            if not model or "--model" in argv or "-m" in argv:
-                return argv
-            if "--" in argv:
-                idx = argv.index("--")
-                return [*argv[:idx], "--model", model, *argv[idx:]]
-            if len(argv) <= 1:
-                return [*argv, "--model", model]
-            return [*argv[:-1], "--model", model, argv[-1]]
-
         out: list[dict] = []
         for profile in profile_rows:
             name = base_engine_for_profile(profile)
@@ -1085,7 +1054,7 @@ def engine_health(backend: str = "local",
                         if profile_uses_endpoint(profile):
                             healthy, detail = drv.health_detail()
                         else:
-                            argv = _insert_model(
+                            argv = _insert_model_arg(
                                 drv._hello_argv(),  # noqa: SLF001 - self-check mirrors driver probe.
                                 str(profile.get("model") or ""))
                             if not argv:

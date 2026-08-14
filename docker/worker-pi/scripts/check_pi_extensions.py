@@ -39,6 +39,7 @@ EXPECTED_EXTENSIONS = {
     "ctf-provenance-guard.ts",
     "ctf-context-injector.ts",
     "ctf-evidence-note.ts",
+    "dswarm-worker-provider.ts",
 }
 
 EXPECTED_GATEWAY_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}

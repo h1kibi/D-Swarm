@@ -52,6 +52,65 @@ def test_replay_consistency_reopen(tmp_path):
     g2.close()
 
 
+
+
+def test_unverified_flag_claim_is_append_only_not_snapshot_flag(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    seq = g.flag_unverified(
+        actor="cli-pi-1",
+        flag="flag{maybe_fake}",
+        reason="FOUND_FLAG prose had no command-output witness",
+        intent_id="I-missing",
+    )
+
+    assert seq > 0
+    assert g.snapshot().flags == []
+    assert g.snapshot().flag is None
+    claims = g.unverified_flags()
+    assert len(claims) == 1
+    assert claims[0]["flag"] == "flag{maybe_fake}"
+    assert claims[0]["status"] == "unverified"
+    assert claims[0]["orphan_intent_id"] == "I-missing"
+    ev = g.events_since(0, kinds=["flag_unverified"])[0]
+    assert ev["seq"] == seq
+    assert ev["verified"] is False
+    g.close()
+
+
+def test_review_summary_includes_unverified_flags_but_not_as_captured(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.flag_unverified(actor="cli-pi-1", flag="flag{claimed}", reason="no stdout witness")
+
+    summary = g.to_review_summary()
+    assert "Unverified flag claims" in summary
+    assert "flag{claimed}" in summary
+    assert "Flags already captured" not in summary
+    g.close()
+
+
+def test_runtime_infra_facts_are_suppressed_from_derived_views_only(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    infra = 'Error: Unknown provider "dswarm-worker". Use --list-models to see available providers/models.'
+    infra_seq = g.add_evidence(actor="cli-pi-1", source="stderr", fact=infra, verified=False)
+    real_seq = g.add_evidence(
+        actor="cli-pi-2", source="curl", fact="/api/images returns 8 rows", verified=True
+    )
+
+    assert infra_seq > 0
+    assert real_seq > infra_seq
+    raw = g.events_since(0, kinds=["fact_added"])
+    assert any((ev["payload"] or {}).get("fact") == infra for ev in raw)
+
+    assert [ev.fact for ev in g.snapshot().evidence] == ["/api/images returns 8 rows"]
+    summary = g.to_reason_summary()
+    assert "/api/images returns 8 rows" in summary
+    assert "Unknown provider" not in summary
+    assert "dswarm-worker" not in g.fact_pin_context()
+    assert g.fact_seqs_for_texts([infra, "/api/images returns 8 rows"]) == [real_seq]
+    assert all(c["fact_seq"] != infra_seq for c in g.active_candidates())
+    g.close()
+
+
 def test_events_since_returns_incremental_filtered_rows(tmp_path):
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
     f1 = g.add_evidence(actor="s1", source="x", fact="f1", verified=True)
@@ -1170,6 +1229,50 @@ def test_compact_retires_barren_intents_keeps_facts(tmp_path):
     assert info["retired_intent_ids"] == ["I1"]  # productive (to_fact_seq) survives
     assert any(e.fact == "keep verified" for e in g.snapshot().evidence)
     assert len(g.compact_epochs()) == 1
+    g.close()
+
+
+
+
+def test_dispatchable_intents_and_lane_annotation_api(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(
+        actor="reason", intent_id="I-expired", goal="expired worker can resume",
+        payload={"priority": 10},
+    )
+    assert g.claim_intent(worker="cli-old", intent_id="I-expired", lease_s=-10) is True
+    g.propose_intent(
+        actor="reason", intent_id="I-open", goal="fresh open work",
+        payload={"priority": 5},
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-review", goal="review housekeeping",
+        payload={"worker_class": "review", "priority": 100},
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-live", goal="already being worked",
+        payload={"priority": 50},
+    )
+    assert g.claim_intent(worker="cli-live", intent_id="I-live", lease_s=600) is True
+
+    rows = g.dispatchable_intents()
+
+    assert [row["intent_id"] for row in rows] == ["I-expired", "I-open", "I-review"]
+    assert rows[0]["worker_class"] == "code"
+    assert rows[0]["resource_key"] == ""
+    assert g.annotate_intent_lane(
+        intent_id="I-open",
+        lane_key="destructive:tcp:445@10.0.0.5",
+        risk_class="destructive",
+    ) is True
+    assert g.annotate_intent_lane(
+        intent_id="I-open",
+        lane_key="destructive:tcp:9999@10.0.0.5",
+        risk_class="destructive",
+    ) is False
+    annotated = {row["intent_id"]: row for row in g.dispatchable_intents()}
+    assert annotated["I-open"]["lane_key"] == "destructive:tcp:445@10.0.0.5"
+    assert annotated["I-open"]["risk_class"] == "destructive"
     g.close()
 
 

@@ -41,6 +41,7 @@ func main() {
 	if raw := os.Getenv("DSWARM_UI_MODE"); raw != "" {
 		uiMode = raw
 	}
+	uiPort = ChooseUiPort(uiPort, backendPort)
 
 	log.Printf("dswarm desktop: repo=%s backend=:%d ui=:%d mode=%s",
 		root, backendPort, uiPort, uiMode)
@@ -51,7 +52,7 @@ func main() {
 		log.Fatalf("desktop startup aborted: UI dependencies: %v", err)
 	}
 	if !strings.EqualFold(strings.TrimSpace(uiMode), "dev") {
-		if err := EnsureUiBuild(root); err != nil {
+		if err := EnsureUiBuild(root, backendPort); err != nil {
 			log.Fatalf("desktop startup aborted: UI production build: %v", err)
 		}
 	}

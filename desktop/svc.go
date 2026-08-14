@@ -9,9 +9,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +45,10 @@ type Snapshot struct {
 	LogCount int          `json:"logCount"`
 }
 
+// HealthProbe performs the readiness check for a service endpoint.
+// Returning nil means the endpoint is safe to reuse/navigate to.
+type HealthProbe func(healthURL string, timeout time.Duration) error
+
 // Service runs ONE child process with health polling and log capture.
 type Service struct {
 	Name          string
@@ -49,6 +57,7 @@ type Service struct {
 	ExtraEnv      []string // KEY=VALUE appended to os.Environ()
 	HealthURL     string   // GET probe; empty = no health wait
 	HealthTTL     time.Duration
+	HealthProbe   HealthProbe // optional stronger probe (UI verifies the deck can hydrate)
 	LogCap        int
 	ReuseExisting bool // adopt an already healthy service on the configured endpoint
 
@@ -110,13 +119,32 @@ func (s *Service) Start(ctx context.Context) error {
 	// instance) already owns the configured endpoint. Reuse a healthy D-Swarm
 	// service instead of launching a second process that immediately dies with
 	// EADDRINUSE. The adopted process is deliberately not killed on shutdown.
-	if s.ReuseExisting && s.HealthURL != "" && healthy(s.HealthURL, 750*time.Millisecond) {
-		s.mu.Lock()
-		s.state = StateRunning
-		s.managed = false
-		s.mu.Unlock()
-		s.log(fmt.Sprintf("reusing existing healthy service at %s", s.HealthURL))
-		return nil
+	if s.ReuseExisting && s.HealthURL != "" {
+		if err := s.healthErr(750 * time.Millisecond); err == nil {
+			s.adoptRunning(fmt.Sprintf("reusing existing healthy service at %s", s.HealthURL))
+			return nil
+		} else if s.HealthProbe != nil && http200Probe(s.HealthURL, 750*time.Millisecond) == nil {
+			// Something is already answering the lightweight API probe on this
+			// port, but it is not good enough for the desktop shell. This most
+			// commonly happens after a stale `next dev` process survives from a
+			// previous run: /api still proxies, while the page's hydration chunks
+			// 404, leaving the WebView stuck on the SSR "Checking" screen.
+			probeErr := err
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				if probeErr = s.healthErr(2 * time.Second); probeErr == nil {
+					s.adoptRunning(fmt.Sprintf("reusing existing healthy service at %s", s.HealthURL))
+					return nil
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			s.setState(StateError)
+			s.mu.Lock()
+			s.lastErr = fmt.Sprintf("existing service at %s is not desktop-ready: %v", s.HealthURL, probeErr)
+			s.mu.Unlock()
+			s.log(s.lastErr)
+			return fmt.Errorf("%s: %s", s.Name, s.lastErr)
+		}
 	}
 
 	bin, err := exec.LookPath(s.Argv[0])
@@ -182,12 +210,8 @@ func (s *Service) Start(ctx context.Context) error {
 				// Another supervisor can win the bind race between our initial
 				// probe and cmd.Start. If that winner is healthy, adopt it rather
 				// than reporting a false startup failure.
-				if s.ReuseExisting && healthy(s.HealthURL, 750*time.Millisecond) {
-					s.mu.Lock()
-					s.state = StateRunning
-					s.managed = false
-					s.mu.Unlock()
-					s.log(fmt.Sprintf("adopted service that won the startup bind race at %s", s.HealthURL))
+				if s.ReuseExisting && s.healthErr(750*time.Millisecond) == nil {
+					s.adoptRunning(fmt.Sprintf("adopted service that won the startup bind race at %s", s.HealthURL))
 					return nil
 				}
 				if processErr == "" {
@@ -199,24 +223,43 @@ func (s *Service) Start(ctx context.Context) error {
 				s.mu.Unlock()
 				return fmt.Errorf("%s: %s", s.Name, processErr)
 			}
-			if healthy(s.HealthURL, 2*time.Second) {
+			if s.healthErr(2*time.Second) == nil {
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-		if !healthy(s.HealthURL, 2*time.Second) {
+		if err := s.healthErr(2 * time.Second); err != nil {
 			// A failed health start must not leave a child process behind. This
 			// was a source of subsequent port conflicts after a failed boot.
 			_ = s.Stop()
 			s.setState(StateError)
 			s.mu.Lock()
-			s.lastErr = fmt.Sprintf("health probe %s never returned 200", s.HealthURL)
+			s.lastErr = fmt.Sprintf("health probe %s never became ready: %v", s.HealthURL, err)
 			s.mu.Unlock()
 			return fmt.Errorf("%s: health probe failed", s.Name)
 		}
 	}
 	s.setState(StateRunning)
 	return nil
+}
+
+func (s *Service) adoptRunning(message string) {
+	s.mu.Lock()
+	s.state = StateRunning
+	s.managed = false
+	s.lastErr = ""
+	s.mu.Unlock()
+	s.log(message)
+}
+
+func (s *Service) healthErr(timeout time.Duration) error {
+	if s.HealthURL == "" {
+		return nil
+	}
+	if s.HealthProbe != nil {
+		return s.HealthProbe(s.HealthURL, timeout)
+	}
+	return http200Probe(s.HealthURL, timeout)
 }
 
 func (s *Service) healthTTL() time.Duration {
@@ -279,15 +322,100 @@ func pumpLines(r io.Reader, emit func(string)) {
 	}
 }
 
-func healthy(url string, timeout time.Duration) bool {
+func http200Probe(rawURL string, timeout time.Duration) error {
 	client := &http.Client{Timeout: timeout}
-	resp, err := client.Get(url)
+	resp, err := client.Get(rawURL)
 	if err != nil {
-		return false
+		return err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return resp.StatusCode == 200
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s returned HTTP %d", rawURL, resp.StatusCode)
+	}
+	return nil
+}
+
+// nextDeckProbe verifies both halves of the desktop UI: the API rewrite and the
+// actual Next page assets needed for client hydration. A stale/broken Next dev
+// server can return 200 for /api while serving an SSR shell whose JS/CSS chunks
+// 404; if Desktop reuses that process, the WebView stays forever on "Checking".
+func nextDeckProbe(apiURL string, timeout time.Duration) error {
+	if err := http200Probe(apiURL, timeout); err != nil {
+		return err
+	}
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return err
+	}
+	root := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
+	return nextPageAssetsReady(root, timeout)
+}
+
+func nextPageAssetsReady(rootURL string, timeout time.Duration) error {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(rootURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("deck root %s returned HTTP %d", rootURL, resp.StatusCode)
+	}
+	root, err := url.Parse(rootURL)
+	if err != nil {
+		return err
+	}
+	assets := nextStaticAssets(string(body))
+	if len(assets) == 0 {
+		return fmt.Errorf("deck root %s did not reference any Next static assets", rootURL)
+	}
+	for _, asset := range assets {
+		assetURL, err := root.Parse(asset)
+		if err != nil {
+			return fmt.Errorf("parse deck asset %q: %w", asset, err)
+		}
+		if err := http200Probe(assetURL.String(), timeout); err != nil {
+			return fmt.Errorf("deck asset %s is not ready: %w", asset, err)
+		}
+	}
+	return nil
+}
+
+func nextStaticAssets(body string) []string {
+	seen := map[string]struct{}{}
+	var assets []string
+	for _, part := range strings.Fields(body) {
+		for _, attr := range []string{"src=", "href="} {
+			idx := strings.Index(part, attr+"\"")
+			if idx < 0 {
+				continue
+			}
+			start := idx + len(attr) + 1
+			rest := part[start:]
+			end := strings.Index(rest, "\"")
+			if end < 0 {
+				continue
+			}
+			asset := html.UnescapeString(rest[:end])
+			if !strings.HasPrefix(asset, "/_next/static/") {
+				continue
+			}
+			if !(strings.Contains(asset, ".js") || strings.Contains(asset, ".css")) {
+				continue
+			}
+			if _, ok := seen[asset]; ok {
+				continue
+			}
+			seen[asset] = struct{}{}
+			assets = append(assets, asset)
+			if len(assets) >= 32 {
+				return assets
+			}
+		}
+	}
+	return assets
 }
 
 func portOf(url string) int {
@@ -298,6 +426,44 @@ func portOf(url string) int {
 		}
 	}
 	return 0
+}
+
+func uiHealthURL(port int) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/api/settings/workers", port)
+}
+
+func tcpPortAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// ChooseUiPort keeps the configured port when it is free or already hosts a
+// fully hydratable D-Swarm deck. If the port is occupied by a stale/broken
+// service, pick a nearby free port so Desktop does not navigate into a shell
+// stuck on the SSR auth "Checking" screen.
+func ChooseUiPort(preferred int, backendPort int) int {
+	if preferred <= 0 {
+		preferred = 3001
+	}
+	if tcpPortAvailable(preferred) {
+		return preferred
+	}
+	if err := nextDeckProbe(uiHealthURL(preferred), 2*time.Second); err == nil {
+		return preferred
+	} else {
+		fmt.Printf("[ui] port :%d is occupied but not desktop-ready (%v)\n", preferred, err)
+	}
+	for port := preferred + 1; port <= preferred+50; port++ {
+		if tcpPortAvailable(port) {
+			fmt.Printf("[ui] using fallback desktop UI port :%d\n", port)
+			return port
+		}
+	}
+	return preferred
 }
 
 // Supervisor owns the two services and their start ordering (backend before UI).
@@ -431,11 +597,14 @@ func UiService(root string, port int, backendPort int, mode string) *Service {
 		argv = []string{"npm.cmd", "run", "dev", "--", "-p", fmt.Sprint(port)}
 	}
 	return &Service{
-		Name:          "ui",
-		Argv:          argv,
-		Dir:           uiDir,
-		HealthURL:     fmt.Sprintf("http://127.0.0.1:%d/", port),
+		Name: "ui",
+		Argv: argv,
+		Dir:  uiDir,
+		// Probe through Next's API rewrite, not just the root page. A stale Next
+		// process can serve / while still proxying /api to an obsolete backend.
+		HealthURL:     uiHealthURL(port),
 		HealthTTL:     240 * time.Second, // first Next compile can take a while
+		HealthProbe:   nextDeckProbe,
 		ReuseExisting: true,
 		ExtraEnv:      extra,
 	}
@@ -467,21 +636,88 @@ func EnsureUiDeps(root string) error {
 	return cmd.Run()
 }
 
-// EnsureUiBuild materializes a production Next build. next start refuses a dev
-// .next directory, so this also gives a clear startup error rather than a proxy
-// that appears alive but cannot serve the deck.
-func EnsureUiBuild(root string) error {
-	uiDir, err := uiDir(root)
+type nextRouteManifest struct {
+	Rewrites []struct {
+		Source      string `json:"source"`
+		Destination string `json:"destination"`
+	} `json:"rewrites"`
+}
+
+func expectedBackendURL(backendPort int) string {
+	return fmt.Sprintf("http://127.0.0.1:%d", backendPort)
+}
+
+// uiBuildMatchesBackend verifies the build-time Next rewrite used by /api.
+// Next resolves rewrites while building, so changing DSWARM_BACKEND only on
+// `next start` cannot repair a build that points at an old backend port.
+func uiBuildMatchesBackend(uiDir string, backendPort int) (bool, error) {
+	if _, err := os.Stat(filepath.Join(uiDir, ".next", "BUILD_ID")); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	raw, err := os.ReadFile(filepath.Join(uiDir, ".next", "routes-manifest.json"))
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	if _, err := os.Stat(filepath.Join(uiDir, ".next", "BUILD_ID")); err == nil {
-		return nil
+	var manifest nextRouteManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return false, fmt.Errorf("parse routes manifest: %w", err)
 	}
-	fmt.Println("[ui] production build missing — running npm run build (one-time)")
+	want := expectedBackendURL(backendPort) + "/api/:path*"
+	for _, rewrite := range manifest.Rewrites {
+		if rewrite.Source == "/api/:path*" {
+			return rewrite.Destination == want, nil
+		}
+	}
+	return false, nil
+}
+
+type uiBuildRunner func(dir string, backendURL string) error
+
+func runUiBuild(dir string, backendURL string) error {
 	cmd := exec.Command("npm.cmd", "run", "build")
-	cmd.Dir = uiDir
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "DSWARM_BACKEND="+backendURL)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// EnsureUiBuild materializes a production Next build whose build-time /api
+// rewrite points at this Desktop instance's backend. A stale BUILD_ID alone is
+// not sufficient: it may contain a valid deck that proxies to an old port.
+func EnsureUiBuild(root string, backendPort int) error {
+	return ensureUiBuild(root, backendPort, runUiBuild)
+}
+
+func ensureUiBuild(root string, backendPort int, build uiBuildRunner) error {
+	dir, err := uiDir(root)
+	if err != nil {
+		return err
+	}
+	matches, verifyErr := uiBuildMatchesBackend(dir, backendPort)
+	if matches && verifyErr == nil {
+		return nil
+	}
+	if verifyErr != nil {
+		fmt.Printf("[ui] production build cannot be verified (%v) — rebuilding\n", verifyErr)
+	} else {
+		fmt.Printf("[ui] production build missing or targets another backend — rebuilding for %s\n", expectedBackendURL(backendPort))
+	}
+	if err := build(dir, expectedBackendURL(backendPort)); err != nil {
+		return err
+	}
+	matches, err = uiBuildMatchesBackend(dir, backendPort)
+	if err != nil {
+		return fmt.Errorf("verify production build: %w", err)
+	}
+	if !matches {
+		return fmt.Errorf("production build /api rewrite does not target %s", expectedBackendURL(backendPort))
+	}
+	return nil
 }

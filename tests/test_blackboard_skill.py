@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from dswarm.models.solve_graph import Challenge
+from dswarm.solver import blackboard_skill
 from dswarm.solver.cli_solver import CliSolver
 from dswarm.solver.workspace import materialize_shared_artifact, link_shared_into_worker
 from dswarm.swarm.shared_graph import SQLiteSharedGraph, _normalize_fact_identity
@@ -460,28 +461,26 @@ def test_sync_deployed_blackboard_skills_resyncs_stale_and_missing(tmp_path, mon
     """The launch-time safety net overwrites a stale/missing deployed copy from the
     repo source and leaves a fresh one alone — closing the run-75378 drift gap for the
     auto-discovered user-scope copies."""
-    from dswarm.solver import cli_solver
-
     claude = tmp_path / ".claude" / "skills" / "dswarm-blackboard" / "blackboard.py"
     agents = tmp_path / ".agents" / "skills" / "dswarm-blackboard" / "blackboard.py"
-    monkeypatch.setattr(cli_solver, "_DEPLOYED_BLACKBOARD_SCRIPTS",
+    monkeypatch.setattr(blackboard_skill, "_DEPLOYED_BLACKBOARD_SCRIPTS",
                         (str(claude), str(agents)))
-    src = Path(cli_solver._repo_blackboard_script())
+    src = Path(blackboard_skill._repo_blackboard_script())
 
     # First run: both missing → both synced from repo (and SKILL.md moves too).
-    rows = cli_solver.sync_deployed_blackboard_skills()
+    rows = blackboard_skill.sync_deployed_blackboard_skills()
     assert {r["status"] for r in rows} == {"synced"}
     assert claude.read_bytes() == src.read_bytes()
     assert agents.read_bytes() == src.read_bytes()
     assert (claude.parent / "SKILL.md").is_file()
 
     # Second run: identical → no action.
-    rows = cli_solver.sync_deployed_blackboard_skills()
+    rows = blackboard_skill.sync_deployed_blackboard_skills()
     assert {r["status"] for r in rows} == {"ok"}
 
     # Drift ONE copy → only it is re-synced; the fresh one is left untouched.
     claude.write_text("# drifted out of sync\n")
-    rows = cli_solver.sync_deployed_blackboard_skills()
+    rows = blackboard_skill.sync_deployed_blackboard_skills()
     by_path = {r["path"]: r["status"] for r in rows}
     assert by_path[str(claude)] == "synced"
     assert by_path[str(agents)] == "ok"
@@ -491,10 +490,8 @@ def test_sync_deployed_blackboard_skills_resyncs_stale_and_missing(tmp_path, mon
 def test_sync_deployed_blackboard_skills_no_source_is_noop(monkeypatch):
     """An installed deployment (no repo skill adjacent to the package) reports
     'no-source' and touches nothing — the deployed copy IS the source of truth there."""
-    from dswarm.solver import cli_solver
-
-    monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
-    rows = cli_solver.sync_deployed_blackboard_skills()
+    monkeypatch.setattr(blackboard_skill, "_repo_blackboard_script", lambda: None)
+    rows = blackboard_skill.sync_deployed_blackboard_skills()
     assert rows and all(r["status"] == "no-source" for r in rows)
 
 

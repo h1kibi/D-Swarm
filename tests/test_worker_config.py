@@ -4,6 +4,7 @@ worker commands (RunManager.post_worker_cmd). Pure/unit 鈥?no subprocess, no ke
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import subprocess
 
@@ -15,8 +16,11 @@ from apps.web.drivers import build_driver
 from apps.web.worker_config import (
     DEFAULT_CATEGORY_OVERRIDES,
     DEFAULT_ENGINES,
+    DEFAULT_MAX_WORKERS,
     DEFAULT_RUNTIME_PROFILES,
+    DEFAULT_START_WORKERS,
     DEFAULT_WORKER_PROFILES,
+    DEFAULT_DEEPSEEK_BASE_URL,
     WorkerConfigStore,
 )
 
@@ -26,15 +30,15 @@ from apps.web.worker_config import (
 def test_config_defaults_when_empty(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     cfg = wc.get()
-    assert cfg["engines"] == DEFAULT_ENGINES
-    assert cfg["start_workers"] == len(DEFAULT_ENGINES)
-    assert cfg["max_workers"] == 10
+    assert cfg["engines"] == []
+    assert cfg["start_workers"] == DEFAULT_START_WORKERS
+    assert cfg["max_workers"] == DEFAULT_MAX_WORKERS
     assert cfg["worker_backend"] == "container"
     assert cfg["wall_clock_budget"] == 0
     assert cfg["max_total_workers"] == 0
     assert cfg["cost_budget_usd"] == 0.0
     assert cfg["stage_policy"]["budgets"]["max_total_workers"] == 0
-    assert cfg["stage_policy"]["coordinator"]["review"]["enabled"] is True
+    assert cfg["stage_policy"]["coordinator"]["review"]["enabled"] is False
     assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "pi-worker"
     assert cfg["stage_policy"]["coordinator"]["review"]["candidate_spike_threshold"] == 5
     assert cfg["llm_profiles"]["planner"]["model"] == "deepseek-v4-pro"
@@ -42,10 +46,16 @@ def test_config_defaults_when_empty(tmp_path):
     assert {r["id"] for r in cfg["runtime_profiles"]} >= {
         "docker-host-target", "docker-offline", "docker-pwn-heavy"}
     assert cfg["worker_profiles"] == DEFAULT_WORKER_PROFILES
-    assert cfg["overrides"] == {
-        cat: {"engines": names, "start_workers": len(names)}
-        for cat, names in DEFAULT_CATEGORY_OVERRIDES.items()
-    }
+    assert cfg["overrides"] == {}
+    assert all(profile["enabled"] is False for profile in cfg["worker_profiles"])
+
+
+def _enabled_default_profiles(*names: str) -> list[dict]:
+    enabled = set(names)
+    profiles = copy.deepcopy(DEFAULT_WORKER_PROFILES)
+    for profile in profiles:
+        profile["enabled"] = profile["name"] in enabled
+    return profiles
 
 
 def test_default_profiles_leave_room_for_bootstrap_and_explore():
@@ -58,12 +68,82 @@ def test_default_profiles_leave_room_for_bootstrap_and_explore():
 def test_default_profiles_have_agent_images():
     assert all(p.get("image") for p in DEFAULT_WORKER_PROFILES)
     by_name = {p["name"]: p["image"] for p in DEFAULT_WORKER_PROFILES}
-    assert by_name["pi-worker"] == "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"
+    assert by_name["pi-worker"] == "ctf-swarm-pi:0.2.0"
+
+
+def test_default_profiles_bind_pi_accounts():
+    by_name = {p["name"]: p for p in DEFAULT_WORKER_PROFILES}
+    assert by_name["pi-worker"]["credential_account"] == "pi-main"
+    for direction in (
+        "web", "pwn", "rev", "crypto", "misc", "forensics", "aisec"
+    ):
+        assert by_name[f"pi-{direction}"]["credential_account"] == f"pi-{direction}-main"
+
+
+def test_default_direction_profiles_use_direction_images():
+    expected = {
+        "pi-web": "ctf-swarm-pi-web:0.2.0",
+        "pi-pwn": "ctf-swarm-pi-pwn:0.2.0",
+        "pi-rev": "ctf-swarm-pi-rev:0.2.0",
+        "pi-crypto": "ctf-swarm-pi-crypto:0.2.0",
+        "pi-misc": "ctf-swarm-pi-misc:0.2.0",
+        "pi-forensics": "ctf-swarm-pi-forensics:0.2.0",
+        "pi-aisec": "ctf-swarm-pi-aisec:0.2.0",
+    }
+    by_name = {p["name"]: p["image"] for p in DEFAULT_WORKER_PROFILES}
+    for name, image in expected.items():
+        assert by_name[name] == image
+
+
+def test_default_profiles_use_flash_medium_and_equal_direction_priority():
+    by_name = {p["name"]: p for p in DEFAULT_WORKER_PROFILES}
+    assert by_name["pi-worker"]["model"] == "deepseek-v4-flash"
+    assert by_name["pi-worker"]["effort"] == "medium"
+    for direction in (
+        "web", "pwn", "rev", "crypto", "misc", "forensics", "aisec"
+    ):
+        profile = by_name[f"pi-{direction}"]
+        assert profile["model"] == "deepseek-v4-flash"
+        assert profile["effort"] == "medium"
+        assert profile["priority"] == 20
+
+
+def test_default_profiles_show_deepseek_base_url():
+    assert all(p["base_url"] == DEFAULT_DEEPSEEK_BASE_URL for p in DEFAULT_WORKER_PROFILES)
+
+
+def test_account_endpoint_overrides_deepseek_default(tmp_path, monkeypatch):
+    from dswarm.solver.credential_accounts import CredentialAccountStore, account_store_root
+
+    root = tmp_path / "sessions"
+    store = CredentialAccountStore(account_store_root(root))
+    store.upsert_secret(
+        account_id="pi-main",
+        engine="api",
+        secret="secret",
+        base_url="https://gateway.example/v1",
+        target_engine="pi",
+    )
+    cfg = WorkerConfigStore(root=root).get()
+    by_name = {p["name"]: p for p in cfg["worker_profiles"]}
+    assert by_name["pi-worker"]["base_url"] == "https://gateway.example/v1"
+
+
+def test_worker_profile_normalization_keeps_effort():
+    from dswarm.solver.worker_profiles import normalize_worker_profiles
+
+    profiles = normalize_worker_profiles([
+        {"id": "pi-web", "name": "pi-web", "engine": "pi", "effort": "high"}
+    ])
+    assert profiles[0]["effort"] == "high"
 
 
 def test_config_set_engines_dedupes_and_filters(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    cfg = wc.set(engines=["pi-worker", "bogus", "pi-worker", "pi-worker"])
+    cfg = wc.set(
+        engines=["pi-worker", "bogus", "pi-worker", "pi-worker"],
+        worker_profiles=_enabled_default_profiles("pi-worker"),
+    )
     assert cfg["engines"] == ["pi-worker"]
 
 
@@ -261,11 +341,11 @@ def test_config_set_clamps_start_workers_to_max_workers(tmp_path):
 
 
 def test_config_persists_across_reload(tmp_path):
-    WorkerConfigStore(root=tmp_path).set(engines=["pi-worker"], start_workers=1,
+    WorkerConfigStore(root=tmp_path).set(
+                                         engines=["pi-worker"], start_workers=1,
+                                         worker_profiles=_enabled_default_profiles("pi-worker"),
                                          max_workers=4, worker_backend="container",
-                                         race_scout=False, race_timeout=300,
                                          wall_clock_budget=1800,
-                                         race_engines=["pi-worker"],
                                          max_total_workers=11,
                                          cost_budget_usd=1.25,
                                          stage_policy={
@@ -285,7 +365,11 @@ def test_config_persists_across_reload(tmp_path):
                                              "titler": {"provider": "deepseek", "model": "titler-x"},
                                          })
     cfg = WorkerConfigStore(root=tmp_path).get()  # fresh load from disk
-    assert cfg["engines"] == ["pi-worker"]
+    enabled_system = next(
+        p for p in cfg["worker_profiles"]
+        if p.get("label") == "pi-worker" and p.get("enabled")
+    )
+    assert cfg["engines"] == [enabled_system["id"]]
     # max_workers is derived from the dispatched seat capacity; the default
     # pi-worker seat now has two slots for bootstrap plus explore.
     assert cfg["start_workers"] == 1 and cfg["max_workers"] == 3
@@ -293,7 +377,10 @@ def test_config_persists_across_reload(tmp_path):
     assert cfg["wall_clock_budget"] == 1800
     assert cfg["max_total_workers"] == 11
     assert cfg["cost_budget_usd"] == 1.25
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] == "pi-worker"
+    assert (
+        cfg["stage_policy"]["coordinator"]["review"]["engine"]
+        == enabled_system["id"]
+    )
     assert cfg["stage_policy"]["coordinator"]["review"]["timeout"] == 333
     assert cfg["stage_policy"]["coordinator"]["review"]["after_fruitless_workers"] == 2
     assert cfg["stage_policy"]["coordinator"]["review"]["candidate_spike_threshold"] == 4
@@ -304,8 +391,11 @@ def test_config_persists_across_reload(tmp_path):
 
 def test_resolve_uses_default_without_override(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(engines=["pi-worker", "pi-worker", "pi-worker"], start_workers=3,
-           worker_backend="container", race_timeout=240)
+    wc.set(
+        engines=["pi-worker", "pi-worker", "pi-worker"], start_workers=3,
+        worker_profiles=_enabled_default_profiles("pi-worker"),
+        worker_backend="container",
+    )
     r = wc.resolve("unsorted")  # a category with no default direction override
     assert r["engines"] == ["pi-worker"]
     assert r["start_workers"] == 3
@@ -316,8 +406,11 @@ def test_resolve_uses_default_without_override(tmp_path):
 
 def test_resolve_applies_category_override(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(engines=["pi-worker", "pi-worker", "pi-worker"],
-           overrides={"pwn": {"engines": ["pi-worker"], "start_workers": 2}})
+    wc.set(
+        engines=["pi-worker", "pi-worker", "pi-worker"],
+        worker_profiles=_enabled_default_profiles("pi-worker"),
+        overrides={"pwn": {"engines": ["pi-worker"], "start_workers": 2}},
+    )
     r = wc.resolve("pwn")
     assert r["engines"] == ["pi-worker"]
     assert r["start_workers"] == 2
@@ -327,24 +420,28 @@ def test_resolve_applies_category_override(tmp_path):
 
 def test_resolve_override_start_workers_defaults_to_engine_count(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    wc.set(overrides={"crypto": {"engines": ["pi-worker"]}})  # no start_workers
+    wc.set(
+        engines=["pi-worker"],
+        worker_profiles=_enabled_default_profiles("pi-worker"),
+        overrides={"crypto": {"engines": ["pi-worker"]}},  # no start_workers
+    )
     resolved = wc.resolve("crypto")
     assert resolved["start_workers"] == 1
     assert resolved["max_workers"] == 3
 
 
-def test_resolve_legacy_config_derives_category_capacity(tmp_path):
-    # Existing installs may have only the roster in _worker_config.json; the
-    # profiles are then hydrated from defaults. The category route routes each
-    # category to its DIRECTION profile and derives the ceiling from that
-    # profile's max_running instead of the global fallback of 10.
+def test_legacy_config_without_profile_enablement_stays_disabled(tmp_path):
+    # A roster-only legacy file has no per-direction enablement state. The new
+    # workspace must not silently launch fresh direction workers until the
+    # operator explicitly configures and enables them.
     (tmp_path / "_worker_config.json").write_text(
         '{"engines": ["pi-worker", "pi-worker"], "start_workers": 1}',
         encoding="utf-8",
     )
     resolved = WorkerConfigStore(root=tmp_path).resolve("web")
-    assert resolved["engines"] == ["pi-web"]
-    assert resolved["max_workers"] == 2
+    assert resolved["engines"] == []
+    assert resolved["start_workers"] == 0
+    assert resolved["max_workers"] == 0
 
 
 def test_direction_profile_names_are_real_not_aliases(tmp_path):
@@ -354,8 +451,8 @@ def test_direction_profile_names_are_real_not_aliases(tmp_path):
     assert {"pi-web", "pi-pwn", "pi-rev", "pi-crypto",
             "pi-misc", "pi-forensics", "pi-aisec"} <= set(by_name)
     # each direction profile carries its own image tag
-    assert by_name["pi-web"]["image"] == "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"
-    assert by_name["pi-rev"]["image"] == "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"
+    assert by_name["pi-web"]["image"] == "ctf-swarm-pi-web:0.2.0"
+    assert by_name["pi-rev"]["image"] == "ctf-swarm-pi-rev:0.2.0"
     # cleaning no longer collapses direction names to pi-worker
     cleaned = wc.get()  # stored engines untouched by defaults
     assert "pi-worker" in {p["name"] for p in cleaned["worker_profiles"]}
@@ -363,6 +460,10 @@ def test_direction_profile_names_are_real_not_aliases(tmp_path):
 
 def test_category_override_routes_each_direction(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
+    wc.set(worker_profiles=_enabled_default_profiles(
+        "pi-web", "pi-pwn", "pi-rev", "pi-crypto", "pi-misc",
+        "pi-forensics", "pi-aisec",
+    ))
     assert wc.resolve("web")["engines"] == ["pi-web"]
     assert wc.resolve("pwn")["engines"] == ["pi-pwn"]
     assert wc.resolve("reverse")["engines"] == ["pi-rev"]
@@ -373,7 +474,10 @@ def test_category_override_routes_each_direction(tmp_path):
 
 def test_clean_engines_matches_direction_names_case_insensitively(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
-    cleaned = wc.set(engines=["pi-AISEC", "pi-WEB"])
+    cleaned = wc.set(
+        engines=["pi-AISEC", "pi-WEB"],
+        worker_profiles=_enabled_default_profiles("pi-aisec", "pi-web"),
+    )
     assert cleaned["engines"] == ["pi-aisec", "pi-web"]
 
 
@@ -685,22 +789,21 @@ def test_account_base_url_hydrates_empty_binding_new_schema_pi_profile(tmp_path)
 
 
 def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
+    import dswarm.solver.cli_driver as cli_driver
+
     root = tmp_path / "_secrets" / "accounts" / "pi-main"
     root.mkdir(parents=True)
     (root / "API_KEY").write_text("secret\n")
 
     seen = {}
 
-    def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        seen["env"] = kwargs.get("env") or {}
-        return subprocess.CompletedProcess(
-            argv, 0,
-            '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n',
-            "",
-        )
+    def fake_probe_endpoint(profile, *, api_key, validate_model=False, **kwargs):
+        seen["profile"] = profile
+        seen["api_key"] = api_key
+        seen["validate_model"] = validate_model
+        return {"ok": True, "detail": "模型验证成功"}
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_driver, "probe_endpoint", fake_probe_endpoint)
     monkeypatch.setenv("DSWARM_PI_PROVIDER", "custom")
     missing = _missing_profile_accounts(
         worker_profiles=[{
@@ -720,10 +823,9 @@ def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
     )
 
     assert missing == []
-    # the endpoint probe is a direct curl to the configured base_url
-    assert seen["argv"][0] == "curl"
-    assert "https://api.deepseek.example/v1" in seen["argv"]
-    assert seen["env"]["OPENAI_API_KEY"] == "secret"
+    assert seen["profile"]["base_url"] == "https://api.deepseek.example/v1"
+    assert seen["api_key"] == "secret"
+    assert seen["validate_model"] is True
 
 
 def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path, monkeypatch):
@@ -763,10 +865,21 @@ def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path
     assert any("Reply with exactly: OK" in str(x) for x in seen["argv"])
 
 
-def test_offline_rejects_custom_endpoint_profiles(tmp_path):
+def test_offline_custom_endpoint_auto_relaxes_strict_network(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeSwarm:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self):
+            return type("Result", (), {"flag": None})()
+
+    monkeypatch.setattr("dswarm.swarm.swarm.Swarm", FakeSwarm)
     mgr = RunManager(sessions_root=tmp_path)
     driver = build_driver({
         "prompt": "solve http://example.test",
+        "reason_swarm": False,
         "offline": True,
         "engines": ["pi-endpoint"],
         "worker_profiles": [{
@@ -782,11 +895,103 @@ def test_offline_rejects_custom_endpoint_profiles(tmp_path):
             "enabled": True,
         }],
         "runtime_profiles": [{"id": "local", "backend": "local"}],
-    }, mgr=mgr)
+    })
     run = mgr.create("endpoint-offline")
 
-    with pytest.raises(RuntimeError, match="offline eval cannot use custom endpoint"):
-        asyncio.run(driver(run))
+    asyncio.run(driver(run))
+
+    assert captured["web_access"] is False
+    assert captured["kb"] is False
+    assert captured["runtime_profiles"] == [{"id": "local", "backend": "local"}]
+    async def collect_events():
+        return [ev async for ev in run.store.replay(run.run_id)]
+
+    events = asyncio.run(collect_events())
+    notice = [
+        ev.payload for ev in events
+        if getattr(ev, "event_type", None).value == "blackboard.delta"
+        and (ev.payload or {}).get("code") == "offline_endpoint_compat"
+    ]
+    assert notice and notice[0]["strict_offline_effective"] is False
+
+
+def test_offline_selected_seat_endpoint_does_not_raise_in_container_runtime(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeSwarm:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self):
+            return type("Result", (), {"flag": None})()
+
+    monkeypatch.setattr("dswarm.swarm.swarm.Swarm", FakeSwarm)
+    mgr = RunManager(sessions_root=tmp_path)
+    driver = build_driver({
+        "prompt": "solve http://node1.anna.nssctf.cn:26179/",
+        "reason_swarm": False,
+        "offline": True,
+        "engines": ["seat_pi_147fcb"],
+        "worker_profiles": [{
+            "id": "seat_pi_147fcb",
+            "name": "seat_pi_147fcb",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_mode": "api",
+            "credential_account": "seat_pi_147fcb",
+            "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+            "api_key_ref": "env:DSWARM_DEEPSEEK_API_KEY",
+            "runtime": "docker-web",
+            "enabled": True,
+        }],
+        "runtime_profiles": [{"id": "docker-web", "backend": "container", "network": "bridge"}],
+    })
+    run = mgr.create("seat-endpoint-offline")
+
+    asyncio.run(driver(run))
+
+    assert captured["web_access"] is False
+    assert captured["kb"] is False
+    assert captured["runtime_profiles"][0]["network"] == "bridge"
+
+
+def test_offline_without_endpoint_keeps_strict_network(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeSwarm:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self):
+            return type("Result", (), {"flag": None})()
+
+    monkeypatch.setattr("dswarm.swarm.swarm.Swarm", FakeSwarm)
+    mgr = RunManager(sessions_root=tmp_path)
+    driver = build_driver({
+        "prompt": "solve http://example.test",
+        "reason_swarm": False,
+        "offline": True,
+        "engines": ["pi-local"],
+        "worker_profiles": [{
+            "id": "pi-local",
+            "name": "pi-local",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "credential_mode": "subscription",
+            "credential_account": "pi-main",
+            "base_url": "",
+            "runtime": "docker-web",
+            "enabled": True,
+        }],
+        "runtime_profiles": [{"id": "docker-web", "backend": "container", "network": "bridge"}],
+    })
+    run = mgr.create("strict-offline")
+
+    asyncio.run(driver(run))
+
+    assert captured["web_access"] is False
+    assert captured["kb"] is False
+    assert captured["runtime_profiles"][0]["network"] == "none"
 
 
 # 鈹€鈹€ llm_profiles base_url (DESIGN 搂2.2 瑁滃挤A) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -802,17 +1007,19 @@ def test_llm_profiles_base_url_accepted_and_normalized(tmp_path):
     cfg = WorkerConfigStore(root=tmp_path).get()  # fresh load from disk
     # trimmed, persisted
     assert cfg["llm_profiles"]["planner"]["base_url"] == "https://api.openai-compat.test/v1"
-    # non-string garbage normalizes to empty (= default DeepSeek), never crashes
-    assert cfg["llm_profiles"]["titler"]["base_url"] == ""
+    # non-string garbage restores the visible DeepSeek default, never crashes
+    assert cfg["llm_profiles"]["titler"]["base_url"] == DEFAULT_DEEPSEEK_BASE_URL
     # no api key leaked into config under any common name
     assert "api_key" not in cfg["llm_profiles"]["planner"]
     assert "key" not in cfg["llm_profiles"]["planner"]
 
 
-def test_llm_profiles_base_url_defaults_empty(tmp_path):
+def test_llm_profiles_base_url_defaults_deepseek(tmp_path):
     cfg = WorkerConfigStore(root=tmp_path).get()
-    assert cfg["llm_profiles"]["planner"]["base_url"] == ""
-    assert cfg["llm_profiles"]["titler"]["base_url"] == ""
+    assert cfg["llm_profiles"]["planner"]["base_url"] == DEFAULT_DEEPSEEK_BASE_URL
+    assert cfg["llm_profiles"]["titler"]["base_url"] == DEFAULT_DEEPSEEK_BASE_URL
+    assert cfg["llm_profiles"]["planner"]["timeout"] == 120
+    assert cfg["llm_profiles"]["titler"]["effort"] == "low"
 
 
 # 鈹€鈹€ runtime-environment write-back (DESIGN 搂5) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -864,15 +1071,17 @@ def test_set_runtime_environment_keeps_direction_profile_names(tmp_path):
     local = store.set_runtime_environment(backend="local", runtime_id="local")
     local_ids = [p["id"] for p in local["worker_profiles"]]
     assert local_ids == DEFAULT_ENGINES
-    assert local["engines"] == local_ids
+    assert local["engines"] == []
     assert local["stage_policy"]["coordinator"]["review"]["engine"] == "pi-worker"
+    assert local["stage_policy"]["coordinator"]["review"]["enabled"] is False
     assert all(p["runtime"] == "local" for p in local["worker_profiles"])
 
     container = store.set_runtime_environment(backend="container", runtime_id="docker-web")
     container_ids = [p["id"] for p in container["worker_profiles"]]
     assert container_ids == DEFAULT_ENGINES
-    assert container["engines"] == container_ids
+    assert container["engines"] == []
     assert container["stage_policy"]["coordinator"]["review"]["engine"] == "pi-worker"
+    assert container["stage_policy"]["coordinator"]["review"]["enabled"] is False
     assert all(p["runtime"] == "docker-web" for p in container["worker_profiles"])
 
 
@@ -890,7 +1099,7 @@ def test_get_drops_stale_refs_and_falls_back_to_enabled_seats(tmp_path):
             "coordinator": {"review": {"enabled": True, "engine": "pi-worker-container"}},
         },
         "worker_profiles": [
-            {**DEFAULT_WORKER_PROFILES[0], "id": "pi-worker", "name": "pi-worker", "runtime": "local"},
+            {**DEFAULT_WORKER_PROFILES[0], "id": "pi-worker", "name": "pi-worker", "runtime": "local", "enabled": True},
         ],
     }
     root = tmp_path / "_worker_config.json"
@@ -921,3 +1130,27 @@ def test_set_runtime_environment_rejects_backend_runtime_mismatch(tmp_path):
         store.set_runtime_environment(backend="local", runtime_id="docker-web")
     with pytest.raises(ValueError, match="unknown runtime"):
         store.set_runtime_environment(backend="container", runtime_id="nope")
+
+
+def test_provider_bound_profile_drops_legacy_endpoint_fields():
+    from dswarm.solver.worker_profiles import normalize_worker_profile
+
+    profile = normalize_worker_profile({
+        "name": "pi-web",
+        "engine": "pi",
+        "enabled": True,
+        "model": "relay-model",
+        "provider_ref": "relay-main",
+        "credential_account": "legacy-unused",
+        "base_url": "https://old.example.test/v1",
+        "api_key_ref": "old-key",
+        "wire_api": "openai-responses",
+        "auth_mode": "x-api-key",
+        "auth_header": "X-API-Key",
+        "auth_prefix": "",
+    })
+    assert profile["provider_ref"] == "relay-main"
+    assert profile["credential_account"] == ""
+    assert profile["base_url"] == ""
+    assert profile["api_key_ref"] == ""
+    assert profile["wire_api"] == "auto"

@@ -49,6 +49,16 @@ export type PheromoneBand = "hot" | "warm" | "cool" | "faint" | "na";
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
 
+function isRuntimeInfraFindingText(x: unknown): boolean {
+  const s = String(x ?? "").trim().toLowerCase();
+  if (!s) return false;
+  if (s.includes("worker cli/runtime failed before producing solver output")) return true;
+  if (s.includes("profile_incompatible offline eval cannot use custom endpoint profile")) return true;
+  if (s.includes("unknown provider") && s.includes("dswarm-worker") && s.includes("--list-models")) return true;
+  if (s.includes("endpoint probe failed:") && (s.includes("curl:") || s.includes("requested url returned error"))) return true;
+  return false;
+}
+
 /** Parse an ISO-8601 UTC timestamp ("…Z") to epoch seconds; undefined on
  *  anything unparseable (missing/garbled field → N/A, never a throw). */
 export function parseIsoSec(v: unknown): number | undefined {
@@ -72,6 +82,8 @@ export function foldFindingUpserted(
   if (p.actor !== "projector") return findings;
   const kind = typeof p.kind === "string" && p.kind ? p.kind : p.delta_type;
   if (kind !== "finding_upserted") return findings;
+
+  if (isRuntimeInfraFindingText(p.target) || isRuntimeInfraFindingText(p.payload?.fact)) return findings;
 
   const sourceSeq = num(p.source_seq);
   const findingId =

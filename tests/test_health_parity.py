@@ -89,13 +89,21 @@ def _capture_kernel(monkeypatch):
 
     calls: list[tuple[str, str, str]] = []
 
-    def _fake(profile, *, backend, sessions_root, depth="auth"):
+    def _fake(profile, *, backend, sessions_root, depth="auth", llm_providers=None):
         pid = str(profile.get("name") or profile.get("id") or profile.get("engine"))
         calls.append((pid, backend, depth))
         return ProfileHealth(
-            profile_id=pid, engine=str(profile.get("engine") or ""), backend=backend,
-            status="ok", layer=None, blocker=None, detail="ok",
-            model=str(profile.get("model") or ""), account_id=str(profile.get("credential_account") or ""),
+            profile_id=pid,
+            engine=str(profile.get("engine") or ""),
+            backend=backend,
+            status="ok",
+            layer=None,
+            blocker=None,
+            detail="ok",
+            model=str(profile.get("model") or ""),
+            account_id=str(profile.get("credential_account") or ""),
+            binding_kind="explicit" if profile.get("credential_account") else "inherited",
+            effective_credential_id=str(profile.get("credential_account") or "pi-main"),
         )
 
     # dispatch imports the kernel lazily INSIDE _missing_profile_accounts, so patch
@@ -168,6 +176,22 @@ def test_settings_endpoint_feeds_kernel_same_tuple_at_auth_depth(tmp_path, monke
     with TestClient(app) as c:
         r = c.post("/api/settings/profiles/pi-local/health")
         assert r.status_code == 200
+        payload = r.json()
+
+    assert payload == {
+        "profile_id": seat_id,
+        "engine": "pi",
+        "backend": "container",
+        "status": "ok",
+        "layer": None,
+        "blocker": None,
+        "detail": "ok",
+        "model": "",
+        "account_id": "pi-main",
+        "binding_kind": "explicit",
+        "effective_credential_id": "pi-main",
+        "ok": True,
+    }
 
     by_pid = {c[0]: c for c in calls}
     # GOLDEN: the endpoint feeds the kernel the SAME (profile_id, backend, depth)
@@ -204,6 +228,22 @@ def test_settings_batch_endpoint_uses_binding_depth(tmp_path, monkeypatch):
     with TestClient(app) as c:
         r = c.get("/api/settings/profiles/health")
         assert r.status_code == 200
+        payload = r.json()
+
+    assert payload["profiles"] == [{
+        "profile_id": next(iter(wc.get()["seat_alias"].values())),
+        "engine": "pi",
+        "backend": "container",
+        "status": "ok",
+        "layer": None,
+        "blocker": None,
+        "detail": "ok",
+        "model": "",
+        "account_id": "pi-main",
+        "binding_kind": "explicit",
+        "effective_credential_id": "pi-main",
+        "ok": True,
+    }]
 
     assert calls, "batch endpoint must evaluate at least one profile"
     assert all(depth == "binding" for (_pid, _backend, depth) in calls)

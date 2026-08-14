@@ -41,9 +41,23 @@ function EmptyPanel({ label }: { label: string }) {
 function ReviewFindingsPanel({ deck }: { deck: DeckState }) {
   const t = useT();
   const rows = deck.blackboard.reviewFindings ?? [];
-  if (!rows.length) return <EmptyPanel label={t("panel.empty")} />;
+  const claims = deck.blackboard.unverifiedFlags ?? [];
+  if (!rows.length && !claims.length) return <EmptyPanel label={t("panel.empty")} />;
   return (
     <div className="artifact-list">
+      {claims.slice().reverse().map((c) => (
+        <div className="artifact-row" key={c.id}>
+          <div className="artifact-row-top">
+            <span className={`artifact-badge ${c.status === "invalidated" ? "bad" : "sev-warn"}`}>{t("panel.flagClaim")}</span>
+            <span className="artifact-row-title">{c.flag}</span>
+            {c.audit?.verdict && <span className="artifact-chip">{c.audit.verdict}</span>}
+          </div>
+          {c.reason && <div className="artifact-row-body">{c.reason}</div>}
+          {c.audit?.reason && <div className="artifact-row-body"><b>{t("panel.flagAudit")}:</b> {c.audit.reason}</div>}
+          {c.audit?.recommendedAction && <div className="artifact-row-body"><b>{t("panel.recommendedAction")}:</b> {c.audit.recommendedAction}</div>}
+          <div className="artifact-row-meta">{[c.actor, c.intentId, c.artifactId, c.seq ? `#${c.seq}` : ""].filter(Boolean).join(" · ")}</div>
+        </div>
+      ))}
       {rows.slice().reverse().map((r) => (
         <div className="artifact-row" key={r.id}>
           <div className="artifact-row-top">

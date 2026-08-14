@@ -184,12 +184,16 @@ def test_exec_argv_passes_only_whitelisted_env():
             "PATH": "/leak",
             "DEEPSEEK_API_KEY_FILE": "/run/dswarm/accounts/pi-main/API_KEY",
             "DEEPSEEK_API_KEY": "plain-secret",
+            "PI_CODING_AGENT_DIR": f"{CONTAINER_WORKSPACE}/homes/cli-pi/.pi/agent",
+            "PI_UNRELATED_SECRET": "nope",
         },
         driver_name="pi", tag="t1", timeout=600)
     assert "DSWARM_X=1" in cmd
     assert "ANTHROPIC_Y=2" in cmd
     assert "DEEPSEEK_API_KEY_FILE=/run/dswarm/accounts/pi-main/API_KEY" in cmd
     assert "DEEPSEEK_API_KEY=plain-secret" in cmd
+    assert f"PI_CODING_AGENT_DIR={CONTAINER_WORKSPACE}/homes/cli-pi/.pi/agent" in cmd
+    assert "PI_UNRELATED_SECRET=nope" not in cmd
     # host HOME/PATH must NOT be forwarded (the container has its own)
     assert "HOME=/leak" not in cmd
     assert "PATH=/leak" not in cmd
@@ -237,6 +241,42 @@ def _fake_docker_factory(calls):
             return type("R", (), {"returncode": 0, "stdout": "cid\n", "stderr": ""})()
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     return fake_docker
+
+
+def test_ensure_container_aborts_if_teardown_starts_mid_creation(monkeypatch, tmp_path):
+    """A stale startup thread must not recreate the run container after delete()."""
+    import dswarm.solver.container_exec as ce
+    import dswarm.solver.control_receiver as cr
+
+    calls = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[:2] == ("inspect", "-f"):
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no"})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    class _FakeRcv:
+        def expect(self, run_id, token):
+            pass
+        def forget(self, run_id):
+            pass
+
+    def teardown_during_chown(path, *, image):
+        ce.teardown_container("run-teardown-race")
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
+    monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
+    monkeypatch.setattr(ce, "_chown_tree_to_worker", teardown_during_chown)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
+
+    with pytest.raises(RuntimeError, match="teardown"):
+        ce.ensure_container("run-teardown-race", str(tmp_path / "ws"), image="img")
+
+    assert not any(call and call[0] == "run" for call in calls)
 
 
 @pytest.mark.posix

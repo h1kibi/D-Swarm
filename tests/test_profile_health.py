@@ -224,3 +224,62 @@ def test_binding_depth_never_probes(tmp_path, monkeypatch):
     )
     assert h.status == "ok"
     assert called["n"] == 0
+
+
+def test_provider_profile_ignores_stale_legacy_account(tmp_path, monkeypatch):
+    """A provider binding is authoritative; an old credential_account must not
+    block dispatch when the provider secret is present."""
+    from apps.web.llm_providers import LLMProviderSecretStore, provider_secret_root
+
+    store = LLMProviderSecretStore(provider_secret_root(tmp_path))
+    store.upsert_secret("relay", "provider-token")
+    monkeypatch.setattr(
+        "dswarm.solver.endpoint_probe.probe_endpoint",
+        lambda profile, **kwargs: {"ok": True, "detail": "provider ok"},
+    )
+    h = evaluate_profile_health(
+        {
+            "name": "seat_pi_test", "engine": "pi", "enabled": True,
+            "provider_ref": "relay", "credential_account": "deleted-old-account",
+            "credential_mode": "provider", "model": "relay-model",
+        },
+        backend="local", sessions_root=tmp_path, depth="auth",
+        llm_providers=[{
+            "id": "relay", "label": "Relay",
+            "base_url": "https://relay.example/v1",
+            "wire_api": "openai-chat", "auth_mode": "bearer",
+        }],
+    )
+    assert h.ok is True
+    assert h.binding_kind == "provider"
+    assert h.effective_credential_id == "relay"
+
+
+def test_provider_profile_missing_provider_is_blocked(tmp_path):
+    h = evaluate_profile_health(
+        {
+            "name": "seat_pi_test", "engine": "pi", "enabled": True,
+            "provider_ref": "missing-relay", "credential_account": "old",
+        },
+        backend="local", sessions_root=tmp_path, depth="binding",
+        llm_providers=[],
+    )
+    assert h.ok is False
+    assert h.status == "blocked"
+    assert h.binding_kind == "provider_missing"
+
+
+def test_provider_profile_missing_secret_is_blocked(tmp_path):
+    h = evaluate_profile_health(
+        {
+            "name": "seat_pi_test", "engine": "pi", "enabled": True,
+            "provider_ref": "relay", "credential_account": "old",
+        },
+        backend="local", sessions_root=tmp_path, depth="binding",
+        llm_providers=[{
+            "id": "relay", "base_url": "https://relay.example/v1",
+        }],
+    )
+    assert h.ok is False
+    assert h.status == "blocked"
+    assert h.binding_kind == "provider_secret_missing"

@@ -14,6 +14,7 @@ from dswarm.core.cost import Budget, CostController
 from dswarm.core.events import EventType
 from dswarm.models.solve_graph import Challenge
 from dswarm.solver import cli_solver
+from dswarm.solver import blackboard_skill
 from dswarm.solver.cli_driver import (
     PiDriver, StreamStep, DRIVERS,
     driver_for, get_driver, _kill_proc_tree,
@@ -134,7 +135,7 @@ def test_worker_env_blackboard_script_falls_back_to_deployed_for_installs(monkey
         flag_format="flag{...}",
     )
     # Simulate "no in-repo skill" so the install fallback path is exercised.
-    monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
+    monkeypatch.setattr(blackboard_skill, "_repo_blackboard_script", lambda: None)
 
     env = CliSolver(None, ch, engine="pi")._worker_env()
     assert env["DSWARM_BLACKBOARD_SCRIPT"].endswith(
@@ -547,21 +548,20 @@ def test_get_driver_unknown_name_raises_clear_error():
 
 
 def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
-    """#5: a FILE-backed Credential Account (api_key_ref empty, secret in a file)
-    must still get an auth header on the health probe. The old _api_key() only
-    handled env: refs and returned '' for file-backed 鈫?probe sent no auth header
-    (false-negative health even though the live worker authenticates fine)."""
-    seen = {}
+    """A file-backed key must reach the shared HTTP endpoint probe."""
+    import dswarm.solver.cli_driver as cli_driver
 
-    def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        seen["env"] = kwargs.get("env") or {}
-        return subprocess.CompletedProcess(
-            argv, 0,
-            '{"type":"turn.completed","usage":{}}\n',
-            "",
-        )
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    seen = []
+
+    def fake_probe_endpoint(profile, *, api_key, validate_model=False, **kwargs):
+        seen.append({
+            "profile": profile,
+            "api_key": api_key,
+            "validate_model": validate_model,
+        })
+        return {"ok": True, "detail": "模型验证成功"}
+
+    monkeypatch.setattr(cli_driver, "probe_endpoint", fake_probe_endpoint)
 
     # (a) explicit file: ref
     keyfile = tmp_path / "API_KEY"
@@ -572,20 +572,18 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
         "api_key_ref": f"file:{keyfile}",
     })
     assert drv.healthcheck() is True
-    assert seen["env"]["OPENAI_API_KEY"] == "file-secret-123", \
-        "#5: file: api_key_ref must be read and injected for the pi endpoint probe"
+    assert seen[-1]["api_key"] == "file-secret-123"
+    assert seen[-1]["validate_model"] is True
 
-    # (b) no ref, but the credential-injection *_API_KEY_FILE env is set (the
-    # container path) 鈫?still resolved.
-    seen.clear()
+    # (b) no ref, but the credential-injection *_API_KEY_FILE env is set.
     monkeypatch.setenv("OPENAI_API_KEY_FILE", str(keyfile))
     drv2 = driver_for({
         "name": "ds2", "engine": "pi", "transport": "pi_cli",
         "credential_mode": "api", "base_url": "https://ds.example",
     })
     assert drv2.healthcheck() is True
-    assert seen["env"]["OPENAI_API_KEY"] == "file-secret-123", \
-        "#5: *_API_KEY_FILE env fallback must be read for the pi endpoint probe"
+    assert seen[-1]["api_key"] == "file-secret-123"
+    assert seen[-1]["validate_model"] is True
 
 
 # 鈹€鈹€ engine binary resolution (pin official, skip broken third-party) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -955,6 +953,23 @@ def test_tool_result_css_brace_is_not_accepted_as_bare_flag():
     asyncio.run(s._emit_step(StreamStep("tool_result", text=css, raw=css)))
     assert s._already_found == set()
     assert s._stream_accepted == []
+    assert not any(
+        "live flag candidate" in str(e.payload.get("text", ""))
+        for e in s.bus.events
+    )
+
+
+def test_tool_result_javascript_brace_is_not_reported_as_flag_candidate():
+    from dswarm.solver.cli_driver import StreamStep
+    s = _flag_solver()
+    js = "else{messageDiv.appendChild(avatarDiv);messageDiv.appendChild(contentDiv);}\n"
+    asyncio.run(s._emit_step(StreamStep("tool_result", text=js, raw=js)))
+    assert s._already_found == set()
+    assert s._stream_accepted == []
+    assert not any(
+        "live flag candidate" in str(e.payload.get("text", ""))
+        for e in s.bus.events
+    )
 
 
 def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
@@ -1236,6 +1251,123 @@ def test_record_fact_db_failure_does_not_emit_blackboard_fact():
     assert fact_seq == -1
     assert "fact_added" not in _bb_kinds(bus.events)
 
+
+
+def test_cli_runtime_stderr_does_not_become_challenge_fact(monkeypatch):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+    calls = {"n": 0}
+
+    def fake_stream(*a, **k):
+        calls["n"] += 1
+        return CliResult(
+            text="", session="sess-x",
+            raw_stderr='Error: Unknown provider "dswarm-worker". Use --list-models to see available providers/models.',
+        )
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    outcome = asyncio.run(s.run())
+    kinds = _bb_kinds(bus.events)
+
+    assert calls["n"] == 1
+    assert outcome.solved is False
+    assert "fact_added" not in kinds
+    assert "worker_runtime_error" in kinds
+    concl = [e for e in bus.events
+             if e.event_type is EventType.BLACKBOARD_DELTA
+             and e.payload.get("kind") == "intent_concluded"][-1]
+    assert concl.payload.get("result") == "runtime_failure"
+    assert _worker_statuses(bus.events)[-1].payload["reason"] == "runtime_failure"
+
+
+def test_cli_runtime_provider_error_emits_diagnostic_and_recovery_directive(monkeypatch):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    s = CliSolver(
+        None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False,
+        worker_env={
+            "DSWARM_LLM_PROVIDER_REF": "deepseek-main",
+            "DSWARM_CREDENTIAL_ACCOUNT_ID": "acct-primary",
+        },
+    )
+
+    def fake_stream(*a, **k):
+        return CliResult(
+            text="",
+            session="sess-x",
+            raw_stderr="ConnectTimeout: connection reset by peer while calling provider",
+        )
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    outcome = asyncio.run(s.run())
+
+    provider_events = [e for e in bus.events if e.event_type is EventType.PROVIDER_ERROR]
+    assert provider_events, "runtime provider stderr must be visible to the UI"
+    diag = provider_events[-1].payload
+    assert diag["category"] == "transient_network"
+    assert diag["retryable"] is True
+    assert diag["should_pause_dispatch"] is False
+    assert diag["provider"] == "deepseek-main"
+    assert diag["account_id"] == "acct-primary"
+    assert diag["worker_id"] == s.solver_id
+
+    directives = [e.payload for e in bus.events
+                  if e.event_type is EventType.BLACKBOARD_DELTA
+                  and e.payload.get("kind") == "provider_recovery_directive"]
+    assert directives, "next worker must have a blackboard directive to consume"
+    assert directives[-1]["recovery_action"] == "retry_next_worker"
+    assert directives[-1]["current_worker_interrupted"] is False
+    assert "single-shot" in directives[-1]["operator_message"]
+    assert outcome.provider_error["category"] == "transient_network"
+
+
+def test_explore_runtime_stderr_does_not_become_challenge_fact(monkeypatch):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    s = CliSolver(
+        None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False,
+        mode="explore", intent_goal="try /admin")
+    calls = {"n": 0}
+
+    def fake_stream(*a, **k):
+        calls["n"] += 1
+        return CliResult(
+            text="", session="sess-x",
+            raw_stderr='Error: Unknown provider "dswarm-worker". Use --list-models to see available providers/models.',
+        )
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    outcome = asyncio.run(s.run())
+    kinds = _bb_kinds(bus.events)
+
+    assert calls["n"] == 1
+    assert outcome.solved is False
+    assert "fact_added" not in kinds
+    assert "worker_runtime_error" in kinds
+    concl = [e for e in bus.events
+             if e.event_type is EventType.BLACKBOARD_DELTA
+             and e.payload.get("kind") == "intent_concluded"][-1]
+    assert concl.payload.get("result") == "runtime_failure"
+    assert _worker_statuses(bus.events)[-1].payload["reason"] == "runtime_failure"
 
 def test_cli_solver_worker_status_reports_timeout(monkeypatch):
     from dswarm.solver import cli_solver as mod

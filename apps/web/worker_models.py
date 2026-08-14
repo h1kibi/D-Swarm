@@ -12,11 +12,10 @@ import os
 import shlex
 import subprocess
 import tempfile
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
-from dswarm.solver.cli_driver import driver_for
+from dswarm.solver.cli_driver import _insert_model_arg, _patched_env, driver_for
 from dswarm.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
     CredentialAccountStore,
@@ -24,6 +23,7 @@ from dswarm.solver.credential_accounts import (
     project_account_root,
     runtime_env_for_engine,
 )
+from dswarm.solver.docker import docker_run
 from dswarm.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
 
 
@@ -54,30 +54,7 @@ def worker_model_options_payload() -> dict[str, Any]:
     return {"allow_custom": True, "models": WORKER_MODEL_OPTIONS}
 
 
-def _insert_model(argv: list[str], model: str) -> list[str]:
-    model = (model or "").strip()
-    if not model or "--model" in argv or "-m" in argv:
-        return argv
-    if "--" in argv:
-        idx = argv.index("--")
-        return [*argv[:idx], "--model", model, *argv[idx:]]
-    if len(argv) <= 1:
-        return [*argv, "--model", model]
-    return [*argv[:-1], "--model", model, argv[-1]]
-
-
-@contextmanager
-def _patched_env(values: dict[str, str]) -> Iterator[None]:
-    old = {k: os.environ.get(k) for k in values}
-    try:
-        os.environ.update(values)
-        yield
-    finally:
-        for k, v in old.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+_insert_model = _insert_model_arg
 
 
 def _detail(returncode: int, stdout: str, stderr: str) -> str:
@@ -87,15 +64,7 @@ def _detail(returncode: int, stdout: str, stderr: str) -> str:
     return f"模型测试退出 {returncode}"
 
 
-def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["docker", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
+_docker = docker_run
 
 
 def _containerize_argv(engine: str, argv: list[str]) -> list[str]:

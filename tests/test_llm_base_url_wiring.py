@@ -123,6 +123,8 @@ def test_planner_uses_registered_pi_account_when_env_key_absent(monkeypatch):
     )
 
     monkeypatch.delenv("DSWARM_DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("DSWARM_DEEPSEEK_BASE_URL", raising=False)
     seen = {}
 
     class _LLM:
@@ -166,4 +168,4 @@ def test_planner_uses_registered_pi_account_when_env_key_absent(monkeypatch):
             asyncio.run(driver(run))
 
     assert seen.get("api_key") == "account-deepseek-key"
-    assert seen.get("base_url") is None
+    assert seen.get("base_url") == "https://api.deepseek.com/v1"

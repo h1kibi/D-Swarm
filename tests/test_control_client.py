@@ -274,11 +274,26 @@ def test_early_frames_before_started_are_not_lost(receiver):
     assert res.runtime_status["status"] == "finished"
 
 
+
+def test_teardown_run_forgets_receiver_link(receiver):
+    receiver.expect("run-teardown", "tok")
+    sup = _FakeSupervisor(receiver._test_port, "run-teardown", "tok")
+    assert sup.ack.get("ok") is True
+    assert receiver.await_link("run-teardown", deadline_s=2).alive is True
+
+    cc.teardown_run("run-teardown")
+
+    assert receiver.get_link("run-teardown") is None
+    assert receiver.has_link("run-teardown") is False
+
 def test_filter_env_only_allowed_keys():
     out = cc._filter_env({
         "DSWARM_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
         "OPENAI_API_KEY": "v", "PATH": "/leak", "HOME": "/leak", "HOME_OK": "x",
+        "PI_CODING_AGENT_DIR": "/home/kali/workspace/homes/cli-pi/.pi/agent",
+        "PI_UNRELATED_SECRET": "nope",
     })
     assert out == {"DSWARM_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
-                   "OPENAI_API_KEY": "v"}
+                   "OPENAI_API_KEY": "v",
+                   "PI_CODING_AGENT_DIR": "/home/kali/workspace/homes/cli-pi/.pi/agent"}
     assert cc._filter_env({"HOME": "/home/kali/workspace/h"}) == {"HOME": "/home/kali/workspace/h"}

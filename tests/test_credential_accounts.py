@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,10 @@ from dswarm.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
     CredentialAccountStore,
     account_store_root,
+    ensure_pi_account_from_env,
     runtime_env_for_engine,
 )
+from apps.web.run_manager import RunManager
 from dswarm.models.solve_graph import Challenge
 from dswarm.solver.cli_solver import CliSolver
 from dswarm.swarm.swarm import Swarm
@@ -18,6 +21,96 @@ from dswarm.swarm.swarm import Swarm
 
 def test_account_store_root_is_sessions_secret_side_table(tmp_path):
     assert account_store_root(tmp_path) == tmp_path / "_secrets" / "accounts"
+
+
+def test_ensure_pi_account_from_env_writes_pi_main(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-key")
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "1")
+
+    assert ensure_pi_account_from_env(tmp_path) is True
+    acct = CredentialAccountStore(account_store_root(tmp_path)).inspect("pi-main")
+    assert acct is not None and acct.present
+    key = (account_store_root(tmp_path) / "pi-main" / "API_KEY").read_text(
+        encoding="utf-8"
+    )
+    assert key.strip() == "env-key"
+
+
+def test_ensure_pi_account_from_env_creates_direction_accounts(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-key")
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "1")
+
+    assert ensure_pi_account_from_env(tmp_path) is True
+    root = account_store_root(tmp_path)
+    for account_id in (
+        "pi-main",
+        "pi-web-main",
+        "pi-pwn-main",
+        "pi-rev-main",
+        "pi-crypto-main",
+        "pi-misc-main",
+        "pi-forensics-main",
+        "pi-aisec-main",
+    ):
+        acct = CredentialAccountStore(root).inspect(account_id)
+        assert acct is not None and acct.present
+
+
+def test_ensure_pi_account_from_env_does_not_overwrite_existing_api_key(
+    tmp_path, monkeypatch
+):
+    root = account_store_root(tmp_path)
+    CredentialAccountStore(root).upsert_secret(
+        account_id="pi-main", engine="pi", secret="custom-key"
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-key")
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "1")
+
+    ensure_pi_account_from_env(tmp_path)
+
+    key = (root / "pi-main" / "API_KEY").read_text(encoding="utf-8").strip()
+    assert key == "custom-key"
+
+
+def test_ensure_pi_account_from_env_respects_disable_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-key")
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "0")
+
+    assert ensure_pi_account_from_env(tmp_path) is False
+    assert not (account_store_root(tmp_path) / "pi-main" / "API_KEY").exists()
+
+
+def test_ensure_pi_account_from_env_never_overwrites_custom_endpoint(
+    tmp_path, monkeypatch
+):
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    store.upsert_secret(
+        account_id="pi-main",
+        engine="api",
+        secret="custom-key",
+        base_url="https://custom.example/v1",
+        target_engine="pi",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-key")
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "1")
+
+    assert ensure_pi_account_from_env(tmp_path) is True
+    assert (root / "pi-main" / "API_KEY").read_text(encoding="utf-8").strip() == "custom-key"
+    assert (root / "pi-main" / "BASE_URL").read_text(encoding="utf-8").strip() == "https://custom.example/v1"
+    assert (root / "pi-web-main" / "API_KEY").exists()
+
+
+def test_run_manager_auto_binds_pi_main(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "run-manager-key")
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "1")
+
+    RunManager(sessions_root=tmp_path)
+
+    key = (account_store_root(tmp_path) / "pi-main" / "API_KEY").read_text(
+        encoding="utf-8"
+    )
+    assert key.strip() == "run-manager-key"
 
 
 def test_pi_container_prefers_key_file_without_reading_secret(tmp_path, monkeypatch):
@@ -119,9 +212,11 @@ def test_credential_account_store_masks_and_replaces_material(tmp_path):
         account_id="shared-main", engine="pi", secret="pi-secret")
     assert pi_acct["account_id"] == "shared-main"
     assert pi_acct["engine"] == "pi"
-    # Secrets are now ECHOED (operator opted into edit-in-place); the key is
-    # surfaced as details.secret_value so the UI can show/edit it.
-    assert pi_acct["details"]["secret_value"] == "pi-secret"
+    assert pi_acct["details"]["has_secret"] is True
+    assert "secret_value" not in pi_acct["details"]
+    assert "pi-secret" not in json.dumps(pi_acct)
+    # Trusted runtime consumers can still inspect the raw material in process.
+    assert store.inspect("shared-main").details["secret_value"] == "pi-secret"
 
     # a custom-endpoint re-save replaces the key material in place.
     api = store.upsert_secret(
@@ -155,7 +250,8 @@ def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path, monkeypat
         target_engine="pi",
     )
     assert acct["engine"] == "pi"
-    assert acct["details"]["secret_value"] == "deepseek-key"   # echoed for edit
+    assert acct["details"]["has_secret"] is True
+    assert "secret_value" not in acct["details"]
 
     monkeypatch.setenv("DSWARM_PI_PROVIDER", "custom")
     pi_env = runtime_env_for_engine(
@@ -192,10 +288,8 @@ def test_custom_endpoint_records_target_engine_for_binding(tmp_path, monkeypatch
     assert env["OPENAI_API_KEY"] == "endpoint-key"
 
 
-def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
-    """The panel echoes BOTH the base_url and the API key so the operator can see
-    and edit them in place (secrets are deliberately surfaced — see
-    _read_secret_value's security note). inspect() and list() agree."""
+def test_custom_endpoint_exposes_base_url_but_keeps_secret_write_only(tmp_path):
+    """Public account metadata includes endpoint state, never raw credentials."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     acct = store.upsert_secret(
@@ -204,12 +298,15 @@ def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
 
     assert acct["details"]["base_url_value"] == "https://api.deepseek.com/v1"
     assert acct["details"]["base_url"] is True
-    assert acct["details"]["secret_value"] == "sk-super-secret"
-    # inspect()/list() agree (list() echoes secrets for every account)
+    assert acct["details"]["has_secret"] is True
+    assert "secret_value" not in acct["details"]
+    # inspect() remains the trusted in-process path used by runtime code.
     assert store.inspect("deepseek-main").details["secret_value"] == "sk-super-secret"
     listed = [a for a in store.list() if a["account_id"] == "deepseek-main"][0]
     assert listed["details"]["base_url_value"] == "https://api.deepseek.com/v1"
-    assert listed["details"]["secret_value"] == "sk-super-secret"
+    assert listed["details"]["has_secret"] is True
+    assert "secret_value" not in listed["details"]
+    assert "sk-super-secret" not in json.dumps(listed)
 
 
 def test_custom_endpoint_without_base_url_reports_api_key_mode(tmp_path):
@@ -223,14 +320,15 @@ def test_custom_endpoint_without_base_url_reports_api_key_mode(tmp_path):
     assert "base_url_value" not in acct["details"]
 
 
-def test_secret_value_echoed_for_pi_accounts(tmp_path):
-    """A pi key account's key is echoed as details.secret_value so the UI can
-    show/edit it. An empty/absent account exposes no secret_value."""
+def test_pi_account_secret_is_write_only_in_public_metadata(tmp_path):
+    """Public writes report presence while inspect() retains trusted secret access."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
 
     pi_acct = store.upsert_secret(account_id="pi-main", engine="pi", secret="pi-key")
-    assert pi_acct["details"]["secret_value"] == "pi-key"
+    assert pi_acct["details"]["has_secret"] is True
+    assert "secret_value" not in pi_acct["details"]
+    assert store.inspect("pi-main").details["secret_value"] == "pi-key"
 
     # an empty account (no material) has no secret_value key at all
     (root / "ghost").mkdir()

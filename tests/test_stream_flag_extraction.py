@@ -424,6 +424,47 @@ async def test_non_rejected_flag_still_accepted_on_fresh_worker(tmp_path):
     assert await sv2._accept_flag("flag{a}") is False
 
 
+
+
+@pytest.mark.asyncio
+async def test_unverified_found_flag_is_recorded_in_shared_graph(tmp_path):
+    bus = EventBus()
+    seen: list[dict] = []
+
+    async def _sink(ev: Event) -> None:
+        if ev.event_type == EventType.BLACKBOARD_DELTA and (ev.payload or {}).get("kind") == "flag_unverified":
+            seen.append(dict(ev.payload or {}))
+
+    bus.add_sink(_sink)
+    sv, sg = _graph_solver(bus, tmp_path, label="cli-claim")
+    claimed = "flag{hallucinated_claim}"
+
+    await sv._surface_unverified_flags(f"Final answer only: FOUND_FLAG={claimed}\n")
+
+    assert seen and seen[0]["flag"] == claimed
+    assert seen[0]["seq"] > 0
+    assert sg.snapshot().flags == []
+    claims = sg.unverified_flags()
+    assert [c["flag"] for c in claims] == [claimed]
+
+
+@pytest.mark.asyncio
+async def test_review_flag_audit_marker_records_proposal(tmp_path):
+    bus = EventBus()
+    sv, sg = _graph_solver(bus, tmp_path, label="cli-review")
+    sv.mode = "review"
+    actions = sv._extract_review_actions(
+        'FLAG_AUDIT={"flag":"flag{claimed}","verdict":"likely_hallucination",'
+        '"reason":"only in prose","recommended_action":"ignore unless reproduced"}\n'
+    )
+
+    assert actions[0][0] == "FLAG_AUDIT"
+    assert await sv._apply_review_actions(actions) == 1
+    evs = sg.events_since(0, kinds=["review_proposal"])
+    assert evs[-1]["payload"]["marker"] == "FLAG_AUDIT"
+    assert evs[-1]["payload"]["payload"]["verdict"] == "likely_hallucination"
+
+
 @pytest.mark.asyncio
 async def test_rejected_flag_block_in_worker_prompt(tmp_path):
     """The known-bad value is surfaced in the worker prompt so the LLM stops

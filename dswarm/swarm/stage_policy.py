@@ -15,7 +15,6 @@ class BudgetPolicy:
 @dataclass(frozen=True)
 class StagePolicy:
     prepare: dict[str, Any] = field(default_factory=dict)
-    race: dict[str, Any] = field(default_factory=dict)
     # the main multi-phase solve loop's policy (wall_clock_budget etc).
     coordinator: dict[str, Any] = field(default_factory=dict)
     budgets: BudgetPolicy = field(default_factory=BudgetPolicy)
@@ -30,7 +29,6 @@ class StagePolicy:
         cost_budget = budgets.get("cost_budget_usd")
         return StagePolicy(
             prepare=dict(raw.get("prepare") or {}),
-            race=dict(raw.get("race") or {}),
             coordinator=dict(raw.get("coordinator") or {}),
             budgets=BudgetPolicy(
                 max_total_workers=(int(max_total) if max_total not in (None, "", 0) else None),
@@ -41,7 +39,6 @@ class StagePolicy:
     def model_dump(self) -> dict[str, Any]:
         return {
             "prepare": dict(self.prepare),
-            "race": dict(self.race),
             "coordinator": dict(self.coordinator),
             "budgets": {
                 "max_total_workers": self.budgets.max_total_workers,

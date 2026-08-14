@@ -386,134 +386,12 @@ sandbox.require = function (id) {{
     _run_ui_node(script)
 
 
-def test_worker_settings_redesigned_ia():
-    """Settings panel IA after the v2 redesign (left tab rail + right content) and
-    the health self-check unification (per-profile readiness, single source of
-    truth shared with the dispatch precheck).
-
-    CONTRACT: the panel is organised by the docs/07 §6.4 pi-only groups —
-    runtime · pi · reasonswarm — not the old flat profile table. Account readiness is
-    PER PROFILE with a three honest states badge (not the old per-engine
-    "an account exists ⇒ green" inference that let a run die on profile_unhealthy
-    while the page showed green). This pins the new shape so a future edit can't
-    silently regress it.
-    """
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
-    css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
-
-    # ── intent tabs (the v2 left rail) ───────────────────────────────────────
-    for tab in ("tabRuntime", "tabPi", "tabReason"):
-        assert f't("settings.{tab}")' in src, f"missing intent tab {tab}"
-
-    # ── credential block CHANGES FACE by run environment ─────────────────────
-    assert 'workerBackend === "container"' in src
-    assert 't("settings.acctSub")' in src        # container: every engine needs an account
-    assert 't("settings.credLocalNote")' in src  # local: system-login note
-    # system-login status is consumed for local mode
-    assert "getSystemLogin" in src and "sysLogin" in src
-
-    # ── run environment = one container per run: backend + recipe ─────────────
-    assert "putRuntimeEnvironment" in src
-    assert "alignProfileRefs" in src
-    assert "worker_backend: workerBackend" in src
-
-    # ── reasoning models: base_url configurable, key NOT in the panel (.env) ──
-    assert "llmBaseUrl" in src
-    assert "base_url: llmBaseUrl" in src
-    assert "testLlmEndpoint" in src
-
-    # ── worker execution models: profile-level selector + real model probe ────
-    assert "getWorkerModelOptions" in src
-    assert "testWorkerProfileModel" in src
-    assert "customModel" in src
-    assert "runModelTest" in src
-    assert "customModelOpen" in src
-    assert 'if (v === "__custom__")' in src
-    assert "setCustomModelOpen((cur) => ({ ...cur, [p.id]: true }))" in src
-    assert 'updateProfile(p.id, { model: "__custom__" })' not in src
-    assert "enabledDispatchRefs" in src
-    assert "profileCapacity(workerProfiles)" in src
-    assert "alignProfileRefs(enabledDispatchRefs(profilesToSave), profilesToSave, workerProfiles)" in src
-    assert "profileCapacity(workerProfiles, engines)" not in src
-    # Saving normalizes runtime first, then writes profiles — the runtime response
-    # must not overwrite model edits already made in the modal.
-    assert "currentById" in src
-    assert "runtime: p.runtime" in src
-
-    # ── HEALTH SELF-CHECK UNIFICATION (single source of truth) ────────────────
-    # Readiness comes from the server's per-profile health, NOT a client-side
-    # per-engine guess. The old engine-dimension inference is GONE.
-    assert "fetchProfilesHealth" in src and "testProfileHealth" in src
-    assert "profileHealth" in src
-    assert "accountForEngine" not in src, "engine-dimension health inference must be gone"
-    assert "missingEngines" not in src, "engine-dimension badge must be gone"
-    # the account tab renders PER PROFILE (ws2-acct rows), with three honest states.
-    # (profileAuthFailed takes an interpolated {layer} arg, so match the t(" prefix
-    # rather than a bare closing paren.)
-    assert "ws2-acct" in src
-    for key in ("acctUnbound", "profileVerified", "profileUnverified", "profileAuthFailed"):
-        assert f't("settings.{key}"' in src, f"missing three-state key {key}"
-    # the badge has an explicit "bound but unverified" state (not a false green)
-    assert '"settings.healthAcctUnverified"' in i18n
-
-    # ── account test wired (the "测连通" button stays a button) ───────────────
-    assert "testCredentialAccount" in src        # still used by the registration form
-    assert 't("settings.testConn")' in src
-    assert "saveAndTestAccount" in src
-    assert 't("settings.saveAndTest")' in src
-    assert '"settings.saveAndTest"' in i18n
-
-        # ── pi-only roster: codex one-click re-auth from the host is gone ────────
-    assert "importHostCodexAuth" not in src
-    assert "importCodexFromHost" not in src
-    assert "settings.importHostCodex" not in src
-    assert "settings.importHostCodex" not in i18n
-    assert 'p.engine === "codex"' not in src
-
-    # local-vs-container is explicit: tests run against the CURRENT run env and
-    # say so (account test labels the backend; self-check probes the right env).
-    assert "backendLabel" in src
-    assert 't("settings.testsAgainst")' in src
-    assert "getEngineHealth(workerBackend)" in src   # self-check follows backend
-    assert 't("settings.selfcheckContainerNote")' in src
-    assert '"settings.selfcheckContainerNote"' in i18n
-
-    # the old flat 13-col profile table + dead subscription-mode columns are GONE
-    assert 'className="ws-profile-table"' not in src
-    assert "api_key_ref" not in src
-
-    # i18n for the still-present notes
-    assert '"settings.credLocalNote"' in i18n
-    assert '"settings.reasonKeyNote"' in i18n
 
 
-def test_custom_endpoint_account_form_binds_to_agent():
-    """A custom endpoint must declare WHICH agent it overrides — not leave it to an
-    undiscoverable account-id naming convention. The form gains an agent selector
-    that auto-aligns the id and is persisted as target_engine."""
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
-
-    # the selector only shows for the custom-endpoint type, beside base_url
-    assert 't("settings.accountTargetEngine")' in src
-    assert "accountApiEngine" in src
-    assert "onAccountApiEngineChange" in src
-    # id auto-aligns to the <engine>-main reference unless the operator customized it
-    assert "isDefaultLikeAccountId" in src
-    assert "-main`" in src
-    # the chosen agent is persisted so inspect()/display can bind it (not orphan "api")
-    assert "target_engine: accountApiEngine" in src
-    # custom-endpoint accounts read back as registered for their agent + labelled
-    assert 'acct?.mode === "custom_endpoint"' in src
-    assert 't("settings.modeCustomEndpoint")' in src
-    # i18n present
-    assert '"settings.accountTargetEngine"' in i18n
-    assert '"settings.modeCustomEndpoint"' in i18n
 
 
 def test_worker_settings_no_longer_emits_race_controls():
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
+    src = (UI_ROOT / "components" / "WorkerSettingsWorkspace.tsx").read_text()
 
     assert "race_engines: nextEngines" not in src
     assert "race: { enabled: raceScout, timeout: raceTimeout, engines: nextEngines }" not in src
@@ -565,6 +443,62 @@ sandbox.require = function (id) {{
         assert(s.blackboard.pocs[0].worker === "cli-b", "claim owner stored");
         assert(s.model.nodes.some((n) => n.id === "poc:poc-1" && n.type === "poc"), "poc graph node");
         assert(s.blackboard.events.some((e) => e.kind === "poc_concluded"), "timeline event");
+        """
+    )
+    _run_ui_node(script)
+
+
+def test_events_reducer_suppresses_runtime_infra_facts_from_views():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+const __modCache = {{}};
+sandbox.require = function (id) {{
+  if (!id.startsWith(".")) return require(id);
+  const p = "lib/" + id.slice(2) + ".ts";
+  if (__modCache[p]) return __modCache[p].exports;
+  const src2 = fs.readFileSync(p, "utf-8");
+  const out2 = ts.transpileModule(src2, {{ compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }} }}).outputText;
+  const m = {{ exports: {{}} }};
+  __modCache[p] = m;
+  const sb = {{ module: m, exports: m.exports, require: sandbox.require }};
+  vm.runInNewContext(out2, sb, {{ filename: p }});
+  return m.exports;
+}};
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        const infra = '[pi] Error: Unknown provider "dswarm-worker". Use --list-models to see available providers/models.';
+        let s = lib.emptyDeck("run-infra");
+        s = lib.reduce(s, {{ event_type: lib.EventType.SOLVE_GRAPH_DELTA, run_id: "run-infra", ts: 1,
+          solver_id: "cli-pi", payload: {{ kind: "evidence_added", fact: infra }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.SHARED_GRAPH_DELTA, run_id: "run-infra", ts: 2,
+          solver_id: "cli-pi", payload: {{ fact_seq: 3, fact: infra, verified: false, actor: "cli-pi" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-infra", ts: 3,
+          solver_id: "cli-pi", payload: {{ kind: "fact_added", fact_seq: 3, fact: infra, verified: false, actor: "cli-pi" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-infra", ts: 4,
+          solver_id: "projector", payload: {{ kind: "finding_upserted", actor: "projector", finding_id: "f-infra", finding_kind: "TEXT_FACT", target: infra, source_seq: 3, payload: {{ fact: infra }} }} }});
+
+        assert(s.graph.evidence.length === 0, "solve graph evidence should skip infra stderr");
+        assert(s.sharedGraph.candidates.length === 0, "shared candidates should skip infra stderr");
+        assert(s.blackboard.facts.length === 0, "blackboard facts should skip infra stderr");
+        assert(s.model.nodes.every((n) => !(String(n.label || '').includes('dswarm-worker'))), "radar should not render infra fact nodes");
+        assert(s.findings.length === 0, "pheromone findings should skip projected infra stderr");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-infra", ts: 5,
+          solver_id: "cli-pi", payload: {{ kind: "fact_added", fact_seq: 4, fact: "/robots.txt exposes /admin", verified: false, actor: "cli-pi" }} }});
+        assert(s.blackboard.facts.length === 1, "normal challenge facts still render");
+        assert(s.blackboard.facts[0].fact === "/robots.txt exposes /admin", "normal fact text preserved");
         """
     )
     _run_ui_node(script)
@@ -1914,7 +1848,7 @@ async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, mo
                 flag = None
             return O()
 
-    def fake_missing(*, worker_profiles, runtime_profiles, sessions_root):
+    def fake_missing(*, worker_profiles, runtime_profiles, sessions_root, llm_providers=None):
         captured["precheck_profiles"] = worker_profiles
         return []
 
@@ -2267,11 +2201,42 @@ def test_infer_challenge_keeps_explicit_crypto_hint_outside_url():
     assert body["challenge"]["category"] == "crypto"
 
 
-def test_worker_settings_exposes_profile_image():
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
-    assert "settings.profileImage" in src
-    assert "image: ev.target.value" in src
-    assert '"settings.profileImage"' in i18n
-    assert "settings.runtimeImages" in src
-    assert '"settings.runtimeImages"' in i18n
+
+
+def test_worker_settings_uses_main_ui_typography():
+    css = (UI_ROOT / "app" / "globals.css").read_text()
+    shell_rule = css.split(".wsw-shell {", 1)[1].split("}", 1)[0]
+
+    # Match the deck body exactly: monospace body copy with the shared type scale.
+    assert "font: var(--fs-body, 13.5px)/1.6 var(--font-mono);" in shell_rule
+    assert "var(--font-sans)" not in shell_rule
+
+    # Worker actions should use the same monospace control face as the main deck.
+    assert "font: 700 15px var(--font-mono); cursor: pointer;" in css
+    assert "font: 700 11px var(--font-mono); transition: .15s ease;" in css
+
+def test_worker_settings_endpoint_editor_contract():
+    workspace = (UI_ROOT / "components" / "WorkerSettingsWorkspace.tsx").read_text()
+    api = (UI_ROOT / "lib" / "useRun.ts").read_text()
+    draft = (UI_ROOT / "lib" / "workerSettingsDraft.ts").read_text()
+    css = (UI_ROOT / "app" / "globals.css").read_text()
+
+    for token in (
+        'value="openai-chat"',
+        'value="openai-responses"',
+        'value="x-api-key"',
+        'value="custom"',
+        'keyValue',
+        'fetchModels',
+        'validateModel',
+        'role="separator"',
+        'onPointerDown={startResize}',
+        'onDoubleClick={resetSplit}',
+    ):
+        assert token in workspace
+    assert '/api/settings/workers/probe' in api
+    assert 'api_key: apiKey' in api
+    assert '{ key: "misc", id: "pi-misc", label: "杂项", category: "misc" }' in draft
+    assert '--bg: #0f1724;' in css
+    assert '--panel: #172235;' in css
+    assert '.wsw-splitter' in css

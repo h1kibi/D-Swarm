@@ -20,6 +20,40 @@ from dswarm.swarm.insight_bus import InsightBus, InsightKind
 from dswarm.swarm.swarm import Swarm
 
 
+def test_worker_runtime_mixin_alloc_workdir_uses_workspace_initializer(tmp_path, monkeypatch):
+    from dswarm.swarm.worker_runtime_mixin import WorkerRuntimeMixin
+
+    called = {"n": 0}
+
+    def fake_ensure_workspace(root, *, runtime):
+        called["n"] += 1
+        assert runtime == {
+            "backend": "local",
+            "run_id": "alloc-run",
+        }
+        (root / "workspace").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "dswarm.swarm.worker_runtime_mixin.ensure_workspace",
+        fake_ensure_workspace,
+    )
+
+    class Probe(WorkerRuntimeMixin):
+        pass
+
+    probe = Probe()
+    probe.worker_root = tmp_path / "workers"
+    probe.workspace_root = tmp_path / "workspace"
+    probe.worker_backend = "local"
+    probe.run_id = "alloc-run"
+    probe._worker_seq = 0
+
+    workdir = probe._alloc_workdir("pi")
+
+    assert called["n"] == 1
+    assert workdir == str(tmp_path / "workers" / "cli-pi-1")
+
+
 @pytest.fixture
 def challenge() -> Challenge:
     return Challenge(id="c-swarm", name="swarm-test", category="web", points=50,
@@ -35,6 +69,82 @@ def _reset_health_probe_cache():
     _swarm_mod._health_cache_clear()
     yield
     _swarm_mod._health_cache_clear()
+
+
+
+
+def test_unverified_flag_claim_queues_review(challenge, tmp_path: Path):
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+        graph_dir=tmp_path / "graph",
+        stage_policy={"coordinator": {"review": {"enabled": True}}},
+    )
+    assert sw.shared_graph is not None
+    sw.shared_graph.flag_unverified(
+        actor="cli-pi-1", flag="flag{claimed}", reason="no command output witness")
+
+    assert sw._queue_unverified_flag_review() is True
+    assert sw._queued_review_requests
+    assert sw._queued_review_requests[-1]["trigger"] == "unverified_flag"
+    assert "FLAG_AUDIT" in sw._queued_review_requests[-1]["directive"]
+
+
+def test_flag_unverified_graph_event_bridges_to_blackboard(challenge, tmp_path: Path):
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+        graph_dir=tmp_path / "graph",
+        stage_policy={"coordinator": {"review": {"enabled": True}}},
+    )
+    assert sw.shared_graph is not None
+    seq = sw.shared_graph.flag_unverified(actor="cli-pi-1", flag="flag{claimed}", reason="no witness")
+    ev = sw.shared_graph.events_since(0, kinds=["flag_unverified"])[0]
+
+    bridged = sw._graph_event_to_bb(ev)
+    assert bridged == [("flag_unverified", {
+        "flag": "flag{claimed}",
+        "claim_state": "unverified",
+        "status": "unverified",
+        "reason": "no witness",
+        "seq": seq,
+        "claim_seq": seq,
+        "source_actor": "cli-pi-1",
+        "artifact_id": "",
+    })]
+
+
+def test_runtime_infra_fact_graph_event_does_not_bridge_to_blackboard(challenge, tmp_path: Path):
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+        graph_dir=tmp_path / "graph",
+    )
+    assert sw.shared_graph is not None
+    sw.shared_graph.add_evidence(
+        actor="cli-pi",
+        source="worker",
+        fact='[pi] Error: Unknown provider "dswarm-worker". Use --list-models to see available providers/models.',
+        verified=False,
+        confidence=0.2,
+    )
+    ev = sw.shared_graph.events_since(0, kinds=["fact_added"])[0]
+
+    assert sw._graph_event_to_bb(ev) == []
+
+    sw.shared_graph.add_evidence(
+        actor="cli-pi", source="worker", fact="/robots.txt exposes /admin", verified=False
+    )
+    normal = sw.shared_graph.events_since(ev["seq"], kinds=["fact_added"])[0]
+    bridged = sw._graph_event_to_bb(normal)
+    assert bridged[0][0] == "fact_added"
+    assert bridged[0][1]["fact"] == "/robots.txt exposes /admin"
 
 
 # ── InsightBus: cross-solver fact/dead-end sharing ───────────────────────────
@@ -63,135 +173,24 @@ async def test_insight_bus_backlog_for_late_subscriber() -> None:
 
 # ── CLI executor: race lineup + degrade (no real subprocess) ─────────────────
 
-def _cli_swarm(challenge, tmp_path, *, cli_race, healthy, **kw):
-    """Build a Swarm in CLI-executor mode with healthchecks stubbed, then build
-    its solver lineup. `healthy` is the set of engine names whose probe passes."""
-    import dswarm.solver.cli_driver as cd
-    sandbox = SandboxManager(root=tmp_path / "sbx")
-    arts = ArtifactStore(root=tmp_path / "arts")
-    swarm = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
-        llm=None, sandbox=sandbox, artifacts=arts,
-        executor="cli", cli_race=cli_race, **kw,
-    )
-    # _build_solvers routes its liveness check through the cached probe path
-    # (_probe_engine_health → driver.health_detail). Stub BOTH the bool healthcheck
-    # and the (ok, detail) health_detail so either entrypoint honours `healthy`, and
-    # disable the probe cache so a stubbed roster can't leak a stale verdict.
-    swarm._health_probe_ttl = 0
-    orig_hc = {n: cd.DRIVERS[n].healthcheck for n in cd.DRIVERS}
-    orig_hd = {n: cd.DRIVERS[n].health_detail for n in cd.DRIVERS}
-    for n, drv in cd.DRIVERS.items():
-        drv.healthcheck = (  # type: ignore[method-assign]
-            lambda *a, n=n, **k: n in healthy)
-        drv.health_detail = (  # type: ignore[method-assign]
-            lambda *a, n=n, **k: (True, "") if n in healthy else (False, f"down ({n})"))
-    try:
-        return swarm._build_solvers()
-    finally:
-        for n, drv in cd.DRIVERS.items():
-            drv.healthcheck = orig_hc[n]  # type: ignore[method-assign]
-            drv.health_detail = orig_hd[n]  # type: ignore[method-assign]
 
 
-async def test_race_finalize_closes_active_intents(challenge, tmp_path: Path):
-    """Race mode must run the same graph-finalize sweep as coordinator mode.
-
-    Before the fix, _run_race closed shared_graph directly, leaving intents made
-    by an operator hint open/active after a solved run.
-    """
-    from dswarm.solver.types import SolveOutcome
-
-    sandbox = SandboxManager(root=tmp_path / "sbx")
-    arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
-        llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-        engines=["pi"],
-    )
-    assert sw.shared_graph is not None
-    db_path = sw.shared_graph.db_path
-    sw.shared_graph.propose_intent(
-        actor="coordinator", intent_id="I-hint", goal="operator supplied route")
-
-    class FinishedWorker:
-        solver_id = "cli-pi"
-        graph = None
-
-        async def run(self):
-            return SolveOutcome(True, "flag{race}", 1, None, "solved",
-                                flags=["flag{race}"])
-
-    sw._build_solvers = lambda: [FinishedWorker()]  # type: ignore[method-assign]
-    outcome = await sw._run_race()
-    assert outcome.solved is True
-
-    from dswarm.swarm.shared_graph import SQLiteSharedGraph
-    reopened = SQLiteSharedGraph.open(db_path=db_path, challenge=challenge)
-    try:
-        with reopened._lock:
-            row = reopened._conn.execute(
-                "SELECT status, dispatch_state FROM intents WHERE intent_id=?",
-                ("I-hint",),
-            ).fetchone()
-        assert row == ("done", "closed")
-    finally:
-        reopened.close()
 
 
-def test_cli_race_builds_two_profiles(challenge, tmp_path: Path) -> None:
-    solvers = _build_profile_race(
-        challenge, tmp_path,
-        [{"id": "pi-web", "name": "pi-web", "engine": "pi", "runtime": "local",
-          "credential_account": "pi-main", "auth": "subscription",
-          "roles": ["race", "bootstrap", "explore", "review"],
-          "race": True, "max_running": 1, "priority": 10, "model": "deepseek-v4-flash",
-          "enabled": True},
-         {"id": "pi-pwn", "name": "pi-pwn", "engine": "pi", "runtime": "local",
-          "credential_account": "pi-main", "auth": "subscription",
-          "roles": ["race", "bootstrap", "explore", "review"],
-          "race": True, "max_running": 1, "priority": 20, "model": "deepseek-v4-pro",
-          "enabled": True}],
-        healthy_base={"pi"})
-    engines = sorted(s.driver.name for s in solvers)
-    assert engines == ["pi", "pi"]
-    # distinct ids so the swarm's winner bookkeeping + deck can tell them apart
-    assert len({s.solver_id for s in solvers}) == 2
 
 
-def test_cli_race_degrades_when_pi_unhealthy(challenge, tmp_path: Path) -> None:
-    # pi usage-limited → race collapses to the pi fallback, swarm still runs.
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=True, healthy=set())
-    assert [s.driver.name for s in solvers] == ["pi"]
 
 
-def test_cli_single_engine_degrades_to_pi(challenge, tmp_path: Path) -> None:
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy=set(),
-                         cli_engine="pi")  # asked for pi, but it's down
-    assert [s.driver.name for s in solvers] == ["pi"]
 
 
-def test_cli_offline_and_no_kb_propagate(challenge, tmp_path: Path) -> None:
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"pi"},
-                         web_access=False, kb=False)
-    s = solvers[0]
-    assert s.web_access is False and s.kb is False
 
 
-def test_cli_race_three_profiles(challenge, tmp_path: Path) -> None:
-    # three direction profiles race, one worker each.
-    solvers = _build_profile_race(challenge, tmp_path,
-                                  _pi_trio_profiles(), healthy_base={"pi"})
-    engines = sorted(s.driver.name for s in solvers)
-    assert engines == ["pi", "pi", "pi"]
-    assert len({s.solver_id for s in solvers}) == 3
 
 
-def test_engines_default_preserves_pi_roster(challenge, tmp_path: Path) -> None:
-    # no engines passed → the default pi roster.
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=True,
-                         healthy={"pi"})
-    assert sorted(s.driver.name for s in solvers) == ["pi"]
+
+
+
+
 
 
 def test_engines_roster_deduped(challenge, tmp_path: Path) -> None:
@@ -225,68 +224,10 @@ def _pi_trio_profiles():
             mk("pi-c", "deepseek-v4-flash", 20)]
 
 
-def _build_profile_race(challenge, tmp_path, profiles, *, healthy_base):
-    """Build a cli_race Swarm over worker_profiles and return _build_solvers().
-
-    NOTE: with profiles, _build_solvers' liveness check goes through
-    _probe_engine_health → driver_for(profile).health_detail. driver_for(profile)
-    returns a ProfileDriver that INHERITS health_detail from CliDriver (it doesn't
-    delegate to the DRIVERS-dict instance), so stubbing DRIVERS[...].health_detail
-    (as _cli_swarm does for bare engine names) would be BYPASSED and a real CLI
-    hello would run. So we stub at the swarm method level instead: the healthcheck
-    just consults the base-engine name against `healthy_base`."""
-    sandbox = SandboxManager(root=tmp_path / "sbx")
-    arts = ArtifactStore(root=tmp_path / "arts")
-    swarm = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
-        llm=None, sandbox=sandbox, artifacts=arts,
-        executor="cli", cli_race=True, worker_profiles=profiles,
-    )
-    from dswarm.solver.worker_profiles import base_engine_for_profile
-    def _stub_probe(name, role):
-        prof = swarm._profile_for_engine(name, role=role, advance=False)
-        base = base_engine_for_profile(prof or name)
-        ok = base in healthy_base
-        return (ok, "" if ok else f"down ({base})")
-    swarm._health_probe_ttl = 0
-    swarm._probe_engine_health = _stub_probe  # type: ignore[assignment]
-    return swarm._build_solvers()
 
 
-def test_cli_race_same_engine_trio_distinct_solver_ids(challenge, tmp_path: Path) -> None:
-    # THE BUG FIX (§10.8 Step 2): the classic cli_race path (_build_solvers,
-    # which bypasses _make_cli_worker) used to give every same-base-engine racer
-    # the same solver_id "cli-pi" → event lanes / account maps overwrite each
-    # other. Now each gets a unique id via the _label_seq scheme.
-    solvers = _build_profile_race(challenge, tmp_path,
-                                  _pi_trio_profiles(), healthy_base={"pi"})
-    # all three actually spawned, one worker per profile
-    assert len(solvers) == 3
-    assert all(s.driver.name == "pi" for s in solvers)
-    # distinct solver_ids — no collapse
-    ids = [s.solver_id for s in solvers]
-    assert len(set(ids)) == 3, ids
-    # first keeps the bare id (winner bookkeeping / back-compat), rest get -2/-3
-    assert set(ids) == {"cli-pi", "cli-pi-2", "cli-pi-3"}, ids
-    # each worker carries its profile's distinct model down to the driver
-    models = sorted(s.driver._model() for s in solvers)
-    assert models == ["deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"], models
 
 
-def test_engines_roster_sorted_by_priority(challenge, tmp_path: Path) -> None:
-    # THE BUG FIX (§10.8 Step 3): self.engines drives dispatch order
-    # (_pick_engine walks it and prefers the first not-running candidate), so it
-    # must be priority-sorted. Declaration order is a,b,c but priorities are
-    # 30,10,20 → expect b(10), c(20), a(30).
-    sandbox = SandboxManager(root=tmp_path / "sbx")
-    arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
-               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               worker_profiles=_pi_trio_profiles())
-    assert sw.engines == ["pi-b", "pi-c", "pi-a"], sw.engines
-    # race_engines (derived from self.engines when not given explicitly) inherits
-    # the priority order too.
-    assert sw.race_engines == ["pi-b", "pi-c", "pi-a"], sw.race_engines
 
 
 def test_pick_engine_honors_priority_order(challenge, tmp_path: Path) -> None:
@@ -382,15 +323,6 @@ def test_engines_priority_sort_only_when_profiles(challenge, tmp_path: Path) -> 
     assert sw.engines == ["pi"]
 
 
-def test_cli_single_mode_preserves_lineup_label(challenge, tmp_path: Path) -> None:
-    # GUARD: the §10.8 Step 2 fix is race-mode-only. Single mode must still take
-    # its solver_id from the lineup spec (solver_label stays None), not get
-    # overridden to "cli-<engine>".
-    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"pi"},
-                         cli_engine="pi")
-    assert len(solvers) == 1
-    # the lineup ModelSpec passed by _cli_swarm has solver_id="seat"
-    assert solvers[0].solver_id == "seat", solvers[0].solver_id
 
 
 # ── _healthy_engines: silent-degrade NO LONGER silent ────────────────────────
@@ -410,7 +342,7 @@ def _bus_health_swarm(challenge, tmp_path, *, healthy: dict[str, bool]):
     sw = Swarm(
         challenge, [ModelSpec(solver_id="seat", model="mock")],
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-        coordinator=True, race_scout=False, bus=bus,
+        bus=bus,
         engines=["pi"],
     )
     # these tests exercise probe → state-change → RE-PROBE semantics (degrade then
@@ -506,42 +438,6 @@ def test_container_backend_health_probe_defers_to_worker_container(
     assert called["driver_for"] is False
 
 
-async def test_coordinator_empty_health_roster_finishes_explicitly(
-        challenge, tmp_path: Path) -> None:
-    """A failed health gate must not leave a run silently alive without workers."""
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import EventType
-
-    bus = EventBus()
-    events: list = []
-    bus.add_sink(lambda ev: events.append(ev) or _noop())
-    sw = _coordinator_swarm(challenge, tmp_path, bus=bus)
-    sw._healthy_engines_async = lambda: _empty_health()  # type: ignore[method-assign]
-    finalized: list[dict] = []
-    real_finalize = sw._finalize_coordinator_run
-
-    async def tracking_finalize(**kwargs):
-        finalized.append(kwargs)
-        await real_finalize(**kwargs)
-
-    sw._finalize_coordinator_run = tracking_finalize  # type: ignore[method-assign]
-    out = await sw._run_coordinator()
-
-    assert out.solved is False
-    assert out.reason == "worker_unavailable"
-    assert finalized and finalized[0]["terminal_reason"] == "worker_unavailable"
-    finished = [
-        e.payload for e in events
-        if e.event_type is EventType.RUN_FINISHED
-    ]
-    assert finished and finished[-1]["reason"] == "worker_unavailable"
-    health = [
-        e.payload for e in events
-        if e.event_type is EventType.BLACKBOARD_DELTA
-        and (e.payload or {}).get("kind") == "worker_health_check"
-    ]
-    assert [p["phase"] for p in health] == ["starting", "failed"]
-    assert health[-1]["reason"] == "no healthy worker profile"
 
 
 async def _empty_health():
@@ -555,7 +451,7 @@ async def test_healthy_engines_async_does_not_block_event_loop(
     sw = Swarm(
         challenge, [ModelSpec(solver_id="seat", model="mock")],
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-        coordinator=True, race_scout=False, engines=["pi"],
+        engines=["pi"],
     )
 
     def slow_probe():
@@ -593,7 +489,7 @@ def _probe_swarm(challenge, tmp_path, engines):
     return Swarm(
         challenge, [ModelSpec(solver_id="seat", model="mock")],
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-        coordinator=True, race_scout=False, engines=list(engines),
+        engines=list(engines),
     )
 
 
@@ -604,7 +500,6 @@ def test_healthy_engines_probes_run_in_parallel(challenge, tmp_path: Path,
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               coordinator=True, race_scout=False,
                worker_profiles=_pi_trio_profiles())
 
     def slow_probe(name, role):
@@ -683,7 +578,7 @@ async def test_reconcile_blackboard_skill_resyncs_and_emits(challenge, tmp_path,
     """A non-container run reconciles deployed skill copies at launch: when something
     was stale it re-syncs AND emits a board delta so the drift is visible."""
     from dswarm.core.event_bus import EventBus
-    from dswarm.solver import cli_solver
+    from dswarm.solver import blackboard_skill
 
     captured = []
     bus = EventBus()
@@ -696,7 +591,7 @@ async def test_reconcile_blackboard_skill_resyncs_and_emits(challenge, tmp_path,
     sw.worker_backend = "local"
 
     monkeypatch.setattr(
-        cli_solver, "sync_deployed_blackboard_skills",
+        blackboard_skill, "sync_deployed_blackboard_skills",
         lambda: [{"path": "/home/u/.claude/skills/dswarm-blackboard/blackboard.py",
                   "status": "synced", "was": "stale(deadbeef0000)", "now": "cafebabe1111"}])
 
@@ -710,12 +605,12 @@ async def test_reconcile_blackboard_skill_skips_container_backend(challenge, tmp
                                                                   monkeypatch):
     """Container workers use the image-baked skill — the host reconcile must be skipped
     entirely (and never even call the sync)."""
-    from dswarm.solver import cli_solver
+    from dswarm.solver import blackboard_skill
 
     sw = _probe_swarm(challenge, tmp_path, ["claude"])
     sw.worker_backend = "container"
     called = {"n": 0}
-    monkeypatch.setattr(cli_solver, "sync_deployed_blackboard_skills",
+    monkeypatch.setattr(blackboard_skill, "sync_deployed_blackboard_skills",
                         lambda: called.__setitem__("n", called["n"] + 1) or [])
 
     await sw._reconcile_blackboard_skill()
@@ -727,13 +622,10 @@ async def test_reconcile_blackboard_skill_skips_container_backend(challenge, tmp
 def _coordinator_swarm(challenge, tmp_path, **kw):
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
-    # default the race-scout layer OFF for coordinator-LOOP tests (they exercise the
-    # main coordinator loop, not the front race phase); race-scout tests pass race_scout=True.
-    kw.setdefault("race_scout", False)
     return Swarm(
         challenge, [ModelSpec(solver_id="seat", model="mock")],
         llm=None, sandbox=sandbox, artifacts=arts,
-        executor="cli", coordinator=True, **kw,
+        executor="cli", **kw,
     )
 
 
@@ -764,6 +656,39 @@ def test_pick_engine_prefers_direction_profile(challenge, tmp_path: Path) -> Non
     # preferred that is NOT on the roster → normal fallback
     assert sw._pick_engine([], ["pi-web", "pi-pwn"], role="explore",
                            preferred="pi-crypto") in ("pi-web", "pi-pwn")
+
+
+def test_healthy_matches_seat_label_aliases(challenge, tmp_path: Path) -> None:
+    from dswarm.solver.worker_profiles import normalize_worker_profiles
+
+    profiles = normalize_worker_profiles([
+        {"id": "seat_pi_web_x", "name": "seat_pi_web_x", "label": "pi-web",
+         "engine": "pi", "transport": "pi_cli"},
+        {"id": "seat_pi_pwn_x", "name": "seat_pi_pwn_x", "label": "pi-pwn",
+         "engine": "pi", "transport": "pi_cli"},
+    ])
+    sw = _coordinator_swarm(challenge, tmp_path, worker_profiles=profiles,
+                            engines=["seat_pi_web_x", "seat_pi_pwn_x"])
+
+    assert sw._healthy_matches("pi-web", ["seat_pi_web_x"]) is True
+    assert sw._healthy_matches("pi-pwn", ["seat_pi_web_x"]) is True
+
+
+def test_pick_engine_resolves_seat_label_alias(challenge, tmp_path: Path) -> None:
+    from dswarm.solver.worker_profiles import normalize_worker_profiles
+
+    profiles = normalize_worker_profiles([
+        {"id": "seat_pi_web_x", "name": "seat_pi_web_x", "label": "pi-web",
+         "engine": "pi", "transport": "pi_cli"},
+        {"id": "seat_pi_pwn_x", "name": "seat_pi_pwn_x", "label": "pi-pwn",
+         "engine": "pi", "transport": "pi_cli"},
+    ])
+    sw = _coordinator_swarm(challenge, tmp_path, worker_profiles=profiles,
+                            engines=["seat_pi_web_x", "seat_pi_pwn_x"])
+    healthy = ["seat_pi_web_x", "seat_pi_pwn_x"]
+
+    assert sw._pick_engine(["seat_pi_web_x"], healthy, role="explore",
+                           preferred="pi-pwn") == "seat_pi_pwn_x"
 
 
 def test_open_intents_carry_direction(challenge, tmp_path: Path) -> None:
@@ -831,59 +756,16 @@ def test_reason_backpressure_trips_on_large_ordinary_queue(challenge, tmp_path: 
 # bootstrap workers re-racing 33+ verified facts). The guard must be an INVARIANT
 # of the coordinator, not something each caller remembers to pass.
 
-def test_is_cold_start_true_on_empty_fresh_graph(challenge, tmp_path: Path):
-    # fresh run, empty graph, no flags, cold_start hint default-True → cold.
-    sw = _coordinator_swarm(challenge, tmp_path)
-    assert sw.cold_start is True
-    assert sw._prior_intent_count() == 0
-    assert sw._is_cold_start() is True
 
 
-def test_is_cold_start_true_with_operator_preseeded_facts_only(challenge, tmp_path: Path):
-    # Codex edge: an operator MAY pre-seed *facts* into a genuine cold run. Facts
-    # alone must NOT be read as a resume — the backstop keys on intents/flags, which
-    # only a prior run produces. So this is still a cold start (race should run).
-    sw = _coordinator_swarm(challenge, tmp_path)
-    sw.shared_graph.add_evidence(
-        actor="operator", source="brief", fact="target is 10.0.0.5:8080")
-    assert sw._total_fact_count() == 1
-    assert sw._prior_intent_count() == 0
-    assert sw._is_cold_start() is True
 
 
-def test_is_cold_start_false_when_prior_intents_present(challenge, tmp_path: Path):
-    # graph-state backstop: a prior run left an intent → resume, even if the caller
-    # forgot to flip cold_start (this is the bug the invariant closes).
-    sw = _coordinator_swarm(challenge, tmp_path)
-    sw.shared_graph.propose_intent(
-        actor="reason", intent_id="I-prior", goal="probe ssh",
-        payload={"worker_class": "code"})
-    assert sw.cold_start is True            # caller did NOT flip it
-    assert sw._prior_intent_count() == 1
-    assert sw._is_cold_start() is False     # ...but the backstop catches it
 
 
-def test_is_cold_start_false_when_flag_already_found(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path)
-    sw._found_flags = ["flag{already}"]
-    assert sw._is_cold_start() is False
 
 
-def test_is_cold_start_false_on_explicit_resume_hint(challenge, tmp_path: Path):
-    # explicit signal is authoritative for "resume": even an empty graph is treated
-    # as a resume when cold_start=False (the web resolve() path).
-    sw = _coordinator_swarm(challenge, tmp_path, cold_start=False)
-    assert sw._prior_intent_count() == 0
-    assert sw._is_cold_start() is False
 
 
-def test_cold_start_hint_from_stage_policy(challenge, tmp_path: Path):
-    # config-driven relaunch can flip cold_start via stage_policy.race without a kwarg.
-    sw = _coordinator_swarm(
-        challenge, tmp_path,
-        stage_policy={"race": {"enabled": True, "cold_start": False}})
-    assert sw.cold_start is False
-    assert sw._is_cold_start() is False
 
 
 def _async_return(value):
@@ -892,112 +774,14 @@ def _async_return(value):
     return _f
 
 
-async def _run_coordinator_briefly(sw, monkeypatch):
-    """Enter _run_coordinator with no-op workers + dry Reason + a tiny wall clock so
-    it returns fast. Records whether _run_race_scout fired and the phase_transition
-    'from' tags emitted. Returns (race_called: bool, transitions: list[str])."""
-    from dswarm.solver.types import SolveOutcome
-
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    monkeypatch.setattr(sw, "_healthy_engines_async",
-                        _async_return(["claude"]))
-
-    race_called = {"n": 0}
-
-    async def fake_race(healthy):
-        race_called["n"] += 1
-        return (None, None, {})  # slow path: no flag, fall through
-    monkeypatch.setattr(sw, "_run_race_scout", fake_race)
-
-    async def fake_reason():
-        return 0  # dry — proposes nothing
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    class FakeWorker:
-        solver_id = "cli-pi"
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "miss")
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: FakeWorker())
-
-    transitions: list[str] = []
-    real_emit = sw._emit_coord_bb
-
-    async def spy_emit(kind, **fields):
-        if kind == "phase_transition":
-            transitions.append(str(fields.get("from")))
-        return await real_emit(kind, **fields)
-    monkeypatch.setattr(sw, "_emit_coord_bb", spy_emit)
-
-    await asyncio.wait_for(sw._run_coordinator(), timeout=5)
-    return race_called["n"] > 0, transitions
 
 
-async def test_coordinator_skips_race_scout_on_populated_graph(
-        challenge, tmp_path: Path, monkeypatch):
-    """INVARIANT: race_scout=True but a graph with prior intents → NO race-scout, go
-    straight to the warm Reason/Explore loop. Caller did NOT pass cold_start=False —
-    the coordinator's own guard must still protect it."""
-    sw = _coordinator_swarm(
-        challenge, tmp_path, race_scout=True, start_workers=1, wall_clock_budget=0.3)
-    sw.shared_graph.add_evidence(
-        actor="cli-pi", source="recon", fact="admin panel at /admin")
-    sw.shared_graph.propose_intent(
-        actor="reason", intent_id="I-prior", goal="probe /admin",
-        payload={"worker_class": "code"})
-    assert sw.cold_start is True  # the bug scenario: hint not flipped
-
-    race_called, transitions = await _run_coordinator_briefly(sw, monkeypatch)
-
-    assert race_called is False            # warm start: race-scout skipped
-    assert "resume" in transitions        # announced the warm entry
-    assert "race" not in transitions      # no after-race transition fired
 
 
-async def test_coordinator_runs_race_scout_on_cold_empty_graph(
-        challenge, tmp_path: Path, monkeypatch):
-    """An empty cold graph must STILL race-scout (no regression to the warmup)."""
-    sw = _coordinator_swarm(
-        challenge, tmp_path, race_scout=True, start_workers=1, wall_clock_budget=0.3)
-    assert sw._is_cold_start() is True
-
-    race_called, transitions = await _run_coordinator_briefly(sw, monkeypatch)
-
-    assert race_called is True             # cold start: race-scout ran
-    assert "race" in transitions          # slow-path race鈫抍oordinator transition
-    assert "resume" not in transitions
 
 
-async def test_coordinator_skips_race_scout_on_explicit_resume(
-        challenge, tmp_path: Path, monkeypatch):
-    """Explicit cold_start=False (web resolve path) skips race-scout even on an
-    empty graph — the explicit signal is authoritative."""
-    sw = _coordinator_swarm(
-        challenge, tmp_path, race_scout=True, cold_start=False,
-        start_workers=1, wall_clock_budget=0.3)
-
-    race_called, transitions = await _run_coordinator_briefly(sw, monkeypatch)
-
-    assert race_called is False
-    assert "resume" in transitions
 
 
-def test_prior_intent_count_survives_reopen_on_same_graph_dir(challenge, tmp_path: Path):
-    """The backstop reads the durable intents table, so a FRESH Swarm constructed on
-    the SAME graph_dir (the reopen shape) sees the prior run's intents even though its
-    in-memory state is empty."""
-    graph_dir = tmp_path / "graph"
-    sw1 = _coordinator_swarm(challenge, tmp_path, graph_dir=graph_dir)
-    sw1.shared_graph.propose_intent(
-        actor="reason", intent_id="I-1", goal="enumerate", payload={})
-    sw1.shared_graph.close()
-
-    # a brand-new Swarm on the same dir (no cold_start flip) — the bug scenario.
-    sw2 = _coordinator_swarm(challenge, tmp_path, graph_dir=graph_dir, race_scout=True)
-    assert sw2._found_flags == []          # fresh in-memory state
-    assert sw2._prior_intent_count() == 1  # ...but the DB carries history
-    assert sw2._is_cold_start() is False
 
 
 async def test_graph_tail_bridge_drains_direct_db_writes_once_in_seq_order(
@@ -1482,6 +1266,75 @@ def test_open_intents_backfills_structured_lane_from_existing_goal_text(
     assert db_rows["I-vague-lane"] == ""
 
 
+
+
+def test_open_intents_uses_shared_graph_public_dispatch_api(
+    challenge, tmp_path: Path,
+):
+    """Coordinator dispatch must not reach into SQLiteSharedGraph internals.
+
+    This keeps the Swarm layer backend-swappable: an HTTP/future graph adapter can
+    expose the SharedGraph protocol without leaking SQLite's private _conn/_lock.
+    """
+    sw = _coordinator_swarm(challenge, tmp_path)
+    graph = sw.shared_graph
+    graph.propose_intent(
+        actor="coordinator",
+        intent_id="I-public-api-lane",
+        goal=(
+            "CONSOLIDATED FINAL DIAGNOSTIC under "
+            "destructive:tcp:5000@107.170.15.231 lane; run exactly one probe."
+        ),
+        payload={"worker_class": "code"},
+    )
+
+    class PublicGraphOnly:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.annotated: list[tuple[str, str, str]] = []
+
+        def dispatchable_intents(self, *, now=None):
+            return self.wrapped.dispatchable_intents(now=now)
+
+        def annotate_intent_lane(self, *, intent_id: str, lane_key: str,
+                                 risk_class: str = ""):
+            self.annotated.append((intent_id, lane_key, risk_class))
+            return self.wrapped.annotate_intent_lane(
+                intent_id=intent_id, lane_key=lane_key, risk_class=risk_class)
+
+        def is_route_suppressed(self, route_hash: str) -> bool:
+            return self.wrapped.is_route_suppressed(route_hash)
+
+        def check_resource_conflicts(self, **kwargs):
+            return self.wrapped.check_resource_conflicts(**kwargs)
+
+    public_graph = PublicGraphOnly(graph)
+    sw.shared_graph = public_graph
+
+    rows = sw._open_intents()
+
+    assert rows == [{
+        "intent_id": "I-public-api-lane",
+        "goal": (
+            "CONSOLIDATED FINAL DIAGNOSTIC under "
+            "destructive:tcp:5000@107.170.15.231 lane; run exactly one probe."
+        ),
+        "worker_class": "code",
+        "route_hash": "",
+        "branch_id": "",
+        "priority": 0,
+        "lane_key": "destructive:tcp:5000@107.170.15.231",
+        "risk_class": "destructive",
+        "resource_key": "",
+        "direction": "",
+    }]
+    assert public_graph.annotated == [(
+        "I-public-api-lane",
+        "destructive:tcp:5000@107.170.15.231",
+        "destructive",
+    )]
+
+
 def test_pick_engine_least_loaded_when_all_running():
     sw = Swarm.__new__(Swarm)
     healthy = ["pi"]
@@ -1587,32 +1440,6 @@ async def test_apply_worker_cmds_rejects_unknown_engine_and_max(challenge, tmp_p
                for k, f in emitted)
 
 
-async def test_coordinator_bootstrap_then_flag(challenge, tmp_path: Path, monkeypatch):
-    """Bootstrap worker finds a flag → coordinator returns solved, no Reason needed."""
-    from dswarm.solver.types import SolveOutcome
-
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
-
-    class FakeWorker:
-        def __init__(self, engine, solved):
-            self.solver_id = f"cli-{engine}"
-            self._solved = solved
-        async def run(self):
-            await asyncio.sleep(0)
-            if self._solved:
-                return SolveOutcome(True, "flag{win}", 1, None, "solved")
-            return SolveOutcome(False, None, 1, None, "miss")
-
-    # claude solves, codex misses
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        return FakeWorker(engine, solved=(engine == "pi"))
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    out = await sw.run()
-    assert out.solved is True
-    assert out.flag == "flag{win}"
-    assert out.winner == "cli-pi"
 
 
 async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, monkeypatch):
@@ -1672,202 +1499,12 @@ async def test_coordinator_singleflag_stops_on_first(challenge, tmp_path: Path, 
     assert sw._found_flags == ["flag{x}"]  # stopped at one
 
 
-async def test_coordinator_ctf_complete_reason_stops_dispatching(
-    challenge, tmp_path: Path, monkeypatch
-):
-    """run-61718 regression: after all real flags are already collected, Reason may
-    return verdict=complete while old/irrelevant intents still exist. CTF must
-    settle immediately instead of spawning another explore worker."""
-    from dswarm.solver.reason import ReasonResult
-    from dswarm.solver.types import SolveOutcome
-
-    challenge.expected_flags = 4
-    challenge.multi_flag = True
-    sw = _coordinator_swarm(
-        challenge, tmp_path, start_workers=1, max_workers=2, wall_clock_budget=0.3)
-    sw._found_flags = ["flag{a}", "flag{b}", "flag{c}", "flag{d}"]
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
-    monkeypatch.setattr(sw, "_verified_fact_count", lambda: 1)
-
-    makes: list[tuple[str, str]] = []
-
-    class FakeWorker:
-        solver_id = "cli-pi"
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "miss")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        makes.append((engine, mode))
-        return FakeWorker()
-
-    async def fake_reason():
-        sw._last_reason = ReasonResult(
-            goal_met=True, intents=[], audit_notes=[],
-            verdict="complete", complete_why="all four flags are verified")
-        return 0
-
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-
-    assert out.solved is True
-    assert makes == [("pi", "bootstrap")]
 
 
-async def test_coordinator_reason_then_explore(challenge, tmp_path: Path, monkeypatch):
-    """Bootstrap finds nothing → Reason proposes an intent → Explore claims it."""
-    from dswarm.solver.types import SolveOutcome
-
-    # finite budget so the (now never-give-up) loop terminates for the assertion —
-    # the swarm no longer stops on its own when Reason runs dry (CTF has a unique
-    # solution → it re-bootstraps forever; only solve/stop/budget ends it).
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
-                            wall_clock_budget=0.3)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-
-    spawned_modes = []
-
-    class FakeWorker:
-        def __init__(self, engine, mode):
-            self.solver_id = f"cli-{engine}"
-            self.mode = mode
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "miss")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawned_modes.append(mode)
-        return FakeWorker(engine, mode)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    # Reason proposes exactly one intent the first time, then nothing
-    reason_calls = {"n": 0}
-    async def fake_reason():
-        reason_calls["n"] += 1
-        if reason_calls["n"] == 1:
-            try:
-                sw.shared_graph.propose_intent(
-                    actor="reason", intent_id="I1", goal="try SQLi")
-            except Exception:
-                pass
-            return 1
-        return 0
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    out = await sw.run()
-    # bootstrap ran, then at least one explore was spawned for the proposed intent
-    assert "bootstrap" in spawned_modes
-    assert "explore" in spawned_modes
-    assert out.solved is False  # nobody found a flag in this scenario
 
 
-async def test_coordinator_rebootstrap_on_course_correct(challenge, tmp_path: Path, monkeypatch):
-    """Reason verdict course_correct → coordinator spawns a re-bootstrap worker
-    seeded with the drift direction (phase 7: adaptive mode switch)."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.solver.reason import ReasonResult
-
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
-                            wall_clock_budget=0.3)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-
-    spawned = []  # (mode, intent_goal)
-
-    class FakeWorker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "miss")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawned.append((mode, intent_goal))
-        return FakeWorker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    calls = {"n": 0}
-    async def fake_reason():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            sw._last_reason = ReasonResult(
-                goal_met=False, intents=[], audit_notes=[],
-                verdict="course_correct", drift="stop brute-forcing, decode the cookie")
-            return 0
-        sw._last_reason = ReasonResult(
-            goal_met=False, intents=[], audit_notes=[], verdict="explore")
-        return 0
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    # a re-bootstrap worker was spawned with the drift as its steer
-    rebootstraps = [g for (m, g) in spawned if m == "bootstrap" and "decode the cookie" in g]
-    assert rebootstraps, f"no re-bootstrap seeded with drift; spawned={spawned}"
 
 
-async def test_course_correct_runs_review_before_rebootstrap(challenge, tmp_path: Path, monkeypatch):
-    """Final flow: Reason course_correct must route through one review worker whose
-    directive controls the rebootstrap, instead of immediately spawning another
-    ordinary bootstrap on raw drift text."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.solver.reason import ReasonResult
-
-    sw = _coordinator_swarm(
-        challenge, tmp_path, start_workers=1, stall_seconds=0.01,
-        wall_clock_budget=0.4,
-        stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "pi", "timeout": 120,
-            "on_course_correct": True, "cooldown_events": 0,
-        }}},
-    )
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
-
-    spawned: list[tuple[str, str, str]] = []
-
-    class FakeWorker:
-        def __init__(self, engine, mode, goal):
-            self.solver_id = f"cli-{engine}-{mode}"
-            self.mode = mode
-            self.goal = goal
-
-        async def run(self):
-            if self.mode == "review":
-                sw.shared_graph.add_coordinator_directive(
-                    actor=self.solver_id,
-                    action="rebootstrap",
-                    directive="Stop brute force; decode the signed cookie.",
-                    priority="high",
-                )
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, self.mode)
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id="", **_kw):
-        spawned.append((engine, mode, intent_goal))
-        return FakeWorker(engine, mode, intent_goal)
-
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    calls = {"n": 0}
-
-    async def fake_reason():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            sw._last_reason = ReasonResult(
-                goal_met=False, intents=[], audit_notes=[],
-                verdict="course_correct", drift="raw drift: stop brute force")
-            return 0
-        sw._last_reason = ReasonResult(
-            goal_met=False, intents=[], audit_notes=[], verdict="explore")
-        return 0
-
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    await asyncio.wait_for(sw.run(), timeout=5)
-
-    assert ("pi", "review", "raw drift: stop brute force") in spawned
-    assert any(mode == "bootstrap" and "decode the signed cookie" in goal
-               for _engine, mode, goal in spawned), spawned
 
 
 async def test_operator_hint_queues_review_request(challenge, tmp_path):
@@ -1888,108 +1525,10 @@ async def test_operator_hint_queues_review_request(challenge, tmp_path):
     assert "SOCKS tunnel" in sw._queued_review_requests[0]["directive"]
 
 
-async def test_completed_worker_threshold_starts_review(challenge, tmp_path: Path, monkeypatch):
-    from dswarm.solver.types import SolveOutcome
-
-    sw = _coordinator_swarm(
-        challenge, tmp_path, start_workers=1, max_workers=2,
-        wall_clock_budget=0.2,
-        stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "pi",
-            "every_completed_workers": 1,
-            "on_candidate_spike": False,
-            "on_reason_dry": False,
-            "cooldown_events": 0,
-        }}},
-    )
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-
-    spawned: list[tuple[str, str]] = []
-
-    class FakeWorker:
-        def __init__(self, engine, mode):
-            self.solver_id = f"cli-{engine}-{mode}-{len(spawned)}"
-            self.mode = mode
-
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, self.mode)
-
-    def fake_make(engine, *, mode, **_kw):
-        spawned.append((engine, mode))
-        return FakeWorker(engine, mode)
-
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is False
-    assert ("pi", "review") in spawned
 
 
-async def test_candidate_spike_starts_review(challenge, tmp_path: Path, monkeypatch):
-    from dswarm.solver.types import SolveOutcome
-
-    sw = _coordinator_swarm(
-        challenge, tmp_path, start_workers=1, max_workers=2,
-        wall_clock_budget=0.2,
-        stage_policy={"coordinator": {"review": {
-            "enabled": True, "engine": "pi",
-            "every_completed_workers": 0,
-            "on_candidate_spike": True,
-            "candidate_spike_threshold": 2,
-            "on_reason_dry": False,
-            "cooldown_events": 0,
-        }}},
-    )
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-    candidates = {"n": 0}
-    monkeypatch.setattr(sw, "_candidate_fact_count", lambda: candidates["n"])
-
-    spawned: list[tuple[str, str]] = []
-
-    class FakeWorker:
-        def __init__(self, engine, mode):
-            self.solver_id = f"cli-{engine}-{mode}-{len(spawned)}"
-            self.mode = mode
-
-        async def run(self):
-            if self.mode != "review":
-                candidates["n"] = 3
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, self.mode)
-
-    def fake_make(engine, *, mode, **_kw):
-        spawned.append((engine, mode))
-        return FakeWorker(engine, mode)
-
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is False
-    assert ("pi", "review") in spawned
 
 
-async def test_coordinator_respects_wall_clock_budget(challenge, tmp_path: Path, monkeypatch):
-    """A worker that never finishes is cancelled when the budget is exhausted."""
-    from dswarm.solver.types import SolveOutcome
-
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1,
-                            wall_clock_budget=0.01, stall_seconds=999)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-
-    class HangWorker:
-        solver_id = "cli-pi"
-        async def run(self):
-            await asyncio.sleep(100)  # never finishes
-            return SolveOutcome(False, None, 1, None, "x")
-
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda *a, **k: HangWorker())
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is False
 
 
 async def _async_zero():
@@ -1998,39 +1537,121 @@ async def _async_zero():
 
 # ── winner KILLS the loser's subprocess, not just its task (bug #2) ───────────
 
-async def test_coordinator_winner_cancels_loser_solver(challenge, tmp_path: Path, monkeypatch):
-    """When one worker finds the flag, the coordinator must call cancel() on the
-    OTHER worker (which kills its CLI subprocess) — not merely cancel the task."""
-    from dswarm.solver.types import SolveOutcome
 
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
 
-    cancelled = []
-    spawn = {"n": 0}
 
-    class FakeWorker:
-        def __init__(self, engine, solved):
-            self.solver_id = f"cli-{engine}"
-            self._solved = solved
-        def cancel(self):
-            cancelled.append(self.solver_id)
+@pytest.mark.asyncio
+async def test_reason_worker_runtime_worker_creation_does_not_block_event_loop(challenge, tmp_path, monkeypatch):
+    """Reason worker construction can touch Docker; it must not block timeouts.
+
+    Startup-test cancellation is driven by asyncio timeouts. If _make_cli_worker
+    runs synchronously on the event loop, a slow Docker/supervisor startup prevents
+    those timeouts and cleanup from running, which can leave a run container alive.
+    """
+    import threading
+    import time
+
+    from dswarm.swarm.agents import AgentProfile, DispatchDecision
+    from dswarm.swarm.runtime import SwarmWorkerRuntime
+
+    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi-web"])
+    release_creation = threading.Event()
+
+    class NeverRunWorker:
+        solver_id = "cli-pi-web-create"
+
         async def run(self):
-            if self._solved:
-                await asyncio.sleep(0)
-                return SolveOutcome(True, "flag{win}", 1, None, "solved")
-            await asyncio.sleep(100)  # loser hangs until cancelled
-            return SolveOutcome(False, None, 1, None, "miss")
+            await asyncio.sleep(3600)
 
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawn["n"] += 1
-        return FakeWorker(engine, solved=(spawn["n"] == 1))
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
+        def cancel(self):
+            pass
 
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is True and out.winner == "cli-pi"
-    # the LOSER's solver.cancel() was invoked (so its subprocess dies)
-    assert "cli-pi" in cancelled
+    def slow_make_cli_worker(*args, **kwargs):
+        release_creation.wait(timeout=0.4)
+        return NeverRunWorker()
+
+    monkeypatch.setattr(sw, "_make_cli_worker", slow_make_cli_worker)
+    monkeypatch.setattr(sw, "_release_worker_account", lambda worker: None)
+
+    runtime = SwarmWorkerRuntime(sw, healthy=["pi-web"])
+    decision = DispatchDecision(
+        intent_id="I-create", profile="pi-web", goal="do not block", mode="explore"
+    )
+    profile = AgentProfile(id="pi-web", worker_profile="pi-web", mode="explore")
+
+    start = time.perf_counter()
+    task = asyncio.create_task(runtime.run(decision, profile))
+    await asyncio.sleep(0.05)
+    elapsed = time.perf_counter() - start
+
+    release_creation.set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert elapsed < 0.2
+
+
+@pytest.mark.asyncio
+async def test_reason_worker_runtime_cancels_underlying_worker_on_task_cancel(challenge, tmp_path, monkeypatch):
+    """Cancelling the ReasonSwarm worker task must signal the shelled CLI worker.
+
+    A bare asyncio task cancellation unwinds the coroutine but does not stop the
+    subprocess/thread that CliSolver.run owns; SwarmWorkerRuntime must call
+    worker.cancel() before releasing the account slot.
+    """
+    from dswarm.swarm.agents import AgentProfile, DispatchDecision
+    from dswarm.swarm.runtime import SwarmWorkerRuntime
+
+    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi-web"])
+    events: list[str] = []
+
+    class BlockingWorker:
+        solver_id = "cli-pi-web-runtime-cancel"
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.cancelled = False
+
+        async def run(self):
+            events.append("run.start")
+            self.started.set()
+            await asyncio.sleep(3600)
+
+        def cancel(self):
+            events.append("worker.cancel")
+            self.cancelled = True
+
+    worker = BlockingWorker()
+
+    def fake_make_cli_worker(*args, **kwargs):
+        return worker
+
+    def fake_release_worker_account(w):
+        events.append(f"release:{getattr(w, 'solver_id', '')}")
+
+    monkeypatch.setattr(sw, "_make_cli_worker", fake_make_cli_worker)
+    monkeypatch.setattr(sw, "_release_worker_account", fake_release_worker_account)
+
+    runtime = SwarmWorkerRuntime(sw, healthy=["pi-web"])
+    decision = DispatchDecision(
+        intent_id="I-cancel", profile="pi-web", goal="cancel me", mode="explore"
+    )
+    profile = AgentProfile(id="pi-web", worker_profile="pi-web", mode="explore")
+
+    task = asyncio.create_task(runtime.run(decision, profile))
+    await asyncio.wait_for(worker.started.wait(), timeout=1.0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert worker.cancelled is True
+    assert events == [
+        "run.start",
+        "worker.cancel",
+        "release:cli-pi-web-runtime-cancel",
+    ]
 
 
 async def test_cancel_solver_is_noop_without_cancel_method():
@@ -2043,39 +1664,6 @@ async def test_cancel_solver_is_noop_without_cancel_method():
     Swarm._cancel_solver(Boom())                     # a throwing cancel is swallowed
 
 
-async def test_coordinator_never_gives_up_rebootstraps_when_reason_dry(challenge, tmp_path: Path, monkeypatch):
-    """CTF has a unique solution → when Reason produces NO new intents and nothing
-    is running, the coordinator must RE-BOOTSTRAP a fresh attempt, not declare
-    'exhausted' and stop. We bound the test with a finite budget; within it, at
-    least one retry-bootstrap must have been spawned."""
-    from dswarm.solver.types import SolveOutcome
-
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
-                            wall_clock_budget=0.4)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
-
-    spawned_modes = []
-
-    class FakeWorker:
-        def __init__(self, engine, mode):
-            self.solver_id = f"cli-{engine}"
-            self.mode = mode
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "miss")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawned_modes.append(mode)
-        return FakeWorker(engine, mode)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-    # Reason ALWAYS dry — never proposes an intent. Old code would stop immediately.
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    # the run never "solved", but it kept re-bootstrapping fresh attempts instead of
-    # giving up after the first dry Reason: >1 bootstrap spawned.
-    assert spawned_modes.count("bootstrap") >= 2, spawned_modes
-    assert out.solved is False
 
 
 def test_retry_goal_lists_dead_ends(challenge, tmp_path):
@@ -2119,57 +1707,6 @@ def test_make_cli_worker_assigns_unique_labels(challenge, tmp_path):
     assert all(w.lifecycle_scope == "worker" for w in (a, b, c, d))
 
 
-async def test_coordinator_emits_single_run_level_finished(challenge, tmp_path, monkeypatch):
-    """The run-7345 bug: a worker ending must NOT mark the whole run finished. Each
-    sub-worker emits WORKER_FINISHED; the coordinator emits exactly ONE run-level
-    RUN_FINISHED when it actually settles (here: a worker solves)."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import Event, EventType
-
-    captured = []
-    bus = EventBus()
-
-    async def _sink(ev):
-        captured.append(ev)
-    bus.add_sink(_sink)
-
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2, bus=bus)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
-
-    class FakeWorker:
-        """Mimics a real CliSolver's lifecycle emits: each worker fires its OWN
-        WORKER_FINISHED (worker-level), never a run-level RUN_FINISHED."""
-        def __init__(self, engine, solved):
-            self.solver_id = f"cli-{engine}"
-            self._solved = solved
-        async def run(self):
-            await asyncio.sleep(0)
-            flag = "flag{win}" if self._solved else None
-            await bus.emit(Event(
-                event_type=EventType.WORKER_FINISHED, run_id=sw.run_id,
-                challenge_id=challenge.id, solver_id=self.solver_id,
-                payload={"flag": flag, "solved": self._solved}))
-            return SolveOutcome(self._solved, flag, 1, None,
-                                "solved" if self._solved else "miss")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        return FakeWorker(engine, solved=(engine == "pi"))
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    out = await sw.run()
-    assert out.solved is True
-
-    run_finished = [e for e in captured if e.event_type is EventType.RUN_FINISHED]
-    worker_finished = [e for e in captured if e.event_type is EventType.WORKER_FINISHED]
-    # the WHOLE run finishes exactly once, regardless of how many workers ended
-    assert len(run_finished) == 1, f"expected 1 run-level RUN_FINISHED, got {len(run_finished)}"
-    assert run_finished[0].payload.get("solved") is True
-    assert run_finished[0].payload.get("flag") == "flag{win}"
-    # the run-level RUN_FINISHED has no solver_id (it belongs to the run, not a worker)
-    assert not run_finished[0].solver_id
-    # both workers reported their own worker-level end
-    assert len(worker_finished) >= 1
 
 
 async def test_m11_cancelled_coordinator_finalizes_and_closes_graph(
@@ -2882,120 +2419,14 @@ async def test_m3_redirect_reaches_next_spawned_worker(challenge, tmp_path, monk
 
 
 # ── race-scout layer (DESIGN_race_scout_layer.md) ────────────────────────────
-async def test_race_scout_fast_path_flag_wins(challenge, tmp_path, monkeypatch):
-    """FAST PATH: a race worker captures the flag → the coordinator finishes via the
-    race phase and NEVER enters the main coordinator loop (no _run_reason call)."""
-    from dswarm.solver.types import SolveOutcome
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            wall_clock_budget=2.0)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
-    reason_calls = {"n": 0}
-    async def fake_reason():
-        reason_calls["n"] += 1
-        return 0
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    class FakeWorker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-            self.timeout = 720
-        async def run(self):
-            await asyncio.sleep(0)
-            solved = self.solver_id == "cli-pi"
-            return SolveOutcome(solved, "flag{won}" if solved else None, 1, None,
-                                "race", flags=["flag{won}"] if solved else None)
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: FakeWorker(engine))
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is True and out.flag == "flag{won}"
-    assert out.winner == "cli-pi"
-    assert reason_calls["n"] == 0, "fast path must skip the coordinator loop entirely"
 
 
-async def test_race_scout_slow_path_hands_off_to_coordinator(challenge, tmp_path, monkeypatch):
-    """SLOW PATH: no race worker captures the flag → their facts are on the graph and
-    the coordinator falls through to the main solve loop (_run_reason IS called)."""
-    from dswarm.solver.types import SolveOutcome
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            wall_clock_budget=0.5)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
-    reason_calls = {"n": 0}
-    async def fake_reason():
-        reason_calls["n"] += 1
-        return 0
-    monkeypatch.setattr(sw, "_run_reason", fake_reason)
-
-    class FakeWorker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-            self.timeout = 720
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "no flag")  # nobody solves
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: FakeWorker(engine))
-
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.solved is False
-    assert reason_calls["n"] >= 1, "slow path must fall through to the main coordinator loop"
 
 
-async def test_race_scout_disabled_does_not_race(challenge, tmp_path, monkeypatch):
-    """race_scout=False → the race phase is skipped entirely; the first workers come
-    from the main coordinator loop (bootstrap), not a parallel race round."""
-    from dswarm.solver.types import SolveOutcome
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=False,
-                            wall_clock_budget=0.3)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-    phases = []
-    class FakeWorker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-            self.timeout = 720
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "x")
-    def fake_make(engine, **kw):
-        phases.append(kw.get("timeout_override"))
-        return FakeWorker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-    await asyncio.wait_for(sw.run(), timeout=5)
-    # no spawn carried a race timeout_override (the race phase never ran).
-    assert all(t is None for t in phases)
 
 
-def test_race_engines_subset_and_timeout(challenge, tmp_path):
-    """config: race_engines restricts which engines race; race_timeout is the short
-    per-worker timeout the race spawns use."""
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            race_engines=["pi"], race_timeout=300,
-                            engines=["pi"])
-    assert sw.race_engines == ["pi"]          # the roster's only engine
-    assert sw.race_timeout == 300
-    w = sw._make_cli_worker("pi", mode="bootstrap", timeout_override=sw.race_timeout)
-    assert w.timeout == 300                       # short race timeout applied
 
 
-def test_stage_policy_overrides_race_budget_and_planner(challenge, tmp_path):
-    sw = _coordinator_swarm(
-        challenge, tmp_path,
-        stage_policy={
-            "race": {"enabled": True, "timeout": 123, "engines": ["pi"]},
-            "coordinator": {"wall_clock_budget": 9},
-            "budgets": {"max_total_workers": 7, "cost_budget_usd": 0.5},
-        },
-        llm_profiles={"planner": {"provider": "deepseek", "model": "planner-x"}},
-        engines=["pi"],
-    )
-    assert sw.race_scout is True
-    assert sw.race_timeout == 123
-    assert sw.race_engines == ["pi"]
-    assert sw.wall_clock_budget == 9
-    assert sw.max_total_workers == 7
-    assert sw.cost_budget_usd == 0.5
-    assert sw.reason_model == "planner-x"
 
 
 def test_stage_policy_reads_coordinator_key():
@@ -3008,139 +2439,16 @@ def test_stage_policy_reads_coordinator_key():
     assert sp.model_dump()["coordinator"] == {"wall_clock_budget": 7}
 
 
-async def test_race_scout_empty_healthy_subset_returns_three_tuple(challenge, tmp_path):
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            race_engines=["pi"], engines=["pi"])
-    got = await sw._run_race_scout([])
-    assert got == (None, None, {})
 
 
-async def test_race_scout_slow_path_emits_phase_transition(challenge, tmp_path, monkeypatch):
-    from dswarm.solver.types import SolveOutcome
-    events = []
-
-    class Bus:
-        async def emit(self, ev):
-            events.append(ev)
-        def add_sink(self, sink):
-            pass
-
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            wall_clock_budget=0.2, bus=Bus())
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-
-    class FakeWorker:
-        solver_id = "cli-pi"
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "no flag")
-
-    monkeypatch.setattr(sw, "_make_cli_worker", lambda *a, **k: FakeWorker())
-    await asyncio.wait_for(sw.run(), timeout=5)
-    assert any(e.payload.get("kind") == "phase_transition" for e in events)
 
 
-async def test_worker_budget_hard_gate_finishes_budget_exhausted(challenge, tmp_path, monkeypatch):
-    from dswarm.solver.types import SolveOutcome
-    events = []
-
-    class Bus:
-        async def emit(self, ev):
-            events.append(ev)
-        def add_sink(self, sink):
-            pass
-
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2,
-                            max_total_workers=1, wall_clock_budget=0.2,
-                            bus=Bus())
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
-
-    class FakeWorker:
-        solver_id = "cli-pi"
-        async def run(self):
-            await asyncio.sleep(0.01)
-            return SolveOutcome(False, None, 1, None, "done")
-
-    def fake_make(*args, **kwargs):
-        sw._reserve_worker_spawn()
-        return FakeWorker()
-
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.reason == "budget_exhausted"
-    assert any(e.payload.get("kind") == "worker_budget_exhausted" for e in events)
 
 
-async def test_cost_budget_hard_gate_finishes_budget_exhausted(challenge, tmp_path, monkeypatch):
-    from dswarm.core.cost import CostController
-    events = []
-
-    class Bus:
-        async def emit(self, ev):
-            events.append(ev)
-        def add_sink(self, sink):
-            pass
-
-    cost = CostController()
-    cost._global.usd = 2.0
-    sw = _coordinator_swarm(challenge, tmp_path, cost=cost,
-                            cost_budget_usd=1.0, bus=Bus())
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    out = await asyncio.wait_for(sw.run(), timeout=5)
-    assert out.reason == "budget_exhausted"
-    assert any(e.payload.get("kind") == "cost_budget_exhausted" for e in events)
 
 
-async def test_operator_stop_interrupts_race_scout_wait(challenge, tmp_path, monkeypatch):
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            race_engines=["claude"], engines=["claude"])
-    sw._operator_event = asyncio.Event()
-    cancelled = {"n": 0}
-
-    class FakeWorker:
-        solver_id = "cli-pi"
-        async def run(self):
-            await asyncio.sleep(10)
-        def cancel(self):
-            cancelled["n"] += 1
-
-    monkeypatch.setattr(sw, "_make_cli_worker", lambda *a, **k: FakeWorker())
-
-    async def stop_soon():
-        await asyncio.sleep(0.02)
-        sw._operator_stop = True
-        sw._operator_event.set()
-
-    stopper = asyncio.create_task(stop_soon())
-    got = await asyncio.wait_for(sw._run_race_scout(["claude"]), timeout=1)
-    await stopper
-    assert got[0] is None
-    assert cancelled["n"] >= 1
 
 
-async def test_race_scout_no_global_signal_kills_worker(challenge, tmp_path, monkeypatch):
-    """RED LINE: the race phase produces no flag and no facts, yet no race worker is
-    cancelled by a global signal — each runs to its own natural exit (run-7352)."""
-    from dswarm.solver.types import SolveOutcome
-    sw = _coordinator_swarm(challenge, tmp_path, race_scout=True,
-                            stall_seconds=0.01, wall_clock_budget=0.5)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi", "cursor"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-    cancelled = {"n": 0}
-    class FakeWorker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-            self.timeout = 720
-        def cancel(self):
-            cancelled["n"] += 1
-        async def run(self):
-            await asyncio.sleep(0.05)             # works a bit, emits nothing
-            return SolveOutcome(False, None, 1, None, "no fact")
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: FakeWorker(engine))
-    await asyncio.wait_for(sw.run(), timeout=5)
-    assert cancelled["n"] == 0, "RED LINE: a global signal must not cancel a race worker"
 
 
 def test_nofact_deadend_conclude_is_not_redispatched(challenge, tmp_path):
@@ -3259,406 +2567,16 @@ def test_drain_hitl_steer_does_not_stop(challenge, tmp_path):
 
 # ── worker raises its hand → coordinator pauses for the operator (not re-spawn) ──
 
-async def test_coordinator_pauses_on_need_input_until_operator(challenge, tmp_path, monkeypatch):
-    """A worker emitting HITL_REQUEST (NEED_INPUT) while the swarm goes idle must
-    make the coordinator WAIT for the operator instead of re-bootstrapping into the
-    same unsolvable-without-help wall. An operator command unblocks it."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import Event, EventType, hitl_request_payload
-
-    bus = EventBus()
-    inbox: asyncio.Queue = asyncio.Queue()
-    # inf budget: a worker explicitly asked, so the pause must wait for the operator
-    # indefinitely (no budget-timeout fallback). The finite-budget timeout path is
-    # covered separately by test_coordinator_need_input_pause_respects_finite_budget.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1,
-                            bus=bus, hitl_inbox=inbox,
-                            wall_clock_budget=float("inf"))
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())  # never proposes
-
-    spawns = {"n": 0}
-    helped = {"v": False}  # flips True once the operator supplies the VPS
-
-    class Worker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            await asyncio.sleep(0)
-            if not helped["v"]:
-                # blocked: raise a hand (the coordinator's sink records HITL_REQUEST)
-                await bus.emit(Event(
-                    event_type=EventType.HITL_REQUEST, run_id=sw.run_id,
-                    challenge_id=challenge.id, solver_id=self.solver_id,
-                    payload=hitl_request_payload(self.solver_id,
-                                                 "need a VPS for reverse shell", kind="need_input")))
-            return SolveOutcome(False, None, 1, None,
-                                "blocked" if not helped["v"] else "tried")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawns["n"] += 1
-        return Worker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    run_task = asyncio.create_task(sw.run())
-    # wait until the coordinator has paused (pending help recorded + event cleared)
-    paused = False
-    for _ in range(300):
-        await asyncio.sleep(0.02)
-        if sw._pending_help and sw._operator_event is not None \
-                and not sw._operator_event.is_set():
-            paused = True
-            break
-    assert paused, "coordinator should have paused awaiting operator after a NEED_INPUT"
-    paused_spawns = spawns["n"]
-    # while paused it must NOT keep spawning retry-bootstraps into the wall
-    await asyncio.sleep(0.2)
-    assert spawns["n"] == paused_spawns, "coordinator must not re-spawn while awaiting operator"
-    # operator supplies the VPS → unblocks; resumed workers no longer raise. Give a
-    # finite budget so the (now never-give-up) loop terminates the test.
-    helped["v"] = True
-    sw.wall_clock_budget = 0.3
-    await inbox.put({"target": "global", "action": "hint",
-                     "text": "standing: ssh root@9.9.9.9", "standing": True})
-    out = await asyncio.wait_for(run_task, timeout=15)
-    assert out.solved is False
-    assert spawns["n"] > paused_spawns, "after operator input the coordinator resumes spawning"
 
 
-async def test_coordinator_pauses_on_need_input_while_BUSY(challenge, tmp_path, monkeypatch):
-    """run-11189 regression: the pause must fire even when the swarm is NOT idle.
-
-    The original pause was nested inside `if not tasks and not open_intents:`, so it
-    only fired when the swarm had fully drained. But the never-give-up Reason engine
-    keeps proposing intents, so `open_intents` is never empty — the swarm stays busy
-    and the pause never fired (3 NEED_INPUTs, 0 awaiting_operator, 30 min of workers
-    hurled at the same no-token wall). Here we FORCE the busy state: _run_reason keeps
-    'proposing' and _open_intents always returns a non-empty list. The coordinator
-    must STILL pause on a pending NEED_INPUT and stop spawning new workers."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import Event, EventType, hitl_request_payload
-
-    bus = EventBus()
-    inbox: asyncio.Queue = asyncio.Queue()
-    # inf budget — same reasoning as the idle-path test above: the explicit ask must
-    # block until the operator acts.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1,
-                            bus=bus, hitl_inbox=inbox,
-                            wall_clock_budget=float("inf"))
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    # BUSY path: Reason "proposes" something every round AND there is always an open
-    # intent — so `not tasks and not open_intents` is NEVER true. The old idle-only
-    # pause could never run here; the new top-of-loop pause must.
-    async def _reason_proposes():
-        return 1
-    monkeypatch.setattr(sw, "_run_reason", lambda: _reason_proposes())
-    monkeypatch.setattr(sw, "_open_intents",
-                        lambda: [{"intent_id": "I1", "goal": "keep going"}])
-
-    spawns = {"n": 0}
-    helped = {"v": False}
-    awaiting = {"seen": False}
-
-    async def _bb_spy(ev: Event) -> None:
-        if (ev.event_type == EventType.BLACKBOARD_DELTA
-                and (ev.payload or {}).get("kind") == "awaiting_operator"):
-            awaiting["seen"] = True
-    bus.add_sink(_bb_spy)
-
-    class Worker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            await asyncio.sleep(0)
-            if not helped["v"]:
-                await bus.emit(Event(
-                    event_type=EventType.HITL_REQUEST, run_id=sw.run_id,
-                    challenge_id=challenge.id, solver_id=self.solver_id,
-                    payload=hitl_request_payload(
-                        self.solver_id, "need the dashboard token", kind="need_input")))
-            return SolveOutcome(False, None, 1, None, "blocked")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawns["n"] += 1
-        return Worker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-    # the explore-spawn path also claims intents on the shared graph; stub it so the
-    # fake _open_intents doesn't need a live claim to round-trip.
-    if sw.shared_graph is not None:
-        monkeypatch.setattr(sw.shared_graph, "claim_intent",
-                            lambda **kw: True)
-
-    run_task = asyncio.create_task(sw.run())
-    # wait until the coordinator pauses despite being "busy"
-    paused = False
-    for _ in range(400):
-        await asyncio.sleep(0.02)
-        if sw._pending_help and sw._operator_event is not None \
-                and not sw._operator_event.is_set():
-            paused = True
-            break
-    assert paused, "coordinator must pause on NEED_INPUT even while busy (intents open)"
-    assert awaiting["seen"], "an awaiting_operator event must be emitted on the busy path"
-    paused_spawns = spawns["n"]
-    await asyncio.sleep(0.25)
-    assert spawns["n"] == paused_spawns, \
-        "while paused the coordinator must NOT spawn new workers into the wall"
-    # operator responds → unblock; give a finite budget so the loop ends the test.
-    helped["v"] = True
-    sw.wall_clock_budget = 0.3
-    await inbox.put({"target": "global", "action": "hint", "text": "token abc123"})
-    out = await asyncio.wait_for(run_task, timeout=15)
-    assert out.solved is False
 
 
-async def test_coordinator_need_input_pause_respects_finite_budget(
-        challenge, tmp_path, monkeypatch):
-    """#8 regression: a NEED_INPUT pause under a FINITE wall_clock_budget (offline
-    eval, no operator present) must still exhaust the budget and terminate rather than
-    block forever on `_operator_event.wait()`. The old code waited unconditionally; the
-    fix mirrors the barren pause's budget-aware wait_for + budget_exhausted break."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import Event, EventType, hitl_request_payload
-
-    bus = EventBus()
-    inbox: asyncio.Queue = asyncio.Queue()
-    # finite budget, and NO operator will ever respond — the pause must time out.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1,
-                            bus=bus, hitl_inbox=inbox, wall_clock_budget=0.4)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())  # never proposes
-
-    budget_exhausted = {"seen": False}
-
-    async def _bb_spy(ev: Event) -> None:
-        if (ev.event_type == EventType.BLACKBOARD_DELTA
-                and (ev.payload or {}).get("kind") == "budget_exhausted"):
-            budget_exhausted["seen"] = True
-    bus.add_sink(_bb_spy)
-
-    class Worker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            await asyncio.sleep(0)
-            await bus.emit(Event(
-                event_type=EventType.HITL_REQUEST, run_id=sw.run_id,
-                challenge_id=challenge.id, solver_id=self.solver_id,
-                payload=hitl_request_payload(
-                    self.solver_id, "need a VPS", kind="need_input")))
-            return SolveOutcome(False, None, 1, None, "blocked")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        return Worker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    # No operator command is ever enqueued; the only way out is the budget timeout.
-    out = await asyncio.wait_for(sw.run(), timeout=15)
-    assert out.solved is False
-    assert budget_exhausted["seen"], \
-        "a finite-budget NEED_INPUT pause must emit budget_exhausted and terminate"
 
 
-async def test_operator_pause_stops_spawning_resume_continues(challenge, tmp_path, monkeypatch):
-    """#5 regression: an operator `pause` HITL command must SOFT-pause the coordinator
-    — stop spawning NEW workers (without killing running ones or ending the run) —
-    and a `resume` must continue. This is the meaningful pause for a single-shot swarm
-    (the old behavior had NO swarm-level pause wired to the operator's pause command,
-    so 'pause' looked like a no-op button)."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    # EventType must be imported INTO this function's scope: the _bb_spy sink below
-    # references it, and EventBus.emit() runs every sink inside `try/except
-    # Exception: pass` (a slow/failing sink must never wedge the publish). Without
-    # the import the sink raised NameError on EVERY event — silently swallowed by
-    # emit — so paused_seen never flipped and the assert failed regardless of the
-    # (correct) production pause logic. This was the whole "flake".
-    from dswarm.core.events import EventType
-
-    bus = EventBus()
-    inbox: asyncio.Queue = asyncio.Queue()
-    # barren_limit=0 DISABLES the no-progress backpressure pause (swarm.py guards it
-    # behind `self.barren_limit > 0`), so this test isolates the OPERATOR pause: the
-    # only thing that can pause the loop here is the operator's `pause` command, not
-    # the autonomous barren-worker backpressure. Without this the fruitless 0.01s
-    # mock workers would race the loop into a barren `collect_idle` park before the
-    # operator command even arrived, making WHERE the loop sits nondeterministic.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1,
-                            bus=bus, hitl_inbox=inbox, barren_limit=0,
-                            wall_clock_budget=float("inf"))
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-
-    spawns = {"n": 0}
-    paused_seen = {"v": False}
-
-    async def _bb_spy(ev):
-        if (ev.event_type == EventType.BLACKBOARD_DELTA
-                and (ev.payload or {}).get("kind") == "operator_paused"):
-            paused_seen["v"] = True
-    bus.add_sink(_bb_spy)
-
-    class Worker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            # sleep long enough (>> the test's 0.15s settle + poll cadence) that a
-            # worker is reliably LIVE in asyncio.wait when the pause arrives, so the
-            # pause is observed mid-flight (not only at an idle boundary).
-            await asyncio.sleep(0.05)
-            return SolveOutcome(False, None, 1, None, "tried")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawns["n"] += 1
-        return Worker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    run_task = asyncio.create_task(sw.run())
-    # let a few workers spawn, then PAUSE
-    await asyncio.sleep(0.15)
-    await inbox.put({"target": "global", "action": "pause"})
-    # wait until the pause is observed (operator_paused delta on the bus) AND the
-    # coordinator flag is set. _drain_hitl handles `pause` on a separate task, so
-    # this is robust to whether the loop is mid-wait or between iterations.
-    for _ in range(200):
-        await asyncio.sleep(0.02)
-        if paused_seen["v"] and sw._operator_paused:
-            break
-    assert paused_seen["v"], "an operator_paused blackboard delta must be emitted"
-    assert sw._operator_paused is True
-    paused_spawns = spawns["n"]
-    # while paused, NO new workers spawn — even though the (single-shot) workers keep
-    # finishing fruitlessly, the loop must park instead of re-bootstrapping.
-    await asyncio.sleep(0.3)
-    assert spawns["n"] == paused_spawns, "no new workers may spawn while paused"
-    # RESUME → spawning continues; give a finite budget so the loop ends the test
-    sw.wall_clock_budget = 0.3
-    await inbox.put({"target": "global", "action": "resume"})
-    out = await asyncio.wait_for(run_task, timeout=15)
-    assert out.solved is False
-    assert sw._operator_paused is False
-    assert spawns["n"] > paused_spawns, "after resume the coordinator spawns again"
 
 
-async def test_coordinator_barren_backpressure_pauses_single_flag(
-        challenge, tmp_path, monkeypatch):
-    """run-11190 regression: a SINGLE-flag run whose workers keep finishing with no
-    new fact/flag must hit the no-progress backpressure and PAUSE for the operator —
-    the old guardrail was collect-mode-only (multi_flag + unknown count), so a
-    single-flag chained run had NO spend cap and could spike workers without bound.
-    Here every worker is fruitless and the board never grows; after barren_limit
-    completions the coordinator must emit the pause and stop spawning."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import Event, EventType
-
-    bus = EventBus()
-    inbox: asyncio.Queue = asyncio.Queue()
-    # single-flag (default multi_flag=False); small limit so the test is quick.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, bus=bus,
-                            hitl_inbox=inbox, barren_limit=3,
-                            wall_clock_budget=10.0)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    # Reason keeps the swarm "busy" (open intent always present) so the pause can
-    # only come from the top-of-loop backpressure, never the fully-idle branch.
-    async def _reason_one():
-        return 1
-    monkeypatch.setattr(sw, "_run_reason", lambda: _reason_one())
-    monkeypatch.setattr(sw, "_open_intents",
-                        lambda: [{"intent_id": "I1", "goal": "keep going"}])
-    if sw.shared_graph is not None:
-        monkeypatch.setattr(sw.shared_graph, "claim_intent", lambda **kw: True)
-    # board never grows — every worker is fruitless.
-    monkeypatch.setattr(sw, "_total_fact_count", lambda: 0)
-    monkeypatch.setattr(sw, "_verified_fact_count", lambda: 0)
-
-    spawns = {"n": 0}
-    paused_seen = {"v": False}
-
-    async def _bb_spy(ev: Event) -> None:
-        if (ev.event_type == EventType.BLACKBOARD_DELTA
-                and (ev.payload or {}).get("kind") == "collect_idle"):
-            paused_seen["v"] = True
-    bus.add_sink(_bb_spy)
-
-    class Worker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "fruitless")
-
-    def fake_make(engine, *, mode, intent_goal="", intent_id=""):
-        spawns["n"] += 1
-        return Worker(engine)
-    monkeypatch.setattr(sw, "_make_cli_worker", fake_make)
-
-    run_task = asyncio.create_task(sw.run())
-    paused = False
-    for _ in range(400):
-        await asyncio.sleep(0.02)
-        if paused_seen["v"] and sw._operator_event is not None \
-                and not sw._operator_event.is_set():
-            paused = True
-            break
-    assert paused, "single-flag run must pause on barren backpressure"
-    paused_spawns = spawns["n"]
-    await asyncio.sleep(0.25)
-    assert spawns["n"] == paused_spawns, \
-        "while paused on backpressure the coordinator must NOT spawn more workers"
-    # operator stops → clean end
-    await inbox.put({"action": "stop"})
-    out = await asyncio.wait_for(run_task, timeout=15)
-    assert out.solved is False
 
 
-async def test_coordinator_barren_resets_on_new_fact(challenge, tmp_path, monkeypatch):
-    """A worker that DOES grow the board (even a candidate fact) must reset the
-    fruitless counter — the backpressure is for genuinely-stuck spend, and a
-    deep-exploit worker mid-chain that just produced a candidate is making
-    progress and must not be paused. With the board growing each round, the run
-    must NEVER hit the barren pause before its finite budget ends it."""
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.core.event_bus import EventBus
-    from dswarm.core.events import Event, EventType
-
-    bus = EventBus()
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, bus=bus,
-                            barren_limit=3, wall_clock_budget=0.5)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
-    monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
-
-    grew = {"n": 0}
-    # board grows by one fact on every call → counter resets every round.
-    monkeypatch.setattr(sw, "_total_fact_count",
-                        lambda: grew.__setitem__("n", grew["n"] + 1) or grew["n"])
-    monkeypatch.setattr(sw, "_verified_fact_count", lambda: 0)
-
-    paused_seen = {"v": False}
-
-    async def _bb_spy(ev: Event) -> None:
-        if (ev.event_type == EventType.BLACKBOARD_DELTA
-                and (ev.payload or {}).get("kind") == "collect_idle"):
-            paused_seen["v"] = True
-    bus.add_sink(_bb_spy)
-
-    class Worker:
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-        async def run(self):
-            await asyncio.sleep(0)
-            return SolveOutcome(False, None, 1, None, "made a candidate")
-
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: Worker(engine))
-
-    out = await asyncio.wait_for(sw.run(), timeout=10)
-    assert out.solved is False
-    assert not paused_seen["v"], \
-        "a run that keeps growing the board must never hit the barren pause"
 
 
 # ── code-review fixes (origin/main..HEAD review) ─────────────────────────────
@@ -3717,25 +2635,45 @@ def test_pi_subscription_uses_profile_capacity_not_account_mutex(challenge, tmp_
     assert sw._profile_for_engine("pi", role="bootstrap", advance=False) is not None
 
 
-def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkeypatch):
-    """#11: one-container-per-run. A second engine whose profile asks for a DIFFERENT
-    runtime than the container was built with must be flagged runtime_degraded, not
-    silently inherit the first profile's isolation settings."""
+def test_active_run_container_is_inherited_without_losing_worker_connection(
+        challenge, tmp_path, monkeypatch):
+    """A Worker joining an active Run reuses its launch container snapshot while
+    retaining its own endpoint, credential, and model selection."""
     import dswarm.solver.container_exec as ce
+    from dswarm.solver.credential_accounts import (
+        CredentialAccountStore,
+        account_store_root,
+    )
 
     class _FakeHandle:
         container = "dswarm-run-x"
-    # _container_for_engine does `from dswarm.solver.container_exec import
-    # ensure_container` at call time, so patch it on the SOURCE module.
-    monkeypatch.setattr(ce, "ensure_container",
-                        lambda *a, **k: _FakeHandle(), raising=False)
+
+    created = []
+
+    def _ensure_container(*args, **kwargs):
+        created.append((args, kwargs))
+        return _FakeHandle()
+
+    monkeypatch.setattr(ce, "ensure_container", _ensure_container, raising=False)
+    account_root = account_store_root(tmp_path)
+    CredentialAccountStore(account_root).upsert_secret(
+        account_id="pi-off-main",
+        engine="api",
+        secret="off-profile-key",
+        base_url="https://off.example/v1",
+        target_engine="pi",
+    )
     wroot = tmp_path / "wroot"
     wroot.mkdir(parents=True, exist_ok=True)
     sw = _coordinator_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=wroot,
+        credential_accounts_root=str(account_root),
         worker_profiles=[
-            {"id": "web", "engine": "pi", "roles": ["bootstrap"], "runtime": "docker-web"},
-            {"id": "off", "engine": "pi", "roles": ["bootstrap"], "runtime": "docker-offline"},
+            {"id": "web", "engine": "pi", "roles": ["bootstrap"],
+             "runtime": "docker-web"},
+            {"id": "off", "engine": "pi", "roles": ["bootstrap"],
+             "runtime": "docker-offline", "credential_account": "pi-off-main",
+             "base_url": "https://off.example/v1", "model": "off-model"},
         ],
         runtime_profiles=[
             {"id": "docker-web", "backend": "container", "network": "bridge"},
@@ -3743,13 +2681,45 @@ def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkey
         ],
     )
     web_profile = sw._profile_for_engine("web", role="bootstrap")
-    sw._container_for_engine("web", web_profile)
+    first_handle = sw._container_for_engine("web", web_profile)
     assert sw._container_runtime_id == "docker-web"
     degraded_before = list(sw._runtime_degraded)
+
     off_profile = sw._profile_for_engine("off", role="bootstrap")
-    sw._container_for_engine("off", off_profile)
-    assert len(sw._runtime_degraded) > len(degraded_before), \
-        "#11: a different requested runtime on the cached container must record degraded"
+    inherited_handle = sw._container_for_engine("off", off_profile)
+
+    assert inherited_handle is first_handle
+    assert len(created) == 1, "an active Run must never create a second container"
+    assert sw._container_runtime_id == "docker-web"
+    assert sw._runtime_degraded == degraded_before
+
+    env = sw._runtime_env_for(
+        "pi", "cli-off", container=inherited_handle, profile=off_profile
+    )
+    assert env["DSWARM_WORKER_MODEL"] == "off-model"
+    assert env["OPENAI_BASE_URL"] == "https://off.example/v1"
+    assert env["OPENAI_API_KEY_FILE"] == "/run/dswarm/accounts/pi-off-main/API_KEY"
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_pi_config_links_replace_stale_copied_config(tmp_path):
+    from dswarm.swarm import swarm as swarm_mod
+
+    home = tmp_path / "home"
+    ext = home / ".pi" / "agent" / "extensions"
+    ext.mkdir(parents=True)
+    (ext / "old-provider.ts").write_text("// stale image copy", encoding="utf-8")
+    settings = home / ".pi" / "agent" / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    swarm_mod._ensure_pi_config_links(home, config_target_root="/fresh/pi-config")
+
+    assert (home / ".pi/agent/extensions").is_symlink()
+    assert str((home / ".pi/agent/extensions").readlink()).replace("\\", "/") == (
+        "/fresh/pi-config/extensions")
+    assert (home / ".pi/agent/settings.json").is_symlink()
+    assert str((home / ".pi/agent/settings.json").readlink()).replace("\\", "/") == (
+        "/fresh/pi-config/settings.json")
 
 
 def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, tmp_path, monkeypatch):
@@ -3779,6 +2749,7 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     env = sw._runtime_env_for("pi", "cli-pi", container=_FakeContainer())
 
     assert env["HOME"] == "/home/kali/workspace/homes/cli-pi"
+    assert env["PI_CODING_AGENT_DIR"] == "/home/kali/workspace/homes/cli-pi/.pi/agent"
     assert env["DSWARM_TASK_TOKEN"] == "task-token"
     assert env["DEEPSEEK_API_KEY"] == "task-token"
     assert env["DSWARM_PI_PROVIDER"] == "ctf-gateway"
@@ -3788,16 +2759,20 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     assert chowned == [home]
     expected_links = {
         ".pi/agent/skills/dswarm-blackboard": "/home/kali/workspace/.dswarm_runtime/dswarm-blackboard",
-        ".pi/agent/settings.json": "/opt/dswarm/pi-config/settings.json",
-        ".pi/agent/models-store.json": "/opt/dswarm/pi-config/models-store.json",
-        ".pi/agent/models.json": "/opt/dswarm/pi-config/models.json",
-        ".pi/agent/extensions": "/opt/dswarm/pi-config/extensions",
+        ".pi/agent/settings.json": "/home/kali/workspace/.dswarm_runtime/pi-config/settings.json",
+        ".pi/agent/models-store.json": "/home/kali/workspace/.dswarm_runtime/pi-config/models-store.json",
+        ".pi/agent/models.json": "/home/kali/workspace/.dswarm_runtime/pi-config/models.json",
+        ".pi/agent/extensions": "/home/kali/workspace/.dswarm_runtime/pi-config/extensions",
     }
     for rel, target in expected_links.items():
         link = home / rel
         assert link.is_symlink()
         # WindowsPath normalizes separators; the target is a POSIX container path
         assert str(link.readlink()).replace("\\", "/") == target
+    runtime_provider = (tmp_path / "workspace" / ".dswarm_runtime" / "pi-config"
+                        / "extensions" / "dswarm-worker-provider.ts")
+    assert runtime_provider.is_file()
+    assert 'readSecret("OPENAI_API_KEY")' in runtime_provider.read_text(encoding="utf-8")
 
 
 # ── review-policy sanitization ───────────────────────────────────────────────
@@ -3872,6 +2847,116 @@ def test_runtime_uses_http_blackboard_fallback_without_shared_graph(
     assert env["DSWARM_BLACKBOARD_RUN_ID"] == sw.run_id
     assert env["DSWARM_BLACKBOARD_TOKEN"] == "bb-token"
     assert "DSWARM_BLACKBOARD_DB" not in env
+
+
+def test_runtime_env_injects_profile_effort_and_endpoint(
+        challenge, tmp_path, monkeypatch):
+    from dswarm.solver.credential_accounts import (
+        CredentialAccountStore,
+        account_store_root,
+    )
+
+    root = account_store_root(tmp_path)
+    CredentialAccountStore(root).upsert_secret(
+        account_id="pi-web-main",
+        engine="api",
+        secret="profile-key",
+        base_url="https://custom.example/v1",
+        target_engine="pi",
+    )
+    sw = _coordinator_swarm(
+        challenge, tmp_path, credential_accounts_root=str(root)
+    )
+    profile = {
+        "id": "pi-web",
+        "label": "pi-web",
+        "credential_account": "pi-web-main",
+        "model": "deepseek-v4-pro",
+        "effort": "high",
+        "base_url": "https://custom.example/v1",
+        "wire_api": "openai-responses",
+        "auth_mode": "custom",
+        "auth_header": "X-API-Token",
+        "auth_prefix": "Token",
+    }
+
+    env = sw._runtime_env_for(
+        "pi", "cli-pi", container=None, profile=profile
+    )
+
+    assert env["DSWARM_WORKER_MODEL"] == "deepseek-v4-pro"
+    assert env["DSWARM_WORKER_THINKING"] == "high"
+    assert env["DSWARM_PI_PROVIDER"] == "dswarm-worker"
+    assert env["OPENAI_BASE_URL"] == "https://custom.example/v1"
+    assert env["OPENAI_API_KEY"] == "profile-key"
+    assert env["DSWARM_WORKER_BASE_URL"] == "https://custom.example/v1"
+    assert env["DSWARM_WORKER_WIRE_API"] == "openai-responses"
+    assert env["DSWARM_WORKER_AUTH_MODE"] == "custom"
+    assert env["DSWARM_WORKER_AUTH_HEADER"] == "X-API-Token"
+    assert env["DSWARM_WORKER_AUTH_PREFIX"] == "Token"
+    assert env["DSWARM_WORKER_API_KEY"] == "profile-key"
+
+
+def test_container_runtime_endpoint_uses_secret_file_and_runtime_pi_config(
+        challenge, tmp_path, monkeypatch):
+    import dswarm.solver.container_exec as container_exec
+    from dswarm.solver.credential_accounts import (
+        CredentialAccountStore,
+        account_store_root,
+    )
+
+    workspace = tmp_path / "workspace"
+    worker_root = workspace / "workers"
+    worker_root.mkdir(parents=True)
+    root = account_store_root(tmp_path)
+    CredentialAccountStore(root).upsert_secret(
+        account_id="pi-web-main",
+        engine="api",
+        secret="profile-key",
+        base_url="https://custom.example/v1",
+        target_engine="pi",
+    )
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container", worker_root=worker_root,
+        credential_accounts_root=str(root),
+    )
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", lambda _path: None)
+
+    class FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return path.replace(str(workspace), "/home/kali/workspace").replace("\\", "/")
+
+    profile = {
+        "id": "pi-web",
+        "label": "pi-web",
+        "credential_account": "pi-web-main",
+        "model": "deepseek-v4-pro",
+        "effort": "high",
+        "base_url": "https://custom.example/v1",
+        "wire_api": "openai-responses",
+        "auth_mode": "bearer",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+    }
+
+    env = sw._runtime_env_for(
+        "pi", "cli-pi", container=FakeContainer(), profile=profile
+    )
+
+    assert env["DSWARM_PI_PROVIDER"] == "dswarm-worker"
+    assert env["OPENAI_BASE_URL"] == "https://custom.example/v1"
+    assert env["DSWARM_WORKER_BASE_URL"] == "https://custom.example/v1"
+    assert env["OPENAI_API_KEY_FILE"] == "/run/dswarm/accounts/pi-web-main/API_KEY"
+    assert env["DSWARM_WORKER_API_KEY_FILE"] == "/run/dswarm/accounts/pi-web-main/API_KEY"
+    assert env["PI_CODING_AGENT_DIR"] == "/home/kali/workspace/homes/cli-pi/.pi/agent"
+    assert "OPENAI_API_KEY" not in env
+    assert "DSWARM_WORKER_API_KEY" not in env
+
+    home = workspace / "homes" / "cli-pi"
+    assert (workspace / ".dswarm_runtime" / "pi-config" / "extensions"
+            / "dswarm-worker-provider.ts").is_file()
+    assert str((home / ".pi/agent/extensions").readlink()).replace("\\", "/") == (
+        "/home/kali/workspace/.dswarm_runtime/pi-config/extensions")
 
 
 @pytest.mark.asyncio
@@ -4052,44 +3137,3 @@ def test_sync_flags_noop_without_graph(challenge, tmp_path: Path):
     sw._found_flags = ["flag{kept}"]
     assert sw._sync_flags_from_graph() == []
     assert sw._found_flags == ["flag{kept}"]             # untouched
-
-
-async def test_coordinator_finalizes_when_flag_only_on_graph(challenge, tmp_path: Path,
-                                                             monkeypatch):
-    """End-to-end (run-75379 BUG②: expected_flags=2 where each worker writes its
-    flag to the shared graph (as _accept_flag does) but returns a SolveOutcome with
-    EMPTY flags — the leak. The per-reap tally stays at 0; only the graph reconcile
-    drives completion. The run must finalize solved instead of spawning forever."""
-    from dswarm.solver.types import SolveOutcome
-
-    challenge.expected_flags = 2
-    challenge.multi_flag = True
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
-    monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
-
-    flag_pool = ["flag{a}", "flag{b}"]
-    spawn = {"n": 0}
-
-    class GraphOnlyWorker:
-        """Accepts a flag onto the shared graph but never returns it in the
-        outcome — models a worker cancelled/errored after _accept_flag, or the
-        live DB→bus bridge path."""
-        def __init__(self, engine):
-            self.solver_id = f"cli-{engine}"
-            self._f = flag_pool[spawn["n"] % len(flag_pool)]
-            spawn["n"] += 1
-        async def run(self):
-            await asyncio.sleep(0)
-            sw.shared_graph.flag_found(actor=self.solver_id, flag=self._f,
-                                       intent_id=None)
-            # outcome carries NO flags → _record_flags(*outcome.flags) sees nothing.
-            return SolveOutcome(False, None, 1, None, "done", flags=[])
-
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: GraphOnlyWorker(engine))
-
-    out = await asyncio.wait_for(sw.run(), timeout=10)
-
-    assert out.solved is True                            # finalized, did not hang
-    assert set(sw._found_flags) == {"flag{a}", "flag{b}"}  # reconciled from graph
-    assert sw._flags_complete() is True

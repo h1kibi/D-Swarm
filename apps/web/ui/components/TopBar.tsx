@@ -62,7 +62,7 @@ export function TopBar({
   };
 
   return (
-    <header className="topbar motion-shell-piece" aria-label={t("topbar.aria")}>
+    <header className="topbar" aria-label={t("topbar.aria")}>
       <button
         className="icon-btn"
         onClick={onToggleRail}

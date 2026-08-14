@@ -55,6 +55,10 @@ desktop/*.exe
 .mypy_cache/
 harness-assessment.html
 
+# Root-level scratch files from UI/probe/debug runs.
+/tmp_*
+/tmp_*/
+
 # Secrets — NEVER commit real API keys / MCP bearer tokens.
 # .mcp.json is the LOCAL knowledge-base MCP client config (may point at a private
 # service + token) and is NOT committed; .mcp.json.example is the sanitized template.

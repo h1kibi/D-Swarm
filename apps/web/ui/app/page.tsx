@@ -6,11 +6,11 @@ import { useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
 import { I18nProvider } from "@/lib/i18n";
 import { ThreadRail } from "@/components/ThreadRail";
+import { StartupTestPanel } from "@/components/StartupTestPanel";
 import { Conversation } from "@/components/Conversation";
 import type { DispatchOpts } from "@/components/Conversation";
 import { ArtifactPanel } from "@/components/ArtifactPanel";
 import { LoginGate } from "@/components/LoginGate";
-import { WorkerSettings } from "@/components/WorkerSettings";
 import { CommandPalette } from "@/components/CommandPalette";
 import { BtwPanel } from "@/components/BtwPanel";
 import { ToastLane, useToasts } from "@/components/Toast";
@@ -50,6 +50,10 @@ type ThemeMode = "light" | "dark";
 const ARTIFACT_WIDTH_MIN = 360;
 const ARTIFACT_WIDTH_MAX = 960;
 const ARTIFACT_WIDTH_STORAGE_KEY = "dswarm.artifact.width";
+const INSPECTOR_WIDTH_MIN = 280;
+const INSPECTOR_WIDTH_MAX = 640;
+const INSPECTOR_WIDTH_DEFAULT = 340;
+const INSPECTOR_WIDTH_STORAGE_KEY = "dswarm.inspector.width";
 
 function artifactWidthMax(viewportWidth?: number): number {
   if (!viewportWidth || viewportWidth <= 0) return ARTIFACT_WIDTH_MAX;
@@ -63,6 +67,16 @@ function artifactWidthDefault(viewportWidth?: number): number {
 function clampArtifactWidth(width: number, viewportWidth?: number): number {
   const next = Number.isFinite(width) ? width : artifactWidthDefault(viewportWidth);
   return Math.round(Math.min(artifactWidthMax(viewportWidth), Math.max(ARTIFACT_WIDTH_MIN, next)));
+}
+
+function inspectorWidthMax(viewportWidth?: number): number {
+  if (!viewportWidth || viewportWidth <= 0) return INSPECTOR_WIDTH_MAX;
+  return Math.max(INSPECTOR_WIDTH_MIN, Math.min(INSPECTOR_WIDTH_MAX, Math.round(viewportWidth * 0.46)));
+}
+
+function clampInspectorWidth(width: number, viewportWidth?: number): number {
+  const next = Number.isFinite(width) ? width : INSPECTOR_WIDTH_DEFAULT;
+  return Math.round(Math.min(inspectorWidthMax(viewportWidth), Math.max(INSPECTOR_WIDTH_MIN, next)));
 }
 
 // per-run routing (/run/<id>): the URL is derived from the active run id (drafts
@@ -125,9 +139,9 @@ function Deck() {
   const [railWidth, setRailWidth] = useState(RAIL_WIDTH_DEFAULT);
   const [railWidthReady, setRailWidthReady] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>("light");
-  const [showSettings, setShowSettings] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [btwOpen, setBtwOpen] = useState(false);
+  const [startupTestOpen, setStartupTestOpen] = useState(false);
   const [artifactOpen, setArtifactOpen] = useState(false);
   const [artifactView, setArtifactView] = useState<ArtifactView>("graph");
   const [artifactWidth, setArtifactWidth] = useState(() => artifactWidthDefault(typeof window !== "undefined" ? window.innerWidth : 1280));
@@ -151,6 +165,8 @@ function Deck() {
   // Phase 4 shell state: right-column inspector visibility, Stage Rail →
   // Decision Timeline jump target, and the Operator Command Bar's target.
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorWidth, setInspectorWidth] = useState(INSPECTOR_WIDTH_DEFAULT);
+  const [inspectorWidthReady, setInspectorWidthReady] = useState(false);
   const [stageJump, setStageJump] = useState<{ stage: Stage; nonce: number } | null>(null);
   const [opTarget, setOpTarget] = useState("global");
   const [opFocusNonce, setOpFocusNonce] = useState(0);
@@ -249,6 +265,27 @@ function Deck() {
     }
   }, [railWidth, railWidthReady]);
 
+  useEffect(() => {
+    try {
+      const raw = readKey(INSPECTOR_WIDTH_STORAGE_KEY);
+      const parsed = raw ? Number(raw) : NaN;
+      if (Number.isFinite(parsed)) setInspectorWidth(clampInspectorWidth(parsed, window.innerWidth));
+    } catch {
+      // localStorage may be blocked; keep the default width.
+    } finally {
+      setInspectorWidthReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!inspectorWidthReady) return;
+    try {
+      writeKey(INSPECTOR_WIDTH_STORAGE_KEY, String(inspectorWidth));
+    } catch {
+      // localStorage may be blocked; resizing should still work for this session.
+    }
+  }, [inspectorWidth, inspectorWidthReady]);
+
   const onRailResize = useCallback((width: number) => {
     const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
     setRailWidth(clampRailWidth(width, viewport));
@@ -256,6 +293,10 @@ function Deck() {
   const onArtifactResize = useCallback((width: number) => {
     const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
     setArtifactWidth(clampArtifactWidth(width, viewport));
+  }, []);
+  const onInspectorResize = useCallback((width: number) => {
+    const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
+    setInspectorWidth(clampInspectorWidth(width, viewport));
   }, []);
 
   // Cmd/Ctrl+K opens (toggles) the command palette — the single, more-powerful
@@ -269,14 +310,13 @@ function Deck() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
-        if (showSettings) return;
         e.preventDefault();
         setPaletteOpen((v) => !v);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showSettings]);
+  }, []);
 
   // BTW observer: Ctrl/Cmd+Shift+/ opens the read-only side-query drawer.
   // Avoids Cmd+B (bookmark bar), `?` (help), and bare-key panel shortcuts
@@ -284,32 +324,30 @@ function Deck() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "/" || e.key === "?")) {
-        if (showSettings || paletteOpen) return;
+        if (paletteOpen) return;
         e.preventDefault();
         setBtwOpen((v) => !v);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showSettings, paletteOpen]);
+  }, [paletteOpen]);
 
   // Escape closes the open artifact panel (graph / blackboard / timeline / …).
-  // Layering: the settings modal sits on top and owns Esc first (its handler is
-  // capture-phase + stopPropagation, and we also guard on `showSettings` here so
-  // a modal Esc never leaks through to close the panel). The rail's ⋯ menu Esc is
+  // Layering: modal drawers own Esc first. The rail's ⋯ menu Esc is
   // an independent transient and doesn't conflict. Only bind while the panel is
   // open and no modal is up. The palette is ALSO a modal layer: while it's open,
   // its own Esc closes it (a React handler with stopPropagation can't stop this
   // native window listener), so gate on !paletteOpen too — otherwise one Esc
   // would close both the palette and the panel beneath it.
   useEffect(() => {
-    if (!artifactOpen || showSettings || paletteOpen || btwOpen) return;
+    if (!artifactOpen || paletteOpen || btwOpen || startupTestOpen) return;
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); setArtifactOpen(false); }
     };
     window.addEventListener("keydown", onEsc);
     return () => window.removeEventListener("keydown", onEsc);
-  }, [artifactOpen, showSettings, paletteOpen, btwOpen]);
+  }, [artifactOpen, paletteOpen, btwOpen, startupTestOpen]);
 
   // Single-key shortcuts to jump the secondary panels from the keyboard, so a
   // power operator watching a run never has to reach for the mouse. Mnemonic map:
@@ -327,7 +365,7 @@ function Deck() {
     f: "findings", c: "credentials", p: "pocs", r: "routes", d: "directives",
   };
   useEffect(() => {
-    if (!deck.started || showSettings || paletteOpen || btwOpen) return;
+    if (!deck.started || paletteOpen || btwOpen || startupTestOpen) return;
     const isTyping = (el: EventTarget | Element | null): boolean => {
       const node = el as HTMLElement | null;
       if (!node || typeof node.tagName !== "string") return false;
@@ -346,7 +384,7 @@ function Deck() {
     return () => window.removeEventListener("keydown", onKey);
     // openArtifact is stable enough for this scope; re-bind only on the gates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deck.started, showSettings, paletteOpen]);
+  }, [deck.started, paletteOpen]);
 
   // When the auto-title lands live (RUN_TITLED → deck.challengeName), refetch the
   // rail immediately so the active row's "new conversation" placeholder is
@@ -629,7 +667,7 @@ function Deck() {
         theme={theme}
         onToggleTheme={toggleTheme}
       />
-      <div className="cc-body">
+      <div className="cc-body layout-refined">
         <ThreadRail
           collapsed={railCollapsed}
           width={railWidth}
@@ -642,7 +680,8 @@ function Deck() {
           onSelect={onSelectRun}
           onAction={onRailAction}
           onResize={onRailResize}
-          onOpenSettings={() => setShowSettings(true)}
+          onOpenSettings={() => { window.location.href = "/settings/workers"; }}
+          onStartupTest={() => setStartupTestOpen(true)}
           onBatch={onBatch}
         />
         <main id="main-conversation" className="main motion-shell-piece" aria-label={t("a11y.main")}>
@@ -693,6 +732,11 @@ function Deck() {
             onOpenArtifact={openArtifact}
             onCommand={onCommand}
             onHitlAnswered={() => pushToast({ msg: t("hitl.answered"), variant: "success" })}
+            width={inspectorWidth}
+            onResize={onInspectorResize}
+            minWidth={INSPECTOR_WIDTH_MIN}
+            maxWidth={inspectorWidthMax(winW)}
+            defaultWidth={INSPECTOR_WIDTH_DEFAULT}
           />
         )}
       </div>
@@ -706,7 +750,6 @@ function Deck() {
         onCommand={onCommand}
       />
       <ToastLane toasts={toasts} onDismiss={dismissToast} />
-      <WorkerSettings open={showSettings} onClose={() => setShowSettings(false)} />
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -718,12 +761,16 @@ function Deck() {
         onOpenArtifact={openArtifact}
         onSelectRun={onSelectRun}
         onSpawnWorker={onSpawnWorker}
-        onOpenSettings={() => setShowSettings(true)}
+        onOpenSettings={() => { window.location.href = "/settings/workers"; }}
       />
       <BtwPanel
         open={btwOpen}
         onClose={() => setBtwOpen(false)}
         runId={runId}
+      />
+      <StartupTestPanel
+        open={startupTestOpen}
+        onClose={() => setStartupTestOpen(false)}
       />
     </div>
   );

@@ -38,6 +38,15 @@ def test_dockerfiles_copy_only_ts_extensions():
     assert errors == [], "\n".join(errors)
 
 
+def test_dswarm_worker_provider_registers_without_direct_key():
+    provider = (REPO_ROOT / "docker" / "worker-pi" / "pi-config" / "extensions"
+                / "dswarm-worker-provider.ts").read_text(encoding="utf-8")
+    assert 'if (!baseUrl) return;' in provider
+    assert 'if (!baseUrl || !apiKey) return;' not in provider
+    assert 'readSecret("OPENAI_API_KEY")' in provider
+    assert 'authMode !== "none"' in provider
+
+
 def test_expected_extension_set_is_exact():
     module = _load_checker()
     files = {path.name for path in module.extension_files()}

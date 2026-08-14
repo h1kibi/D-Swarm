@@ -1,8 +1,11 @@
 @echo off
+setlocal
 rem Build the P6 desktop shell exe from the desktop/ dir (wails needs it as cwd).
 cd /d %~dp0
 rem Desktop defaults to `next start`, so package a fresh production deck build.
 pushd ..\apps\web\ui
+rem Next rewrites are resolved at build time; pin the packaged deck to Desktop's default backend.
+set "DSWARM_BACKEND=http://127.0.0.1:8000"
 call npm.cmd run build
 if errorlevel 1 (
   set BUILD_RC=%ERRORLEVEL%
@@ -23,4 +26,6 @@ if errorlevel 1 (
   exit /b %ERRORLEVEL%
 )
 C:\Users\Administrator\go\bin\wails.exe build -nocolour -windowsconsole
-echo BUILD_RC=%ERRORLEVEL%
+set "BUILD_RC=%ERRORLEVEL%"
+echo BUILD_RC=%BUILD_RC%
+exit /b %BUILD_RC%

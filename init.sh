@@ -5,6 +5,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Fail fast before running uv if this script is launched from WSL against a
+# Windows workspace (/mnt/<drive>/...). WSL uv creates a Linux virtualenv shape
+# (for example .venv/lib64 symlinks) that Windows uv cannot safely reuse. Run the
+# startup check from PowerShell/CMD with Windows uv, or clone the repo inside the
+# WSL filesystem instead.
+if [[ -n "${WSL_DISTRO_NAME:-}" && "$(pwd -P)" == /mnt/[A-Za-z]/* ]]; then
+  echo "ERROR: WSL bash is running init.sh inside a Windows workspace: $(pwd -P)" >&2
+  echo "       Stop before running uv; use PowerShell/CMD in this checkout, or a WSL-native clone." >&2
+  exit 1
+fi
+
 echo "==> [1/3] Python toolchain (uv)"
 if ! command -v uv >/dev/null 2>&1; then
   # ~/.local/bin is where the official installer drops uv but a non-login shell
@@ -42,10 +53,11 @@ fi
 
 PYTEST_ARGS=(-q)
 
-# The pwn SDK is optional and depends on pwntools / the dswarm-pwn container.
-# Keep the default session bootstrap lean: pwn-specific tests only run when the
-# operator explicitly opts in after installing those tools.
-if [[ "${DSWARM_RUN_PWN_TESTS:-0}" != "1" ]]; then
+# The pwn SDK is optional and depends on pwntools / a pwn-capable worker image.
+# Keep the default session bootstrap lean. Older checkouts had a dedicated
+# tests/test_kit_pwn.py module; ignore it only when present so this script does
+# not advertise a non-existent test file.
+if [[ "${DSWARM_RUN_PWN_TESTS:-0}" != "1" && -f tests/test_kit_pwn.py ]]; then
   PYTEST_ARGS+=(--ignore=tests/test_kit_pwn.py)
 fi
 
@@ -62,7 +74,7 @@ echo "OK — suite green. See README.md to get started; AGENTS.md for the dev ma
 
 # Optional pwn SDK verification:
 #   DSWARM_RUN_PWN_TESTS=1 ./init.sh
-# Requires pwntools (and dynamic tests may require the dswarm-pwn image).
+# Requires pwntools (and dynamic tests may require a pwn-capable worker image).
 #
 # To run a real challenge (needs an API key), use the web deck:
 #   ./run.sh web   → create a run, flip the offline toggle for a clean black-box.

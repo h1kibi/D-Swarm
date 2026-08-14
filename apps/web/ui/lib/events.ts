@@ -38,6 +38,18 @@ export enum EventType {
   HITL_TRANSLATED = "hitl.translated",
   GRAPH_COMPACTED = "graph.compacted",
   WORKER_LIFECYCLE = "worker.lifecycle",
+  PROVIDER_ERROR = "provider.error",
+  PROVIDER_BATCH_ALERT = "provider.batch_alert",
+}
+
+export function isRuntimeInfraFactText(x: unknown): boolean {
+  const s = String(x ?? "").trim().toLowerCase();
+  if (!s) return false;
+  if (s.includes("worker cli/runtime failed before producing solver output")) return true;
+  if (s.includes("profile_incompatible offline eval cannot use custom endpoint profile")) return true;
+  if (s.includes("unknown provider") && s.includes("dswarm-worker") && s.includes("--list-models")) return true;
+  if (s.includes("endpoint probe failed:") && (s.includes("curl:") || s.includes("requested url returned error"))) return true;
+  return false;
 }
 
 export interface DSwarmEvent {
@@ -317,6 +329,24 @@ export interface BlackboardPoc {
   claimedTs?: number;
   concludedTs?: number;
 }
+export interface BlackboardFlagClaim {
+  id: string;
+  flag: string;
+  status: "unverified" | "invalidated";
+  reason?: string;
+  actor: string;
+  ts: number;
+  seq?: number;
+  intentId?: string;
+  artifactId?: string;
+  audit?: {
+    verdict?: string;
+    reason?: string;
+    recommendedAction?: string;
+    actor?: string;
+    ts?: number;
+  };
+}
 export interface BlackboardEvent {
   id: string;
   kind: string;          // intent_proposed | intent_claimed | … | fact_added | dead_end | flag_found
@@ -333,6 +363,7 @@ export interface BlackboardView {
   suppressedRoutes: BlackboardSuppressedRoute[];
   branches: BlackboardBranch[];
   directives: BlackboardDirective[];
+  unverifiedFlags: BlackboardFlagClaim[];
   flag?: string;                       // first/primary flag (back-comat)
   flags?: string[];                    // every distinct flag captured (multi-flag)
   events: BlackboardEvent[];           // append-only timeline
@@ -434,6 +465,7 @@ export function emptyDeck(runId: string): DeckState {
       suppressedRoutes: [],
       branches: [],
       directives: [],
+      unverifiedFlags: [],
       flags: [],
       events: [],
       workers: [],
@@ -627,6 +659,7 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       suppressedRoutes: [...(prev.blackboard.suppressedRoutes ?? [])],
       branches: [...(prev.blackboard.branches ?? [])],
       directives: [...(prev.blackboard.directives ?? [])],
+      unverifiedFlags: [...(prev.blackboard.unverifiedFlags ?? [])],
       events: [...prev.blackboard.events],
       workers: [...prev.blackboard.workers],
       flag: prev.blackboard.flag,
@@ -794,8 +827,9 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       s.terminal = [...s.terminal, p.text ?? ""].slice(-1000);
       break;
     case EventType.SOLVE_GRAPH_DELTA:
-      if (p.kind === "evidence_added") s.graph.evidence = [...s.graph.evidence, p.fact].slice(-50);
-      else if (p.kind === "flag") { s.graph.flag = p.flag; mergeFlags(s, p.flag); }
+      if (p.kind === "evidence_added") {
+        if (!isRuntimeInfraFactText(p.fact)) s.graph.evidence = [...s.graph.evidence, p.fact].slice(-50);
+      } else if (p.kind === "flag") { s.graph.flag = p.flag; mergeFlags(s, p.flag); }
       else if (p.kind === "dead_end") {
         s.graph.deadEnds = [...s.graph.deadEnds, p.reason];
         addGraphNode(m, "dead_end", p.reason ?? "dead end", { from: sid ? `solver:${sid}` : undefined, kind: "refutes" });
@@ -815,6 +849,7 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
         fact: p.fact ?? "", verified: !!p.verified, confidence: p.confidence ?? 0,
         actor: p.actor ?? sid ?? "", verifier: p.verifier ?? "",
       };
+      if (isRuntimeInfraFactText(row.fact)) break;
       if (row.verified) s.sharedGraph.verified = [...s.sharedGraph.verified, row].slice(-50);
       else s.sharedGraph.candidates = [...s.sharedGraph.candidates, row].slice(-50);
       const from = row.actor ? `solver:${row.actor}` : (sid ? `solver:${sid}` : undefined);
@@ -905,6 +940,7 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           break;
         }
         case "fact_added": {
+          if (isRuntimeInfraFactText(p.fact)) break;
           const rawFactSeq = typeof p.fact_seq === "number" ? p.fact_seq : undefined;
           if (rawFactSeq !== undefined && rawFactSeq <= 0) break;
           const factSeq = rawFactSeq && rawFactSeq > 0 ? rawFactSeq : undefined;
@@ -1209,6 +1245,8 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
                 m.version += 1;
               }
             }
+            bb.unverifiedFlags = bb.unverifiedFlags.map((x) =>
+              x.flag === p.flag ? { ...x, status: "invalidated" } : x);
           }
           break;
         }
@@ -1219,6 +1257,82 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           mergeFlags(s, p.flag);
           bb.flags = [...s.flags]; // mirror the deduped flag set onto the blackboard
           tlabel(`${actor} FLAG ${p.flag ?? ""}`);
+          break;
+        }
+        case "flag_unverified": {
+          const flag = String(p.flag ?? "").trim();
+          if (!flag) break;
+          const seq = Number(p.seq ?? p.claim_seq ?? 0) || undefined;
+          const id = seq ? `flag-claim:${seq}` : `flag-claim:${flag}:${actor}`;
+          const row: BlackboardFlagClaim = {
+            id,
+            flag,
+            status: "unverified",
+            reason: String(p.reason ?? ""),
+            actor: String(p.source_actor ?? actor),
+            ts: ev.ts,
+            seq,
+            intentId: p.intent_id ? String(p.intent_id) : undefined,
+            artifactId: p.artifact_id ? String(p.artifact_id) : undefined,
+          };
+          const existing = bb.unverifiedFlags.findIndex((x) => x.id === id || x.flag === flag);
+          if (existing >= 0) {
+            bb.unverifiedFlags = bb.unverifiedFlags.map((x, ix) => ix === existing ? { ...x, ...row, audit: x.audit } : x);
+          } else {
+            bb.unverifiedFlags = [...bb.unverifiedFlags, row].slice(-80);
+          }
+          tlabel(`unverified flag claim: ${flag}`);
+          pushChat(s, {
+            role: "system", kind: "status",
+            content: `未验证 flag 声明：${flag}（等待 Reviewer 审计/真实输出复现）`,
+            ts: ev.ts,
+          });
+          break;
+        }
+        case "flag_audit": {
+          const flag = String(p.flag ?? "").trim();
+          if (!flag) break;
+          const audit = {
+            verdict: p.verdict ? String(p.verdict) : undefined,
+            reason: p.reason ? String(p.reason) : undefined,
+            recommendedAction: p.recommended_action ? String(p.recommended_action) : undefined,
+            actor,
+            ts: ev.ts,
+          };
+          const ix = bb.unverifiedFlags.findIndex((x) => x.flag === flag);
+          if (ix >= 0) {
+            bb.unverifiedFlags = bb.unverifiedFlags.map((x, i) => i === ix ? { ...x, audit } : x);
+          } else {
+            const row: BlackboardFlagClaim = {
+              id: `flag-claim:audit:${flag}:${ev.ts}`,
+              flag,
+              status: "unverified",
+              actor: String(actor),
+              ts: ev.ts,
+              audit,
+            };
+            bb.unverifiedFlags = [...bb.unverifiedFlags, row].slice(-80);
+          }
+          tlabel(`flag audit ${audit.verdict ?? "review"}: ${flag}`);
+          break;
+        }
+        case "review_proposal": {
+          const marker = String(p.marker ?? "").toUpperCase();
+          if (marker === "FLAG_AUDIT") {
+            const flag = String(p.flag ?? "").trim();
+            if (flag) {
+              const audit = {
+                verdict: p.verdict ? String(p.verdict) : undefined,
+                reason: p.summary ? String(p.summary) : undefined,
+                recommendedAction: p.recommended_action ? String(p.recommended_action) : undefined,
+                actor,
+                ts: ev.ts,
+              };
+              const ix = bb.unverifiedFlags.findIndex((x) => x.flag === flag);
+              if (ix >= 0) bb.unverifiedFlags = bb.unverifiedFlags.map((x, i) => i === ix ? { ...x, audit } : x);
+            }
+          }
+          tlabel(`review proposal ${marker || "review"}: ${String(p.summary ?? "").slice(0, 72)}`);
           break;
         }
         case "need_input": {
@@ -1398,6 +1512,95 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           bb.branches = bb.branches.map((b) =>
             idSet.has(b.branchId) ? { ...b, status: "resolved" } : b);
           tlabel(`branch resolved: ${ids.join(", ") || "branch"}`);
+          break;
+        }
+        case "provider_recovery_directive": {
+          const worker = String(p.worker ?? actor ?? "worker");
+          const category = String(p.category ?? "provider_error");
+          const action = String(p.recovery_action ?? "retry_next_worker");
+          const singleShot = p.current_worker_interrupted === false
+            ? "当前 worker 是 single-shot，本轮不会被强行中断；"
+            : "";
+          const operatorMessage = String(p.operator_message ?? "").trim();
+          const message = operatorMessage || `${singleShot}恢复指令已写入黑板，下一个 Worker/Reason 会消费。`;
+          bb.directives = [...bb.directives, {
+            action,
+            directive: message,
+            actor: worker || actor,
+            ts: ev.ts,
+          }].slice(-60);
+          tlabel(`${worker} provider 恢复指令 (${category}): ${singleShot}下一个 Worker/Reason 会消费`);
+          pushChat(s, {
+            role: "system",
+            kind: "status",
+            content: `Worker provider 恢复指令：${worker} 遇到 ${category}。${message}`,
+            ts: ev.ts,
+          });
+          if (worker) {
+            const l = lane(s, worker);
+            s.lanes[l.solverId] = { ...l, status: "provider_warning", statusReason: category };
+          }
+          break;
+        }
+        case "worker_recovery_scheduled": {
+          const worker = String(p.worker ?? actor ?? "worker");
+          const category = String(p.category ?? "provider_error");
+          const intentId = p.intent_id ? String(p.intent_id) : "当前 intent";
+          const attempt = p.attempt != null ? String(p.attempt) : "?";
+          const maxAttempts = p.max_attempts != null ? String(p.max_attempts) : "?";
+          tlabel(`${worker} 自动恢复 ${intentId} (${category}) ${attempt}/${maxAttempts}`);
+          pushChat(s, {
+            role: "system",
+            kind: "status",
+            content: `Worker 自动恢复：${worker} 因 ${category} 失败，已重新派发 ${intentId}（${attempt}/${maxAttempts}）。`,
+            ts: ev.ts,
+          });
+          break;
+        }
+        case "provider_dispatch_paused": {
+          const profile = String(p.profile ?? p.worker ?? actor ?? "provider profile");
+          const category = String(p.category ?? "provider_error");
+          const provider = p.provider ? ` provider=${String(p.provider)}` : "";
+          const message = `已暂停派发 ${profile}${provider}，原因：${category}。请检查额度/认证/模型配置后再恢复。`;
+          bb.directives = [...bb.directives, {
+            action: "pause_provider_dispatch",
+            directive: message,
+            actor,
+            ts: ev.ts,
+          }].slice(-60);
+          tlabel(`暂停派发 ${profile} (${category})`);
+          pushChat(s, { role: "system", kind: "guidance", content: message, ts: ev.ts });
+          break;
+        }
+        case "worker_recovery_exhausted": {
+          const worker = String(p.worker ?? actor ?? "worker");
+          const intentId = p.intent_id ? String(p.intent_id) : "当前 intent";
+          const category = String(p.category ?? "provider_error");
+          const attempts = p.attempts != null ? String(p.attempts) : "?";
+          const message = `Worker 恢复重试已用尽：${worker} / ${intentId} 连续 ${attempts} 次遇到 ${category}。请检查 provider、网络、额度或切换模型。`;
+          tlabel(`${worker} 恢复重试已用尽 ${intentId} (${category})`);
+          pushChat(s, { role: "system", kind: "guidance", content: message, ts: ev.ts });
+          if (worker) {
+            const l = lane(s, worker);
+            s.lanes[l.solverId] = { ...l, status: "provider_error", statusReason: category };
+          }
+          break;
+        }
+        case "provider_batch_alert": {
+          const category = String(p.category ?? "provider_error");
+          const count = Number(p.count ?? 0);
+          const affected = p.affected_workers != null ? String(p.affected_workers) : "?";
+          const active = p.active_workers != null ? String(p.active_workers) : "?";
+          const provider = p.provider ? ` provider=${String(p.provider)}` : "";
+          const account = p.account_id ? ` account=${String(p.account_id)}` : "";
+          const pause = p.should_pause_dispatch === true
+            ? "已达到批量错误阈值，应暂停派发并检查额度/认证/模型配置。"
+            : "多个 worker 受影响，请检查 provider 稳定性。";
+          const message = `系统性 LLM 错误告警: ${category}${provider}${account}; ${count || "多"} 次，影响 ${affected}/${active} worker。${pause}`;
+          tlabel(`批量错误告警 ${category}: ${count || "多"} 次，影响 ${affected}/${active}`);
+          if (s.chat.at(-1)?.content !== message) {
+            pushChat(s, { role: "system", kind: "guidance", content: message, ts: ev.ts });
+          }
           break;
         }
         case "coordinator_directive": {
@@ -1665,6 +1868,59 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
         s.solvedChatShown = true;
         pushChat(s, { role: "system", kind: "status", content: `SOLVED — ${p.flag ?? ""}`, ts: ev.ts, i18nKey: "sys.solved", i18nVars: { flag: p.flag ?? "" } });
       }
+      break;
+    }
+    case EventType.PROVIDER_ERROR: {
+      const category = String(p.category ?? "unknown_worker_failure");
+      const severity = String(p.severity ?? "warning");
+      const provider = p.provider ? ` provider=${String(p.provider)}` : "";
+      const account = p.account_id ? ` account=${String(p.account_id)}` : "";
+      const retry = p.retryable === true
+        ? " 系统会尽量自动重试/由后续 worker 接续。"
+        : "";
+      const pause = p.should_pause_dispatch === true
+        ? " 建议暂停继续派发，先修复账号/模型/额度配置。"
+        : "";
+      const message = String(p.user_message || p.raw_message || "").trim();
+      const suggested = p.suggested_action ? ` 建议：${String(p.suggested_action)}` : "";
+      pushChat(s, {
+        role: "system",
+        kind: p.should_pause_dispatch === true ? "guidance" : "status",
+        content: `LLM provider ${severity}: ${category}${provider}${account}.${message ? ` ${message}` : ""}${retry}${pause}${suggested}`,
+        ts: ev.ts,
+        i18nKey: "sys.providerError",
+        i18nVars: { category, severity, provider: String(p.provider ?? ""), account: String(p.account_id ?? "") },
+      });
+      if (sid) {
+        const l = lane(s, sid);
+        s.lanes[l.solverId] = {
+          ...l,
+          status: severity === "fatal" ? "provider_error" : "provider_warning",
+          statusReason: category,
+        };
+      }
+      break;
+    }
+    case EventType.PROVIDER_BATCH_ALERT: {
+      const category = String(p.category ?? "provider_error");
+      const count = Number(p.count ?? 0);
+      const affected = p.affected_workers != null ? String(p.affected_workers) : "?";
+      const active = p.active_workers != null ? String(p.active_workers) : "?";
+      const provider = p.provider ? ` provider=${String(p.provider)}` : "";
+      const account = p.account_id ? ` account=${String(p.account_id)}` : "";
+      const pause = p.should_pause_dispatch === true
+        ? " 已达到批量错误阈值，应暂停派发并检查额度/认证/模型配置。"
+        : " 多个 worker 受影响，请检查 provider 稳定性。";
+      const message = String(p.user_message || "").trim();
+      const suggested = p.suggested_action ? ` 建议：${String(p.suggested_action)}` : "";
+      pushChat(s, {
+        role: "system",
+        kind: "guidance",
+        content: `系统性 LLM 错误告警: ${category}${provider}${account}; ${count || "多"} 次，影响 ${affected}/${active} worker。${message ? ` ${message}` : ""}${pause}${suggested}`,
+        ts: ev.ts,
+        i18nKey: "sys.providerBatchAlert",
+        i18nVars: { category, count: String(count), affected, active },
+      });
       break;
     }
     case EventType.RUN_FINISHED: {

@@ -35,6 +35,7 @@ __all__ = [
 # cased below; everything else (host PATH etc.) is supplied by the supervisor's
 # baseEnv, so we don't leak the host's full environment into the container.
 _ENV_PREFIXES = ("DSWARM_", "ANTHROPIC_", "OPENAI_", "DEEPSEEK_")
+_PI_ENV_KEYS = {"PI_CODING_AGENT_DIR"}
 _CONTAINER_WORKSPACE = "/home/kali/workspace"
 
 
@@ -47,6 +48,13 @@ def _filter_env(env: Optional[dict]) -> dict[str, str]:
         return out
     for k, v in env.items():
         if k == "HOME":
+            if str(v).startswith(f"{_CONTAINER_WORKSPACE}/"):
+                out[k] = str(v)
+            continue
+        if k in _PI_ENV_KEYS:
+            # Only forward pi's config root when it points at the mounted
+            # workspace. Avoid broad PI_* forwarding so host/user pi secrets or
+            # unrelated settings cannot leak into the worker container.
             if str(v).startswith(f"{_CONTAINER_WORKSPACE}/"):
                 out[k] = str(v)
             continue

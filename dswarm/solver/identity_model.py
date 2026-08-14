@@ -150,6 +150,7 @@ class Seat:
     credential_id: str
     environment_id: str
     model: str = ""
+    effort: str = ""
     roles: list[str] = field(default_factory=lambda: list(DEFAULT_ROLES))
     race: bool = True
     max_running: int = 1
@@ -162,6 +163,7 @@ class Seat:
             "id": self.id, "label": self.label, "engine": self.engine,
             "credential_id": self.credential_id, "environment_id": self.environment_id,
             "model": self.model, "roles": list(self.roles), "race": self.race,
+            "effort": self.effort,
             "capacity": {
                 "max_running": self.max_running,
                 "max_review_running": self.max_review_running,
@@ -331,6 +333,7 @@ def migrate_legacy_config(
             id=sid, label=label, engine=engine,
             credential_id=cid, environment_id=env_id,
             model=str(p.get("model") or "").strip(),
+            effort=str(p.get("effort") or "").strip().lower(),
             roles=roles,
             race=bool(p.get("race", "race" in roles)),
             max_running=coerce_pos_int(p.get("max_running", cap.get("max_running")), 1),
@@ -367,9 +370,9 @@ def _seat_direction_image(seat: dict[str, Any]) -> str:
 
     A direction seat names its direction in `label` (UI "Agent" name, e.g.
     `pi-web`) or carries the direction profile id itself as `id`/`label`
-    (`pi-web`). Map those to the unified Kali pi image
-    (`ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1`); everything else keeps the
-    same default worker image.
+    (`pi-web`). Map those to the matching local direction image
+    (`ctf-swarm-pi-<direction>:0.2.0`); everything else keeps the same default
+    worker image.
     Without this the new-shape config silently ran every direction seat on the
     base image (same bug class as the stale single-profile roster).
     """
@@ -443,6 +446,7 @@ def seat_to_legacy_profile(
         "max_review_running": coerce_nonneg_int(seat.get("max_review_running", cap.get("max_review_running")), 0),
         "priority": coerce_nonneg_int(seat.get("priority"), 100),
         "model": str(seat.get("model") or "").strip(),
+        "effort": str(seat.get("effort") or "").strip().lower(),
         "enabled": bool(seat.get("enabled", True)),
     }
 

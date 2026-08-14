@@ -24,12 +24,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from apps.web.provider_errors import ProviderErrorAggregator, classify_provider_error
 from apps.web.run_meta import FolderStore, RunMetaStore
 from apps.web.worker_config import WorkerConfigStore
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.events import Event, EventType, hitl_response_payload
 from dswarm.core.session_store import SessionStore
+from dswarm.solver.credential_accounts import ensure_pi_account_from_env
 
 LOG = logging.getLogger(__name__)
 
@@ -205,6 +207,7 @@ class RunManager:
         self.sessions_root = Path(sessions_root)
         self.sessions_root.mkdir(parents=True, exist_ok=True)
         self.runs: dict[str, Run] = {}
+        self.provider_errors = ProviderErrorAggregator()
         self._seq = 0
         self.meta = RunMetaStore(root=self.sessions_root)
         # operator-created rail folders (id → name); runs reference one via meta.
@@ -212,6 +215,9 @@ class RunManager:
         # default worker-roster config (which engines launch per challenge); the
         # dispatch path falls back to this when a request doesn't say otherwise.
         self.worker_config = WorkerConfigStore(root=self.sessions_root)
+        # pi-only convenience: mirror DEEPSEEK_API_KEY into pi-main so container
+        # workers can mount it without forcing the operator to manage accounts.
+        ensure_pi_account_from_env(self.sessions_root)
         # P4: FIFO run queue + global concurrency cap (default 5, 1..8). Every
         # manager start goes through it; the queue is in-memory (transient).
         from apps.web.run_scheduler import RunScheduler
@@ -911,6 +917,52 @@ class RunManager:
                      "limit": self.scheduler.max_concurrent_runs}))
         return run
 
+    async def _emit_provider_diagnostics(
+        self, run: "Run", detail: str, *, worker_id: str = "", provider: str = "",
+        account_id: str = "", active_workers: int | None = None,
+    ) -> None:
+        """Emit operator-facing diagnostics for a provider/runtime failure.
+
+        This does not verify/accept flags and does not alter solver state; it only
+        translates raw LLM/provider/CLI error text into stable events the UI can
+        surface. Fatal quota/auth/model errors are visible immediately as
+        ``provider.error``; repeated failures in the sliding window additionally
+        produce ``provider.batch_alert`` so the operator knows dispatch should be
+        paused or reconfigured.
+        """
+        raw = str(detail or "").strip()
+        if not raw:
+            return
+        diag = classify_provider_error(
+            raw, provider=provider, account_id=account_id,
+            worker_id=worker_id or run.run_id,
+        )
+        try:
+            await run.bus.emit(Event(
+                event_type=EventType.PROVIDER_ERROR,
+                run_id=run.run_id,
+                solver_id=worker_id or None,
+                payload=diag.to_event(),
+            ))
+        except Exception:
+            LOG.exception("failed to emit provider diagnostic for run %s", run.run_id)
+            return
+        try:
+            active = active_workers
+            if active is None:
+                active = max(self.scheduler.active_count, 1)
+            alert = self.provider_errors.record(
+                diag, now=time.time(), active_workers=int(active or 0),
+            )
+            if alert:
+                await run.bus.emit(Event(
+                    event_type=EventType.PROVIDER_BATCH_ALERT,
+                    run_id=run.run_id,
+                    payload=alert,
+                ))
+        except Exception:
+            LOG.exception("failed to aggregate provider diagnostic for run %s", run.run_id)
+
     def _launch(self, run: "Run", driver: Driver) -> None:
         """Create the run's driver task (slot already held by the scheduler).
         The driver's finally frees the slot and fills the queue."""
@@ -925,6 +977,7 @@ class RunManager:
             except Exception as exc:
                 LOG.exception("driver crashed for run %s", run_id)
                 failure_detail = str(exc)[:500]
+                await self._emit_provider_diagnostics(run, failure_detail)
             finally:
                 # If the driver exited WITHOUT emitting RUN_FINISHED (cancelled
                 # mid-run, or it crashed before its own terminal event), the deck

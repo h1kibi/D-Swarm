@@ -6,8 +6,8 @@ Reproduces the June-2026 NYU CTF Bench eval as an in-repo, CLI-driven harness:
       --limit 3 --budget 300 --out eval_nyu/results/<tag>.jsonl --report
 
 Design:
-- ONE engine per challenge run (attribution is the point): the swarm runs
-  solo (start_workers=1, race_scout=False) — the winner IS that engine.
+- ONE engine per challenge run (attribution is the point): the ReasonSwarm
+  runs solo (start_workers=1) — the winner IS that engine.
 - pi runs through the P3 container stack (ctf-swarm-pi-<cat> image + host
   model gateway + task token); claude/codex/cursor run local (and are
   skipped with a note when the CLI binary is absent).
@@ -378,8 +378,6 @@ async def run_challenge(
         executor="cli",
         engines=[engine],
         web_access=True,
-        coordinator=True,
-        race_scout=False,          # attribution: the ONLY worker is the engine
         start_workers=1,
         max_workers=2,
         worker_root=root / "workspace" / "workers",

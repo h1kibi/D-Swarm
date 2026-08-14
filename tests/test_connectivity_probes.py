@@ -225,7 +225,8 @@ def test_account_test_container_uses_docker_run_rm_not_local(tmp_path, monkeypat
         return subprocess.CompletedProcess(args, 0, "DSWARM_OK\n", "")
 
     import dswarm.solver.cli_driver as cli_driver
-    monkeypatch.setattr(account_test, "_docker", fake_docker)
+    import dswarm.solver.container_probe as container_probe
+    monkeypatch.setattr(container_probe, "_docker", fake_docker)
     monkeypatch.setattr(cli_driver, "driver_for", lambda profile: type(
         "D", (), {"health_detail": lambda self, env=None: (True, "")})())
     res = account_test.probe_account(
@@ -249,7 +250,8 @@ def test_account_test_container_docker_unavailable_is_not_ok(tmp_path, monkeypat
     def fake_docker(*args, timeout=30.0):
         raise FileNotFoundError("docker not found")
 
-    monkeypatch.setattr(account_test, "_docker", fake_docker)
+    import dswarm.solver.container_probe as container_probe
+    monkeypatch.setattr(container_probe, "_docker", fake_docker)
     res = account_test.probe_account(
         engine="pi", account_id="pi-main",
         sessions_root=tmp_path, backend="container")
@@ -265,7 +267,8 @@ def test_account_test_container_mount_unreadable_layer(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(args, 0, "", "")
         return subprocess.CompletedProcess(args, 71, "DSWARM_MOUNT_UNREADABLE\n", "")
 
-    monkeypatch.setattr(account_test, "_docker", fake_docker)
+    import dswarm.solver.container_probe as container_probe
+    monkeypatch.setattr(container_probe, "_docker", fake_docker)
     res = account_test.probe_account(
         engine="pi", account_id="pi-main",
         sessions_root=tmp_path, backend="container")

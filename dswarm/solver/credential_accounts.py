@@ -15,10 +15,11 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+from dswarm.solver.secret_store import atomic_write, chmod_private_dir, updated_at
 
 
 CONTAINER_ACCOUNTS_ROOT = "/run/dswarm/accounts"
@@ -119,6 +120,9 @@ class CredentialAccountStore:
                     updated_at=updated,
                     details={
                         "api_key_file": True,
+                        # Kept only on the internal inspect() object for runtime
+                        # consumers. Public API responses are sanitized by
+                        # _public() and never expose this value.
                         "secret_value": self._read_secret_value(base),
                         "target_engine": target or None,
                     },
@@ -133,9 +137,9 @@ class CredentialAccountStore:
                 details={
                     "api_key_file": True,
                     "base_url": bool(base_url),
-                    # base_url is non-sensitive config (a public host); secret_value
-                    # is the API key (see _read_secret_value's security note). Both
-                    # are echoed so the panel can show & edit them in place.
+                    # base_url is non-sensitive config. secret_value remains
+                    # available only to trusted in-process runtime consumers;
+                    # _public() strips it from every API response.
                     "base_url_value": base_url,
                     "secret_value": self._read_secret_value(base),
                     "custom_endpoint": True,
@@ -230,6 +234,26 @@ class CredentialAccountStore:
 
     @staticmethod
     def _public(acct: CredentialAccount) -> dict[str, Any]:
+        """Return write-only-safe account metadata for HTTP/UI consumers.
+
+        ``inspect()`` intentionally retains the raw secret for trusted runtime
+        code such as the endpoint driver. The public shape is an explicit
+        allow-list so a future internal detail cannot accidentally cross the API
+        boundary.
+        """
+        details = acct.details or {}
+        safe_details = {
+            key: details[key]
+            for key in (
+                "api_key_file",
+                "base_url",
+                "base_url_value",
+                "custom_endpoint",
+                "target_engine",
+            )
+            if key in details
+        }
+        safe_details["has_secret"] = bool(acct.present and details.get("api_key_file"))
         return {
             "account_id": acct.account_id,
             "engine": acct.engine,
@@ -237,7 +261,7 @@ class CredentialAccountStore:
             "present": acct.present,
             "writable_state": acct.writable_state,
             "updated_at": acct.updated_at,
-            "details": acct.details or {},
+            "details": safe_details,
         }
 
     @staticmethod
@@ -269,16 +293,12 @@ class CredentialAccountStore:
 
     @staticmethod
     def _read_secret_value(base: Path) -> str:
-        """The account's stored SECRET in plaintext, or "" if absent/unreadable.
+        """Read the stored secret for trusted in-process runtime consumers only.
 
-        ⚠️ SECURITY POSTURE: this deliberately returns the raw credential
-        (OAuth token / API key) so the settings UI can ECHO it
-        into the edit form (operator request: "show it, let me edit it"). It is
-        therefore included in the JSON of the (password-authenticated) credential
-        endpoints and visible in the browser's Network tab. Callers that don't
-        want the plaintext must strip details.secret_value before forwarding.
-
-        it's the single-line token/key.
+        Public account metadata is produced through ``_public()``, whose explicit
+        allow-list strips ``details.secret_value``. HTTP/UI callers must use that
+        public shape; the raw value remains available here only for driver/runtime
+        injection paths that already execute inside the trusted backend process.
         """
         p = base / "API_KEY"
         if p.exists():
@@ -290,38 +310,15 @@ class CredentialAccountStore:
 
     @staticmethod
     def _updated_at(path: Path) -> float | None:
-        try:
-            newest = path.stat().st_mtime
-            for p in path.rglob("*"):
-                try:
-                    newest = max(newest, p.stat().st_mtime)
-                except OSError:
-                    pass
-            return newest
-        except OSError:
-            return None
+        return updated_at(path)
 
     @staticmethod
     def _chmod_private_dir(path: Path) -> None:
-        try:
-            path.chmod(0o700)
-        except OSError:
-            pass
+        chmod_private_dir(path)
 
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{int(time.time() * 1000)}.tmp")
-        tmp.write_text(text, encoding="utf-8")
-        try:
-            tmp.chmod(0o600)
-        except OSError:
-            pass
-        tmp.replace(path)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        atomic_write(path, text)
 
     def _snapshot_material(self, account_id: str) -> dict[str, str]:
         """Read an existing account's stored secrets/markers before a rewrite.
@@ -396,7 +393,7 @@ def runtime_env_for_engine(
                     container_path=_container_secret_path(account_id, "API_KEY"),
                     source=source,
                 )
-            elif prov in ("openai", "custom"):
+            elif prov in ("openai", "custom", "dswarm-worker"):
                 _add_secret_file_or_env(
                     out,
                     base=base,
@@ -487,6 +484,54 @@ def detect_system_login(engine: str, env: Mapping[str, str] | None = None) -> st
         return "absent"
 
     return "unknown"
+
+
+def ensure_pi_account_from_env(
+    sessions_root: str | Path,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Auto-register default pi accounts from the host provider key when safe.
+
+    Container workers need a local account file so the key can be mounted into
+    the worker image. For a pi-only deployment this should be invisible to the
+    operator: if DEEPSEEK_API_KEY / DSWARM_DEEPSEEK_API_KEY is present, mirror it
+    into each default direction account at startup. Never overwrite an existing
+    account that the operator has customized.
+    """
+    source = env or os.environ
+    flag = str(source.get("DSWARM_AUTO_BIND_PI_ACCOUNT", "1")).strip().lower()
+    if flag in {"0", "false", "no", "off", ""}:
+        return False
+    key = str(
+        source.get("DSWARM_DEEPSEEK_API_KEY")
+        or source.get("DEEPSEEK_API_KEY")
+        or ""
+    ).strip()
+    if not key:
+        return False
+    root = account_store_root(sessions_root)
+    store = CredentialAccountStore(root)
+    account_ids = [
+        "pi-main",
+        "pi-web-main",
+        "pi-pwn-main",
+        "pi-rev-main",
+        "pi-crypto-main",
+        "pi-misc-main",
+        "pi-forensics-main",
+        "pi-aisec-main",
+    ]
+    created = False
+    for account_id in account_ids:
+        existing = store.inspect(account_id)
+        if existing is not None and existing.mode == "custom_endpoint":
+            continue
+        if existing is not None and existing.present:
+            continue
+        store.upsert_secret(account_id=account_id, engine="pi", secret=key)
+        created = True
+    return created
 
 
 # Filenames whose containing dir must be WRITABLE inside the container so the CLI

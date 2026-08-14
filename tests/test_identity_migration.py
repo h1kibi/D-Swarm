@@ -140,6 +140,23 @@ def test_engines_roster_preserved_on_reload(tmp_path):
     assert len(cfg["engines"]) == 2
 
 
+def test_new_shape_overrides_remap_legacy_profile_names(tmp_path):
+    st = _store(tmp_path, LEGACY_CONFIG, accounts=_ACCOUNTS)
+    ident = st.get()
+    st.set_identity_model(seats=ident["seats"], credentials=ident["credentials"],
+                          environments=ident["environments"])
+    path = tmp_path / "_worker_config.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["overrides"] = {"web": {"engines": ["pi-web-local"], "start_workers": 1}}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    cfg = WorkerConfigStore(root=tmp_path).get()
+
+    sid = cfg["seat_alias"]["pi-web-local"]
+    assert cfg["overrides"]["web"]["engines"] == [sid]
+    assert WorkerConfigStore(root=tmp_path).resolve("web")["engines"] == [sid]
+
+
 # 7) empty binding migrates to inherited (pi-pwn-local), bound to default account
 def test_empty_binding_becomes_inherited_credential(tmp_path):
     st = _store(tmp_path, LEGACY_CONFIG)

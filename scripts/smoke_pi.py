@@ -93,8 +93,6 @@ async def main() -> int:
         executor="cli",
         engines=["pi"],
         web_access=True,
-        coordinator=True,
-        race_scout=False,          # straight to the coordinator loop
         start_workers=1,
         max_workers=2,
         worker_root=root / "workspace" / "workers",

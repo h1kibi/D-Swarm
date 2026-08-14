@@ -1,11 +1,11 @@
-"""Default worker-roster configuration — which engines launch per challenge.
+"""Default worker-roster configuration — which Pi worker profiles launch per challenge.
 
 An OPERATOR preference (like the rail meta side-table), not part of the
 event-sourced solve: a single small JSON file under the sessions root, loaded on
 startup and rewritten on each mutation. It answers "when a challenge is
 dispatched and the request doesn't say otherwise, which engines run, and how
-many bootstrap workers?" — with an optional per-category override (e.g. give pwn
-only claude+codex, give web all three).
+many bootstrap workers?" — with optional per-category overrides for direction
+profiles and endpoint-backed Pi workers.
 
 The dispatch path (apps/web/drivers.py) reads `resolve(category)` as the FALLBACK
 when the request body carries no explicit engines/start_workers; an explicit body
@@ -14,15 +14,19 @@ always wins, so this never overrides an intentional per-run choice.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Optional
 
 from dswarm.core.runtime_env import is_web_container
+from apps.web.llm_providers import clean_llm_providers
 from dswarm.solver.worker_profiles import (
     DEFAULT_WORKER_IMAGE,
     VALID_BASE_ENGINES,
     base_engine_for_profile,
+    direction_account_id,
     direction_image,
     normalize_profile_roster,
     normalize_worker_profiles,
@@ -36,12 +40,16 @@ from dswarm.solver.identity_model import (
 
 VALID_ENGINES = VALID_BASE_ENGINES
 VALID_BACKENDS = ("local", "container")
-DEFAULT_MAX_WORKERS = 10
+DEFAULT_MAX_WORKERS = 8
+DEFAULT_START_WORKERS = 1
 DEFAULT_WORKER_BACKEND = "container"
 DEFAULT_RACE_TIMEOUT = 720
 DEFAULT_WALL_CLOCK_BUDGET = 0
 DEFAULT_MAX_TOTAL_WORKERS = 0
 DEFAULT_COST_BUDGET_USD = 0.0
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEFAULT_LLM_PROVIDERS: list[dict[str, object]] = []
+
 DEFAULT_REVIEW_POLICY = {
     "enabled": True,
     "engine": "pi-worker",
@@ -61,8 +69,26 @@ DEFAULT_REVIEW_POLICY = {
     "max_review_workers": 12,
 }
 DEFAULT_LLM_PROFILES = {
-    "planner": {"provider": "deepseek", "model": "deepseek-v4-pro", "base_url": ""},
-    "titler": {"provider": "deepseek", "model": "deepseek-v4-flash", "base_url": ""},
+    "planner": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "effort": "medium",
+        "timeout": 120,
+        "credential_source": "auto",
+        "credential_account": "pi-main",
+        "wire_api": "auto",
+    },
+    "titler": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "effort": "low",
+        "timeout": 60,
+        "credential_source": "auto",
+        "credential_account": "pi-main",
+        "wire_api": "auto",
+    },
 }
 
 DEFAULT_RUNTIME_PROFILES = [
@@ -94,12 +120,15 @@ def _direction_profiles() -> list[dict[str, object]]:
             "id": f"pi-{direction}", "name": f"pi-{direction}",
             "engine": "pi", "transport": "pi_cli",
             "auth": "api_key", "credential_mode": "api_key",
-            "api_key_ref": "", "base_url": "", "wire_api": "",
+            "credential_account": direction_account_id(direction),
+            "api_key_ref": "", "base_url": DEFAULT_DEEPSEEK_BASE_URL, "wire_api": "auto",
+            "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer",
             "runtime": "docker-web",
             "roles": ["recon", "bootstrap", "explore", "respond", "review"],
             "image": direction_image(direction),
             "race": True, "max_running": 2, "max_review_running": 1,
-            "priority": 10, "model": "", "enabled": True,
+            "priority": 20, "model": "deepseek-v4-flash",
+            "effort": "medium", "enabled": False,
         })
     return out
 
@@ -108,12 +137,14 @@ DEFAULT_WORKER_PROFILES = [
     {"id": "pi-worker", "name": "pi-worker",
      "engine": "pi", "transport": "pi_cli",
      "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
+     "credential_account": "pi-main", "api_key_ref": "", "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+     "wire_api": "auto", "auth_mode": "bearer",
+     "auth_header": "Authorization", "auth_prefix": "Bearer",
      "runtime": "docker-web", "roles": ["recon", "bootstrap", "explore", "respond", "review"],
      "image": DEFAULT_WORKER_IMAGE,
-     "race": True, "max_running": 3, "max_review_running": 1, "priority": 10, "model": "",
-     "enabled": True},
+     "race": True, "max_running": 3, "max_review_running": 1, "priority": 10,
+     "model": "deepseek-v4-flash", "effort": "medium",
+     "enabled": False},
     *_direction_profiles(),
 ]
 DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
@@ -253,6 +284,30 @@ def _profile_name(profile: dict[str, Any]) -> str:
     return str(profile.get("name") or profile.get("id") or "").strip()
 
 
+_AUTOMATIC_WORKER_LABELS = {
+    "pi-worker",
+    "pi-web",
+    "pi-pwn",
+    "pi-rev",
+    "pi-crypto",
+    "pi-misc",
+    "pi-forensics",
+    "pi-aisec",
+}
+
+
+def _automatic_worker_profile(profile: dict[str, Any]) -> bool:
+    """Whether a profile may participate in future-run automatic routing.
+
+    Advanced/custom Workers are retained for explicit manual spawn commands, but
+    never enter the default roster merely because they are enabled.
+    """
+    label = str(
+        profile.get("label") or profile.get("name") or profile.get("id") or ""
+    ).strip().lower()
+    return label in _AUTOMATIC_WORKER_LABELS
+
+
 def _ordinary_worker_roles(profile: dict[str, Any]) -> set[str]:
     roles = profile.get("roles") or []
     return {
@@ -318,8 +373,6 @@ class WorkerConfigStore:
 
             if isinstance(d.get("engines"), list):
                 d["engines"] = [_to_name(r) for r in d["engines"]]
-            if isinstance(d.get("race_engines"), list):
-                d["race_engines"] = [_to_name(r) for r in d["race_engines"]]
             # The dispatch lineup MUST track the seats' enabled toggles — that's
             # the only lineup control the seat UI exposes. A stale top-level
             # `engines` (e.g. left over from a legacy config, or a seat that was
@@ -328,20 +381,29 @@ class WorkerConfigStore:
             # the UI left dispatch racing only the one stale engine. Reconcile:
             # the lineup is exactly the enabled seats, preserving the order of any
             # already named in `engines`, then appending newly-enabled ones.
-            enabled_ids = [str(s.get("id")) for s in seats
-                           if s.get("enabled", True) and s.get("id")]
+            directional_routing = d.get("routing_mode") == "directional"
+            enabled_ids = [
+                str(s.get("id")) for s in seats
+                if s.get("enabled", True) and s.get("id")
+                and (not directional_routing or _automatic_worker_profile(s))
+            ]
             enabled_set = set(enabled_ids)
             prior = [r for r in (d.get("engines") or []) if r in enabled_set]
             d["engines"] = prior + [sid for sid in enabled_ids if sid not in prior]
-            # race_engines is an optional SUBSET knob: keep only still-enabled
-            # seats (drop stale refs), but don't force-add — empty means "all".
-            if isinstance(d.get("race_engines"), list):
-                d["race_engines"] = [r for r in d["race_engines"] if r in enabled_set]
+            if isinstance(d.get("overrides"), dict):
+                remapped_overrides: dict[str, Any] = {}
+                for cat, ov in d["overrides"].items():
+                    if not isinstance(ov, dict):
+                        remapped_overrides[str(cat)] = ov
+                        continue
+                    engines = ov.get("engines")
+                    next_ov = dict(ov)
+                    if isinstance(engines, list):
+                        next_ov["engines"] = [_to_name(r) for r in engines]
+                    remapped_overrides[str(cat)] = next_ov
+                d["overrides"] = remapped_overrides
             sp = d.get("stage_policy")
             if isinstance(sp, dict):
-                race = sp.get("race")
-                if isinstance(race, dict) and isinstance(race.get("engines"), list):
-                    race["engines"] = [_to_name(r) for r in race["engines"]]
                 review = (sp.get("coordinator") or {}).get("review") if isinstance(sp.get("coordinator"), dict) else None
                 if isinstance(review, dict) and review.get("engine"):
                     review["engine"] = _to_name(review["engine"])
@@ -354,6 +416,24 @@ class WorkerConfigStore:
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         tmp.replace(self.path)  # atomic on POSIX
+
+    def revision(self) -> str:
+        """Stable non-secret revision for optimistic settings updates."""
+        payload = json.dumps(
+            self._data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    def raw_snapshot(self) -> dict[str, Any]:
+        """Deep-copy the persisted config for request-level rollback."""
+        return copy.deepcopy(self._data)
+
+    def restore_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Restore a previously captured raw snapshot and refresh projections."""
+        self._data = copy.deepcopy(snapshot) if isinstance(snapshot, dict) else {}
+        self._project_identity_to_legacy()
+        self._flush()
+        return self.get()
 
     def _account_modes(self) -> dict[str, str]:
         """Map account_id → on-disk credential mode, so migration binds an empty
@@ -412,11 +492,11 @@ class WorkerConfigStore:
     ) -> list[dict[str, Any]]:
         """Overlay account-store custom endpoint metadata onto worker profiles.
 
-        This fixes the "settings account has BASE_URL but Codex still calls
-        OpenAI" class of bugs: Codex's provider override is driven by profile
-        base_url, while the settings form stores base_url on the credential
-        account. Explicit profile base_url still wins; the account store only
-        fills the gap.
+        This fixes the "settings account has BASE_URL but the worker still calls
+        the default provider" class of bugs: the Pi provider override is driven
+        by profile base_url, while the settings form stores base_url on the
+        credential account. Explicit profile base_url still wins; the account
+        store only fills the gap.
         """
         endpoints = self._custom_endpoint_accounts()
         if not endpoints:
@@ -442,7 +522,9 @@ class WorkerConfigStore:
                     continue
                 if not explicit_account and target != engine:
                     continue
-                if not str(p.get("base_url") or "").strip():
+                current_base = str(p.get("base_url") or "").strip().rstrip("/")
+                default_base = DEFAULT_DEEPSEEK_BASE_URL.rstrip("/")
+                if not current_base or current_base == default_base:
                     p["base_url"] = ep["base_url"]
                 p["credential_account"] = account_id
                 p["credential_mode"] = "api_key"
@@ -475,10 +557,28 @@ class WorkerConfigStore:
             self._clean_worker_profiles(d.get("worker_profiles"))
         )
         worker_backend = self._clean_backend(d.get("worker_backend"))
-        engines = _clean_engines_for_backend(d.get("engines"), worker_profiles, worker_backend) or [
-            p["name"] for p in worker_profiles if p.get("enabled", True)
+        directional_routing = d.get("routing_mode") == "directional"
+        enabled_names = {
+            _profile_name(p) for p in worker_profiles
+            if p.get("enabled", True)
+            and _ordinary_worker_roles(p)
+            and (not directional_routing or _automatic_worker_profile(p))
+        }
+        raw_engines = d.get("engines")
+        cleaned_engines = [
+            ref for ref in _clean_engines_for_backend(
+                raw_engines, worker_profiles, worker_backend
+            )
+            if ref in enabled_names
         ]
-        start_workers = self._coerce_pos_int(d.get("start_workers"), len(engines))
+        if directional_routing and isinstance(raw_engines, list) and not raw_engines:
+            engines = []
+        else:
+            engines = cleaned_engines or [
+                _profile_name(p) for p in worker_profiles
+                if _profile_name(p) in enabled_names
+            ]
+        start_workers = self._coerce_pos_int(d.get("start_workers"), DEFAULT_START_WORKERS)
         max_workers = self._coerce_pos_int(d.get("max_workers"), DEFAULT_MAX_WORKERS)
         wall_clock_budget = self._coerce_nonneg_int(
             d.get("wall_clock_budget"), DEFAULT_WALL_CLOCK_BUDGET)
@@ -487,6 +587,7 @@ class WorkerConfigStore:
         cost_budget_usd = self._coerce_nonneg_float(
             d.get("cost_budget_usd"), DEFAULT_COST_BUDGET_USD)
         llm_profiles = self._clean_llm_profiles(d.get("llm_profiles"))
+        llm_providers = self._clean_llm_providers(d.get("llm_providers"))
         raw_stage_policy = d.get("stage_policy")
         if isinstance(raw_stage_policy, dict):
             raw_stage_policy = json.loads(json.dumps(raw_stage_policy))
@@ -519,6 +620,11 @@ class WorkerConfigStore:
                 engines[0] if engines else DEFAULT_REVIEW_POLICY["engine"],
             )
         review["engine"] = review_engine
+        if review_engine not in enabled_names:
+            # A disabled System Worker cannot be an active Review dispatcher.
+            # Preserve the selected ref for future re-enable, but make the
+            # effective fresh/default policy safe.
+            review["enabled"] = False
         overrides: dict[str, Any] = {}
         raw_ov = d.get("overrides")
         if not isinstance(raw_ov, dict):
@@ -532,8 +638,12 @@ class WorkerConfigStore:
                     ov = {"engines": ov}
                 if not isinstance(ov, dict):
                     continue
-                cat_engines = _clean_engines_for_backend(
-                    ov.get("engines"), worker_profiles, worker_backend)
+                cat_engines = [
+                    ref for ref in _clean_engines_for_backend(
+                        ov.get("engines"), worker_profiles, worker_backend
+                    )
+                    if ref in enabled_names
+                ]
                 if not cat_engines:
                     continue
                 overrides[str(cat)] = {
@@ -551,6 +661,7 @@ class WorkerConfigStore:
             "cost_budget_usd": cost_budget_usd,
             "stage_policy": stage_policy,
             "llm_profiles": llm_profiles,
+            "llm_providers": llm_providers,
             "runtime_profiles": runtime_profiles,
             "worker_profiles": worker_profiles,
             "overrides": overrides,
@@ -613,19 +724,33 @@ class WorkerConfigStore:
                 "cost_budget_usd": cfg["cost_budget_usd"],
                 "stage_policy": cfg["stage_policy"],
                 "llm_profiles": cfg["llm_profiles"],
+                "llm_providers": cfg.get("llm_providers", []),
                 "runtime_profiles": cfg["runtime_profiles"],
                 "worker_profiles": cfg["worker_profiles"],
             }
+        # Unknown/unclassified categories use only the hidden System Worker.
+        # They must never fan out across every enabled direction/custom seat.
+        generic = next((
+            p for p in cfg["worker_profiles"]
+            if str(p.get("label") or p.get("name") or p.get("id")) == "pi-worker"
+            and p.get("enabled", True)
+            and _ordinary_worker_roles(p)
+        ), None)
+        fallback_engines = [_profile_name(generic)] if generic else []
+        fallback_max = (
+            self._coerce_pos_int(generic.get("max_running"), 1) if generic else 0
+        )
         return {
-            "engines": cfg["engines"],
-            "start_workers": cfg["start_workers"],
-            "max_workers": cfg["max_workers"],
+            "engines": fallback_engines,
+            "start_workers": min(cfg["start_workers"], fallback_max) if fallback_max else 0,
+            "max_workers": fallback_max,
             "worker_backend": cfg["worker_backend"],
             "wall_clock_budget": cfg["wall_clock_budget"],
             "max_total_workers": cfg["max_total_workers"],
             "cost_budget_usd": cfg["cost_budget_usd"],
             "stage_policy": cfg["stage_policy"],
             "llm_profiles": cfg["llm_profiles"],
+            "llm_providers": cfg.get("llm_providers", []),
             "runtime_profiles": cfg["runtime_profiles"],
             "worker_profiles": cfg["worker_profiles"],
         }
@@ -637,17 +762,16 @@ class WorkerConfigStore:
         start_workers: Any = None,
         max_workers: Any = None,
         worker_backend: Any = None,
-        race_scout: Any = None,
-        race_timeout: Any = None,
         wall_clock_budget: Any = None,
-        race_engines: Any = None,
         max_total_workers: Any = None,
         cost_budget_usd: Any = None,
         stage_policy: Any = None,
         llm_profiles: Any = None,
+        llm_providers: Any = None,
         runtime_profiles: Any = None,
         worker_profiles: Any = None,
         overrides: Any = None,
+        routing_mode: Any = None,
     ) -> dict[str, Any]:
         """Update the default config. Each arg is optional; only provided fields
         change. Invalid values are rejected (raise ValueError) so a bad PUT
@@ -657,6 +781,11 @@ class WorkerConfigStore:
             if worker_backend is not None
             else self._clean_backend(self._data.get("worker_backend"))
         )
+        if routing_mode is not None:
+            mode = str(routing_mode).strip().lower()
+            if mode != "directional":
+                raise ValueError("routing_mode must be 'directional'")
+            self._data["routing_mode"] = mode
         if engines is not None:
             profiles_for_engine_validation = (
                 self._clean_worker_profiles(worker_profiles, reject_invalid=True)
@@ -665,7 +794,8 @@ class WorkerConfigStore:
             )
             cleaned = _clean_engines_for_backend(
                 engines, profiles_for_engine_validation, target_backend)
-            if not cleaned:
+            explicit_empty = isinstance(engines, list) and not engines
+            if not cleaned and not explicit_empty:
                 raise ValueError("engines must name at least one enabled worker profile")
             self._data["engines"] = cleaned
         if start_workers is not None:
@@ -676,19 +806,9 @@ class WorkerConfigStore:
                 max_workers, "max_workers")
         if worker_backend is not None:
             self._data["worker_backend"] = target_backend
-        if race_scout is not None:
-            self._data["race_scout"] = bool(race_scout)
-        if race_timeout is not None:
-            self._data["race_timeout"] = self._require_pos_int(
-                race_timeout, "race_timeout")
         if wall_clock_budget is not None:
             self._data["wall_clock_budget"] = self._require_nonneg_int(
                 wall_clock_budget, "wall_clock_budget")
-        if race_engines is not None:
-            profiles_for_engine_validation = self._clean_worker_profiles(
-                worker_profiles if worker_profiles is not None else self._data.get("worker_profiles"))
-            self._data["race_engines"] = _clean_engines_for_backend(
-                race_engines, profiles_for_engine_validation, target_backend)
         if max_total_workers is not None:
             self._data["max_total_workers"] = self._require_nonneg_int(
                 max_total_workers, "max_total_workers")
@@ -704,9 +824,6 @@ class WorkerConfigStore:
                 else stage_policy
             )
             if isinstance(clean_stage, dict):
-                race = clean_stage.setdefault("race", {})
-                race["engines"] = _remap_profile_refs(
-                    race.get("engines"), profiles_for_stage, target_backend)
                 review = clean_stage.setdefault("coordinator", {}).setdefault("review", {})
                 review["engine"] = _remap_profile_ref(
                     review.get("engine") or DEFAULT_REVIEW_POLICY["engine"],
@@ -717,6 +834,9 @@ class WorkerConfigStore:
         if llm_profiles is not None:
             self._data["llm_profiles"] = self._clean_llm_profiles(
                 llm_profiles, reject_invalid=True)
+        if llm_providers is not None:
+            self._data["llm_providers"] = self._clean_llm_providers(
+                llm_providers, reject_invalid=True)
         if runtime_profiles is not None or worker_profiles is not None:
             next_runtime_profiles = (
                 self._clean_runtime_profiles(runtime_profiles, reject_invalid=True)
@@ -873,9 +993,12 @@ class WorkerConfigStore:
         if link_profile_capacity:
             profiles = self._clean_worker_profiles(self._data.get("worker_profiles"))
             backend = self._clean_backend(self._data.get("worker_backend"))
+            directional_routing = self._data.get("routing_mode") == "directional"
             selected = _clean_engines_for_backend(
                 self._data.get("engines"), profiles, backend) or [
-                    _profile_name(p) for p in profiles if p.get("enabled", True)
+                    _profile_name(p) for p in profiles
+                    if p.get("enabled", True)
+                    and (not directional_routing or _automatic_worker_profile(p))
                 ]
             selected_set = set(selected)
             eligible = [
@@ -890,7 +1013,7 @@ class WorkerConfigStore:
         max_workers = self._coerce_pos_int(
             self._data.get("max_workers"), DEFAULT_MAX_WORKERS)
         start_workers = self._coerce_pos_int(
-            self._data.get("start_workers"), len(DEFAULT_ENGINES))
+            self._data.get("start_workers"), DEFAULT_START_WORKERS)
         if start_workers > max_workers:
             self._data["start_workers"] = max_workers
 
@@ -939,13 +1062,8 @@ class WorkerConfigStore:
 
         if "engines" in self._data:
             self._data["engines"] = rewrite_ref(self._data.get("engines"))
-        if "race_engines" in self._data:
-            self._data["race_engines"] = rewrite_ref(self._data.get("race_engines"))
         raw_stage = self._data.get("stage_policy")
         stage = json.loads(json.dumps(raw_stage)) if isinstance(raw_stage, dict) else {}
-        race = stage.setdefault("race", {})
-        if race.get("engines") is not None:
-            race["engines"] = rewrite_ref(race.get("engines"))
         coord = stage.setdefault("coordinator", {})
         review = coord.setdefault("review", {})
         review["engine"] = rewrite_ref(
@@ -1026,7 +1144,7 @@ class WorkerConfigStore:
         return n
 
     @staticmethod
-    def _clean_llm_profiles(value: Any, *, reject_invalid: bool = False) -> dict[str, dict[str, str]]:
+    def _clean_llm_profiles(value: Any, *, reject_invalid: bool = False) -> dict[str, dict[str, Any]]:
         if value is None:
             return {k: dict(v) for k, v in DEFAULT_LLM_PROFILES.items()}
         if not isinstance(value, dict):
@@ -1044,21 +1162,54 @@ class WorkerConfigStore:
                 continue
             model = str(raw.get("model") or out[key]["model"]).strip()
             provider = str(raw.get("provider") or out[key]["provider"]).strip()
-            # base_url is the OpenAI-compatible endpoint override; empty = default
-            # DeepSeek. The API key is NOT stored here — it stays in .env
-            # (DSWARM_DEEPSEEK_API_KEY). A non-string/garbage value normalizes to "".
+            # base_url is visible and explicit in the UI. Empty/non-string values
+            # restore the DeepSeek OpenAI-compatible default; the API key is never
+            # stored here (env/account store remains authoritative for secrets).
             raw_base = raw.get("base_url")
             base_url = str(raw_base).strip() if isinstance(raw_base, str) else ""
+            provider_ref = str(raw.get("provider_ref") or out[key].get("provider_ref") or "").strip()
+            if provider_ref:
+                # Provider registry owns endpoint, auth and protocol. Keep the
+                # legacy fields only as non-secret compatibility markers.
+                base_url = ""
+            elif not base_url:
+                base_url = DEFAULT_DEEPSEEK_BASE_URL
+            effort = str(raw.get("effort") or out[key].get("effort") or "medium").strip().lower()
+            timeout = WorkerConfigStore._coerce_nonneg_int(raw.get("timeout"), int(out[key].get("timeout") or 0))
             if not model:
                 if reject_invalid:
                     raise ValueError(f"llm_profiles.{key}.model must be non-empty")
-                model = out[key]["model"]
+                model = str(out[key]["model"])
+            credential_source = str(raw.get("credential_source") or out[key].get("credential_source") or "auto").strip().lower()
+            if credential_source not in {"auto", "env", "account", "provider"}:
+                credential_source = "auto"
+            credential_account = str(raw.get("credential_account") or out[key].get("credential_account") or "pi-main").strip()
+            wire_api = str(raw.get("wire_api") or out[key].get("wire_api") or "auto").strip().lower()
+            if wire_api not in {"auto", "openai", "openai-chat", "openai-responses"}:
+                wire_api = "auto"
+            if provider_ref:
+                credential_source = "provider"
+                credential_account = provider_ref
+                wire_api = "auto"
             out[key] = {
                 "provider": provider or out[key]["provider"],
                 "model": model,
                 "base_url": base_url,
+                "effort": effort or str(out[key].get("effort") or "medium"),
+                "timeout": timeout,
+                "credential_source": credential_source,
+                "credential_account": credential_account,
+                "wire_api": wire_api,
+                "provider_ref": provider_ref,
             }
         return out
+
+
+    @staticmethod
+    def _clean_llm_providers(value: Any, *, reject_invalid: bool = False) -> list[dict[str, Any]]:
+        if value is None:
+            return [dict(p) for p in DEFAULT_LLM_PROVIDERS]
+        return clean_llm_providers(value, reject_invalid=reject_invalid)
 
     @staticmethod
     def _clean_stage_policy(value: Any, defaults: dict[str, Any]) -> dict[str, Any]:
@@ -1075,6 +1226,14 @@ class WorkerConfigStore:
         if isinstance(raw_review, dict):
             review["enabled"] = bool(raw_review.get("enabled", review["enabled"]))
             review["engine"] = str(raw_review.get("engine") or review["engine"]).strip()
+            for key in ("provider_ref", "credential_source", "credential_account", "base_url", "wire_api", "model"):
+                if raw_review.get(key) is not None:
+                    review[key] = str(raw_review.get(key) or "").strip()
+            if review.get("provider_ref"):
+                review["credential_source"] = "provider"
+                review["credential_account"] = review["provider_ref"]
+                review["base_url"] = ""
+                review["wire_api"] = "auto"
             for key in (
                 "after_fruitless_workers", "after_duplicate_intents",
                 "every_completed_workers", "candidate_spike_threshold",

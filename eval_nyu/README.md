@@ -64,7 +64,7 @@ aggregates solve rate / median time / cost per engine and category, and — with
 ## Caveats
 
 - The queue is per-(challenge,engine); engine attribution assumes
-  `race_scout=False` (solo worker = the engine under test).
+  a solo ReasonSwarm run (the winner IS that engine).
 - pi runs through the P3 container stack (ctf-swarm-pi-<cat> image + host
   model gateway + per-run task token). Requires the worker images built and
   Docker Desktop running.

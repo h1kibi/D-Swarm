@@ -34,16 +34,16 @@ uv run pytest -m "not live"  # 测试套件（无 key 时 live 测试自动跳�
 ## 路线与状态
 
 - **路线 A**：fork dswarm 为底座，BTFly 资产以功能形式并入。许可证 AGPL-3.0（已接受）。
-- 进度：P0 基线完成（BTFly 参考恢复、dswarm 测试通过 1009/1009+）；P1（Pi 引擎）进行中。
+- 进度：P0 基线完成；P1（Pi 引擎）已成为当前 worker 路线。测试数量随工作区演进变化，以 `uv run pytest -q` 的实际输出为准。
 - 详见 [docs/06-route-a-plan.md](docs/06-route-a-plan.md)。
 
 ## 开发约定
 
-- 内核（`dswarm/`）只读：所有 BTFly 资产落在扩展点（driver / docker / web 层），跟踪上游更新：`git fetch upstream && git merge upstream/main`。
+- 内核（`dswarm/`）保持边界清晰：BTFly/运营资产应落在扩展点（driver / docker / web 层）。如需同步上游，请先配置对应 remote，再按维护者确认的合并流程操作。
 - 测试：Windows 宿主跑测试用 `PYTHONUTF8=1`；容器执行路径的 POSIX 专属测试在 Windows 上跳过。
 - Worker 引擎名册：`pi`（当前唯一 worker 引擎；方向 profile 统一使用同一 Kali 镜像）。
 
 ## 上游
 
-- dswarm（内核）：AGPL-3.0，本仓库 upstream remote。
+- dswarm/muteki（内核来源）：AGPL-3.0。当前 checkout 默认只配置 `origin`；如需跟踪上游，请显式添加 upstream remote。
 - CTF-BTFly（参考）：源码在 `references/btfly/`，commit `a141bb5`，AGPL-3.0。

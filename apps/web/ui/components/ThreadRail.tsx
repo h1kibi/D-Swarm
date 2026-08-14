@@ -57,6 +57,7 @@ export function ThreadRail({
   onAction,
   onResize,
   onOpenSettings,
+  onStartupTest,
   onBatch,
 }: {
   collapsed: boolean;
@@ -74,6 +75,7 @@ export function ThreadRail({
   onAction: (a: RailAction) => void | Promise<Folder | null | void>;
   onResize: (width: number) => void;
   onOpenSettings: () => void;
+  onStartupTest: () => void;
   // Fleet batch control (§5.2): fan out pause/resume/stop to the selected runs.
   onBatch: (action: BatchAction, runIds: string[]) => void;
 }) {
@@ -322,7 +324,10 @@ export function ThreadRail({
         <div className="rail-top">
           <span className="brand"><span>D-Swarm</span></span>
         </div>
-        <button className="newsolve" onClick={onNew}>{t("rail.newSolve")}</button>
+        <div className="rail-actions">
+          <button className="newsolve" onClick={onNew}>{t("rail.newSolve")}</button>
+          <button className="newsolve" onClick={onStartupTest}>{t("rail.startupTest")}</button>
+        </div>
 
         <div className="rail-search">
           <span className="rail-search-ico" aria-hidden="true"><Icon name="search" size={14} /></span>

@@ -7,7 +7,7 @@ swarm can depend on these dataclasses without importing the old Solver class.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from dswarm.models.solve_graph import SolveGraph
 
@@ -55,3 +55,7 @@ class SolveOutcome:
     # so the standby driver can persist it (e.g. writeup.md) without re-parsing the
     # event stream. Empty for solve runs.
     reply: str = ""
+    # Runtime/provider diagnostic when a worker failed before producing solver output.
+    # This is telemetry for recovery/dispatch management only; it never influences
+    # flag acceptance or provenance.
+    provider_error: dict[str, Any] = field(default_factory=dict)

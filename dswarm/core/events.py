@@ -62,6 +62,8 @@ class EventType(str, Enum):
     GRAPH_COMPACTED = "graph.compacted"  # H: a long-run graph compaction epoch landed
     WORKER_LIFECYCLE = "worker.lifecycle"  # I: granular worker lifecycle (spawned/
     #   phase_changed/stalled/exited) — finer than WORKER_STATUS online/offline
+    PROVIDER_ERROR = "provider.error"  # LLM/provider/runtime failure diagnostic for operator feedback
+    PROVIDER_BATCH_ALERT = "provider.batch_alert"  # many provider errors in a sliding window
 
 
 class Event(BaseModel):

@@ -413,8 +413,6 @@ async def test_reason_scheduler_empty_health_roster_finishes_explicitly(tmp_path
         config=SolverConfig(),
         run_id="c-reason-health-empty",
         executor="cli",
-        coordinator=True,
-        reason_swarm=True,
         engines=["pi"],
         bus=bus,
     )
@@ -451,8 +449,6 @@ async def test_swarm_reason_path_starts_with_one_recon(tmp_path):
         config=SolverConfig(),
         run_id="c-reason",
         executor="cli",
-        coordinator=True,
-        reason_swarm=True,
         engines=["pi"],
     )
 
@@ -635,8 +631,6 @@ async def test_reason_path_hitl_pause_resume_gates_reason_loop(tmp_path):
         config=SolverConfig(),
         run_id="c-reason-pause",
         executor="cli",
-        coordinator=True,
-        reason_swarm=True,
         engines=["pi"],
         hitl_inbox=hitl,
     )
@@ -1011,8 +1005,6 @@ async def test_reason_path_finalizes_board_and_persists_real_winner(tmp_path):
         config=SolverConfig(),
         run_id="c-reason-finalize",
         executor="cli",
-        coordinator=True,
-        reason_swarm=True,
         engines=["pi"],
         graph_dir=graph_dir,
         worker_root=worker_root,
@@ -1105,3 +1097,139 @@ async def test_operator_hint_intent_dispatched_before_fallback(tmp_path):
     assert calls[1].mode == "explore"
     assert calls[1].profile == "pi-web"
     graph.close()
+
+
+async def test_reason_swarm_retries_retryable_provider_runtime_failure():
+    board = MemoryBoard("c-reason")
+    calls: list[DispatchDecision] = []
+    reason_calls = {"n": 0}
+
+    async def worker(decision: DispatchDecision, profile) -> SimpleNamespace:
+        calls.append(decision)
+        if decision.mode == "recon":
+            return _outcome()
+        if len([c for c in calls if c.intent_id == "I1"]) == 1:
+            return SimpleNamespace(
+                flag=None,
+                flags=[],
+                engine="pi-worker",
+                reason="pi CLI: runtime failure",
+                provider_error={
+                    "category": "transient_network",
+                    "retryable": True,
+                    "should_pause_dispatch": False,
+                    "raw_message": "connection reset by peer",
+                    "provider": "deepseek-main",
+                    "account_id": "acct-primary",
+                    "worker_id": "cli-pi#1",
+                },
+            )
+        return _outcome("flag{recovered_after_retry}")
+
+    async def reason_fn(summary: str, challenge_id: str) -> ReasonResult:
+        reason_calls["n"] += 1
+        if reason_calls["n"] <= 2:
+            return ReasonResult(
+                goal_met=False,
+                intents=[Intent(intent_id="I1", goal="probe login", mode="explore")],
+                audit_notes=[],
+            )
+        return ReasonResult(goal_met=True, intents=[], audit_notes=[])
+
+    class _Bus:
+        def __init__(self):
+            self.events = []
+        async def emit(self, ev):
+            self.events.append(ev)
+
+    bus = _Bus()
+    swarm = ReasonSwarm(
+        _challenge(),
+        board=board,
+        bus=bus,
+        run_id="run-retry-provider",
+        worker_factory=worker,
+        reason_fn=reason_fn,
+    )
+
+    result = await swarm.run()
+
+    i1_calls = [c for c in calls if c.intent_id == "I1"]
+    assert len(i1_calls) == 2, "retryable provider runtime failure should free intent for redispatch"
+    assert result["solved"] is True
+    assert result["flags"] == ["flag{recovered_after_retry}"]
+    deltas = [e.payload for e in bus.events if e.event_type is EventType.BLACKBOARD_DELTA]
+    assert any(d.get("kind") == "intent_failed" and d.get("intent_id") == "I1" for d in deltas)
+    assert any(d.get("kind") == "worker_recovery_scheduled" and d.get("intent_id") == "I1" for d in deltas)
+
+
+async def test_reason_swarm_emits_provider_batch_alert_for_many_fatal_errors():
+    board = MemoryBoard("c-reason")
+    calls: list[DispatchDecision] = []
+
+    async def worker(decision: DispatchDecision, profile) -> SimpleNamespace:
+        calls.append(decision)
+        if decision.mode == "recon":
+            return _outcome()
+        return SimpleNamespace(
+            flag=None,
+            flags=[],
+            engine="pi-worker",
+            reason="pi CLI: runtime failure",
+            provider_error={
+                "category": "insufficient_quota",
+                "severity": "fatal",
+                "retryable": False,
+                "should_pause_dispatch": True,
+                "raw_message": "402 insufficient balance",
+                "provider": "deepseek-main",
+                "account_id": "acct-primary",
+                "worker_id": decision.intent_id,
+                "user_message": "LLM 提供商返回余额/额度不足，继续派发会批量失败。",
+                "suggested_action": "请检查账号余额、套餐额度或切换可用账号/模型后再恢复。",
+            },
+        )
+
+    async def reason_fn(summary: str, challenge_id: str) -> ReasonResult:
+        return ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent(intent_id="I1", goal="probe login", mode="explore", priority=1.0, direction="web"),
+                Intent(intent_id="I2", goal="probe upload", mode="explore", priority=0.9, direction="misc"),
+                Intent(intent_id="I3", goal="probe token", mode="explore", priority=0.8, direction="pwn"),
+            ],
+            audit_notes=[],
+        )
+
+    class _Bus:
+        def __init__(self):
+            self.events = []
+        async def emit(self, ev):
+            self.events.append(ev)
+
+    bus = _Bus()
+    swarm = ReasonSwarm(
+        _challenge(),
+        board=board,
+        bus=bus,
+        run_id="run-provider-batch",
+        worker_factory=worker,
+        reason_fn=reason_fn,
+        max_intents_per_reason=3,
+        max_workers=3,
+    )
+
+    await swarm.run()
+
+    alerts = [e for e in bus.events if e.event_type is EventType.PROVIDER_BATCH_ALERT]
+    assert alerts, "three fatal provider errors in one window must alert the operator"
+    payload = alerts[-1].payload
+    assert payload["category"] == "insufficient_quota"
+    assert payload["count"] >= 3
+    assert payload["affected_workers"] >= 3
+    assert payload["should_pause_dispatch"] is True
+    assert "余额" in payload["user_message"]
+    board_alerts = [e.payload for e in bus.events
+                    if e.event_type is EventType.BLACKBOARD_DELTA
+                    and e.payload.get("kind") == "provider_batch_alert"]
+    assert board_alerts, "batch alert should also be visible on the blackboard timeline"

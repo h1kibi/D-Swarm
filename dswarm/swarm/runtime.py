@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Protocol, runtime_checkable
 
 from dswarm.swarm.agents import AgentProfile, DispatchDecision
@@ -56,20 +57,56 @@ class SwarmWorkerRuntime:
                     decision,
                     f"profile {decision.profile} unavailable; falling back to {engine}",
                 )
-        worker = swarm._make_cli_worker(
-            engine,
-            mode=mode,
-            intent_goal=decision.goal,
-            intent_id=decision.intent_id,
-            profile_role=role,
-            timeout_override=profile.timeout,
-            task_kind=decision.task_kind or swarm.challenge.category,
-            host_scan=decision.host_scan,
+        make_kwargs = {
+            "mode": mode,
+            "intent_goal": decision.goal,
+            "intent_id": decision.intent_id,
+            "profile_role": role,
+            "timeout_override": profile.timeout,
+            "task_kind": decision.task_kind or swarm.challenge.category,
+            "host_scan": decision.host_scan,
+        }
+        loop = asyncio.get_running_loop()
+        create_future = loop.run_in_executor(
+            None, lambda: swarm._make_cli_worker(engine, **make_kwargs)
         )
+        worker = None
+
+        async def _cancel_late_created_worker() -> None:
+            try:
+                late_worker = await create_future
+            except BaseException:
+                return
+            try:
+                swarm._cancel_solver(late_worker)
+            finally:
+                swarm._release_worker_account(late_worker)
+
+        try:
+            # Worker construction can synchronously start/wait for a Docker
+            # container. Keep that off the event loop so startup-test / stop /
+            # delete timeouts can still fire. Shield the executor future so task
+            # cancellation does not discard a late-created worker; the cleanup
+            # task below cancels and releases it once construction returns.
+            worker = await asyncio.shield(create_future)
+        except BaseException as exc:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                asyncio.create_task(_cancel_late_created_worker())
+            raise
+
         try:
             outcome = await worker.run()
             if swarm.shared_graph is not None and self.projector is not None:
                 self.projector.sync(swarm.shared_graph)
             return outcome
+        except BaseException as exc:
+            # asyncio task cancellation alone does not stop the shelled CLI
+            # worker's subprocess / to_thread runner. Signal the underlying
+            # solver before unwinding so RunManager.delete() and ReasonSwarm
+            # cancellation cannot leave a live worker that later recreates the
+            # run container.
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                swarm._cancel_solver(worker)
+            raise
         finally:
             swarm._release_worker_account(worker)

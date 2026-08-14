@@ -101,5 +101,5 @@ def test_worker_image_for_profile_falls_back_to_category(monkeypatch):
     monkeypatch.delenv("DSWARM_WORKER_IMAGE", raising=False)
     monkeypatch.delenv("DSWARM_CATEGORY_IMAGE_CRYPTO", raising=False)
     image = worker_image_for_profile(None, category="crypto")
-    # category fallback now resolves to the direction image
-    assert image == "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"
+    # category fallback now resolves to the local direction image
+    assert image == "ctf-swarm-pi-crypto:0.2.0"

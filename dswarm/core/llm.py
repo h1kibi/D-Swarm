@@ -30,6 +30,36 @@ from dswarm.core.events import Event, EventType
 DEFAULT_BASE_URL = os.environ.get("DSWARM_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
 
+def classify_llm_exception(exc: BaseException) -> dict[str, Any]:
+    """Map an LLM client exception to a stable diagnostic code and detail."""
+    status = None
+    text = str(exc) or type(exc).__name__
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code if exc.response is not None else None
+    lowered = text.lower()
+    if status == 401 or "401" in lowered or "unauthorized" in lowered or "illegal header" in lowered:
+        code = "http_401" if "illegal header" not in lowered else "missing_api_key"
+        detail = "Planner endpoint returned 401; check API key or relay auth mode."
+        if code == "missing_api_key":
+            detail = "Planner API key is missing; select a credential account or set DSWARM_DEEPSEEK_API_KEY."
+    elif status == 403 or "403" in lowered or "forbidden" in lowered:
+        code = "http_403"
+        detail = "Planner endpoint returned 403; the key is not allowed to use this relay/model."
+    elif status == 404 or "model" in lowered and ("not found" in lowered or "does not exist" in lowered):
+        code = "model_not_found"
+        detail = "Planner model was not accepted by the relay; choose a tested model."
+    elif isinstance(exc, (httpx.TimeoutException, TimeoutError)) or "timeout" in lowered or "timed out" in lowered:
+        code = "timeout"
+        detail = "Planner endpoint timed out."
+    elif isinstance(exc, httpx.InvalidURL):
+        code = "invalid_base_url"
+        detail = "Planner Base URL is invalid."
+    else:
+        code = "network_error"
+        detail = text[:240]
+    return {"code": code, "detail": detail, "status": status, "raw": text[:240]}
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -101,11 +131,26 @@ class LLMClient:
         timeout: float = 180.0,
         overall_timeout: float = 300.0,
         trust_env: Optional[bool] = None,
+        auth_mode: str = "bearer",
+        auth_header: Optional[str] = None,
+        auth_prefix: Optional[str] = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("DSWARM_DEEPSEEK_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.bus = bus
         self.cost = cost
+        self.auth_mode = (auth_mode or "bearer").strip().lower()
+        if self.auth_mode not in {"bearer", "x-api-key", "custom"}:
+            self.auth_mode = "bearer"
+        self.auth_header = (
+            auth_header or ("x-api-key" if self.auth_mode == "x-api-key" else "Authorization")
+        ).strip()
+        if auth_prefix is not None:
+            self.auth_prefix = auth_prefix.strip()
+        elif self.auth_mode == "x-api-key":
+            self.auth_prefix = ""
+        else:
+            self.auth_prefix = "Bearer"
         # Keep tests and local evals isolated from desktop-wide proxy settings.
         # Users who really need a proxy for the LLM API can opt in explicitly.
         self.trust_env = _env_bool("DSWARM_LLM_TRUST_ENV", False) if trust_env is None else trust_env
@@ -129,8 +174,9 @@ class LLMClient:
         await self.aclose()
 
     def _headers(self) -> dict[str, str]:
+        value = f"{self.auth_prefix} {self.api_key}".strip() if self.auth_prefix else self.api_key
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            self.auth_header: value,
             "Content-Type": "application/json",
         }
 

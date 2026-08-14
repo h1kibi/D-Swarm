@@ -23,6 +23,7 @@ import subprocess
 from typing import Any
 
 from dswarm.solver.container_exec import WORKER_IMAGE
+from dswarm.solver.docker import docker_run
 
 # Expected worker-image version, set by the deployment (compose). Unset → the
 # version check is informational (we report what's pulled, don't flag a mismatch).
@@ -31,13 +32,7 @@ EXPECTED_WORKER_VERSION = os.environ.get("DSWARM_WORKER_IMAGE_VERSION", "").stri
 _VERSION_LABEL = "org.opencontainers.image.version"
 
 
-def _docker(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["docker", *args],
-        capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-        timeout=timeout,
-    )
+_docker = docker_run
 
 
 def _daemon_ok() -> tuple[bool, str]:

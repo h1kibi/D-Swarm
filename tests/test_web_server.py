@@ -164,6 +164,9 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
     monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
     mgr = RunManager(sessions_root=tmp_path)
+    profiles = mgr.worker_config.get()["worker_profiles"]
+    next(p for p in profiles if p["name"] == "pi-worker")["enabled"] = True
+    mgr.worker_config.set(worker_profiles=profiles, engines=["pi-worker"])
     run = mgr.create("btw-run")
     run.name = "btw demo"
     run.category = "web"
@@ -482,6 +485,7 @@ async def test_non_dict_body_is_rejected_with_400(server) -> None:
             ("POST", "/api/runs/badbody-run/start"),
             ("POST", "/api/folders"),
             ("PUT", "/api/settings/workers"),
+            ("POST", "/api/settings/workers/probe"),
             ("POST", "/api/settings/worker-model/test"),
             ("POST", "/api/runs/badbody-run/workers"),
             ("DELETE", "/api/runs/badbody-run/workers"),
@@ -526,6 +530,50 @@ async def test_worker_model_options_and_probe_routes(server, monkeypatch) -> Non
         assert r.json()["ok"] is True
         assert seen["model"] == "deepseek-v4-pro"
         assert seen["profile"]["id"] == "pi-sub"
+
+
+async def test_worker_endpoint_probe_uses_unsaved_key_without_echoing_it(server, monkeypatch) -> None:
+    from apps.web import worker_endpoint
+
+    seen = {}
+
+    def fake_probe_worker_endpoint(profile, *, api_key, validate_model=False):
+        seen["profile"] = profile
+        seen["api_key"] = api_key
+        seen["validate_model"] = validate_model
+        return {
+            "ok": False,
+            "detail": "服务器已收到请求，但认证失败，请检查 API Key 和认证方式。",
+            "error_layer": "authentication",
+            "models": [],
+            "authentication": {"ok": False, "status": 401},
+        }
+
+    monkeypatch.setattr(worker_endpoint, "probe_worker_endpoint", fake_probe_worker_endpoint)
+    draft_key = "draft-secret-never-echo"
+    async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
+        response = await client.post("/api/settings/workers/probe", json={
+            "profile": {
+                "id": "pi-web",
+                "engine": "pi",
+                "base_url": "https://api.example.test/v1",
+                "wire_api": "openai-responses",
+                "auth_mode": "x-api-key",
+                "model": "example-model",
+            },
+            "api_key": draft_key,
+            "validate_model": True,
+        })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_layer"] == "authentication"
+    assert payload["authentication"]["status"] == 401
+    assert draft_key not in response.text
+    assert seen["api_key"] == draft_key
+    assert seen["validate_model"] is True
+    assert seen["profile"]["auth_mode"] == "x-api-key"
 
 
 async def test_engine_health_route_passes_enabled_worker_profiles(tmp_path, monkeypatch) -> None:
@@ -642,13 +690,10 @@ async def test_engines_endpoint_passes_enabled_worker_profiles(tmp_path, monkeyp
     assert seen["profiles"][0]["model"] == "deepseek-v4-flash"
 
 
-async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> None:
-    """The credential endpoints deliberately ECHO the stored secret back so the
-    settings UI can show & edit it in place (operator request — see
-    credential_accounts._read_secret_value's SECURITY POSTURE note). The route is
-    password-authenticated; the plaintext travels only over that gated channel.
-    Here we assert the secret round-trips through both PUT and the list GET."""
-    app = create_app(RunManager(sessions_root=str(tmp_path / "sessions")))
+async def test_credential_account_api_keeps_secret_write_only_and_persists(tmp_path) -> None:
+    """Credential routes expose presence/endpoint metadata, never raw keys."""
+    sessions = tmp_path / "sessions"
+    app = create_app(RunManager(sessions_root=str(sessions)))
     with _Server(app) as srv:
         async with httpx.AsyncClient(base_url=srv.base, timeout=15, trust_env=False) as client:
             r = await client.put(
@@ -656,16 +701,23 @@ async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> No
                 json={"engine": "pi", "secret": "super-secret-token"},
             )
             assert r.status_code == 200
-            assert r.json()["account"]["engine"] == "pi"
-            # echoed for in-place editing, not masked
-            assert r.json()["account"]["details"]["secret_value"] == "super-secret-token"
+            account = r.json()["account"]
+            assert account["engine"] == "pi"
+            assert account["details"]["has_secret"] is True
+            assert "secret_value" not in account["details"]
+            assert "super-secret-token" not in r.text
 
             listed = await client.get("/api/settings/credential-accounts")
             assert listed.status_code == 200
             accounts = listed.json()["accounts"]
             assert accounts[0]["account_id"] == "pi-team"
             assert accounts[0]["present"] is True
-            assert accounts[0]["details"]["secret_value"] == "super-secret-token"
+            assert accounts[0]["details"]["has_secret"] is True
+            assert "secret_value" not in accounts[0]["details"]
+            assert "super-secret-token" not in listed.text
+            assert (
+                sessions / "_secrets" / "accounts" / "pi-team" / "API_KEY"
+            ).read_text(encoding="utf-8").strip() == "super-secret-token"
 
             api = await client.put(
                 "/api/settings/credential-accounts/deepseek-main",
@@ -676,11 +728,13 @@ async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> No
                 },
             )
             assert api.status_code == 200
-            # both the api key and base_url are echoed for editing
-            assert api.json()["account"]["details"]["secret_value"] == "deepseek-secret"
-            assert api.json()["account"]["details"]["base_url"] is True
+            api_account = api.json()["account"]
+            assert api_account["details"]["has_secret"] is True
+            assert "secret_value" not in api_account["details"]
+            assert "deepseek-secret" not in api.text
+            assert api_account["details"]["base_url"] is True
             assert (
-                api.json()["account"]["details"]["base_url_value"]
+                api_account["details"]["base_url_value"]
                 == "https://api.deepseek.example/v1"
             )
 
@@ -1195,3 +1249,61 @@ def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
     assert seen
     assert seen[-1]["reason"] == "runtime_failure"
     assert "pi-api-local:pi-main" in seen[-1]["detail"]
+
+
+
+def test_run_manager_emits_provider_diagnostics_for_runtime_failures(tmp_path) -> None:
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    seen: list[tuple[EventType, dict]] = []
+
+    async def go() -> None:
+        async def sink(ev) -> None:
+            if ev.event_type in (EventType.PROVIDER_ERROR, EventType.PROVIDER_BATCH_ALERT, EventType.RUN_FINISHED):
+                seen.append((ev.event_type, ev.payload))
+
+        async def driver(run) -> None:
+            run.bus.add_sink(sink)
+            raise RuntimeError("402 insufficient balance: please recharge your account")
+
+        run = await mgr.start("provider-failed-run", driver)
+        await run.task
+
+    asyncio.run(go())
+
+    provider_errors = [payload for typ, payload in seen if typ is EventType.PROVIDER_ERROR]
+    assert provider_errors
+    assert provider_errors[-1]["category"] == "insufficient_quota"
+    assert provider_errors[-1]["severity"] == "fatal"
+    assert provider_errors[-1]["should_pause_dispatch"] is True
+    assert any(typ is EventType.RUN_FINISHED for typ, _ in seen)
+
+
+def test_run_manager_emits_provider_batch_alert_for_repeated_runtime_failures(tmp_path) -> None:
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    seen: list[tuple[EventType, dict]] = []
+
+    async def go() -> None:
+        async def sink(ev) -> None:
+            if ev.event_type in (EventType.PROVIDER_ERROR, EventType.PROVIDER_BATCH_ALERT):
+                seen.append((ev.event_type, ev.payload))
+
+        async def driver(run) -> None:
+            run.bus.add_sink(sink)
+            raise RuntimeError("402 insufficient quota: account balance exhausted")
+
+        runs = []
+        for idx in range(3):
+            run = await mgr.start(f"provider-batch-{idx}", driver)
+            runs.append(run)
+            await run.task
+
+    asyncio.run(go())
+
+    provider_errors = [payload for typ, payload in seen if typ is EventType.PROVIDER_ERROR]
+    batch_alerts = [payload for typ, payload in seen if typ is EventType.PROVIDER_BATCH_ALERT]
+    assert len(provider_errors) == 3
+    assert batch_alerts
+    alert = batch_alerts[-1]
+    assert alert["category"] == "insufficient_quota"
+    assert alert["count"] == 3
+    assert alert["should_pause_dispatch"] is True

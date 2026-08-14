@@ -6,11 +6,11 @@ selects; ``profile["engine"]`` is the concrete CLI transport family.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 
 VALID_BASE_ENGINES = ("pi",)
-DEFAULT_WORKER_IMAGE = "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"
+DEFAULT_WORKER_IMAGE = "ctf-swarm-pi:0.2.0"
 TRANSPORT_TO_ENGINE = {
     "pi": "pi",
     "pi_cli": "pi",
@@ -47,10 +47,16 @@ _CANONICAL_DIRECTION = {
     "ai_sec": "aisec",
 }
 
-# Route A now ships one all-in-one Kali worker image; every direction profile
-# uses the same tag so the operator does not have to maintain per-track images.
+# Route A ships a generic pi base plus one direction-tagged worker image per
+# category. The base tag remains the fallback for the generic pi-worker profile.
 _DIRECTION_IMAGE_TAG = {
-    direction: DEFAULT_WORKER_IMAGE for direction in DIRECTIONS
+    "web": "ctf-swarm-pi-web:0.2.0",
+    "pwn": "ctf-swarm-pi-pwn:0.2.0",
+    "rev": "ctf-swarm-pi-rev:0.2.0",
+    "crypto": "ctf-swarm-pi-crypto:0.2.0",
+    "misc": "ctf-swarm-pi-misc:0.2.0",
+    "forensics": "ctf-swarm-pi-forensics:0.2.0",
+    "aisec": "ctf-swarm-pi-aisec:0.2.0",
 }
 
 
@@ -71,6 +77,11 @@ def canonical_direction(value: Any) -> str:
 def direction_image(direction: str) -> str:
     """The worker image tag for a direction, e.g. the unified Kali image."""
     return _DIRECTION_IMAGE_TAG.get((direction or "").strip().lower(), "")
+
+
+def direction_account_id(direction: str) -> str:
+    """Default credential account id for one direction profile."""
+    return f"pi-{(direction or '').strip().lower()}-main"
 
 
 def coerce_nonneg_int(value: Any, default: int) -> int:
@@ -122,8 +133,7 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         if reject_invalid:
             raise ValueError("worker profile must be an object")
         return None
-    if not item.get("enabled", True):
-        return None
+    enabled = bool(item.get("enabled", True))
     transport = str(item.get("transport") or item.get("engine") or "").strip()
     engine = TRANSPORT_TO_ENGINE.get(transport, str(item.get("engine") or "").strip())
     if engine not in VALID_BASE_ENGINES:
@@ -161,6 +171,25 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
     else:
         raw_account = f"{engine}-main"
     credential_account = str(raw_account or "").strip()
+    provider_ref = str(item.get("provider_ref") or "").strip()
+    # A provider binding owns the endpoint, protocol and secret.  Keep only the
+    # provider reference so a stale legacy credential_account/base_url cannot
+    # shadow or double-bind the profile.
+    if provider_ref:
+        credential_account = ""
+        base_url = ""
+        api_key_ref = ""
+        wire_api = "auto"
+        auth_mode = "bearer"
+        auth_header = "Authorization"
+        auth_prefix = "Bearer"
+    else:
+        base_url = str(item.get("base_url") or "").strip()
+        api_key_ref = str(item.get("api_key_ref") or "").strip()
+        wire_api = str(item.get("wire_api") or "auto").strip().lower()
+        auth_mode = str(item.get("auth_mode") or "bearer").strip().lower()
+        auth_header = str(item.get("auth_header") or "Authorization").strip()
+        auth_prefix = str(item.get("auth_prefix") if item.get("auth_prefix") is not None else "Bearer").strip()
     normalized = {
         "id": pid,
         "name": pid,
@@ -173,9 +202,13 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "credential_mode": credential_mode,
         "auth": credential_mode,
         "credential_account": credential_account,
-        "api_key_ref": str(item.get("api_key_ref") or "").strip(),
-        "base_url": str(item.get("base_url") or "").strip(),
-        "wire_api": str(item.get("wire_api") or "").strip(),
+        "api_key_ref": api_key_ref,
+        "provider_ref": provider_ref,
+        "base_url": base_url,
+        "wire_api": wire_api,
+        "auth_mode": auth_mode,
+        "auth_header": auth_header,
+        "auth_prefix": auth_prefix,
         "runtime": str(item.get("runtime") or "docker-web").strip(),
         "image": _normalize_worker_image(item.get("image")),
         "roles": roles,
@@ -187,7 +220,8 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "max_review_running": coerce_nonneg_int(item.get("max_review_running"), 0),
         "priority": coerce_nonneg_int(item.get("priority"), 100),
         "model": str(item.get("model") or "").strip(),
-        "enabled": True,
+        "effort": str(item.get("effort") or "").strip().lower(),
+        "enabled": enabled,
     }
     return normalized
 
@@ -232,6 +266,16 @@ def profile_names(profiles: list[dict[str, Any]]) -> list[str]:
     return [str(p["name"]) for p in profiles if p.get("enabled", True)]
 
 
+def profile_label(profile: Mapping[str, Any]) -> str:
+    """Human-facing worker label: explicit label, name, or id."""
+    return str(profile.get("label") or profile.get("name") or profile.get("id") or "").strip()
+
+
+def profile_ref(profile: Mapping[str, Any]) -> str:
+    """Stable dispatch reference: name/id before the display label."""
+    return str(profile.get("name") or profile.get("id") or profile_label(profile)).strip()
+
+
 def normalize_profile_roster(values: Any, profiles: list[dict[str, Any]]) -> list[str]:
     """Map profile names and legacy base-engine names to profile-name roster.
 
@@ -270,7 +314,7 @@ def normalize_profile_roster(values: Any, profiles: list[dict[str, Any]]) -> lis
 def profile_uses_endpoint(profile: dict[str, Any] | None) -> bool:
     if not profile:
         return False
-    return bool(profile.get("base_url"))
+    return bool(profile.get("base_url") or profile.get("provider_ref"))
 
 
 def resolve_seat_ref(
@@ -281,7 +325,7 @@ def resolve_seat_ref(
 ) -> str | None:
     """THE single seat-reference resolver (plan §5.0(b)).
 
-    A foreign key in config (engines[]/review.engine/race_engines/...) may name a
+    A foreign key in config (engines[]/review.engine/...) may name a
     seat THREE ways:
       - a new seat id (`seat_claude_ab12cd`),
       - a legacy profile name (`claude-local`),

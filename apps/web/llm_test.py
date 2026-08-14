@@ -1,20 +1,13 @@
-"""Test-connectivity for the planner/titler LLM endpoint (DESIGN §2.4 補強C-1).
+"""Test-connectivity for the planner/titler LLM endpoint.
 
-Tests the values the operator is EDITING (passed in the request body), not the
-saved config — so a freshly-typed base_url/model is what gets tested.
-
-Key correctness rule (reviewer P3): judge `ok` by API success, NOT by non-empty
-content. The configured models are reasoning models (dswarm/core/llm.py header):
-tokens go to `reasoning_content` first, so a small cap can return empty `content`
-on a perfectly healthy endpoint. We use the client's default cap and treat "chat
-returned without raising" as success.
-
-The API key is NOT taken from the request — it stays in .env
-(DSWARM_DEEPSEEK_API_KEY). base_url empty → default DeepSeek endpoint.
+Tests the values the operator is editing, while resolving secrets only on the
+server side from .env or a selected credential account.  Success is a real
+OpenAI-compatible chat completion, not non-empty content and not /models alone.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -23,35 +16,32 @@ async def test_llm_endpoint(
     which: str,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
+    sessions_root: str | Path | None = None,
+    worker_profiles: list[dict[str, Any]] | None = None,
+    llm_providers: list[dict[str, Any]] | None = None,
+    provider_ref: Optional[str] = None,
+    credential_account: Optional[str] = None,
+    credential_source: Optional[str] = None,
+    wire_api: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Make one minimal chat against the (edited) endpoint. Never raises."""
-    from dswarm.core.llm import LLMClient
+    """Make one minimal chat against the edited endpoint. Never raises.
 
-    which = (which or "").strip() or "planner"
-    base_url = (base_url or "").strip()
-    model = (model or "").strip()
-    if not model:
-        return {"ok": False, "detail": "model 不能为空", "model": ""}
+    The request body supplies visible Planner/Titler fields; secrets are resolved
+    server-side from .env or the selected credential account.  The authoritative
+    pass/fail remains a real ``chat/completions`` call because relay ``/models``
+    support is inconsistent.
+    """
+    from apps.web.reason_llm import probe_reason_llm_endpoint
 
-    client = LLMClient(base_url=base_url) if base_url else LLMClient()
-    try:
-        # default cap (generous) so a reasoning model's content isn't starved.
-        resp = await client.chat(
-            model=model,
-            messages=[{"role": "user", "content": "ping"}],
-            temperature=0.0,
-            stream=False,
-        )
-        # ok = the call SUCCEEDED. content may be empty on a reasoning model and
-        # that's still a healthy endpoint (reviewer P3) — do NOT require content.
-        fr = getattr(resp, "finish_reason", "") or ""
-        if fr == "error":
-            return {"ok": False, "detail": "endpoint 返回 error finish_reason", "model": model}
-        return {"ok": True, "detail": "端点可达，凭据有效", "model": model}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "detail": str(exc)[:200], "model": model}
-    finally:
-        try:
-            await client.aclose()
-        except Exception:  # noqa: BLE001
-            pass
+    return await probe_reason_llm_endpoint(
+        which=which,
+        base_url=base_url,
+        model=model,
+        sessions_root=sessions_root,
+        worker_profiles=worker_profiles or [],
+        llm_providers=llm_providers or [],
+        provider_ref=provider_ref,
+        credential_account=credential_account,
+        credential_source=credential_source,
+        wire_api=wire_api,
+    )

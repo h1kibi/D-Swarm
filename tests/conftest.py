@@ -42,3 +42,10 @@ def _read_text_utf8(self, encoding: str | None = None, *args, **kwargs):
 
 
 pathlib.Path.read_text = _read_text_utf8  # type: ignore[method-assign]
+
+
+@pytest.fixture(autouse=True)
+def _disable_auto_bind(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Auto-binding pi-main from DEEPSEEK_API_KEY is a runtime convenience. Keep
+    # unit tests on the old explicit-account behavior unless a test opts in.
+    monkeypatch.setenv("DSWARM_AUTO_BIND_PI_ACCOUNT", "0")

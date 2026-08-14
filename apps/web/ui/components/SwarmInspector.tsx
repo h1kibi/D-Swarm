@@ -1,6 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect, useMemo, useRef, useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   isFactRetired,
   workerChat,
@@ -375,6 +380,11 @@ export function SwarmInspector({
   onOpenArtifact,
   onCommand,
   onHitlAnswered,
+  width,
+  onResize,
+  minWidth,
+  maxWidth,
+  defaultWidth,
 }: {
   deck: DeckState;
   running: boolean;
@@ -385,15 +395,74 @@ export function SwarmInspector({
   onOpenArtifact: (view: ArtifactView) => void;
   onCommand: (target: string, action: string, text: string) => void;
   onHitlAnswered?: () => void;
+  width: number;
+  onResize: (width: number) => void;
+  minWidth: number;
+  maxWidth: number;
+  defaultWidth: number;
 }) {
   const t = useT();
   const [tab, setTab] = useState<Tab>("workers");
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [flashIntent, setFlashIntent] = useState<string | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+  const [resizing, setResizing] = useState(false);
   const lanes = useMemo(() => workerLanes(deck), [deck]);
   const nowSec = usePheromoneClock(deck);
-  useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current); }, []);
+  useEffect(() => () => {
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    resizeCleanupRef.current?.();
+    document.body.classList.remove("swarm-resizing");
+  }, []);
+
+  const resizeToClientX = (clientX: number) => {
+    if (typeof window === "undefined") return;
+    onResize(window.innerWidth - clientX);
+  };
+
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resizeCleanupRef.current?.();
+    setResizing(true);
+    document.body.classList.add("swarm-resizing");
+    const onMove = (moveEvent: PointerEvent) => {
+      moveEvent.preventDefault();
+      resizeToClientX(moveEvent.clientX);
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", cleanup);
+      setResizing(false);
+      document.body.classList.remove("swarm-resizing");
+      resizeCleanupRef.current = null;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", cleanup, { once: true });
+    resizeCleanupRef.current = cleanup;
+    resizeToClientX(event.clientX);
+  };
+
+  const onResizeKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      onResize(width + (event.shiftKey ? 32 : 12));
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      onResize(width - (event.shiftKey ? 32 : 12));
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      onResize(minWidth);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      onResize(maxWidth);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      onResize(defaultWidth);
+    }
+  };
 
   // intent currently bound to each worker (latest dispatch wins) + the pending
   // intent queue (proposed/queued), priority desc (§5.5).
@@ -470,7 +539,25 @@ export function SwarmInspector({
   }, [tab, flashIntent]);
 
   return (
-    <aside className="swarm motion-inspector" aria-label={t("swarm.title")}>
+    <aside
+      className={`swarm motion-inspector ${resizing ? "resizing" : ""}`}
+      aria-label={t("swarm.title")}
+      style={{ width: `${width}px`, flexBasis: `${width}px`, minWidth: `${minWidth}px`, maxWidth: `${maxWidth}px` } as CSSProperties}
+    >
+      <div
+        className="swarm-resizer"
+        role="separator"
+        tabIndex={0}
+        aria-label={t("art.resizeCanvas")}
+        title={t("art.resizeCanvas")}
+        aria-orientation="vertical"
+        aria-valuemin={minWidth}
+        aria-valuemax={maxWidth}
+        aria-valuenow={width}
+        onPointerDown={startResize}
+        onKeyDown={onResizeKey}
+        onDoubleClick={() => onResize(defaultWidth)}
+      />
       <div className="swarm-tabs" role="tablist" aria-label={t("swarm.title")}>
         {(["workers", "intents", "panels"] as Tab[]).map((k) => (
           <button

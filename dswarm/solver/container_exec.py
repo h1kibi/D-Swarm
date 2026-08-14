@@ -49,7 +49,8 @@ from typing import Callable, Optional, Any
 
 from dswarm.solver.cli_driver import CliDriver, CliResult, StreamStep
 from dswarm.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
-from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE
+from dswarm.solver.docker import docker_run
+from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, direction_image
 
 # Tool-only worker image. Real credentials are injected from Credential Accounts
 # at runtime; do not bake pi provider/login state into this image. Override with
@@ -66,13 +67,13 @@ _RUN_PREFIX = "dswarm-run-"
 # env overrides win:
 #   DSWARM_CATEGORY_IMAGE_WEB=my-web:tag
 _CATEGORY_IMAGES = {
-    "web": DEFAULT_WORKER_IMAGE,
-    "crypto": DEFAULT_WORKER_IMAGE,
-    "pwn": DEFAULT_WORKER_IMAGE,
-    "reverse": DEFAULT_WORKER_IMAGE,
-    "forensics": DEFAULT_WORKER_IMAGE,
-    "misc": DEFAULT_WORKER_IMAGE,
-    "aisec": DEFAULT_WORKER_IMAGE,
+    "web": direction_image("web"),
+    "crypto": direction_image("crypto"),
+    "pwn": direction_image("pwn"),
+    "reverse": direction_image("rev"),
+    "forensics": direction_image("forensics"),
+    "misc": direction_image("misc"),
+    "aisec": direction_image("aisec"),
 }
 
 
@@ -288,12 +289,36 @@ def _mount_source(path: str) -> str:
     return ap
 
 
-def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    # encoding=utf-8/errors=replace (P2-v3): docker/agent output is UTF-8; without
-    # an explicit encoding text=True decodes by the host's locale (cp1252/cp936 on
-    # Windows), corrupting non-ASCII output / the JSON event stream.
-    return subprocess.run(["docker", *args], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+_docker = docker_run
+
+_STOPPING_RUNS: set[str] = set()
+_STOPPING_LOCK = threading.Lock()
+
+
+def allow_container_start(run_id: str) -> None:
+    """Permit a fresh lifecycle for ``run_id`` to create a worker container.
+
+    ``teardown_container`` leaves a short-lived tombstone so stale startup /
+    recovery threads cannot recreate a just-deleted run container after cleanup.
+    A deliberate new solve/resume lifecycle clears that tombstone at its start.
+    """
+    with _STOPPING_LOCK:
+        _STOPPING_RUNS.discard(str(run_id))
+
+
+def _mark_container_stopping(run_id: str) -> None:
+    with _STOPPING_LOCK:
+        _STOPPING_RUNS.add(str(run_id))
+
+
+def _container_start_allowed(run_id: str) -> bool:
+    with _STOPPING_LOCK:
+        return str(run_id) not in _STOPPING_RUNS
+
+
+def _raise_if_container_stopping(run_id: str) -> None:
+    if not _container_start_allowed(run_id):
+        raise RuntimeError(f"container teardown in progress for run {run_id}")
 
 
 def _safe(run_id: str) -> str:
@@ -468,6 +493,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
     mode; `sleep infinity` in legacy dockerexec mode); later callers (other workers)
     find it running and reuse it. Only the run workspace is bind-mounted (plus the
     control-socket dir and the account projection)."""
+    _raise_if_container_stopping(run_id)
     os.makedirs(host_workspace, exist_ok=True)
     # Make the shared workspace (incl. the already-created graph/shared_graph.db
     # team board) writable by the kali worker uid — it's created root-owned here
@@ -476,6 +502,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
     # This runs before the FIRST worker spawns; the DB is created earlier (swarm
     # bootstrap), so a recursive chown of the tree covers it. Best-effort.
     _chown_tree_to_worker(host_workspace, image=image)
+    _raise_if_container_stopping(run_id)
     mount_account_root = account_root
     if account_root:
         os.makedirs(account_root, exist_ok=True)
@@ -493,6 +520,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
             mount_account_root = projection
         except OSError:
             mount_account_root = account_root  # fall back to raw store mount
+    _raise_if_container_stopping(run_id)
     r = _docker("image", "inspect", image, timeout=20)
     if r.returncode != 0:
         raise RuntimeError(
@@ -560,6 +588,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
                              account_root=mount_account_root,
                              mode=mode, control_dir=control_dir, token=token)
     with _ENSURE_LOCK:
+        _raise_if_container_stopping(run_id)
         state = _container_state(name)
         if state == "running":
             if mode == "rcp":
@@ -621,6 +650,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
                 "--mount",
                 f"type=bind,source={_mount_source(handle.account_root)},target={CONTAINER_ACCOUNTS_ROOT}",
             ]
+        _raise_if_container_stopping(run_id)
         if mode == "dockerexec":
             run = _docker(*run_cmd, image, "sleep", "infinity", timeout=60)
         else:
@@ -700,6 +730,7 @@ def teardown_container(run_id: str, *, remove: bool = True) -> None:
     per-worker design, so a mixed-version state never leaks. Filters are end-anchored
     on the run's safe name to avoid the substring误杀 that killed live targets under
     the old fixed-name scheme."""
+    _mark_container_stopping(run_id)
     # drop the run's control link + registered token from the receiver first (the
     # supervisor goes away with the container, but free the host-side registry).
     try:
@@ -734,6 +765,7 @@ def _ensure_alive(handle: ContainerHandle) -> None:
     / crash / race removed it, lazily recreate it (same name + mounts) so this worker
     doesn't die "No such container". Cheap when it's already running (one inspect).
     Re-syncs the handle's rcp token (+ receiver registration) if it had to recreate."""
+    _raise_if_container_stopping(handle.run_id)
     if _container_state(handle.container) == "running":
         return
     fresh = ensure_container(handle.run_id, handle.host_workspace,
@@ -752,6 +784,7 @@ def _recover_run_container(handle: ContainerHandle) -> None:
     """Force-recreate the run container after its supervisor/link died (crash or
     the supervisor's host-link-loss exit), so a fresh supervisor dials back in.
     Forgets the stale receiver link and adopts the recreated handle's token."""
+    _raise_if_container_stopping(handle.run_id)
     from dswarm.solver.control_receiver import ControlReceiver
     try:
         ControlReceiver.instance().forget(handle.run_id)
@@ -938,6 +971,12 @@ class _DockerExecBackend:
         if env:
             for k, v in env.items():
                 if k == "HOME":
+                    if str(v).startswith(f"{CONTAINER_WORKSPACE}/"):
+                        cmd += ["-e", f"{k}={v}"]
+                    continue
+                if k == "PI_CODING_AGENT_DIR":
+                    # Keep pi's config-root override, but only for the mounted
+                    # workspace path. Do not whitelist arbitrary PI_* env.
                     if str(v).startswith(f"{CONTAINER_WORKSPACE}/"):
                         cmd += ["-e", f"{k}={v}"]
                     continue

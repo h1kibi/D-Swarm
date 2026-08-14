@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
+from dswarm.core.provider_errors import classify_provider_error
 from dswarm.core.events import (
     Event, EventType, blackboard_delta_payload, hitl_request_payload,
     insight_payload, shared_graph_delta_payload, solve_graph_delta_payload,
@@ -39,9 +40,20 @@ from dswarm.core.events import (
 )
 from dswarm.models.solve_graph import Challenge, SolveGraph
 from dswarm.swarm.board import StructuredFinding
+from dswarm.solver import blackboard_skill
 from dswarm.solver.cli_driver import (
     CliDriver, CliResult, KB_MCP_NAME, StreamStep, driver_for, run_cli,
     run_cli_streaming,
+)
+from dswarm.solver.cli_stream import (
+    _BRACE_FLAG,
+    _clean_flag_token,
+    _is_stream_delta,
+    _json_event_has_prose,
+    _looks_like_verifier_output,
+    _normalize_need_kind,
+    _parse_lockout_seconds,
+    classify_need_kind,
 )
 from dswarm.solver.gate import flag_ok as _gate_flag_ok, is_placeholder_flag
 from dswarm.solver.result import ArtifactStore
@@ -50,6 +62,7 @@ from dswarm.solver.result_codes import (
     RESULT_DEAD_END,
     RESULT_EXPLORED,
     RESULT_OOM,
+    RESULT_RUNTIME_FAILURE,
     RESULT_SOLVED,
     RESULT_STEERED,
     RESULT_TIMED_OUT,
@@ -96,155 +109,6 @@ def _stable_worker_path(current: str, *, sep: "Optional[str]" = None) -> str:
         parts.append(item)
     return sep.join(parts)
 
-
-# The dswarm-blackboard skill ships in the repo at <repo>/skills/dswarm-blackboard/.
-# cli_solver.py lives at <repo>/dswarm/solver/, so the repo root is two parents up.
-_REPO_BLACKBOARD_SCRIPT = (
-    Path(__file__).resolve().parent.parent.parent
-    / "skills" / "dswarm-blackboard" / "blackboard.py"
-)
-
-
-def _repo_blackboard_script() -> Optional[str]:
-    """Absolute path to the IN-REPO blackboard skill if we're running from a source
-    checkout, else None.
-
-    A non-containerized worker invokes the skill purely as
-    `python3 "$DSWARM_BLACKBOARD_SCRIPT" <subcommand>` — so whatever path we hand it
-    is the ONLY copy that runs. Historically that pointed at the DEPLOYED copy under
-    ~/.claude or ~/.agents (installed once by scripts/install_blackboard_skill.sh),
-    which silently rotted whenever the repo skill changed: run-75378 shipped workers a
-    skill missing the entire G0-G4 + lifecycle landing (stale dedupe_key, no
-    _retired_fact_seqs filter, no dispatch_state fence), half-defeating the run-75377
-    echo-dedup fix. Pointing source runs straight at the repo copy removes that drift
-    class entirely — there is no second copy to fall out of sync."""
-    p = _REPO_BLACKBOARD_SCRIPT
-    try:
-        return str(p) if p.is_file() else None
-    except OSError:
-        return None
-
-
-def materialize_runtime_blackboard_skill(workspace_root: str | Path) -> Optional[Path]:
-    """Copy the current source skill into the run workspace for container workers.
-
-    A container image is long-lived while the checkout changes on every patch.  The
-    run workspace is already bind-mounted into every worker, so a small runtime
-    copy gives both the explicit ``DSWARM_BLACKBOARD_SCRIPT`` command and pi's skill
-    auto-discovery one authoritative, version-matched implementation.  This avoids
-    trusting an image-baked copy that may predate the current CLI protocol.
-
-    The helper is intentionally idempotent: several workers may prepare the same
-    run concurrently, and an existing byte-identical file is left alone.
-    """
-    src_text = _repo_blackboard_script()
-    if src_text is None:
-        return None
-    source_dir = Path(src_text).parent
-    sources = {
-        "blackboard.py": Path(src_text),
-        "SKILL.md": source_dir / "SKILL.md",
-    }
-    if not all(src.is_file() for src in sources.values()):
-        return None
-    target = Path(workspace_root) / ".dswarm_runtime" / "dswarm-blackboard"
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        for name, src in sources.items():
-            dst = target / name
-            payload = src.read_bytes()
-            if dst.is_file() and _file_sha256(dst) == hashlib.sha256(payload).hexdigest():
-                continue
-            tmp = target / f".{name}.staging.{os.getpid()}.{time.time_ns()}"
-            try:
-                tmp.write_bytes(payload)
-                if name == "blackboard.py":
-                    tmp.chmod(0o755)
-                os.replace(tmp, dst)
-            finally:
-                try:
-                    tmp.unlink()
-                except FileNotFoundError:
-                    pass
-        return target
-    except OSError:
-        return None
-
-
-# The user-scope copy pi auto-discovers (~/.pi/agent/skills), installed once by
-# scripts/install_blackboard_skill.sh.
-_DEPLOYED_BLACKBOARD_SCRIPTS = (
-    "~/.pi/agent/skills/dswarm-blackboard/blackboard.py",
-)
-
-
-def _file_sha256(path: Path) -> Optional[str]:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
-
-
-def sync_deployed_blackboard_skills() -> list[dict]:
-    """SAFETY NET (run once at swarm launch): reconcile the DEPLOYED user-scope skill
-    copies with the in-repo source.
-
-    Source runs invoke the repo skill directly (see _blackboard_script_path), so the
-    deployed copies don't gate THAT path. But a worker CLI also AUTO-DISCOVERS the
-    skill from its user-scope dir for any unprompted `dswarm-blackboard` use, and an
-    installed (non-source) deployment relies on the deployed copy outright. Those
-    copies are installed once and then rot whenever the repo skill changes (run-75378:
-    deployed skill missing the entire G0-G4 + lifecycle landing). When a repo source is
-    present we treat it as truth and overwrite any stale/missing deployed copy.
-
-    Returns one report row per deployed target: {path, status, ...} where status is
-      'synced'        — was stale/missing, overwritten from repo (action taken)
-      'ok'            — already byte-identical to repo
-      'no-source'     — no in-repo source (installed deployment); nothing to compare
-      'error'         — copy failed (details in 'error')
-    The caller logs this + emits a board delta so a silent drift can't recur unseen."""
-    src = _repo_blackboard_script()
-    if src is None:
-        # Installed deployment with no adjacent repo skill: the deployed copy IS the
-        # source of truth, kept fresh by the package install, so there's nothing to
-        # reconcile against.
-        return [{"path": os.path.expanduser(t), "status": "no-source"}
-                for t in _DEPLOYED_BLACKBOARD_SCRIPTS]
-    src_path = Path(src)
-    src_hash = _file_sha256(src_path)
-    rows: list[dict] = []
-    for target in _DEPLOYED_BLACKBOARD_SCRIPTS:
-        dest = Path(os.path.expanduser(target))
-        if dest.resolve() == src_path.resolve():
-            # Deployed dir is a symlink (or the same file) into the repo — already
-            # impossible to drift; nothing to do.
-            rows.append({"path": str(dest), "status": "ok"})
-            continue
-        dest_hash = _file_sha256(dest)
-        if dest_hash == src_hash:
-            rows.append({"path": str(dest), "status": "ok"})
-            continue
-        # Stale or missing → overwrite from repo. Also refresh SKILL.md alongside it so
-        # the discovered skill's docs and code move together.
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dest)
-            try:
-                os.chmod(dest, 0o755)
-            except OSError:
-                pass
-            skill_md = src_path.parent / "SKILL.md"
-            if skill_md.is_file():
-                shutil.copy2(skill_md, dest.parent / "SKILL.md")
-            rows.append({
-                "path": str(dest),
-                "status": "synced",
-                "was": "missing" if dest_hash is None else f"stale({dest_hash[:12]})",
-                "now": (src_hash or "")[:12],
-            })
-        except OSError as e:
-            rows.append({"path": str(dest), "status": "error", "error": str(e)})
-    return rows
 
 
 # A focused, black-box prompt. No domain how-to — just "become an expert";
@@ -516,9 +380,17 @@ _REVIEW_PROMPT = (
     "\"risk_class\":\"destructive\",\"reason\":\"serialize SMB exploit attempts\"}}\n"
     "LANE_UNLOCK={{\"lane_key\":\"destructive:tcp:445@172.22.11.45\","
     "\"reason\":\"owner finished or lock was stale\"}}\n"
-    "NEXT_INTENT={{\"worker_class\":\"verifier\",\"goal\":\"Verify JWT alg from a real token\"}}\n\n"
-    "Never output FOUND_FLAG. If you see a flag in the board, treat it as existing "
-    "state only; the normal flag gate already handled it."
+    "NEXT_INTENT={{\"worker_class\":\"verifier\",\"goal\":\"Verify JWT alg from a real token\"}}\n"
+    "FLAG_AUDIT={{\"flag\":\"flag{{...}}\",\"verdict\":\"likely_hallucination\","
+    "\"reason\":\"only appears in worker prose; no command output witness\","
+    "\"recommended_action\":\"suppress claim; require verifier reproduction before trust\"}}\n\n"
+    "Flag audit rule: unverified flag claims are NOT accepted flags. Classify them as "
+    "likely_hallucination, likely_real_needs_repro, obvious_placeholder, or "
+    "insufficient_context. If possibly real, pair FLAG_AUDIT with NEXT_INTENT for a "
+    "verifier to reproduce the value from real target/tool output. Never accept or "
+    "declare a flag yourself.\n"
+    "Never output FOUND_FLAG. If you see a flag in the board, treat accepted flags as "
+    "state already handled by the normal gate, and unverified claims as audit leads only."
 )
 
 # Capture EVERYTHING after FOUND_FLAG= to end-of-line (not \S+), so a flag whose
@@ -528,25 +400,6 @@ _REVIEW_PROMPT = (
 # to `flag{H1570rY` → never closed → never registered, despite the worker solving.)
 _FLAG_LINE = re.compile(r"FOUND_FLAG=\s*(.+)")
 # A xxx{...} brace-structured flag anywhere in the captured tail — inner spaces OK.
-_BRACE_FLAG = re.compile(r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
-
-
-def _clean_flag_token(raw: str) -> str:
-    """Turn the raw FOUND_FLAG= tail into the actual flag token. Two shapes:
-      - brace flag `xxx{...}`: return the FULL brace structure (spaces allowed
-        inside) — fixes both the markdown-`**` pollution (BUG-1) and the
-        space-truncation (BUG-2), since we grab exactly `…{…}` and drop any
-        trailing prose / `**` / punctuation the worker appended on the same line.
-      - bare token (no braces): take the first whitespace-delimited word, stripped
-        of wrapping quotes/backticks/markdown — old behavior preserved.
-    """
-    s = (raw or "").strip().strip("`'\"*_ ").strip()
-    m = _BRACE_FLAG.search(s)
-    if m:
-        return m.group(0)
-    # bare token: first word, minus wrapping markdown/punctuation
-    tok = s.split()[0] if s.split() else ""
-    return tok.strip("`'\"*_.,;:!").strip()
 _VERIFIED_FACT_LINE = re.compile(r"VERIFIED_FACT=\s*(.+)")
 _FINDING_TYPE_LINE = re.compile(r"FINDING_TYPE=\s*(\S+)")
 _FINDING_TARGET_LINE = re.compile(r"FINDING_TARGET=\s*(\S+)")
@@ -572,63 +425,11 @@ _SECRET_LITERAL_RE = re.compile(
 # end-of-run summary takes the last non-empty line of the transcript; without this
 # filter a trailing stream delta would be recorded as a bogus "fact" (run-3154
 # seq 83; run-3155 seq 7 — an `agent_end` with EMPTY messages/content).
-_STREAM_ENVELOPE_TYPES = frozenset({
-    "session", "agent_start", "turn_start", "message_start",
-    "message_update", "message_delta", "text_delta",
-    "toolcall_delta", "tool_call_delta", "content_update",
-    "tool_execution_start", "tool_execution_end", "agent_settled",
-})
 # event types that MAY carry the assistant's actual prose
-_STREAM_CONTENT_TYPES = frozenset({"message", "message_end", "turn_end", "agent_end"})
 
 
-def _json_event_has_prose(ev: dict) -> bool:
-    """True if a pi json-mode event carries non-empty assistant text anywhere:
-    message.content[].text, message.text, or nested messages arrays."""
-    msgs = ev.get("messages")
-    if isinstance(msgs, list):
-        return any(isinstance(m, dict) and _json_event_has_prose(m) for m in msgs)
-    msg = ev.get("message")
-    if isinstance(msg, dict) and _json_event_has_prose(msg):
-        return True
-    v = ev.get("text")
-    if isinstance(v, str) and v.strip():
-        return True
-    content = ev.get("content")
-    if isinstance(content, str) and content.strip():
-        return True
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict):
-                if _json_event_has_prose(item):
-                    return True
-            elif isinstance(item, str) and item.strip():
-                return True
-    return False
 
 
-def _is_stream_delta(line: str) -> bool:
-    line = line.strip()
-    if not line.startswith("{"):
-        return False
-    try:
-        ev = json.loads(line)
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(ev, dict):
-        return False
-    t = ev.get("type")
-    if not isinstance(t, str):
-        return False
-    if t in _STREAM_ENVELOPE_TYPES:
-        return True
-    if t in _STREAM_CONTENT_TYPES:
-        # keep only when the event actually carries assistant prose; an empty
-        # envelope (agent_end with no messages, message_end with empty content)
-        # is still a protocol artifact — run-3155 seq 7 recorded it as a fact.
-        return not _json_event_has_prose(ev)
-    # unknown JSON event — never trust it as summary prose.
-    return True
 
 # ── rate-limited verifier (submission gate) markers + lockout parsing ────────
 # A worker about to submit to a rate-limited verifier first declares this so the
@@ -637,7 +438,7 @@ def _is_stream_delta(line: str) -> bool:
 # 18/18 people, admiralty conservative").
 _READY_TO_SUBMIT_LINE = re.compile(r"READY_TO_SUBMIT=\s*(.+)")
 _REVIEW_JSON_MARKERS = {
-    "REVIEW_FINDING", "FACT_CHALLENGE", "FACT_REVALIDATION",
+    "REVIEW_FINDING", "FLAG_AUDIT", "FACT_CHALLENGE", "FACT_REVALIDATION",
     "FACT_REJECT", "FACT_MERGE", "FACT_SUPERSEDE",
     "ROUTE_SUPPRESS", "ROUTE_REOPEN", "BRANCH_SPLIT", "BRANCH_RESOLVE",
     "COORDINATOR_DIRECTIVE", "NEXT_INTENT", "LANE_LOCK", "LANE_UNLOCK",
@@ -646,69 +447,13 @@ _REVIEW_JSON_MARKERS = {
 # swarm backs off for exactly that long. Covers the common phrasings: "wait N
 # minutes", "locked for N min", "try again in N seconds", "cooldown: Ns". Returns
 # seconds. Conservative — only fires on an explicit duration next to a lock word.
-_LOCKOUT_RE = re.compile(
-    r"(?:lock(?:ed|out)?|cooldown|wait|try again|rate.?limit|too many|burn)\D{0,40}?"
-    r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
-    re.IGNORECASE)
-
-_VALID_NEED_KINDS = {
-    "external_blocker",
-    "operator_directive_needed",
-    "lane_lock_request",
-    "route_dead_end",
-    "worker_uncertainty",
-}
 
 
-def _normalize_need_kind(kind: str) -> str:
-    k = (kind or "").strip().lower()
-    return k if k in _VALID_NEED_KINDS else ""
 
 
-def classify_need_kind(text: str) -> str:
-    """Fine-grained HITL classifier, separate from legacy env_down/need_input."""
-    low = (text or "").lower()
-    if any(k in low for k in (
-        "ask operator", "operator decide", "需要 operator", "need a decision from",
-    )):
-        return "operator_directive_needed"
-    if any(k in low for k in (
-        "exclusive", "独占", "serialize", "序列化", "another worker",
-        "其它 worker", "其他 worker", "same target", "stop hammering",
-    )):
-        return "lane_lock_request"
-    if any(k in low for k in (
-        "unreachable", "connection refused", "refused", "timed out", "timeout",
-        "expired", "instance", "502", "503", "down", "credential", "凭据",
-        "vps", "attachment", "附件", "token", "runtime", "container",
-    )):
-        return "external_blocker"
-    if any(k in low for k in (
-        "已知失败", "repeatedly fail", "known dead", "dead end", "dead-end",
-        "route dead", "route failed", "no longer viable", "打不通", "走死",
-    )):
-        return "route_dead_end"
-    return "worker_uncertainty"
 
 
-def _parse_lockout_seconds(text: str) -> float:
-    """Return the LARGEST lockout duration (in seconds) mentioned in `text`, or 0
-    if none. We take the max because a worker's output may quote both an 8s
-    per-attempt cooldown and a 30-min burn-lockout in the same chunk — the long one
-    is the binding backoff. Bare unit letters (s/m/h) are honored too."""
-    best = 0.0
-    for m in _LOCKOUT_RE.finditer(text or ""):
-        try:
-            n = float(m.group(1))
-        except (TypeError, ValueError):
-            continue
-        unit = (m.group(2) or "s").lower().rstrip("s")  # minutes→minute, hrs→hr
-        if unit in ("minute", "min", "m"):
-            n *= 60
-        elif unit in ("hour", "hr", "h"):
-            n *= 3600
-        best = max(best, n)
-    return best
+
 
 
 # A lockout is real ONLY if this text is the verifier's OWN verdict output — not a
@@ -723,47 +468,13 @@ def _parse_lockout_seconds(text: str) -> float:
 # … attempt" / "N attempts remaining" — phrasings a doc paraphrase rarely
 # reproduces verbatim). NEGATIVE: if the chunk is dominated by file-read signatures
 # (a `read:`/`cat`/`head` of a path, or our own doc/brief filenames), it's prose.
-_VERIFIER_VERDICT_RE = re.compile(
-    r"burn-?lock(?:out)?\s*[:\-]|"            # "burn-lockout:" — the verifier's own header
-    r"\d+\s*burns?\s+in\s+(?:the\s+)?last|"   # "3 burns in last 30 min"
-    r"attempts?\s+(?:left|remaining)|"        # "2 attempts remaining"
-    r"too\s+many\s+(?:wrong\s+)?attempts?|"   # "too many wrong attempts"
-    r"locked\s+for\s+\d|"                     # "locked for 30 minutes"
-    r"wait\s+(?:for\s+)?(?:the\s+)?cooldown",  # "wait for the cooldown to lift"
-    re.IGNORECASE)
 # Reading a local file/doc that talks ABOUT the lockout — the false-trigger surface.
-_DOC_READ_RE = re.compile(
-    r"(?:^|\n)\s*read:\s|"                    # the CLI's file-read step label
-    r"PROBLEM_verifier|BRIEFING|known_intel|missions?\.json|"
-    r"\.md\b|DESIGN_|SOP_",                   # our own markdown docs
-    re.IGNORECASE)
 
 
 # The verifier's invocation footprint — present when its verdict was actually
 # produced (the script ran), absent in free narrative prose.
-_VERIFIER_INVOKE_RE = re.compile(
-    r"(?:specter-verify|verify-[a-z0-9-]+\.sh|/opt/verify-)", re.IGNORECASE)
 
 
-def _looks_like_verifier_output(text: str) -> bool:
-    """True only when a lock phrase in `text` is the VERIFIER's own verdict. Three
-    gates, all required:
-      1. characteristic verdict PHRASING (burn-lockout: / N burns in last / locked
-         for N / too many attempts / cooldown) — generic "it's locked" isn't enough;
-      2. the verifier INVOCATION footprint (specter-verify / verify-*.sh / /opt/
-         verify-) — proof the verdict was actually produced, not narrated;
-      3. NOT a doc/file read (read:/our markdown/BRIEFING/intel) — the false-trigger
-         surface (run-11553: cursor read PROBLEM_verifier_*.md, which has BOTH the
-         phrasing AND mentions /opt/verify-…sh, so the footprint alone is fooled —
-         the doc-read guard is what rejects it)."""
-    t = text or ""
-    if not _VERIFIER_VERDICT_RE.search(t):
-        return False           # generic "locked 30 min" prose → not a verdict
-    if not _VERIFIER_INVOKE_RE.search(t):
-        return False           # no invocation footprint → narrated, not produced
-    if _DOC_READ_RE.search(t):
-        return False           # footprint + phrasing came from a doc read → prose
-    return True
 
 # ── Respond mode (post-solve standby) ───────────────────────────────────────
 # A human typed something after the challenge was solved (or the server
@@ -1198,7 +909,7 @@ class CliSolver:
         if self.container is not None:
             workspace = getattr(self.container, "host_workspace", "")
             if workspace:
-                runtime_skill = materialize_runtime_blackboard_skill(workspace)
+                runtime_skill = blackboard_skill.materialize_runtime_blackboard_skill(workspace)
                 mapper = getattr(self.container, "to_container_path", None)
                 if runtime_skill is not None and callable(mapper):
                     try:
@@ -1211,7 +922,7 @@ class CliSolver:
         # Source checkout: run the repo copy DIRECTLY — no deployed copy to drift
         # out of sync (see _repo_blackboard_script). This is the common case for
         # `./run.sh` from a working tree.
-        repo = _repo_blackboard_script()
+        repo = blackboard_skill._repo_blackboard_script()
         if repo is not None:
             return repo
         # Installed deployment (pip/wheel; skills/ not adjacent to the package):
@@ -1512,6 +1223,10 @@ class CliSolver:
         if model and "--model" not in out and "-m" not in out:
             out = insert_before_prompt(out, ["--model", model])
 
+        thinking = (env.get("DSWARM_WORKER_THINKING") or "").strip()
+        if thinking and "--thinking" not in out:
+            out = insert_before_prompt(out, ["--thinking", thinking])
+
         # route A P3: the per-worker env is the AUTHORITATIVE provider choice — it
         # carries DSWARM_PI_PROVIDER=ctf-gateway for container workers with a live
         # task token (the real upstream key stays host-side). The argv was built
@@ -1728,7 +1443,8 @@ class CliSolver:
                     from dswarm.solver.gate import is_placeholder_flag
                     for m in _BRACE_FLAG.finditer(raw):
                         cand = m.group(0)
-                        if is_placeholder_flag(cand):
+                        if (is_placeholder_flag(cand)
+                                or not self._is_bare_raw_flag(cand)):
                             continue
                         key = ("FC", cand)
                         if key in self._published_markers:
@@ -1741,7 +1457,7 @@ class CliSolver:
                                 f"real output: {cand}"
                             ),
                         )
-                        if self._is_bare_raw_flag(cand) and self._flag_ok(cand, raw):
+                        if self._flag_ok(cand, raw):
                             if await self._accept_flag(cand):
                                 if cand not in self._stream_accepted:
                                     self._stream_accepted.append(cand)
@@ -2761,6 +2477,22 @@ class CliSolver:
             return ""
         return "\n".join(err.splitlines()[-12:])[-max_chars:]
 
+    def _runtime_infra_error(self, res: CliResult) -> str:
+        """Return CLI/runtime stderr that must not become challenge evidence.
+
+        ``raw_stderr`` is emitted by the model CLI process itself, not by commands
+        the worker ran against the target.  When the CLI produced no stdout, treating
+        that stderr as a candidate fact pollutes Reason/Reviewer with infrastructure
+        failures (e.g. ``Unknown provider dswarm-worker``) and can send the swarm down
+        a bogus challenge direction.
+        """
+        if (res.text or "").strip():
+            return ""
+        tail = self._stderr_tail(res)
+        if not tail:
+            return ""
+        return tail
+
     def _result_text_with_stderr(self, res: CliResult) -> str:
         text = res.text or ""
         if text.strip():
@@ -2769,6 +2501,68 @@ class CliSolver:
         if not tail:
             return text
         return f"[{self.driver.name} stderr]\n{tail}"
+
+    def _provider_runtime_diagnostic(self, detail: str) -> dict[str, Any]:
+        env = dict(getattr(self, "_extra_worker_env", {}) or {})
+        provider = (
+            env.get("DSWARM_LLM_PROVIDER_REF")
+            or env.get("DSWARM_PI_PROVIDER")
+            or env.get("DSWARM_WORKER_BASE_URL")
+            or env.get("OPENAI_BASE_URL")
+            or self.driver.name
+        )
+        account_id = env.get("DSWARM_CREDENTIAL_ACCOUNT_ID") or ""
+        return classify_provider_error(
+            detail,
+            provider=str(provider or ""),
+            account_id=str(account_id or ""),
+            worker_id=self.solver_id,
+        ).to_event()
+
+    async def _emit_worker_runtime_error(self, detail: str) -> dict[str, Any]:
+        if not detail:
+            return {}
+        diag = self._provider_runtime_diagnostic(detail)
+        await self._emit(
+            EventType.PROVIDER_ERROR,
+            **diag,
+        )
+        retryable = bool(diag.get("retryable"))
+        recovery_action = "retry_next_worker" if retryable else "pause_provider_dispatch"
+        operator_message = (
+            "当前 CLI 是 single-shot worker；本轮已自然收尾，不会强行中断。"
+            "系统已把 provider/runtime 恢复指令写入黑板，后续 Worker/Reason 会消费并接续。"
+            if retryable else
+            "当前 CLI 是 single-shot worker；本轮已自然收尾。该错误疑似配置/额度级失败，"
+            "系统已写入暂停同类 provider/account 派发的指令并提示操作员处理。"
+        )
+        await self._emit_bb(
+            "worker_runtime_error",
+            severity="error",
+            error=detail[:1200],
+            category=str(diag.get("category") or ""),
+            retryable=retryable,
+            should_pause_dispatch=bool(diag.get("should_pause_dispatch")),
+            message=(
+                "Worker CLI/runtime failed before producing solver output; "
+                "this infrastructure error was not added as challenge evidence."
+            ),
+        )
+        await self._emit_bb(
+            "provider_recovery_directive",
+            severity=str(diag.get("severity") or "warning"),
+            provider=str(diag.get("provider") or ""),
+            account_id=str(diag.get("account_id") or ""),
+            category=str(diag.get("category") or ""),
+            retryable=retryable,
+            should_pause_dispatch=bool(diag.get("should_pause_dispatch")),
+            recovery_action=recovery_action,
+            current_worker_interrupted=False,
+            operator_message=operator_message,
+            suggested_action=str(diag.get("suggested_action") or ""),
+            raw_message=str(diag.get("raw_message") or "")[:1000],
+        )
+        return diag
 
     async def _emit_empty_stderr_diagnostic(self, res: CliResult) -> None:
         if (res.text or "").strip():
@@ -3195,17 +2989,21 @@ class CliSolver:
                 payload = dict(payload or {})
                 seq = self.shared_graph.add_review_proposal(
                     actor=self.solver_id, marker=marker, payload=payload, tier=tier)
+                summary = str(
+                    payload.get("summary") or payload.get("reason")
+                    or payload.get("goal") or payload.get("directive")
+                    or payload.get("recommended_action") or marker
+                )[:240]
                 await self._emit_bb(
                     "review_proposal",
                     seq=seq,
                     marker=marker,
                     tier=tier,
                     route_hash=str(payload.get("route_hash") or ""),
-                    summary=str(
-                        payload.get("summary") or payload.get("reason")
-                        or payload.get("goal") or payload.get("directive")
-                        or marker
-                    )[:240],
+                    flag=str(payload.get("flag") or ""),
+                    verdict=str(payload.get("verdict") or ""),
+                    recommended_action=str(payload.get("recommended_action") or ""),
+                    summary=summary,
                 )
                 proposed += 1
             except Exception as exc:  # noqa: BLE001
@@ -3351,6 +3149,7 @@ class CliSolver:
         worker_timed_out = False
         worker_cancelled = False
         worker_steered = False
+        infra_failure_detail = ""
         all_text = ""
         accepted: "Optional[str]" = None
         res: CliResult = CliResult(text="")
@@ -3358,12 +3157,17 @@ class CliSolver:
         async def _absorb(r: CliResult) -> None:
             """Fold one subprocess result into the worker's state: stream cost +
             markers, append transcript, accept every gate-passing flag."""
-            nonlocal all_text, accepted
+            nonlocal all_text, accepted, infra_failure_detail
             self._mark_session_if_live(r)
             await self._emit_empty_stderr_diagnostic(r)
+            infra = self._runtime_infra_error(r)
+            if infra and not infra_failure_detail:
+                infra_failure_detail = infra
             result_text = self._result_text_with_stderr(r)
             all_text = (all_text + "\n" + result_text).strip()
             await self._stream_cost(r)
+            if infra:
+                return
             # gate flags in the summarized result against the FULL provenance corpus
             # (raw command outputs ∪ result text), not the envelope alone — a flag the
             # agent names in its summary is accepted only if a real command actually
@@ -3409,6 +3213,7 @@ class CliSolver:
         # cancel (sibling won / stop) or an OOM-kill skips it — die immediately.
         if (not worker_cancelled
                 and not worker_steered
+                and not infra_failure_detail
                 and not worker_oom_killed
                 and worker_timed_out
                 and len(self._already_found) < self._expected_flags()):
@@ -3439,6 +3244,20 @@ class CliSolver:
             return SolveOutcome(False, None, 1, self.graph,
                                 f"{self.driver.name} CLI: steered",
                                 flags=partial_flags)
+
+        if infra_failure_detail and not accepted:
+            self._note_worker_stop("runtime_failure")
+            detail = f"Worker runtime failed before solver output: {infra_failure_detail[:220]}"
+            self._conclude_intent_db(result=RESULT_RUNTIME_FAILURE, result_detail=detail)
+            provider_error = await self._emit_worker_runtime_error(infra_failure_detail)
+            await self._emit_bb("intent_concluded", intent_id=self._intent_id,
+                                worker=self.solver_id, result=RESULT_RUNTIME_FAILURE,
+                                result_detail=detail)
+            partial_flags = list(self.graph.flags)
+            await self._emit_finished(flag=None, flags=partial_flags, solved=False)
+            return SolveOutcome(False, None, 1, self.graph,
+                                f"{self.driver.name} CLI: runtime failure",
+                                flags=partial_flags, provider_error=provider_error)
 
         # the coordinator extracts structured facts/dead-ends from the
         # worker's output and writes them to the board (the worker is a stateless
@@ -3577,6 +3396,7 @@ class CliSolver:
         await self._note_cli_session(session)  # claude pre-seeds; codex stays None
         worker_cancelled = False
         worker_steered = False
+        infra_failure_detail = ""
         all_text = ""
         res: CliResult = CliResult(text="")
 
@@ -3589,17 +3409,21 @@ class CliSolver:
         self._mark_session_if_live(res)
         await self._note_cli_session(session)
         await self._emit_empty_stderr_diagnostic(res)
+        infra = self._runtime_infra_error(res)
+        if infra and not infra_failure_detail:
+            infra_failure_detail = infra
         result_text = self._result_text_with_stderr(res)
         all_text = (all_text + "\n" + result_text).strip()
         await self._stream_cost(res)
-        await self._stream_markers(result_text)
+        if not infra:
+            await self._stream_markers(result_text)
         worker_cancelled = res.cancelled
         worker_steered = res.steered
         worker_timed_out = res.timed_out
 
         # one conclude fallback: timed out OR no structured markers at all → resume
         # the same session once to force a summary. A cancel skips it (die now).
-        if not worker_cancelled and not worker_steered:
+        if not worker_cancelled and not worker_steered and not infra_failure_detail:
             facts, deadends = self._extract_structured_facts(all_text)
             flag = self._extract_flag(all_text)
             if worker_timed_out or (not facts and not deadends and not flag):
@@ -3613,10 +3437,14 @@ class CliSolver:
                 self._mark_session_if_live(res)
                 await self._note_cli_session(session)
                 await self._emit_empty_stderr_diagnostic(res)
+                infra = self._runtime_infra_error(res)
+                if infra and not infra_failure_detail:
+                    infra_failure_detail = infra
                 result_text = self._result_text_with_stderr(res)
                 all_text = (all_text + "\n" + result_text).strip()
                 await self._stream_cost(res)
-                await self._stream_markers(result_text)
+                if not infra:
+                    await self._stream_markers(result_text)
                 worker_cancelled = worker_cancelled or res.cancelled
                 worker_steered = worker_steered or res.steered
 
@@ -3634,13 +3462,30 @@ class CliSolver:
         # already streamed live mid-solve (bug #1). The full combined transcript is
         # re-scanned so the conclude-pass markers are caught too. This also accepts
         # any FOUND_FLAG that only ever appeared in streamed/intermediate text.
-        await self._stream_markers(all_text)
+        if not infra_failure_detail:
+            await self._stream_markers(all_text)
         # a flag accepted only via the live stream (not in all_text's terminal-result
         # tail) still makes this explore worker solved (run-11189).
         if self._stream_accepted and accepted is None:
             accepted = self._stream_accepted[0]
         # recompute the full marker set for the result decision below.
         facts, deadends = self._extract_structured_facts(all_text)
+
+        if infra_failure_detail and not accepted:
+            self._note_worker_stop("runtime_failure")
+            detail = f"Worker runtime failed before solver output: {infra_failure_detail[:220]}"
+            self._conclude_intent_db(result=RESULT_RUNTIME_FAILURE, result_detail=detail)
+            provider_error = await self._emit_worker_runtime_error(infra_failure_detail)
+            await self._emit_bb("intent_concluded", intent_id=self._intent_id,
+                                worker=self.solver_id, result=RESULT_RUNTIME_FAILURE,
+                                to_fact_seq=None, result_detail=detail)
+            partial_flags = list(self.graph.flags)
+            await self._emit_finished(flag=None, flags=partial_flags, solved=False)
+            return SolveOutcome(False, None, 1, self.graph,
+                                f"{self.driver.name} explore: runtime failure",
+                                session=session, engine=self.driver.name,
+                                workdir=str(wd), flags=partial_flags,
+                                provider_error=provider_error)
 
         # if no structured output at all, record the transcript tail as a candidate fact
         if not facts and not deadends and not accepted:
@@ -4237,16 +4082,31 @@ class CliSolver:
         if self.mode == "review":
             return
         rejected = self._rejected_flags()
+        intent_id = getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or ""
         for flag in self._extract_flags(all_text):
             if flag in self._already_found:
-                continue  # accepted — already a real flag, nothing to surface
+                continue  # accepted; already a real flag, nothing to surface
             if flag in rejected:
                 continue  # operator already ruled this value out; don't re-nag
             key = ("U", flag[:200])
             if key in self._published_markers:
                 continue
             self._published_markers.add(key)
+            reason = ("claimed via FOUND_FLAG= but traces to no real command "
+                      "output; reviewer audit/verifier reproduction needed")
+            seq = -1
+            if self.shared_graph is not None:
+                try:
+                    seq = self.shared_graph.flag_unverified(
+                        actor=self.solver_id,
+                        flag=flag,
+                        reason=reason,
+                        intent_id=intent_id or None,
+                        context=all_text[-2000:],
+                    )
+                except Exception:
+                    seq = -1
             await self._emit_bb(
-                "flag_unverified", flag=flag,
-                reason="claimed via FOUND_FLAG= but traces to no real command "
-                       "output — operator verification needed")
+                "flag_unverified", flag=flag, seq=seq,
+                reason=reason,
+                intent_id=intent_id)

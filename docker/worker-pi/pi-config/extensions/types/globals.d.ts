@@ -12,6 +12,7 @@ declare const console: {
 declare module "node:fs" {
   export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
   export function appendFileSync(path: string, data: string, encoding?: "utf8"): void;
+  export function readFileSync(path: string, encoding: "utf8"): string;
 }
 
 declare module "node:path" {

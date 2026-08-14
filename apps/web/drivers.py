@@ -21,6 +21,7 @@ from apps.web.run_manager import Run, RunManager
 from apps.web.worker_config import (
     DEFAULT_ENGINES,
     DEFAULT_WORKER_BACKEND,
+    DEFAULT_DEEPSEEK_BASE_URL,
     backend_for_profile,
     resolve_worker_backend,
 )
@@ -60,6 +61,7 @@ def _missing_profile_accounts(
     worker_profiles: list[dict],
     runtime_profiles: list[dict],
     sessions_root: Path,
+    llm_providers: list[dict] | None = None,
 ) -> list[str]:
     """Dispatch precheck — now a thin wrapper over the profile_health kernel so it
     can never disagree with the settings self-check. Same two-pass cost profile:
@@ -84,7 +86,8 @@ def _missing_profile_accounts(
             in_web_container=is_web_container(),
         )
         return p, evaluate_profile_health(
-            p, backend=backend, sessions_root=sessions_root, depth="auth"
+            p, backend=backend, sessions_root=sessions_root, depth="auth",
+            llm_providers=llm_providers,
         )
 
     if len(enabled) == 1:
@@ -107,61 +110,19 @@ def _planner_llm_credentials(
     worker_profiles: list[dict],
     planner_base: str,
 ) -> tuple[str, str]:
-    """Resolve planner key/base_url without requiring DSWARM_DEEPSEEK_API_KEY.
+    """Backward-compatible credential resolver used by BTW and older tests.
 
-    The Reason planner is a host-side LLM call, not a worker container call.
-    Prefer the explicit env key for backward compatibility; when it is absent,
-    reuse the same registered credential account the pi worker would consume.
-    Returns (api_key, base_url); base_url is empty when the default DeepSeek
-    endpoint should be used.
+    New ReasonSwarm code should use ``apps.web.reason_llm.resolve_reason_llm_endpoint``
+    so it also receives diagnostic/source metadata.
     """
-    from dswarm.solver.credential_accounts import CredentialAccountStore
+    from apps.web.reason_llm import resolve_reason_llm_endpoint
 
-    store = CredentialAccountStore(account_store_root(sessions_root))
-    seen: set[str] = set()
-    candidates: list[Any] = []
-    for profile in worker_profiles:
-        if not isinstance(profile, dict):
-            continue
-        account_id = str(profile.get("credential_account") or "").strip()
-        if account_id and account_id not in seen:
-            seen.add(account_id)
-            acct = store.inspect(account_id)
-            if acct is not None:
-                candidates.append(acct)
-    if "pi-main" not in seen:
-        seen.add("pi-main")
-        acct = store.inspect("pi-main")
-        if acct is not None:
-            candidates.append(acct)
-    for raw in store.list():
-        account_id = str(raw.get("account_id") or "").strip()
-        if not account_id or account_id in seen:
-            continue
-        seen.add(account_id)
-        acct = store.inspect(account_id)
-        if acct is not None:
-            candidates.append(acct)
-
-    planner_base_norm = planner_base.rstrip("/")
-    for acct in candidates:
-        if acct is None or not getattr(acct, "present", False):
-            continue
-        details = getattr(acct, "details", None) or {}
-        api_key = str(details.get("secret_value") or "").strip()
-        if not api_key:
-            continue
-        acct_base = str(details.get("base_url_value") or "").strip().rstrip("/")
-        mode = str(getattr(acct, "mode", "") or "")
-        if mode == "custom_endpoint":
-            if planner_base:
-                if acct_base != planner_base_norm:
-                    continue
-            elif not acct_base:
-                continue
-            return api_key, acct_base or planner_base_norm
-        return api_key, planner_base_norm or ""
-    return "", planner_base_norm or ""
+    resolved = resolve_reason_llm_endpoint(
+        sessions_root=sessions_root,
+        worker_profiles=worker_profiles,
+        profile={"base_url": planner_base, "credential_source": "auto", "credential_account": "pi-main"},
+    )
+    return str(resolved.get("api_key") or ""), str(resolved.get("base_url") or "")
 
 
 _LEGACY_SWARM_FIELDS = (
@@ -341,14 +302,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
 
     Knobs from the request body (all optional):
       challenge.{name,category,target,description,flag_format}  (inferred from prompt)
-      cli_race: bool (default True)           — race pi direction profiles
-      cli_engine: "pi"                        — single engine when not racing
-      race_scout: bool (default True)         — one parallel single-shot recon round
-                                                in front of the main coordinator loop
-                                                (fast path on flag, else hands facts
-                                                to the coordinator loop)
-      race_engines: list (default = engines)  — which engines race (worker switch)
-      race_timeout: int (default 720)         — short per-worker recon timeout (s)
+      cli_engine: "pi"                        — worker engine (pi only)
+      legacy race/coordinator fields are rejected at the API boundary; the only
+      runtime path is ReasonSwarm.
       offline: bool (default False)           — deny worker web tools (clean eval);
                                                 also denies the KB unless `kb` is set
       kb: bool (default: True online / False offline) — let the worker query the KB
@@ -427,22 +383,25 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         engines = body.get("engines") or wc.get("engines") or DEFAULT_ENGINES
         runtime_profiles = body.get("runtime_profiles") or wc.get("runtime_profiles") or []
         worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
+        offline_endpoint_profiles: list[dict[str, Any]] = []
+        strict_offline_network = offline
         if offline:
+            offline_endpoint_profiles = [
+                p for p in _selected_profiles(engines, worker_profiles)
+                if profile_uses_endpoint(p)
+            ]
+            # The web deck's "offline" switch means "deny worker web tools / KB".
+            # A selected OpenAI-compatible endpoint still needs network egress to
+            # reach the configured LLM gateway (DeepSeek by default), so do not fail
+            # startup or force container network=none. We keep web_access=False and
+            # kb=False; only the hard network isolation is relaxed and surfaced.
+            strict_offline_network = not offline_endpoint_profiles
+        if strict_offline_network:
             runtime_profiles = [
                 {**r, "network": "none"} if isinstance(r, dict)
                 and str(r.get("backend") or "") == "container" else r
                 for r in runtime_profiles
             ]
-            endpoint_profiles = [
-                p for p in _selected_profiles(engines, worker_profiles)
-                if profile_uses_endpoint(p)
-            ]
-            if endpoint_profiles:
-                names = ", ".join(str(p.get("name") or p.get("id")) for p in endpoint_profiles)
-                raise RuntimeError(
-                    "profile_incompatible offline eval cannot use custom endpoint profile(s): "
-                    + names
-                )
         # bootstrap worker count: explicit body wins, else the config default, else
         # one per engine (heterogeneous rush). max_workers likewise from config.
         default_sw = wc.get("start_workers") or len(engines)
@@ -457,6 +416,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         max_total_workers = int(body.get("max_total_workers", wc.get("max_total_workers", 0)) or 0) or None
         cost_budget_usd = float(body.get("cost_budget_usd", wc.get("cost_budget_usd", 0.0)) or 0.0) or None
         llm_profiles = body.get("llm_profiles") or wc.get("llm_profiles") or {}
+        llm_providers = body.get("llm_providers") or wc.get("llm_providers") or []
         if "stage_policy" in body:
             stage_policy = copy.deepcopy(body.get("stage_policy") or {})
         elif wc.get("stage_policy"):
@@ -502,6 +462,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 worker_profiles=precheck_profiles,
                 runtime_profiles=runtime_profiles,
                 sessions_root=mgr.sessions_root,
+                llm_providers=llm_providers,
             )
             if missing_accounts:
                 raise RuntimeError(
@@ -525,41 +486,109 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # sbx. It's cleaned up with the run (RunManager.delete drops sessions/{id}).
         worker_root = root / "workers"
 
+        if offline_endpoint_profiles:
+            from dswarm.core.events import Event, EventType, blackboard_delta_payload
+            names = [
+                str(p.get("name") or p.get("id") or p.get("engine") or "worker")
+                for p in offline_endpoint_profiles
+            ]
+            await run.bus.emit(Event(
+                event_type=EventType.BLACKBOARD_DELTA,
+                run_id=run.run_id,
+                challenge_id=challenge.id,
+                payload=blackboard_delta_payload(
+                    "system_notice",
+                    actor="system",
+                    severity="info",
+                    code="offline_endpoint_compat",
+                    message=(
+                        "检测到自定义 Worker Endpoint，已自动关闭严格离线评测网络隔离；"
+                        "外部搜索/KB 仍按配置禁用。"
+                    ),
+                    offline_requested=True,
+                    strict_offline_effective=False,
+                    web_access=web_access,
+                    kb=kb,
+                    endpoint_profiles=names,
+                    default_base_url=DEFAULT_DEEPSEEK_BASE_URL,
+                ),
+            ))
+
         # LLMClient: the coordinator needs it for the Reason planner. A plain CLI
-        # race needs none.
+        # race needs none. Resolve the host-side Planner through the same account
+        # model the settings UI tests, so a relay-backed Worker account can power
+        # Reason without requiring a separate DeepSeek env key.
         llm_cm = None
         llm = None
+        reason_planner_diagnostic: dict[str, Any] = {}
         if reason_swarm:
+            from apps.web.reason_llm import (
+                base_url_host,
+                classify_llm_exception,
+                resolve_reason_llm_endpoint,
+            )
+            from dswarm.core.events import Event, EventType, blackboard_delta_payload
             from dswarm.core.llm import LLMClient
+
+            planner_profile = dict(llm_profiles.get("planner") or {})
             try:
-                # planner endpoint override (DESIGN §2.2): base_url from the
-                # planner llm_profile (empty = default DeepSeek). The key comes
-                # from env first, then the registered worker account.
-                planner_base = str((llm_profiles.get("planner") or {}).get("base_url") or "").strip()
-                llm_kwargs: dict[str, Any] = {"cost": run.cost, "bus": run.bus}
-                env_key = os.environ.get("DSWARM_DEEPSEEK_API_KEY", "").strip()
-                account_key, account_base = (
-                    _planner_llm_credentials(
-                        sessions_root=mgr.sessions_root,
-                        worker_profiles=worker_profiles,
-                        planner_base=planner_base,
-                    )
-                    if mgr is not None
-                    else ("", "")
+                resolved = resolve_reason_llm_endpoint(
+                    sessions_root=(mgr.sessions_root if mgr is not None else None),
+                    worker_profiles=worker_profiles,
+                    profile=planner_profile,
+                    llm_providers=llm_providers,
                 )
-                if planner_base:
-                    llm_kwargs["base_url"] = planner_base
-                elif account_base:
-                    llm_kwargs["base_url"] = account_base
-                if env_key:
-                    llm_kwargs["api_key"] = env_key
-                elif account_key:
-                    llm_kwargs["api_key"] = account_key
-                llm_cm = LLMClient(**llm_kwargs)
-                llm = await llm_cm.__aenter__()
-            except Exception:
+                reason_planner_diagnostic = {
+                    "code": "ok" if resolved.get("has_api_key") else "missing_api_key",
+                    "detail": (
+                        "Planner LLM endpoint resolved."
+                        if resolved.get("has_api_key")
+                        else "Planner API key is missing; select a credential account or set DSWARM_DEEPSEEK_API_KEY."
+                    ),
+                    "planner": str(resolved.get("model") or planner_profile.get("model") or "deepseek-v4-pro"),
+                    "base_url_host": str(resolved.get("base_url_host") or base_url_host(str(resolved.get("base_url") or ""))),
+                    "credential_source": str(resolved.get("credential_source") or "auto"),
+                    "credential_account": str(resolved.get("credential_account") or ""),
+                    "base_url_source": str(resolved.get("base_url_source") or ""),
+                }
+                if resolved.get("has_api_key"):
+                    timeout = float(planner_profile.get("timeout") or 120)
+                    llm_cm = LLMClient(
+                        api_key=str(resolved.get("api_key") or ""),
+                        base_url=str(resolved.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
+                        timeout=timeout,
+                        overall_timeout=max(timeout + 30.0, timeout),
+                        cost=run.cost,
+                        bus=run.bus,
+                    )
+                    llm = await llm_cm.__aenter__()
+                else:
+                    await run.bus.emit(Event(
+                        event_type=EventType.BLACKBOARD_DELTA,
+                        run_id=run.run_id,
+                        challenge_id=challenge.id,
+                        payload=blackboard_delta_payload(
+                            "reason_planner_unavailable",
+                            actor="reason",
+                            delta_type="reason_planner_unavailable",
+                            stage="reason",
+                            failures=0,
+                            max_failures=0,
+                            **reason_planner_diagnostic,
+                        ),
+                    ))
+            except Exception as exc:  # noqa: BLE001
                 # no key / client unavailable → coordinator Reason will no-op,
                 # bootstrap workers still run. Never block the run on this.
+                diag = classify_llm_exception(exc)
+                reason_planner_diagnostic = {
+                    "code": str(diag.get("code") or "network_error"),
+                    "detail": str(diag.get("detail") or "Planner LLM unavailable."),
+                    "planner": str(planner_profile.get("model") or "deepseek-v4-pro"),
+                    "base_url_host": base_url_host(str(planner_profile.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL)),
+                    "credential_source": str(planner_profile.get("credential_source") or "auto"),
+                    "credential_account": str(planner_profile.get("credential_account") or ""),
+                }
                 llm_cm = None
                 llm = None
 
@@ -575,14 +604,16 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             worker_cmds=run.worker_cmds,  # operator spawn/kill of specific engines
             executor=executor, cli_engine=cli_engine,
             engines=engines, start_workers=start_workers, max_workers=max_workers,
-            web_access=web_access, kb=kb, reason_swarm=reason_swarm,
+            web_access=web_access, kb=kb,
             graph_dir=graph_dir, worker_root=worker_root,
             wall_clock_budget=wall_clock_budget,
             max_total_workers=max_total_workers,
             cost_budget_usd=cost_budget_usd,
             stage_policy=stage_policy,
             llm_profiles=llm_profiles,
+            llm_providers=llm_providers,
             reason_model=(llm_profiles.get("planner") or {}).get("model", "deepseek-v4-pro"),
+            reason_planner_diagnostic=reason_planner_diagnostic,
             worker_backend=worker_backend,
             runtime_profiles=runtime_profiles,
             worker_profiles=worker_profiles,

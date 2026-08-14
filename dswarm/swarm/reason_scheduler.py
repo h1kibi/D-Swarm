@@ -15,6 +15,11 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
 from dswarm.core.events import Event, EventType, blackboard_delta_payload
+from dswarm.core.provider_errors import (
+    ProviderErrorAggregator,
+    ProviderErrorDiagnostic,
+    classify_provider_error,
+)
 from dswarm.models.solve_graph import Challenge
 from dswarm.swarm.agents import AgentProfile, AgentRegistry, DispatchDecision
 from dswarm.swarm.board import (
@@ -63,6 +68,7 @@ class ReasonSwarm:
         max_intents_per_reason: int = 4,
         reason_debounce: float = 1.0,
         pause_event: Optional[asyncio.Event] = None,
+        planner_diagnostic: Optional[dict[str, Any]] = None,
     ) -> None:
         self.challenge = challenge
         self.board = board or MemoryBoard(challenge.id, pheromone=pheromone)
@@ -86,6 +92,7 @@ class ReasonSwarm:
         self._executed: set[str] = set()
         self._fallback_executed = False
         self._planner_failures = 0
+        self._last_planner_error: dict[str, Any] = dict(planner_diagnostic or {})
         self._max_planner_failures = int(
             os.environ.get("DSWARM_REASON_MAX_PLANNER_FAILURES", "6") or 6)
         self._generation = 0
@@ -93,6 +100,15 @@ class ReasonSwarm:
         # session/workdir to persist winner.json; reducing Reason results to strings
         # used to discard that continuation handle.
         self._winner_outcome: Any = None
+        self._recovery_attempts: dict[str, int] = {}
+        self._max_recovery_attempts = int(
+            os.environ.get("DSWARM_WORKER_PROVIDER_RECOVERY_ATTEMPTS", "2") or 2)
+        self._paused_profiles: set[str] = set()
+        self._provider_errors = ProviderErrorAggregator(
+            window_s=float(os.environ.get("DSWARM_PROVIDER_ERROR_WINDOW_S", "60") or 60),
+            fatal_threshold=int(os.environ.get("DSWARM_PROVIDER_FATAL_THRESHOLD", "3") or 3),
+            majority_ratio=float(os.environ.get("DSWARM_PROVIDER_MAJORITY_RATIO", "0.5") or 0.5),
+        )
 
     async def _emit(self, delta_type: str, *, stage: Optional[str] = None, **fields: Any) -> None:
         """Structured observability delta (D-Swarm Phase 2, docs/07 §7.1).
@@ -153,6 +169,74 @@ class ReasonSwarm:
             raise RuntimeError("ReasonSwarm requires a worker_factory")
         return await self.worker_factory(decision, profile)
 
+    def _provider_diag_from_outcome(self, outcome: Any, error: Optional[str]) -> dict[str, Any]:
+        diag = getattr(outcome, "provider_error", None) or {}
+        if isinstance(diag, dict) and diag:
+            return dict(diag)
+        reason = str(getattr(outcome, "reason", "") or "")
+        text = error or reason
+        if not text:
+            return {}
+        low = text.lower()
+        if "runtime failure" not in low and "provider" not in low:
+            return {}
+        return classify_provider_error(
+            text,
+            provider=str(getattr(outcome, "engine", "") or ""),
+            worker_id=str(getattr(outcome, "solver_id", "") or ""),
+        ).to_event()
+
+    def _outcome_runtime_failed(self, outcome: Any, error: Optional[str],
+                                provider_diag: dict[str, Any]) -> bool:
+        if error is not None:
+            return True
+        if provider_diag:
+            return True
+        reason = str(getattr(outcome, "reason", "") or "").lower()
+        return "runtime failure" in reason
+
+    def _provider_diag_obj(self, diag: dict[str, Any]) -> ProviderErrorDiagnostic | None:
+        if not diag:
+            return None
+        fields = {
+            "category": str(diag.get("category") or "unknown_worker_failure"),
+            "severity": str(diag.get("severity") or ("fatal" if diag.get("should_pause_dispatch") else "warning")),
+            "retryable": bool(diag.get("retryable")),
+            "should_pause_dispatch": bool(diag.get("should_pause_dispatch")),
+            "provider": str(diag.get("provider") or ""),
+            "account_id": str(diag.get("account_id") or ""),
+            "worker_id": str(diag.get("worker_id") or ""),
+            "raw_message": str(diag.get("raw_message") or "")[:1000],
+            "user_message": str(diag.get("user_message") or "Worker provider/runtime error."),
+            "suggested_action": str(diag.get("suggested_action") or "查看 worker/provider 配置并决定是否恢复。"),
+        }
+        return ProviderErrorDiagnostic(**fields)
+
+    async def _record_provider_error(self, diag: dict[str, Any], *,
+                                     active_workers: int) -> None:
+        obj = self._provider_diag_obj(diag)
+        if obj is None:
+            return
+        alert = self._provider_errors.record(
+            obj, now=time.monotonic(), active_workers=active_workers)
+        if not alert:
+            return
+        if self.bus is not None:
+            try:
+                await self.bus.emit(Event(
+                    event_type=EventType.PROVIDER_BATCH_ALERT,
+                    run_id=self.run_id or self.challenge.id,
+                    challenge_id=self.challenge.id,
+                    payload=alert,
+                ))
+            except Exception:
+                pass
+        await self._emit(
+            "provider_batch_alert",
+            stage="dispatch",
+            **{k: v for k, v in alert.items() if k != "type"},
+        )
+
     def _register_decision(self, decision: DispatchDecision) -> None:
         """Persist a Reason dispatch before the worker can produce graph products.
 
@@ -196,6 +280,23 @@ class ReasonSwarm:
             )
         return "\n".join(lines)
 
+    def _planner_exception_diag(self, exc: BaseException) -> dict[str, Any]:
+        try:
+            from dswarm.core.llm import classify_llm_exception
+            diag = classify_llm_exception(exc)
+        except Exception:  # noqa: BLE001 - core scheduler must not depend on web
+            diag = {
+                "code": "planner_exception",
+                "detail": str(exc) or type(exc).__name__,
+            }
+        out = dict(self._last_planner_error or {})
+        out.update({
+            "code": str(diag.get("code") or "planner_exception"),
+            "detail": str(diag.get("detail") or str(exc) or type(exc).__name__),
+            "planner": str(out.get("planner") or self.reason_model),
+        })
+        return out
+
     async def _run_reason(self) -> ReasonResult:
         if self.graph is not None:
             try:
@@ -206,14 +307,19 @@ class ReasonSwarm:
             summary = self._board_summary()
         if self.reason_fn is not None:
             result = None
+            last_exc: BaseException | None = None
             for attempt in range(3):
                 try:
                     result = await self.reason_fn(summary, self.challenge.id)
+                    self._last_planner_error = {}
                     break
-                except Exception:  # noqa: BLE001 — planner is advisory
+                except Exception as exc:  # noqa: BLE001 — planner is advisory
+                    last_exc = exc
                     if attempt < 2:
                         await asyncio.sleep(2.0 * (attempt + 1))
             if result is None:
+                if last_exc is not None:
+                    self._last_planner_error = self._planner_exception_diag(last_exc)
                 result = ReasonResult(
                     goal_met=False,
                     intents=[],
@@ -228,6 +334,7 @@ class ReasonSwarm:
             from dswarm.solver.reason import run_reason
 
             result = None
+            last_exc: BaseException | None = None
             for attempt in range(3):
                 try:
                     result = await run_reason(
@@ -239,18 +346,29 @@ class ReasonSwarm:
                         mode=getattr(self.challenge, "mode", "ctf"),
                         goal=getattr(self.challenge, "goal", "") or None,
                     )
+                    self._last_planner_error = {}
                     break
-                except Exception:  # noqa: BLE001 — planner is advisory
+                except Exception as exc:  # noqa: BLE001 — planner is advisory
+                    last_exc = exc
                     if attempt < 2:
                         await asyncio.sleep(2.0 * (attempt + 1))
             if result is None:
+                if last_exc is not None:
+                    self._last_planner_error = self._planner_exception_diag(last_exc)
                 result = ReasonResult(
                     goal_met=False,
                     intents=[],
                     audit_notes=["reason planner unavailable"],
                 )
         else:
-            result = ReasonResult(goal_met=False, intents=[], audit_notes=[])
+            if self._last_planner_error and self._last_planner_error.get("code") != "ok":
+                result = ReasonResult(
+                    goal_met=False,
+                    intents=[],
+                    audit_notes=["reason planner unavailable"],
+                )
+            else:
+                result = ReasonResult(goal_met=False, intents=[], audit_notes=[])
         self._last_reason = result
         return result
 
@@ -438,6 +556,9 @@ class ReasonSwarm:
                             self.projector.sync(self.graph)
                         except Exception:
                             pass
+                    provider_diag = self._provider_diag_from_outcome(outcome, error)
+                    runtime_failed = self._outcome_runtime_failed(
+                        outcome, error, provider_diag)
                     fields: dict[str, Any] = {
                         "stage": "execute",
                         "intent_id": decision.intent_id,
@@ -449,8 +570,65 @@ class ReasonSwarm:
                     }
                     if error is not None:
                         fields["error"] = error
+                    elif runtime_failed:
+                        fields["error"] = (
+                            str(provider_diag.get("raw_message") or "")
+                            or str(getattr(outcome, "reason", "") or "runtime failure")
+                        )
+                    if provider_diag:
+                        fields["provider_error"] = provider_diag
+                        await self._record_provider_error(
+                            provider_diag, active_workers=self.max_workers)
+                    if runtime_failed and provider_diag.get("retryable"):
+                        attempts = self._recovery_attempts.get(decision.dedupe_key, 0) + 1
+                        self._recovery_attempts[decision.dedupe_key] = attempts
+                        if attempts <= self._max_recovery_attempts:
+                            self._executed.discard(decision.dedupe_key)
+                            await self._emit(
+                                "worker_recovery_scheduled",
+                                stage="dispatch",
+                                intent_id=decision.intent_id,
+                                profile=profile.id,
+                                mode=decision.mode,
+                                dedupe_key=decision.dedupe_key,
+                                reason_cycle_id=cycle_id,
+                                recovery_action="redispatch_intent",
+                                attempts=attempts,
+                                max_attempts=self._max_recovery_attempts,
+                                current_worker_interrupted=False,
+                                provider_error=provider_diag,
+                                operator_message=(
+                                    "single-shot worker 当前轮已收尾；retryable provider "
+                                    "错误已释放 intent，下一轮 Reason/Worker 会接续消费。"
+                                ),
+                            )
+                        else:
+                            await self._emit(
+                                "worker_recovery_exhausted",
+                                stage="dispatch",
+                                intent_id=decision.intent_id,
+                                profile=profile.id,
+                                dedupe_key=decision.dedupe_key,
+                                attempts=attempts,
+                                max_attempts=self._max_recovery_attempts,
+                                provider_error=provider_diag,
+                            )
+                    elif runtime_failed and provider_diag.get("should_pause_dispatch"):
+                        self._paused_profiles.add(profile.id)
+                        await self._emit(
+                            "provider_dispatch_paused",
+                            stage="dispatch",
+                            intent_id=decision.intent_id,
+                            profile=profile.id,
+                            reason_cycle_id=cycle_id,
+                            provider_error=provider_diag,
+                            operator_message=(
+                                "检测到 fatal provider/account 错误；已暂停该 profile "
+                                "后续派发，避免余额/鉴权类错误批量扩散。"
+                            ),
+                        )
                     await self._emit(
-                        "intent_failed" if error is not None else "intent_completed",
+                        "intent_failed" if runtime_failed else "intent_completed",
                         **fields,
                     )
 
@@ -475,9 +653,20 @@ class ReasonSwarm:
                 fresh = [
                     d for d in capped
                     if d.dedupe_key not in self._executed
+                    and d.profile not in self._paused_profiles
                 ]
                 for d in capped:
-                    if d.dedupe_key in self._executed:
+                    if d.profile in self._paused_profiles:
+                        await self._emit(
+                            "intent_skipped",
+                            stage="dispatch",
+                            intent_id=d.intent_id,
+                            dedupe_key=d.dedupe_key,
+                            profile=d.profile,
+                            skip_reason="provider_dispatch_paused",
+                            reason_cycle_id=cycle_id,
+                        )
+                    elif d.dedupe_key in self._executed:
                         await self._emit(
                             "intent_skipped",
                             stage="dispatch",
@@ -497,12 +686,17 @@ class ReasonSwarm:
                         for n in (getattr(result, "audit_notes", None) or []))
                     if planner_unavailable and not self._flags_complete():
                         self._planner_failures += 1
+                        planner_diag = dict(self._last_planner_error or {})
+                        planner_diag.setdefault("code", "planner_unavailable")
+                        planner_diag.setdefault("detail", "Reason planner unavailable.")
+                        planner_diag.setdefault("planner", self.reason_model)
                         await self._emit(
                             "reason_planner_unavailable",
                             stage="reason",
                             reason_cycle_id=cycle_id,
                             failures=self._planner_failures,
                             max_failures=self._max_planner_failures,
+                            **planner_diag,
                         )
                         if self._planner_failures >= self._max_planner_failures:
                             await self._emit(

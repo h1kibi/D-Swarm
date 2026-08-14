@@ -1,10 +1,10 @@
 # Project Muteki — Iteration Roadmap
 
-> **Current status override (2026-06-16 CST):** this roadmap is retained as
-> historical planning context. It predates the CLI-only executor, multi-flag work,
-> current web deck, and code-review v7 remediation queue. Use `progress.md`,
-> `session-handoff.md`, `feature_list.json`, and `docs/CODE_REVIEW_2026-06-15.md`
-> for the active next step.
+> **Current status override:** this roadmap is retained as historical planning
+> context. It predates the Pi-only executor, multi-flag work, current web deck,
+> and later review/remediation queues. For active work, prefer the current code,
+> `AGENTS.md`, and any local handoff files if they exist (`progress.md`,
+> `session-handoff.md`, `feature_list.json`).
 
 > Synthesized 2026-05-30 from a 6-dimension parallel audit (gap-vs-design, missing-tracks,
 > solve-rate levers, code-quality, eval-rigor, frontend/platform) + a synthesis pass.
