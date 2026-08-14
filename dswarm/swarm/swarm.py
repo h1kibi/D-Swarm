@@ -66,6 +66,7 @@ from dswarm.swarm.health import (
     _health_cache_put,
 )
 from dswarm.swarm.projection import BoardProjector
+from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 from dswarm.swarm.reason_scheduler import ReasonSwarm
 from dswarm.swarm.review_capacity import ReviewCapacityMixin
 from dswarm.swarm.runtime import SwarmWorkerRuntime
@@ -1695,7 +1696,10 @@ class Swarm(
                     "worker_class": wc,
                     "route_hash": route,
                     "branch_id": str(r.get("branch_id") or ""),
-                    "priority": int(r.get("priority") or 0),
+                    "priority": normalize_priority(r.get("priority")),
+                    "priority_scale": normalize_priority_scale(
+                        r.get("priority_scale"), raw_priority=r.get("priority")
+                    ),
                     "lane_key": lane_key,
                     "risk_class": risk_class,
                     "resource_key": resource_key,

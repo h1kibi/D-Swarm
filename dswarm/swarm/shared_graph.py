@@ -40,6 +40,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from dswarm.models.solve_graph import Challenge, SolveGraph
 from dswarm.solver.result_codes import is_genuine_giveup
 from dswarm.swarm.board import StructuredFinding
+from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 
 
 # ── event types (C: append-only log) ─────────────────────────────────────────
@@ -505,6 +506,7 @@ CREATE TABLE IF NOT EXISTS intents (
     lane_deferrals INTEGER NOT NULL DEFAULT 0,
     deferred_against_locked_seq INTEGER,
     priority      INTEGER NOT NULL DEFAULT 0,
+    priority_scale TEXT NOT NULL DEFAULT 'planner',
     status        TEXT NOT NULL DEFAULT 'open',  -- open|claimed|done
     worker        TEXT,
     lease_until   REAL,
@@ -748,6 +750,7 @@ class SQLiteSharedGraph:
             "ALTER TABLE intents ADD COLUMN lane_deferrals INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE intents ADD COLUMN deferred_against_locked_seq INTEGER",
             "ALTER TABLE intents ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE intents ADD COLUMN priority_scale TEXT NOT NULL DEFAULT 'planner'",
         ):
             try:
                 self._conn.execute(ddl)
@@ -780,8 +783,9 @@ class SQLiteSharedGraph:
                 pass
         try:
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_intents_dispatch "
-                "ON intents(challenge_id, dispatch_state, status, priority, created_seq)"
+                "CREATE INDEX IF NOT EXISTS idx_intents_dispatch_priority_v2 "
+                "ON intents(challenge_id, dispatch_state, status, priority_scale, "
+                "priority, created_seq)"
             )
             self._conn.commit()
         except sqlite3.OperationalError:
@@ -2501,16 +2505,14 @@ class SQLiteSharedGraph:
             if lane_key else ""
         )
         raw_priority = payload.get("priority")
-        if raw_priority is None and payload.get("source") == "operator_hint":
+        source = str(payload.get("source") or "").strip()
+        if raw_priority is None and source == "operator_hint":
             raw_priority = "operator"
-        if isinstance(raw_priority, str):
-            priority = {"operator": 100, "high": 50, "normal": 0, "low": -10}.get(
-                raw_priority.strip().lower(), 0)
-        else:
-            try:
-                priority = int(raw_priority or 0)
-            except (TypeError, ValueError):
-                priority = 0
+        priority = normalize_priority(raw_priority)
+        priority_scale = normalize_priority_scale(
+            payload.get("priority_scale"), actor=actor, source=source,
+            raw_priority=raw_priority,
+        )
         resource_key = str(payload.get("resource_key") or "").strip()
         directive_id = str(payload.get("directive_id") or "").strip()
         direction = str(payload.get("direction") or "").strip()
@@ -2521,19 +2523,22 @@ class SQLiteSharedGraph:
                            "lane_key": lane_key, "risk_class": risk_class,
                            "resource_key": resource_key, "directive_id": directive_id,
                            "direction": direction,
-                           "priority": priority},
+                           "priority": priority,
+                           "priority_scale": priority_scale},
                           dedupe_key=f"intent::{intent_id}")
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO intents "
                 "(intent_id, challenge_id, goal, worker_class, route_hash, branch_id, "
-                " lane_key, risk_class, priority, status, dispatch_state, created_seq, "
+                " lane_key, risk_class, priority, priority_scale, status, "
+                " dispatch_state, created_seq, "
                 " resource_key, directive_id, direction) "
-                "VALUES (?,?,?,?,?,?,?,?,?,'open','active',?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,'open','active',?,?,?,?)",
                 (intent_id, self.challenge.id, goal, worker_class,
                  route_hash or None, branch_id or None,
                  lane_key or None, risk_class if lane_key else None, priority,
-                 seq if seq > 0 else 0, resource_key or None, directive_id or None,
+                 priority_scale, seq if seq > 0 else 0, resource_key or None,
+                 directive_id or None,
                  direction or None),
             )
             if from_fact_seqs:
@@ -3512,9 +3517,10 @@ class SQLiteSharedGraph:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT goal, status, worker, worker_class, route_hash, branch_id, "
-                "priority, lane_key, risk_class FROM intents "
+                "priority, priority_scale, lane_key, risk_class FROM intents "
                 "WHERE status IN ('open','claimed') AND dispatch_state='active' "
-                "ORDER BY priority DESC, created_seq",
+                "ORDER BY CASE priority_scale WHEN 'operator' THEN 0 ELSE 1 END, "
+                "priority DESC, created_seq ASC",
             ).fetchall()
         if not rows:
             return ""
@@ -3523,7 +3529,8 @@ class SQLiteSharedGraph:
         lines = ["\n## Open intents (directions in flight)"]
         if omitted:
             lines.append(f"  (... {omitted} earlier open intents omitted)")
-        for goal, status, worker, worker_class, route_hash, branch_id, priority, lane_key, risk_class in rows:
+        for (goal, status, worker, worker_class, route_hash, branch_id,
+             priority, priority_scale, lane_key, risk_class) in rows:
             who = f" [{worker}]" if worker else ""
             meta = []
             if worker_class and worker_class != "code":
@@ -3536,8 +3543,9 @@ class SQLiteSharedGraph:
                 meta.append(f"lane={lane_key}")
             if risk_class:
                 meta.append(f"risk={risk_class}")
-            if int(priority or 0):
-                meta.append(f"priority={int(priority or 0)}")
+            priority_value = normalize_priority(priority)
+            if priority_value:
+                meta.append(f"priority={priority_value:g}")
             suffix = f" ({', '.join(meta)})" if meta else ""
             lines.append(f"- ({status}){who} {str(goal)[:160]}{suffix}")
         return "\n".join(lines)
@@ -3589,7 +3597,8 @@ class SQLiteSharedGraph:
             rows = self._conn.execute(
                 "SELECT intent_id, goal, status, worker, worker_class, route_hash, branch_id "
                 "FROM intents WHERE status IN ('open','claimed') AND dispatch_state='active' "
-                "ORDER BY priority DESC, created_seq",
+                "ORDER BY CASE priority_scale WHEN 'operator' THEN 0 ELSE 1 END, "
+                "priority DESC, created_seq ASC",
             ).fetchall()
         return [
             {"intent_id": r[0], "goal": r[1], "status": r[2], "worker": r[3] or "",
@@ -3906,17 +3915,20 @@ class SQLiteSharedGraph:
             now = time.time()
         cols = (
             "intent_id", "goal", "worker_class", "direction", "route_hash",
-            "branch_id", "priority", "lane_key", "risk_class", "resource_key",
+            "branch_id", "priority", "priority_scale", "lane_key", "risk_class",
+            "resource_key",
         )
         with self._lock:
             rows = self._conn.execute(
                 "SELECT intent_id, goal, worker_class, direction, route_hash, branch_id, "
-                "priority, lane_key, risk_class, resource_key FROM intents "
+                "priority, priority_scale, lane_key, risk_class, resource_key FROM intents "
                 "WHERE challenge_id=? AND dispatch_state='active' AND (status='open' "
                 "   OR (status='claimed' AND lease_until IS NOT NULL "
                 "       AND lease_until < ?)) "
                 "ORDER BY CASE WHEN worker_class IN ('verifier','review') "
-                "         THEN 1 ELSE 0 END, priority DESC, created_seq",
+                "         THEN 1 ELSE 0 END, "
+                "CASE priority_scale WHEN 'operator' THEN 0 ELSE 1 END, "
+                "priority DESC, created_seq ASC",
                 (self.challenge.id, float(now)),
             ).fetchall()
         out: list[dict] = []
@@ -3928,7 +3940,10 @@ class SQLiteSharedGraph:
             item["direction"] = str(item.get("direction") or "")
             item["route_hash"] = str(item.get("route_hash") or "")
             item["branch_id"] = str(item.get("branch_id") or "")
-            item["priority"] = int(item.get("priority") or 0)
+            item["priority"] = normalize_priority(item.get("priority"))
+            item["priority_scale"] = normalize_priority_scale(
+                item.get("priority_scale"), raw_priority=item.get("priority")
+            )
             item["lane_key"] = str(item.get("lane_key") or "")
             item["risk_class"] = str(item.get("risk_class") or "")
             item["resource_key"] = str(item.get("resource_key") or "")
@@ -3979,13 +3994,15 @@ class SQLiteSharedGraph:
         claimable, focused direction instead of being orphaned.
         """
         cols = ("intent_id", "goal", "worker_class", "direction", "priority",
-                "directive_id")
+                "priority_scale", "directive_id")
         with self._lock:
             rows = self._conn.execute(
-                "SELECT intent_id, goal, worker_class, direction, priority, directive_id "
+                "SELECT intent_id, goal, worker_class, direction, priority, "
+                "priority_scale, directive_id "
                 "FROM intents WHERE directive_id IS NOT NULL AND directive_id<>'' "
                 "AND status='open' AND dispatch_state='active' "
-                "ORDER BY priority DESC, created_seq ASC LIMIT ?",
+                "ORDER BY CASE priority_scale WHEN 'operator' THEN 0 ELSE 1 END, "
+                "priority DESC, created_seq ASC LIMIT ?",
                 (int(limit),),
             ).fetchall()
         return [dict(zip(cols, r)) for r in rows]

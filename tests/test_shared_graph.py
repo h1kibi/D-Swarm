@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import threading
 
 from dswarm.models.solve_graph import Challenge
@@ -1295,4 +1297,100 @@ def test_open_operator_intents_returns_only_open_operator_intents(tmp_path):
     # a claimed operator intent is no longer listed
     assert g.claim_intent(worker="cli-pi", intent_id=op_id) is True
     assert g.open_operator_intents() == []
+    g.close()
+
+
+def test_intent_priority_float_persists_and_orders_by_scale_fifo(tmp_path):
+    p = tmp_path / "priority.db"
+    g = SQLiteSharedGraph.open(db_path=p, challenge=_chal())
+    g.propose_intent(
+        actor="reason", intent_id="I-mid-old", goal="mid old",
+        payload={"priority": 0.5},
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-high", goal="high",
+        payload={"priority": 0.9},
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-mid-new", goal="mid new",
+        payload={"priority": 0.5},
+    )
+    g.propose_intent(
+        actor="operator", intent_id="I-operator-low", goal="operator first",
+        payload={"priority": -10, "priority_scale": "operator"},
+    )
+    g.propose_intent(
+        actor="review", intent_id="I-review", goal="review stays in review lane",
+        payload={"worker_class": "review", "priority": 999,
+                 "priority_scale": "operator"},
+    )
+
+    rows = g.dispatchable_intents()
+    assert [row["intent_id"] for row in rows] == [
+        "I-operator-low", "I-high", "I-mid-old", "I-mid-new", "I-review",
+    ]
+    by_id = {row["intent_id"]: row for row in rows}
+    assert by_id["I-high"]["priority"] == 0.9
+    assert by_id["I-high"]["priority_scale"] == "planner"
+    assert by_id["I-operator-low"]["priority"] == -10.0
+    assert by_id["I-operator-low"]["priority_scale"] == "operator"
+    with g._lock:
+        stored = g._conn.execute(
+            "SELECT priority, typeof(priority), priority_scale FROM intents "
+            "WHERE intent_id='I-high'"
+        ).fetchone()
+        event_payload = g._conn.execute(
+            "SELECT payload FROM events WHERE kind='intent_proposed' "
+            "AND json_extract(payload, '$.intent_id')='I-high'"
+        ).fetchone()[0]
+    assert stored == (0.9, "real", "planner")
+    event = json.loads(event_payload)
+    assert event["priority"] == 0.9
+    assert event["priority_scale"] == "planner"
+    g.close()
+
+    reopened = SQLiteSharedGraph.open(db_path=p, challenge=_chal())
+    reopened_rows = reopened.dispatchable_intents()
+    assert [row["intent_id"] for row in reopened_rows] == [
+        "I-operator-low", "I-high", "I-mid-old", "I-mid-new", "I-review",
+    ]
+    assert {row["intent_id"]: row["priority"] for row in reopened_rows}["I-high"] == 0.9
+    reopened.close()
+
+
+def test_old_integer_priority_db_gains_planner_scale(tmp_path):
+    p = tmp_path / "legacy-priority.db"
+    conn = sqlite3.connect(p)
+    conn.execute(
+        "CREATE TABLE intents ("
+        "intent_id TEXT PRIMARY KEY, challenge_id TEXT NOT NULL, goal TEXT NOT NULL, "
+        "worker_class TEXT NOT NULL DEFAULT 'code', direction TEXT, route_hash TEXT, "
+        "branch_id TEXT, lane_key TEXT, risk_class TEXT, "
+        "lane_deferrals INTEGER NOT NULL DEFAULT 0, "
+        "deferred_against_locked_seq INTEGER, priority INTEGER NOT NULL DEFAULT 0, "
+        "status TEXT NOT NULL DEFAULT 'open', worker TEXT, lease_until REAL, "
+        "created_seq INTEGER NOT NULL, result_seq INTEGER, result_detail TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO intents (intent_id, challenge_id, goal, priority, created_seq) "
+        "VALUES ('I-legacy', 't1', 'legacy work', 7, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    g = SQLiteSharedGraph.open(db_path=p, challenge=_chal())
+    rows = g.dispatchable_intents()
+    assert rows[0]["intent_id"] == "I-legacy"
+    assert rows[0]["priority"] == 7.0
+    assert rows[0]["priority_scale"] == "planner"
+    g.close()
+
+
+def test_reason_summary_preserves_fractional_intent_priority(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(
+        actor="reason", intent_id="I-fraction", goal="fractional priority",
+        payload={"priority": 0.5},
+    )
+    assert "priority=0.5" in g._open_intents_block()
     g.close()
