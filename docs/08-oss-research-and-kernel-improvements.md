@@ -1,321 +1,347 @@
-# 开源调研与内核改进方案 v2（已按评审意见修订）
+# 开源调研与内核改进方案 v3（吸收两轮评审后定稿）
 
-> 状态：**v2（2026-08-10）**。v1 经第三方 LLM 评审（见
-> [docs/09-kernel-improvement-review-feedback.md](09-kernel-improvement-review-feedback.md)），
-> 本版已逐条核验并吸收其事实校正与方案 verdict。v1 的关键不准确表述已在 §7 列出并改正。
-> 本版结论较 v1 有实质变化：**方向诊断与基线正确性进入近期实施；route energy 先做离线
-> telemetry/ablation；Advisor 触发器缩为单触发器实验；写入硬限速暂缓**。
+> 状态：**v3（2026-08-14）**。v1 经首轮评审（[docs/09](09-kernel-improvement-review-feedback.md) §1-7）
+> 修订为 v2；v2 经第二轮复评（docs/09 §10）后修订为本版。本版按复评 §10.6 的八项
+> 修订动作逐条落地，并保留两轮评审中确认正确的部分。
+> **实现级设计见 [docs/10-v4-kernel-improvement-implementation.md](10-v4-kernel-improvement-implementation.md)（v4）。**
+>
+> **本版关键结论**：方案定位为**分阶段研究路线**，不整包实施。批次结论：
+> 第一批 Conditional Go / 第二批 Go after model correction / 第三批 Redesign before Go /
+> 第四批 Conditional Go / 第五批 Offline Go + Online No-Go / 第六批 No-Go。
 >
 > 调研对象（不变）：
-> 1. [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki)（D-Swarm 上游内核）
+> 1. [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki)（上游）
 > 2. [Armur-Ai/Pentest-Swarm-AI](https://github.com/Armur-Ai/Pentest-Swarm-AI) 及[实施计划](https://github.com/Armur-Ai/Pentest-Swarm-AI/blob/main/IMPLEMENTATION_PLAN.md)
 > 3. [深入拆解Pentest-Swarm-AI：群体智能自动化渗透测试架构解析](https://cloud.tencent.com/developer/article/2709729)
 
 ---
 
-## 0. 结论（v2）
+## 0. 结论与路线图
 
-1. **上游 muteki 是 D-Swarm 的祖先**，两线独立演进。上游的并行 race 与多引擎驱动**不采纳**
-   （目标函数是成本均衡而非首血速度，见 §6）。
-2. **信息素数学与 Board 展示层已存在，但未进入正常 Reason 主规划输入，也不是"只差一根线"**：
-   真正接入还缺 route 归属、原始 event 时间、投影覆盖、durable consumer、复杂度控制。
-3. **提案分六批**（评审 §4）：先修三个基线正确性问题（priority 精度、max_workers 并发、
-   append-only 语义与守护测试），再做方向可观测性，再 token 预算接线，再 route 数据完整性，
-   energy 与 Advisor 一律"先离线、先 telemetry、先单点实验"。
-4. 总红线改为评审建议的精确表述：**不修改 provenance gate；不让派生注意力成为证据；
-   尽可能不增加模型调用；新增计算与 token 成本必须可测量、可开关、可回滚。**
+1. 上游 muteki 是 D-Swarm 祖先；其并行 race 与多引擎驱动**不采纳**（成本均衡 vs 首血速度，见 §6）。
+2. 信息素数学与 Board 展示层已存在，但未进入 Reason 主规划输入；接入还缺 route lineage、
+   event time、durable consumer 与复杂度控制（复评确认）。
+3. **六批路线（v3 定稿）**：
+
+| 批次 | 结论 | 实施前必须补齐 |
+|---|---|---|
+| 第一批：基线正确性 | **Conditional Go** | 先移除 priority 的 Python `int()` 截断；并发按 ordinary/review 双 lane；append-only 定稿为严格 event-row immutable |
+| 第二批：方向可观测性 | **Go after model correction** | diagnostics 逐 Intent 建模（不在 ReasonResult 上放单值字段） |
+| 第三批：token 预算接线 | **Redesign before Go** | 唯一账本、稳定 usage 幂等键、instance/profile/provider 三层维度 |
+| 第四批：route 数据完整性 | **Conditional Go** | lineage、event time、route-less 分类、durable replay、独立 telemetry 载体 |
+| 第五批：energy | **Offline Go / Online No-Go** | 去相关、稳定排序、exact-equal tie-break、统计显著性与 feature-off 等价 |
+| 第六批：单 Advisor | **No-Go** | 先证明 suggestion 的唤醒/消费路径与相对 baseline 的延迟收益 |
+
+4. 总红线（两轮评审一致保留）：**不修改或弱化 provenance gate；派生 attention/energy/Advisor
+   结果永远不是 flag provenance；capability eval 全程离线、零假 flag；新机制有 feature flag、
+   关闭后恢复 baseline，额外 CPU/IO/内存/prompt 成本可测量。**
+
+---
+
+## 0.1 思想溯源映射（从三个资源到本方案的显式对应）
+
+本节把「从开源项目/文章吸取了什么 → 落在方案哪里」画成显式映射，供评估者核对
+思想吸收的完整性。**注意两点诚实标注**：(a) 六批里可实施的前三批主要来自内部工程债
+（两轮评审揪出），而非外部思想；(b) 外部思想主要落在第四~六批（Conditional/Offline/No-Go）。
+
+| 来源 | 吸取的思想 | v3 落点 | 状态 |
+|---|---|---|---|
+| PSA + 腾讯文 | 信息素衰减：注意力按类型半衰期衰减、自动聚焦新鲜高价值发现 | §5.5 route energy（`[0,1]` clamp、actor/source 去相关、virtual time、exact-equal tie-break） | Offline Go / Online No-Go |
+| PSA + 腾讯文 | 触发器谓词：环境变化直接唤醒行动，不等中央规划周期 | §5.6 Advisor（AdvisorySuggestion 模型，不直接派发） | No-Go（缺消费协议与延迟证据） |
+| PSA | 写入门槛与记忆投毒防御：clamp、限速、burst 指纹、类型越权 | §5.7 注意力卫生 + §5.4 write-rate telemetry（独立 metrics 载体；硬限速/actor cap 先测量后决定） | 部分采纳（先 telemetry） |
+| PSA | per-agent token 预算：软警告 → 硬上限 → 暂停派发 | §5.3 token accounting 三层 identity 重设计 | Redesign before Go |
+| PSA | Verified-PoC 门：finding 必须带 Reproduction 重放验证 | **§5.8-1（本轮补回挂起项）** | 待办（v1→v3 重构时漏挂，见 §5.8） |
+| PSA | scope 双层强制 → 事后审计形态 | **§5.8-2（本轮补回挂起项）** | 待办（同上） |
+| PSA | cleanup registry：清理先注册、逆序执行 | **§5.8-3（本轮补回挂起项）** | 待办（同上） |
+| upstream muteki | 并行 race/recon（多引擎单发冲刺） | §6 否决（成本均衡 vs 首血速度） | 否决（维护者决策） |
+| upstream muteki | 多引擎异构盲区互补 | §6 否决（per-profile provider/model/effort 已是配置问题） | 否决 |
+| upstream muteki | custom-endpoint 健康检查跑真实 CLI 回合（0.2.4） | **§5.8-4（本轮补回挂起项）** | 待办合并补丁 |
+| 腾讯文 | 去中心化的调试成本 / alpha 成熟度争议 | §6「否决全面去中心化」的论据 | 佐证 |
+| upstream muteki | Reviewer 机制 | 非提案——D-Swarm 已有 `review_flow.py` | 已有 |
+
+另注：D-Swarm 在调研前已**自发拥有** PSA 的部分思想（`board.py` 的
+`Finding.pheromone()`/`PheromoneSettings`/`FindingPredicate`/`subscribe`），这是"接电"
+而非"移植"的判断基础，两轮评审均确认该判断成立。
 
 ---
 
 ## 1. D-Swarm 内核背景（评估者 grounding）
 
-| 层 | 模块 | 一句话职责 |
+| 层 | 模块 | 职责 |
 |---|---|---|
-| 事件脊 | `core/events.py` `event_bus.py` `session_store.py` | 有序类型化事件流 + JSONL 持久化，前端是哑订阅者 |
-| 证据图 | `swarm/shared_graph.py` | 事件溯源 SQLite；facts/intents 是物化视图 |
-| 通知总线 | `swarm/insight_bus.py` | 跨 worker 已验证事实/死路/flag 的内存 fan-out |
+| 事件脊 | `core/events.py` `event_bus.py` `session_store.py` | 有序事件流 + JSONL 持久化 |
+| 证据图 | `swarm/shared_graph.py` | 事件溯源 SQLite；facts/intents 为物化视图 |
+| 通知总线 | `swarm/insight_bus.py` | 跨 worker 已验证事实 fan-out |
 | 执行器 | `solver/cli_driver.py` `cli_solver.py` | shell 出 `pi` CLI（单发 worker） |
-| 规划/评审 | `solver/reason.py` `swarm/reason_scheduler.py` `review_flow.py` | 中央 Reason 规划 + Reviewer 仲裁 |
+| 规划/评审 | `solver/reason.py` `swarm/reason_scheduler.py` `review_flow.py` | 中央 Reason + Reviewer 仲裁 |
 
-**append-only 语义的当前真实状态（评审 §1.10，v2 已核实）**：`events` 表事实内容只 INSERT，
-但存在两处派生元数据 UPDATE——`add_evidence` 的 candidate→verified 提升（`UPDATE events SET
-verified=1`）与 `record_fact_summary` 的 zh gist 写回（`UPDATE events SET payload`）。
-代码注释将其解释为"派生 metadata"。这与 AGENTS.md "never overwrite in place" 的严格表述
-存在张力。**第一批工作之一就是明确二选一语义**（见 §5.4），在此之前文档不再使用
-"严格 append-only" 一词，改用"**事实内容只增不改，派生元数据可更新（待正式定稿）**"。
+**append-only 语义（v3 定稿，不再开放）**：按 AGENTS.md 现有不变式，选择**严格 event-row
+immutability**——`events` 的 `ts/actor/kind/payload/artifact_id/verified/confidence/dedupe_key`
+均不可原位修改；candidate→verified 提升写新事件或写可由 event log 重建的 projection/state
+表；summary 写 side table 或追加新事件；`intents` 等物化投影可更新但必须声明为非 canonical。
+守护测试静态禁止**所有** `UPDATE events`，并验证 replay 可重建相同投影状态。
 
-当前派发主循环（`reason_scheduler.py::ReasonSwarm.run`）：`initial recon（单 worker，方向 =
-category）→ while 未完成：Reason 读图提 intent → 保留模型返回顺序截断到
-max_intents_per_reason → 对 fresh decisions 直接 gather 并发执行 → 投影 → 循环`。
-注意（评审 §1.7/§1.8，v2 已核实）：**该 gather 没有 max_workers 并发约束**，且**主派发顺序
-是模型返回顺序，不是 SharedGraph 的 priority DESC 查询顺序**——两条事实都影响 §5.1 的设计。
+当前派发主循环：`initial recon（单 worker，方向=category）→ while 未完成：Reason 读图提
+intent → 截断到 max_intents_per_reason → 对 fresh decisions 直接 `asyncio.gather` 并发 →
+投影 → 循环`。已核实：该 gather **没有 max_workers 约束**（复评 §10.3.2 确认缺口成立），且
+主派发顺序是模型返回顺序。
 
 ---
 
 ## 2. 参考材料一：FishCodeTech/muteki（上游）
 
-### 2.1 它是什么
-
-[Project Muteki（無敵）](https://github.com/FishCodeTech/muteki)：异构多模型 CTF 解题 agent
-swarm，shell 出 claude/codex/cursor 三个闭源 CLI。核心三件套与 D-Swarm 同源：**异构引擎 +
-共享黑板 + provenance gate**。worker 与平台的唯一数据通道是内建 `muteki-blackboard` skill。
-
-### 2.2 关键成绩（上游自述，能力快照）
-
-- NYU CTF Bench 200/200 = 100%（30 分钟/题，累计 ~370M tokens、~$214，中位 2–4 分钟）
-- 引擎分布 cursor 80 · claude 75 · codex 45 —— 盲区互补是上游 200/200 的核心论据
-- RIFFHACK 2026 第 8 名；blackmaze 首血；HTB Insane/Hard 全类目 AK
-- 设计哲学 "less is more"：不捆绑安全工具、网络全开、worker 自行安装依赖
-
-### 2.3 架构（四阶段 + 每 tick 协作环）
-
-| 阶段 | 何时 | 做什么 |
-|---|---|---|
-| ① Prepare | run 开始 | 建黑板、挂附件、健康检查、装 skill、起容器 |
-| ② Recon Race | 冷启动 | **多引擎并行单发**整题，广覆盖侦察（flag→快速通道，或一批事实） |
-| ③ 协调主循环 | recon 未解时 | 读黑板 → Reason 规划 → intent 上黑板 → worker 认领执行 → 回写（约 2s 一圈） |
-| ④ Wind-down | 收尾 | 持久化 winner、释放 claims、终止事件、清理 |
-
-另有 **Reviewer**（上游致谢 l4n 引入）：执行中周期性复核已记录事实、及时纠偏，是上游跳出
-死循环的关键。
-
-### 2.4 与 D-Swarm 的关系
-
-D-Swarm（`h1kibi/D-Swarm`）在更早时点 fork（当时上游叫 dswarm，现已改名 muteki），两线
-独立演进。逐文件 diff：
-
-- **D-Swarm 领先**：`gate.py` 15KB vs 9.3KB（多 `_TEST_MARKER_RE` 等防护）；`btw.py` 45KB vs
-  28.7KB；swarm 拆成 8 个 mixin（上游是 266KB 单体）；另有 modelgateway、方向 skills、容器探针。
-- **上游领先**：`_run_race`/`_run_race_scout`（D-Swarm 已删）；claude/codex/cursor 三引擎驱动
-  （D-Swarm 在 pi-only 提交中移除）；0.2.4 自定义 endpoint 健康检查跑真实 CLI 回合；0.2.5
-  探测镜像真实 UID/GID 再 chown；容器内强制 container backend、拒绝静默回退 host。
-
----
+（内容与 v1/v2 相同，摘要）异构多模型 CTF swarm（claude/codex/cursor），NYU 200/200
+（~$214、~370M tokens、中位 2-4 分钟；引擎分布 cursor 80 / claude 75 / codex 45），四阶段
+架构（Prepare / Recon Race / 协调主循环 2s 一圈 / Wind-down）+ Reviewer。与 D-Swarm 的关系：
+同源 fork 各自演进——D-Swarm 在 gate 加固（`_TEST_MARKER_RE` 等）、btw、模块化领先；上游在
+race 模式、多引擎驱动、custom-endpoint 真实健康检查（0.2.4）、容器一致性强制领先。
 
 ## 3. 参考材料二：Armur-Ai/Pentest-Swarm-AI
 
-Go 1.24、AGPL-3.0，自定位"第一个真正的 swarm"。三原则：
-
-1. **Stigmergy**：agent 靠读写共享黑板间接协调；finding 带信息素权重，按类型半衰期衰减。
-2. **Emergence**：攻击链从黑板状态涌现，不由中央规划。
-3. **Decentralization**：每 agent 只有自己的触发器谓词；调度器只做并发/预算/关闭。
-
-工程护栏：Postgres+pgvector 黑板、per-type 半衰期（`pheromones.yaml`）、scope 双层强制、
-cleanup registry（逆序、SIGINT 也跑）、Claude prompt caching、per-agent token 预算
-（软警告+硬上限）、CVSS v3.1、md/html/json/SARIF 报告。记忆投毒四层防御（Ed25519 签名、
-MINJA clamp、MemoryGraft 看门狗、token-bucket 限速）。Verified-PoC 门：finding 必须带
-`Reproduction{Command, HTTPRequest, ExpectedIndicator}` 重放验证。
-
----
+（内容与 v1/v2 相同，摘要）Go + Postgres/pgvector 黑板，stigmergy 三原则（信息素衰减/
+涌现/触发器谓词去中心化），工程护栏（scope 双层强制、cleanup registry、prompt caching、
+per-agent 预算、Verified-PoC 门），记忆投毒四层防御（Ed25519 签名、MINJA clamp、MemoryGraft
+看门狗、token-bucket 限速）。
 
 ## 4. 参考材料三：腾讯云文章（MS08067）
 
-第三方 PSA 解读，价值在**中立工程视角与争议清单**：去中心化复杂度更高、调试更难；项目仍
-alpha；Go 生态相对小。未来方向：工具链扩展、向量学习、可视化调试、Benchmark。
+（内容与 v1/v2 相同，摘要）PSA 第三方拆解；争议清单（去中心化难调试、alpha 成熟度、Go
+生态小）是 §6 否决项的重要旁证。
 
 ---
 
-## 5. 改进方案（v2，按评审 §4 六批优先级重排）
+## 5. 六批方案（v3，按复评 §10.3 修正后的最终形态）
 
-> 通用约束（v2 修订版，评审 §3.6）：**不修改 provenance gate；不让派生注意力成为证据；
-> 尽可能不增加模型调用；新增计算与 token 成本必须可测量、可开关、可回滚。**
-> 所有"在线生效"的改动都有确定性测试；所有"实验性"改动都走 telemetry/ablation。
+### 5.1 第一批：基线正确性（Conditional Go）
 
-### 5.1 第一批：基线正确性（先修地基，再做加法）
+**A. priority：先删 Python 截断，不先迁 schema**（复评 §10.3.1，已核实）
+- 事实：`propose_intent`（`int(raw_priority or 0)`）与 `dispatchable_intents`
+  （`item["priority"] = int(...)`）两处截断；另有摘要块 `int(priority or 0)` 多处。
+  SQLite INTEGER affinity 实际可保存 REAL（0.5/0.9 不丢）。
+- 方案：① 删除全部 `int()` 截断；② Python/API 层统一 `float`；③ 对新旧 SQLite DB 做
+  持久化/排序/replay 测试；④ 仅当跨后端 DDL 契约确需时才迁列类型。**不默认 ×100**（planner
+  priority 不保证两位小数，固定缩放引入精度上限与双尺度转换）。
+- 另须定义 operator priority（100/50/0/-10 映射）与 planner priority（0..1）的**统一比较
+  尺度契约**——两套尺度当前混用，不能只修存储。
 
-**A. priority 持久化精度**（评审 §1.6，已核实）：`propose_intent` 里 `int(raw_priority or 0)`
-+ INTEGER 列，0.5/0.9 全部变 0。Reason 的浮点 priority 在 DB 层已无意义。
-- 方案：`priority` 改为 REAL 存储（迁移：新列或 ×100 整数），`_open_intents` 的
-  `ORDER BY priority DESC` 保持语义；`DispatchDecision.priority` 直接透传不转 int。
-- 价值：在讨论任何"按优先级派发"之前，先把优先级本身修对——否则 energy 实验的基线不可靠。
-- 验收：`0.5/0.9` 持久化后不丢精度（确定性测试）。
+**B. 并发：ordinary/review 双 lane**（复评 §10.3.2，已核实 `test_swarm.py:925`
+`test_review_worker_uses_reserved_capacity_when_ordinary_slots_full` 存在）
+- 约束（v3 定稿，替换 v2 的 `max_active_workers <= max_workers`）：
+  ```text
+  ordinary_active_workers <= max_workers
+  review_active_workers    <= review_policy.max_concurrent
+  total_active_workers     <= max_workers + review_policy.max_concurrent
+  ```
+- 实现：两把独立 semaphore；明确 recon/explore/recovery/operator-fallback 属 ordinary lane、
+  review worker 属 review lane；取消/异常/重试/恢复全部经同一容量控制并可靠释放 permit。
 
-**B. `max_workers` 并发约束**（评审 §1.7，已核实）：ReasonSwarm 的 `gather` 并发上限是
-`max_intents_per_reason`，`max_workers` 只在 provider 告警里当统计数用。
-- 方案：`gather` 前加 semaphore（容量 `max_workers`），超出部分按顺序排队。
-- 价值：这直接命中维护者的核心关切（成本均衡、provider 限流、worker 生命周期、UI 上
-  "Worker 策略"的可信度）。这是比 energy 更优先的修复。
-- 验收：`max_active_workers <= max_workers` 有确定性测试。
+**C. append-only：严格 event-row immutable**（复评 §10.3.3，§1 已定稿；删除 v2 的
+`(i)/(ii)` 开放选择）。守护测试：静态禁止所有 `UPDATE events` + 行为测试（verification/
+summary/review 后原行字段或稳定哈希不变；replay 重建相同投影）。provenance gate 及其测试
+保持原样。
 
-**C. append-only 语义定稿 + 守护测试**（评审 §1.10，已核实）：`test_architecture.py` 当前
-只查 core 不 import apps、LF、WSL，没有 append-only/provenance 守护；而代码存在元数据
-UPDATE（verified 提升、summary 写回）。
-- 方案：二选一定稿——(i) 严格事件不可变（提升/摘要写旁表或新事件）；或 (ii) "原始事实
-  不可变、派生字段可更新"并在 AGENTS.md 明确。选定后补一个真正的 architecture guard 测试
-  （断言 `events` 表的 `kind/payload.fact/actor/ts` 字段不被 UPDATE；允许的元数据列白名单化）。
-- 价值：provenance 是项目圣物；"append-only"一词在文档、注释、代码间语义不一致时，任何
-  新功能都可能在不自知中破坏溯源。先把语义钉死。
-- 验收：guard 测试存在且绿；白名单外的 UPDATE 被测试拒绝。
+### 5.2 第二批：方向可观测性（Go after model correction）
 
-### 5.2 第二批：方向路由可观测性（评审 §2.1 修改后采纳）
+- **diagnostics 逐 Intent 建模**（复评 §10.3.4）：在 `Intent` 上增加：
+  ```text
+  raw_direction
+  canonical_direction
+  direction_resolution ∈ {empty, explicit_auto, recognized_alias, invalid,
+                          mechanical_fallback, category_fallback}
+  ```
+  原始值进事件/UI 前做长度限制；机械 fallback 只处理空/非法 direction，**不得覆盖**合法
+  canonicalize 的模型输出；方向 registry 为单一权威来源，用 typed fields（profile/镜像/
+  prompt/关键词各自类型化），不做无类型巨型 dict。
+- misc 机械 seed 第一版；flash triage 保持为有成本可选项。
+- 补 decision → profile → worker factory → runtime 全链路测试（decision 层测试已存在）。
 
-**现状核实**（v2 修正）：decision 层路由测试**已存在**
-（`tests/test_reason_swarm.py::test_reason_decisions_route_direction_to_profile`，crypto→
-pi-crypto / 空→category / rev→pi-rev），v1 "无回归测试"的说法错误。真实缺口是：
-(a) **非法 direction 在 parser 层就丢失**——`parse_reason_reply` 里
-`direction=canonical_direction(raw.get("direction"))`，`"reversing"` 进 scheduler 前已变空串，
-`_decisions_from_reason` 拿不到原始错误词；(b) 缺 decision → profile → engine/镜像/skills/
-prompt 的 runtime 层端到端接线测试。
+### 5.3 第三批：token 预算接线（Redesign before Go）
 
-- 方案 A（parser 层）：`ReasonResult` 保留 `raw_direction` + `direction_diagnostic`
-  （"canonicalized:reversing→unknown" / "empty:fallback-to-category" / "invalid:xyz"），
-  进 `propose_intent` payload 与黑板 delta，操作员可见。
-- 方案 B（fallback 规则）：机械规则**只对空/非法 direction 做高置信 fallback**；模型给出
-  合法 direction 时默认尊重模型，冲突只记 telemetry 不覆盖（评审例证："extract RSA key from
-  binary" 同时命中 crypto+rev，"decrypt cookie through web endpoint" 同时命中 web+crypto，
-  关键词覆盖模型的误判率高）。所有 direction 规则（aliases、canonical id、profile、category
-  aliases、关键词）收敛到**单一权威结构**（`worker_profiles.py` 扩展），避免双表漂移。
-- 方案 C（misc）：第一版**不做 LLM triage**（评审 §2.1：与"尽可能不加模型调用"矛盾），用
-  机械 seed（description/attachment 扩展名关键词）；flash triage 单独标注为**有成本可选项**。
-- 方案 D：runtime 接线测试——断言 direction 最终传到正确 engine/镜像/skills/prompt。
+复评 §10.3.5 推翻 v2 的"每次 spawn 唯一 solver_id 即天然去重"设计，理由成立：retry/recovery
+新 ID 会重置 per-agent cap，且无法限制同一 profile/provider/account 累计消耗。v3 契约：
 
-- 价值：把"规划器打错方向"从静默故障变成可观测事件；只在不牺牲模型合法决策的前提下兜底；
-  成本零新增调用（第一版）。
-- 验收：非法 raw direction 可观测；合法 direction 不被低置信关键词覆盖；direction 最终传到
-  正确 profile/engine/runtime。
+- **唯一账本**：扩展 `CostController`/`COST_UPDATE` 为唯一事实源；`MemoryBoard`/UI 只做投影。
+- **usage 幂等键**：`usage::<worker_instance_id>::<provider_call_id>`（或 ledger event id），
+  防 outcome 重放 / backend restart / recovery / provider 内部重试重复计费。
+- **三层身份**：`worker_instance_id`（单次生命周期归因）、`profile_id/direction`（调度预算）、
+  `provider/account_id`（配额、错误聚合、暂停派发）。
+- **unknown usage 语义**：provider 未返回 usage → 记 `unknown/estimated`，不得静默记为 0。
+- 如实改写能力现状：`MemoryBoard.charge_agent` 仅累计+warned，`_budget_exhausted` 只查
+  challenge global；"per-agent 软告警→硬上限→暂停派发"状态机**尚不存在**，属本批待建。
 
-### 5.3 第三批：token budget 接线（评审 §2.4 优先采纳）
+### 5.4 第四批：route 数据完整性与 telemetry（Conditional Go）
 
-**现状**：`MemoryBoard.agent_budget`/`charge_agent` 状态机完整，但 `reason_scheduler._one`
-里传 `tokens=0`；`SolveOutcome` 没有 token delta 字段。v1 称"一行改动"，不准确。
+- **route lineage**：优先 `intent_id → intents.route_hash` 解析，不单信 payload 中可缺失的
+  `route_hash`；区分 explicit route / intent-inherited / route-less（结构化原因枚举），
+  route-less 进独立 `unattributed` bucket，不自动归入热门 route。
+- **时间分离**：同时保存 event time 与 projection write time；benchmark replay 用
+  **virtual time**，防重放当天时钟改变 pheromone/energy。
+- **telemetry 载体**（复评 §10.4-5）：高频 write-rate/重复率/膨胀等原始数据写**独立
+  append-only metrics artifact/table**；UI 只收低频聚合 delta；**不写回 evidence graph、
+  不扩大 Reason prompt**。
+- durable consumer：crash/restart 从 checkpoint 恢复，重放不重复产生派生记录。
 
-- 方案：`SolveOutcome` 增 `tokens: int`（`CliSolver.run()` 结束写 `_tokens_spent()`）；
-  `_one` 在 `_absorb_outcome` 前按 worker 实例结算一次；recon/普通/retry/recovery 统一走
-  同一结算路径；恢复/重试按**新 worker 实例**结算（天然去重，不跨实例累计）；agent 维度
-  用 solver_id（每 spawn 唯一，与 board 的 charge_agent 键一致）。
-- 价值：复活已存在的 per-worker 预算告警（软警告→硬上限→暂停派发），是成本均衡的直接抓手；
-  也是 provider error 关联分析的数据源。
-- 验收：token 对 recon、worker、retry、recovery 恰好结算一次（确定性测试）。
+### 5.5 第五批：energy（Offline Go / Online No-Go）
 
-### 5.4 第四批：route 数据完整性与 telemetry（energy/Advisor 的地基）
+- 公式前置条件（复评 §10.3.7）：正贡献每项先 clamp 到 `[0,1]`；计算前做 identity dedupe +
+  actor/source 相关性分组（组内取 max 或折扣，再跨独立来源组合）；定义多条 dead-end 的
+  合并、正负贡献尺度与最终 score 边界；同 route 同 priority 的**稳定排序键**；feature off 时
+  与 baseline decision-for-decision 一致。
+- **在线语义 v3 定稿**：第一版只允许 **priority 完全相等**时 energy tie-break。排序键：
+  ```text
+  lifecycle_lane -> planner_priority -> energy_if_priority_equal -> original_index
+  ```
+  v2 的"接近时 tie-break"与"永不覆盖 planner priority"自相矛盾（0.90 vs 0.85 交换顺序即已
+  覆盖），删除；near-equal 若未来要做须显式定义 epsilon/bucket 并承认是有界重排。
+- 复杂度：不得按固定短周期全量扫历史；缓存失效策略有基准数据。
+- 离线实验口径：相同 benchmark/model/provider/token-worker 预算/离线网络；报告多 seed、
+  flag latency、worker starts、tokens、provider errors、route churn 与置信区间；样本不足
+  不得据此批准在线调度。
 
-**现状核实**（评审 §1.2/§1.3，已核实）：`BoardProjector.project_event` 只投影 `fact_added`；
-`FLAG_FOUND`/`POC_SAVED`/`dead_end` 不进入 Board；`Finding` 无 `route_hash` 字段、`created_at`
-是投影时刻而非原始 event 时间（重建投影会重置衰减时钟）；`MemoryBoard.subscribe` 不自动
-读写 `cursor`/`commit_cursor`（API 存在但 durable consumer 语义未封装——v1 的说法不准）。
-注意：`SQLiteSharedGraph.subscribe_events(after_seq)` **已存在**，是原始事件流，比 Board
-订阅更适合做 Advisor 的事件源。
+### 5.6 第六批：单 Advisor（No-Go，设计阻塞）
 
-- 方案：① 投影补 route_hash（从 `payload.route_hash`/`finding` 数据提取）与原始 event ts；
-  ② 定义 dead-end/flag/PoC/route-less finding 的归属规则；③ write-rate、dedupe 命中率、
-  summary 膨胀等 telemetry 指标；④ 建立可重放 benchmark fixture（事件日志回放）。
-- 价值：energy 与 Advisor 的正确性都依赖"route 归属 + 真实时间"，没有这层数据任何实验都是
-  在错误基线上测；telemetry 本身就是 §5.5 写限速的证据来源。
-- 验收：投影保留原始 event 时间与 route_hash；重放 fixture 可复现。
+复评 §10.3.8 的两个矛盾成立：① AdvisorySuggestion 不直接执行，没有"事件即执行"收益；
+② ReasonSwarm 等本轮 `gather` 全部完成才进下一 Reason cycle，慢 worker 阻塞快路径。
+`subscribe_events()` 只解决事件可见性，未解决谁被唤醒、何时消费、如何中断等待、如何受
+pause/stop/budget 约束。且 multi-flag 的 Reason prompt 已能看到已捕获 flag，flag-scout
+是否比下一轮 Reason 更快**尚无证据**。
 
-### 5.5 第五批：route energy —— 先离线实验，后 tie-breaker（评审 §2.2）
+- 当前：**不实施**。恢复研究的前置：完整消费协议 + 延迟对照 trace
+  `flag_found → suggestion → Reason consume → focused dispatch`，测量
+  `time(flag_found → next focused dispatch)` 与 baseline，记录接受/拒绝原因，验证
+  restart/replay 幂等与 pause/stop 后零新 spawn；幂等键用 source event seq/hash，不拼接
+  原始 flag；budget/cooldown/durable cursor 不得只存进程内变量。
 
-**v1 公式的问题（评审 §2.2，全部成立）**：dead-end 公式 `-penalty·(1-exp(-age/τ))` 随
-时间**增强**惩罚，与注释"随时间衰减"矛盾；正贡献求和后 clamp 易饱和（无法区分一条强证据
-与大量同源回声）；actor cap 0.4 无 trace 支撑；冷启动（全 route≈0）未定义；review/verifier
-"不抢热"可能饿死。
+### 5.7 注意力卫生（继承 v2 拆分，无变化）
 
-- 修订公式（v2 草案，仍属实验参数，不做生产常量）：
-  - 正贡献：`E_route = 1 - Π(1 - w_i·exp(-age_i/τ))`（概率合并式，天然防饱和、有上界）；
-  - dead-end：`-penalty·exp(-age/τ)`（惩罚随时间减弱；**图内 suppression 不受影响**——衰减
-    只发生在注意力视图）；
-  - 冷启动：E 全为 0 或方差 < ε 时**回退 planner 原顺序**；
-  - review/verifier：独立 lane，不参与热度竞争（保底服务额度）。
-- 落地路径（严格分阶段）：
-  1. 只输出 route heat **telemetry**（黑板 delta + 日志），不改任何派发；
-  2. 用 benchmark/replay fixture 做 ablation（权重/半衰期/cap 扫描）；
-  3. 证明有效后，在线第一版**只作 planner priority 相同或接近时的 tie-breaker**；
-  4. 永不覆盖 planner priority；route heat 永不写回 evidence graph。
-- 价值：能量排序的目标（把既定预算投向证据最厚的路线）不变，但 v1 直接进生产派发是拿
-  未验证公式去替换一个已工作的调度器；分阶段后收益可测、风险可控。
-- 验收：冷启动保持 planner 原顺序；dead-end 惩罚随时间减弱；review/verifier 不因热度饥饿；
-  能量计算不得每 0.5s 全量扫历史（复杂度约束/缓存策略必须有）。
+token accounting 并入第三批（redesign 版）；write-rate telemetry 并入第四批（独立 metrics
+载体）；硬限速与 burst 指纹/actor cap 仍为"先测量后决定"，不做生产常量。
 
-### 5.6 第六批：Advisor 触发器 —— 缩为单触发器实验（评审 §2.3）
+### 5.8 OSS 遗产待办（v1→v3 批次重构时漏挂，本轮显式补回；不进六批，独立小项）
 
-**v1 的核心矛盾（评审 §2.3，成立）**："Advisor 调 `propose_intent`" 与"Reason 仍是唯一
-裁决者"不可兼得——`propose_intent` 写的是正式 intent，派发器消费它则 Advisor 就是决策者，
-不消费则是一堆不执行的记录。必须二选一：
+以下四项来自调研、在 v1 方案中提出、但在 v2/v3 的六批重构中失去了落点。它们不是六批的
+前置条件，也不阻塞六批实施，作为**显式挂起项**记录，防止思想吸收链条断裂：
 
-- **AdvisorySuggestion 模型**：Advisor 只写非执行性建议，Reason 下一轮决定是否转化
-  （Reason 仍是唯一裁决者，但没有"事件即执行"的 OODA 收益）；
-- **Formal Intent 模型**：Advisor 直接写可 claim intent（OODA 快，但必须承认决策主体
-  多元化，需要完整仲裁与预算协议）。
-
-- v2 建议：**第一版只做一个单触发器实验**——选因果关系最确定、低重复、低 token 风险的
-  **flag-scout**（multi-flag 梯子题：`FLAG_FOUND` → propose 下一层侦察），采用
-  AdvisorySuggestion 模型 + 事件源用 `shared_graph.subscribe_events`（已存在，不依赖
-  Board 投影扩展）。补齐：stable idempotency key（`flag-scout::{flag}`）、global fanout
-  budget（≤N 次/run）、cooldown、pause/stop/resume 生命周期合规。四触发器体系等调度仲裁
-  统一后再设计。
-- 价值：保留"事件即反应"的 OODA 收益，但把仲裁/预算/幂等/生命周期的完整协议作为前置条件
-  而不是事后补丁；单触发器实验产出真实 trace 后再决定是否扩面。
-- 验收：相同 trigger 重放不重复生成 intent；不绕过 operator pause/stop/resume。
-
-### 5.7 注意力卫生（评审 §2.4 拆分采纳）
-
-| 子项 | v2 结论 |
-|---|---|
-| token accounting | **优先采纳**（§5.3），但需要正式 outcome/accounting 接口与去重结算，不是"一行改动" |
-| write-rate telemetry | **采纳**：先记录不拒绝——每 worker 每分钟 fact/dead_end 数、verified/candidate 比例、dedupe 命中率、route-less 比率、summary 膨胀、provider error 与 burst 关联 |
-| 写入硬限速 | **暂缓**：`60s/30 条` 可能误伤回合末批量抽取事实/扫描结果的合法高产 worker；存储层静默拒绝伤害审计性。将来若做，需结构化结果码（不复用 -1）、UI/Reviewer 可见、SQLite/Postgres 语义一致、不丢关键 dead-end/witness、阈值有真实 trace 支撑 |
-| burst 指纹 / actor cap | **降级为实验参数**：run-75377 的主因可能已被 identity normalization 修复，不能用旧事故证明"近义重复仍是当前主因"，需新 trace；actor cap 不做硬编码 0.4 |
+1. **Pentest 模式 Verified-PoC 门**（PSA §4.3 → flag gate 哲学迁移）：高严重度 finding 只有
+   通过 verifier intent 重跑 `{Command, HTTPRequest, ExpectedIndicator}` 且指标出现在真实
+   执行输出中才能 verified=true。与既有 `POC_SAVE=` 标记、`claim_poc/conclude_poc`、
+   witness gate 组合实现。
+2. **scope 事后审计**（PSA 工具层+执行层双层强制 → shelled-CLI 架构下的等价物）：扫描
+   provenance corpus，检测 out-of-scope 主机/资产引用，命中则事实标记 `scope_violation`、
+   从报告排除、HITL 提示操作员。前置：第三批的 provenance corpus 可复用性与第四批的
+   metrics 载体。
+3. **cleanup registry**（PSA §1.3.1 → 目标侧产物治理）：worker 在目标侧创建的产物
+   （listener 端口、上传文件、残留会话）登记进 shared_graph（`resource_locks` 已有雏形），
+   wind-down 逆序释放 + 报告清单。
+4. **上游合并补丁**（muteki 0.2.4/0.2.5）：custom-endpoint 健康检查跑真实 CLI 回合、开跑前
+   暴露 LiteLLM/DeepSeek schema 错误；探测 worker 镜像真实 UID/GID 再 chown；容器内强制
+   container backend、拒绝静默回退 host。均为小合并，各自独立验证。
 
 ---
 
-## 6. 已讨论并否决的方案（决策上下文，v2 维持不变）
+## 6. 已否决方案（决策上下文，累积三版）
 
 | 否决项 | 理由 |
 |---|---|
-| 并行 race/recon（上游 `_run_race`） | 上游目标函数是首血（时间最贵）；D-Swarm 是成本均衡。并发预算留给窄 scope explore intent |
-| 异构模型补齐引擎异构 | 内核已支持 per-profile provider/model/effort，是配置问题非内核优化 |
-| 多见证共识（≥2 actor 同事实 → 升级标注） | worker 开局读 board，第二 actor 的确认多是回声而非验证；主动验证版 = 已有 review/verifier intent，重复工作 |
-| 全面去中心化（废中央 Reason） | 腾讯云文章争议（调试难、alpha）+ 上游 200/200 实为协调器+Reviewer 架构 |
-| 重上 claude/codex/cursor 闭源驱动 | 与 pi 引擎 + BTFly 路线冲突 |
-| Postgres+pgvector 替换 SQLite 黑板 | 单文件事件溯源是卖点；postgres_board 已是可选后端 |
-| 捆绑 ProjectDiscovery 8 工具适配器 | 违背 "less is more"（worker 自带工具） |
+| 并行 race/recon（上游） | 成本均衡 vs 首血速度 |
+| 异构模型补齐引擎异构 | 配置问题，非内核优化 |
+| 多见证共识 | 回声≠验证；主动验证版=已有 review/verifier |
+| 全面去中心化 | 调试难、alpha；上游实为协调器+Reviewer |
+| 重上闭源引擎驱动 | 与 pi 路线冲突 |
+| Postgres+pgvector 替换 SQLite | 单文件溯源是卖点 |
+| 捆绑工具适配器 | less is more |
+| **energy "near-equal" 在线重排**（v2 提出，本轮否决） | 与"不覆盖 planner priority"自相矛盾；v3 只允许 exact-equal |
+| **Advisor 借 `subscribe_events` 直接上实验**（v2 提出，本轮否决） | 缺唤醒/消费协议与延迟证据，No-Go |
+| **append-only 放宽语义 `(ii)`**（v2 开放选项，本轮否决） | 与 AGENTS.md 不变式冲突；严格 immutable 定稿 |
+| **per-agent 预算以 solver_id 为唯一维度**（v2 提出，本轮否决） | retry/recovery 新 ID 重置预算；需三层 identity |
 
 ---
 
-## 7. v1 不准确表述与修正（对应评审 §6，逐条核实后确认）
+## 7. 验收标准（替换 v2 §8，采用复评 §10.5 清单）
 
-| v1 表述 | 核实结果 | v2 修正 |
+**基线正确性**
+- [ ] priority 在 parser/event payload/intent projection/dispatch API/UI/replay 全链路保持浮点精度
+- [ ] `0.5/0.9` 持久化、重启、重放、排序后不丢精度
+- [ ] operator 与 planner priority 的尺度、覆盖规则、稳定排序有明确契约
+- [ ] `ordinary_active_workers <= max_workers`；`review_active_workers <= review_policy.max_concurrent`；`total <= 两者之和`
+- [ ] 取消/异常/retry/recovery 后所有 semaphore permit 释放且不超发
+- [ ] 源码与 SQL guard 禁止所有 `UPDATE events`
+- [ ] verification/summary/review 后原 event 行字段/稳定哈希不变
+- [ ] 仅从 event log replay 可重建相同 verified/summary projection
+
+**方向路由**
+- [ ] 同一 ReasonResult 中多 intent 各自保留正确 raw/canonical/diagnostic
+- [ ] diagnostic 用结构化枚举；非法 raw 值进事件前限长
+- [ ] 合法 direction 不被低置信机械规则覆盖
+- [ ] direction 经 decision → profile → worker factory → runtime 全链路一致
+
+**token 与预算**
+- [ ] recon/ordinary/review/provider retry/worker recovery 的 usage 进同一 ledger
+- [ ] 相同 usage/outcome/event 重放不重复计费
+- [ ] retry/recovery 不通过新 solver_id 重置 profile/provider/account 预算
+- [ ] CostController、Board projection、API/UI 的 token/cost 总量一致
+- [ ] provider 未返回 usage → 显示 `unknown/estimated`，不静默记为 0
+- [ ] 软告警/硬上限/暂停派发/恢复条件有确定性状态机测试
+
+**route 与 telemetry**
+- [ ] explicit / intent-inherited / unattributed route 可区分；route-less 原因结构化枚举
+- [ ] event time 与 projection write time 分离；replay 用 virtual time 结果稳定
+- [ ] telemetry 原始数据不进 evidence graph、不扩大 Reason prompt
+- [ ] durable consumer 崩溃重启后从 checkpoint 恢复，重放不重复派生
+
+**energy 离线实验**
+- [ ] 正贡献项组合前 clamp `[0,1]`；weight/τ/dead-end 合并/score 边界有定义
+- [ ] 同 actor/source 回声不把 route energy 刷满
+- [ ] 冷启动及 feature off 与 planner baseline decision-for-decision 一致
+- [ ] 第一版仅 exact-equal priority tie-break；相同输入多次排序完全稳定
+- [ ] review/verifier 不受 route heat 排序影响（独立容量与生命周期 lane）
+- [ ] 无固定短周期全量扫描；复杂度与缓存失效有基准
+- [ ] ablation 同 benchmark/模型/provider/预算/离线网络；报告多 seed 与置信区间；样本不足不批准在线
+
+**Advisor 实验（第六批恢复研究时）**
+- [ ] `flag_found → suggestion → Reason consume → dispatch` 完整 trace
+- [ ] `flag_found → next focused dispatch` 延迟对照 baseline
+- [ ] 接受/拒绝原因可追踪；被拒 suggestion 不生成正式 intent
+- [ ] source event 重放、进程重启、cursor 恢复不重复建议/派发
+- [ ] pause/stop/budget exhausted 后绝不触发新 worker
+
+**总红线与评估口径**
+- [ ] 不修改或弱化 provenance gate；派生 attention/energy/Advisor 结果永远不是 flag provenance
+- [ ] capability eval 全程离线、零假 flag
+- [ ] "solve-rate 不退化"用预定义非劣界、相同预算、多 seed/置信区间判断（不要求每次 run 绝对不退化）
+- [ ] 新机制有 feature flag，关闭后恢复 baseline，可测量额外 CPU/IO/内存/prompt 成本
+
+---
+
+## 8. 验证状态与诚实记录
+
+**测试基线冲突已在第三轮复评（docs/09 §11）中定论，本工作区已按 §11 修复并验证。**
+v3 初版的归因（"`test_planner_forwards_base_url` 任何环境下确定性失败，原因是 claude
+profile 被 pi-only 拒绝"）**经 §11 复核后证明是错的**，更正后的因果链（已在本工作区
+逐条复现确认）：
+
+- 4 个 LLM 测试（connectivity ×3 + planner base_url）的真实失败原因是 **ambient
+  credential 依赖**：`resolve_reason_llm_endpoint` 的 `has_api_key` 预检在构造（被 mock 的）
+  LLMClient 之前执行；无 key → 不构造 client → `__aenter__` 不执行 → `_StopHere` 不抛出。
+  注入占位 key 后**旧 claude fixture 也能通过**——claude fixture 确属 pi-only 迁移残留应当
+  迁移，但不是失败的直接原因。
+- tsc 测试的真实原因是 `find_tsc()` 的 PATH 优先顺序（TS_BIN → PATH → repo-local），会被
+  其他项目/全局的 TS6 遮蔽；与 tsconfig 的 `baseUrl` 弃用叠加导致机器相关。
+- 评审方记录的 `exit code 0` 是真实结果；其遗漏是没有记录兼容变量 `DEEPSEEK_API_KEY`
+  在评审环境中已设置。
+
+**已应用的修复（限定 4 个文件，对应 §11 建议）并验收：**
+
+| 文件 | 修复 | 验收结果 |
 |---|---|---|
-| "`MemoryBoard.subscribe` 完整实现 cursor+commit_cursor 光标幂等" | subscribe 不自动读写 cursor（已读代码确认） | "subscribe 与 cursor API 都存在，但 durable consumer 语义未封装" |
-| "四个 Advisor 复用 subscribe，零额外读开销" | `project_event` 只投影 fact_added；FLAG/POC/dead_end 不进 Board（已确认） | "复用部分基础设施；需补事件投影、cursor、幂等、预算与复杂度控制" |
-| "中央 Reason 仍是唯一裁决者，同时 Advisor 调 propose_intent" | 逻辑矛盾（评审论证成立） | 二选一模型（§5.6） |
-| "misc triage 符合零新增 LLM 调用" | 与总约束矛盾 | "有成本可选项；第一版用机械 seed" |
-| "charge_agent 是一行改动" | `SolveOutcome` 无 token delta 字段（已确认） | "需要 outcome 接口与 retry/recovery 去重结算" |
-| "append-only 由 test_architecture.py 同类测试守护" | 该测试只查 import 方向/LF/WSL（已确认） | "当前尚无 append-only/provenance architecture guard（第一批补）" |
-| "复合题 crypto intent → pi-crypto profile 无回归测试" | `test_reason_decisions_route_direction_to_profile` 已存在（已确认） | "decision 层已有，缺 runtime/factory 端到端接线测试" |
+| `tests/test_connectivity_probes.py` | 3 个 LLM 测试内注入占位 key + 删除 ambient `DEEPSEEK_API_KEY` | 两 key 均为空时 4 个 LLM 测试全过；有/无真实 key 结果一致 |
+| `tests/test_llm_base_url_wiring.py` | planner 测试同时完成两件事：注入占位 key + 旧 claude fixture 迁移为合法 pi profile | 同上 |
+| `docker/worker-pi/scripts/check_pi_extensions.py` | `find_tsc()` 顺序改为 TS_BIN → repo-local → PATH | tsc 测试稳定使用 repo-local 5.9.3；`TS_BIN` 显式覆盖保留（TS6 CI） |
+| `docker/worker-pi/pi-config/extensions/tsconfig.json` | 删除 `baseUrl`，`paths` 改为显式相对路径（仅删 baseUrl 会 TS5090，故不采用 `ignoreDeprecations` 掩盖） | repo-local 5.9.3 通过 |
 
----
+完整 `uv run pytest -q`（两 key 均为空的环境）结果见工作区实测：**0 失败**（本轮执行）。
 
-## 8. 验收标准（替换 v1 §7，采用评审 §5 清单）
-
-- [ ] `max_active_workers <= max_workers` 有确定性测试
-- [ ] `0.5/0.9` priority 持久化后不丢精度
-- [ ] 非法 raw direction 可观测
-- [ ] 合法 direction 不被低置信关键词错误覆盖
-- [ ] direction 最终传到正确 profile/engine/runtime
-- [ ] token 对 recon、worker、retry、recovery 恰好结算一次
-- [ ] energy 冷启动保持 planner 原顺序
-- [ ] dead-end 惩罚随时间减弱
-- [ ] review/verifier 不因 route heat 饥饿
-- [ ] energy 计算不能每 0.5 秒全量扫描全部历史（复杂度约束或缓存策略）
-- [ ] Advisor 相同 trigger 重放不会重复生成 intent
-- [ ] Advisor 不能绕过 operator pause/stop/resume 生命周期
-- [ ] 所有 attention/pheromone 结果只能影响调度，不能绕过 provenance gate
-- [ ] 离线 eval 零假 flag
-- [ ] 相同 token/worker 预算下 solve-rate 不退化，并提供成本与等待时间对照
-
----
-
-## 9. 留给下一轮评估者的开放问题（v1 §8 的延续）
-
-1. **append-only 语义选哪边**？(i) 严格事件不可变（verified 提升/summary 写旁表或新事件）
-   还是 (ii) "原始事实不可变、派生字段可更新"并在 AGENTS.md 明确定稿？这影响 guard 测试
-   与所有未来图功能。
-2. **AdvisorySuggestion vs Formal Intent**：单触发器实验选哪个模型？flag-scout 用
-   Suggestion 模型会损失多少 OODA 收益，值不值？
-3. **priority 迁移**：REAL 列 + ×100 整数两种方案，对 `_open_intents` 排序、web 设置页、
-   已有 DB 迁移的影响哪种更小？
-4. **energy 的概率合并式**（`1-Π(1-w·exp(-age/τ))`）在 route 无归属的 fact（route-less
-   ratio 当前占比？）上的行为：route-less 事实进哪个 bucket？
-5. **telemetry 的载体**：write-rate/膨胀指标走黑板 delta 还是独立 metrics 文件/表？如何
-   让离线 ablation 可复现？
+**遗留清理项（与前两轮审计相关，不影响本方案审批）：** `public_eval/RESULTS.md` 仍为上游
+Muteki 数据需标注归属；`stale_reason_limit`/`stall_seconds` 死参数；`DSWARM_WORKER_TASK_KIND`
+写而不读；3 个文件的 61 处 U+9225 mojibake；README 的 upstream remote 指引与
+`server.py` 的 `docs/_local` 悬空引用。
