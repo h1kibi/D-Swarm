@@ -538,6 +538,9 @@ async def test_reason_swarm_salvages_flag_after_worker_crash():
     result = await swarm.run()
     assert result["solved"] is True
     assert result["flags"] == ["flag{salvaged}"]
+    assert swarm.lane_gate.snapshot() == {
+        "ordinary_active": 0, "review_active": 0,
+    }
 
 
 async def test_reason_swarm_fallback_bootstrap_when_reason_empty():
@@ -1233,3 +1236,149 @@ async def test_reason_swarm_emits_provider_batch_alert_for_many_fatal_errors():
                     if e.event_type is EventType.BLACKBOARD_DELTA
                     and e.payload.get("kind") == "provider_batch_alert"]
     assert board_alerts, "batch alert should also be visible on the blackboard timeline"
+
+async def test_reason_swarm_caps_fresh_ordinary_workers_at_max_workers():
+    board = MemoryBoard("c-reason")
+    active = 0
+    peak = 0
+    first_pair_started = asyncio.Event()
+    release = asyncio.Event()
+    reason_calls = 0
+
+    async def worker(decision: DispatchDecision, profile) -> SimpleNamespace:
+        nonlocal active, peak
+        if decision.mode == "recon":
+            return _outcome()
+        active += 1
+        peak = max(peak, active)
+        if active == 2:
+            first_pair_started.set()
+        try:
+            await release.wait()
+            return _outcome()
+        finally:
+            active -= 1
+
+    async def reason_fn(summary: str, challenge_id: str) -> ReasonResult:
+        nonlocal reason_calls
+        reason_calls += 1
+        if reason_calls > 1:
+            return ReasonResult(goal_met=True, intents=[], audit_notes=[])
+        return ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent(intent_id=f"I{i}", goal=f"probe {i}", mode="explore")
+                for i in range(4)
+            ],
+            audit_notes=[],
+        )
+
+    swarm = ReasonSwarm(
+        _challenge(),
+        board=board,
+        worker_factory=worker,
+        reason_fn=reason_fn,
+        max_workers=2,
+        max_intents_per_reason=4,
+    )
+    task = asyncio.create_task(swarm.run())
+    await asyncio.wait_for(first_pair_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+
+    assert peak == 2
+    assert active == 2
+
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert peak == 2
+    assert swarm.lane_gate.snapshot() == {
+        "ordinary_active": 0,
+        "review_active": 0,
+    }
+
+
+def test_reason_decision_preserves_worker_class_for_lane_routing():
+    swarm = ReasonSwarm(_challenge())
+    result = ReasonResult(
+        goal_met=False,
+        intents=[
+            Intent(
+                intent_id="I-verify",
+                goal="reproduce candidate flag",
+                worker_class="verifier",
+                mode="explore",
+            )
+        ],
+        audit_notes=[],
+    )
+
+    decision = swarm._decisions_from_reason(result)[0]
+
+    assert decision.worker_class == "verifier"
+    assert swarm.lane_gate.lane_for(
+        mode=decision.mode,
+        worker_class=decision.worker_class,
+    ) == "review"
+
+async def test_swarm_injects_its_worker_lane_gate_into_reason_scheduler(
+    tmp_path, monkeypatch,
+):
+    challenge = _challenge()
+    swarm = Swarm(
+        challenge,
+        [ModelSpec(solver_id="seat", model="mock")],
+        llm=None,
+        sandbox=SandboxManager(root=tmp_path / "sbx"),
+        artifacts=ArtifactStore(root=tmp_path / "arts"),
+        config=SolverConfig(),
+        executor="cli",
+        engines=["pi"],
+        max_workers=3,
+        stage_policy={
+            "coordinator": {
+                "review": {"enabled": True, "max_concurrent": 2}
+            }
+        },
+    )
+    captured = {}
+
+    async def fake_healthy(*args, **kwargs):
+        return ["pi"]
+
+    class FakeReasonSwarm:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self):
+            return {"solved": False, "flags": [], "winner_outcome": None}
+
+    monkeypatch.setattr(swarm, "_healthy_engines_async", fake_healthy)
+    monkeypatch.setattr("dswarm.swarm.swarm.ReasonSwarm", FakeReasonSwarm)
+
+    await swarm._run_reason_scheduler()
+
+    assert captured["lane_gate"] is swarm._worker_lane_gate
+    assert swarm._worker_lane_gate.ordinary_limit == 3
+    assert swarm._worker_lane_gate.review_limit == 2
+
+
+def test_swarm_preserves_zero_review_lane_capacity(tmp_path):
+    swarm = Swarm(
+        _challenge(),
+        [ModelSpec(solver_id="seat", model="mock")],
+        llm=None,
+        sandbox=SandboxManager(root=tmp_path / "sbx"),
+        artifacts=ArtifactStore(root=tmp_path / "arts"),
+        config=SolverConfig(),
+        executor="cli",
+        engines=["pi"],
+        stage_policy={
+            "coordinator": {
+                "review": {"enabled": True, "max_concurrent": 0}
+            }
+        },
+    )
+
+    assert swarm.review_policy["max_concurrent"] == 0
+    assert swarm._worker_lane_gate.review_limit == 0
+    assert swarm._review_capacity_available() is False

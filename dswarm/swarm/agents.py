@@ -34,6 +34,7 @@ class DispatchDecision:
     intent_id: str
     profile: str
     goal: str
+    worker_class: str = "code"
     from_facts: list[int] = field(default_factory=list)
     direction: str = ""
     mode: str = "explore"

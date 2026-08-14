@@ -909,17 +909,23 @@ async def test_review_intents_wait_when_review_concurrency_full(challenge, tmp_p
     async def sleeper():
         await asyncio.sleep(0.05)
 
+    lane = await sw._worker_lane_gate.acquire(
+        mode="review", worker_class="review"
+    )
     task = asyncio.create_task(sleeper())
     sw._active_review_tasks.add(task)
     intents = [
         {"intent_id": "I-review", "goal": "audit", "worker_class": "review"},
+        {"intent_id": "I-verify", "goal": "reproduce", "worker_class": "verifier"},
         {"intent_id": "I-code", "goal": "exploit", "worker_class": "code"},
     ]
 
-    filtered = sw._dispatchable_open_intents(intents)
-
-    assert [i["intent_id"] for i in filtered] == ["I-code"]
-    await task
+    try:
+        filtered = sw._dispatchable_open_intents(intents)
+        assert [i["intent_id"] for i in filtered] == ["I-code"]
+    finally:
+        sw._worker_lane_gate.release(lane)
+        await task
 
 
 async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
@@ -971,9 +977,16 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
             if task.get_name().startswith("review-")
         ) == 1
         assert any(k == "review_started" for k, _ in emitted)
+        assert sw._worker_lane_gate.snapshot() == {
+            "ordinary_active": 0, "review_active": 1,
+        }
     finally:
         for task in list(tasks):
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert sw._worker_lane_gate.snapshot() == {
+        "ordinary_active": 0, "review_active": 0,
+    }
 
 
 async def test_review_intent_remains_dispatchable_when_ordinary_slots_full(
@@ -989,6 +1002,7 @@ async def test_review_intent_remains_dispatchable_when_ordinary_slots_full(
     async def long_running():
         await asyncio.sleep(3600)
 
+    ordinary_lane = await sw._worker_lane_gate.acquire(mode="explore")
     ordinary = asyncio.create_task(long_running(), name="ordinary")
     tasks = {ordinary: "codex"}
     intents = [
@@ -1002,6 +1016,7 @@ async def test_review_intent_remains_dispatchable_when_ordinary_slots_full(
 
         assert [i["intent_id"] for i in filtered] == ["I-review"]
     finally:
+        sw._worker_lane_gate.release(ordinary_lane)
         ordinary.cancel()
 
 
@@ -1394,6 +1409,9 @@ async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatc
     w = next(iter(task_solvers.values()))
     assert w.solver_id == "cli-pi-op"
     assert any(k == "worker_spawned" for k, _ in emitted)
+    assert sw._worker_lane_gate.snapshot() == {
+        "ordinary_active": 1, "review_active": 0,
+    }
 
     # kill it by solver_id → solver cancelled + worker_killed emitted
     sw.worker_cmds.put_nowait({"action": "kill", "solver_id": "cli-pi-op"})
@@ -1405,6 +1423,50 @@ async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatc
 
     for t in list(tasks):
         t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert sw._worker_lane_gate.snapshot() == {
+        "ordinary_active": 0, "review_active": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_apply_worker_cmds_multiple_spawns_keep_worker_and_lane_isolated(
+    challenge, tmp_path, monkeypatch,
+):
+    sw = _coordinator_swarm(
+        challenge, tmp_path, engines=["pi", "codex"], max_workers=2,
+    )
+    sw.worker_cmds = asyncio.Queue()
+    started: list[str] = []
+
+    class RecordingWorker(_FakeWorker):
+        async def run(self):
+            started.append(self.solver_id)
+
+    monkeypatch.setattr(
+        sw, "_make_cli_worker", lambda engine, **kw: RecordingWorker(engine),
+    )
+    tasks: dict = {}
+    task_solvers: dict = {}
+
+    async def emit_bb(kind, **fields):
+        return None
+
+    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "pi"})
+    sw.worker_cmds.put_nowait({"action": "spawn", "engine": "codex"})
+    await sw._apply_worker_cmds(
+        tasks=tasks,
+        task_solvers=task_solvers,
+        healthy=["pi", "codex"],
+        running_engines_fn=lambda: list(tasks.values()),
+        emit_bb=emit_bb,
+    )
+    await asyncio.gather(*tasks)
+
+    assert sorted(started) == ["cli-codex-op", "cli-pi-op"]
+    assert sw._worker_lane_gate.snapshot() == {
+        "ordinary_active": 0, "review_active": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -3138,3 +3200,37 @@ def test_sync_flags_noop_without_graph(challenge, tmp_path: Path):
     sw._found_flags = ["flag{kept}"]
     assert sw._sync_flags_from_graph() == []
     assert sw._found_flags == ["flag{kept}"]             # untouched
+
+async def test_review_factory_exception_releases_reserved_lane(
+    challenge, tmp_path: Path, monkeypatch,
+):
+    sw = _coordinator_swarm(
+        challenge, tmp_path, max_workers=1,
+        stage_policy={"coordinator": {"review": {
+            "enabled": True, "engine": "pi", "max_concurrent": 1,
+            "cooldown_events": 0,
+        }}},
+    )
+    monkeypatch.setattr(sw, "_select_review_engine", lambda healthy: "pi")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("review construction failed")
+
+    monkeypatch.setattr(sw, "_make_cli_worker", boom)
+
+    async def emit_bb(kind, **fields):
+        return None
+
+    with pytest.raises(RuntimeError, match="review construction failed"):
+        await sw._maybe_start_review(
+            trigger="operator_hint",
+            directive="audit",
+            healthy=["pi"],
+            tasks={},
+            task_solvers={},
+            emit_bb=emit_bb,
+        )
+
+    assert sw._worker_lane_gate.snapshot() == {
+        "ordinary_active": 0, "review_active": 0,
+    }

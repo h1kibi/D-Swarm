@@ -65,38 +65,61 @@
 
 ## M2 双 lane 并发（09 §10.3.2 / §10.5 基线 4-7）
 
-**现状（已核实）**：`ReasonSwarm.run` 对 fresh decisions 直接 `gather`，上限仅
+**状态（2026-08-14）**：已按 docs/09 §12.4 的 Conditional Go 修正条件实施。M2 专项、
+受影响的 Reason/Swarm 回归及空凭据全量 `uv run pytest -q` 均已通过。
+
+**实施前现状（已核实）**：`ReasonSwarm.run` 对 fresh decisions 直接 `gather`，上限仅
 `max_intents_per_reason`；`max_workers` 只在 provider 告警里当统计数；review worker 走
-ReasonSwarm 派发时**没有任何容量门**（`review_policy.max_concurrent` 只被 swarm.py 的
-mixin 使用）。既有测试 `test_review_worker_uses_reserved_capacity_when_ordinary_slots_full`
-保护"ordinary 满员时 reviewer 仍可启动"语义，不可破坏。
+ReasonSwarm 派发时没有容量门，classic Swarm 又由 `_active_review_tasks` 单独计数，存在多套
+容量语义。既有测试 `test_review_worker_uses_reserved_capacity_when_ordinary_slots_full` 保护
+"ordinary 满员时 reviewer 仍可启动"语义，不可破坏。
 
-**设计**
+**实际实现**
 
-1. 新模块 `dswarm/swarm/lane_gate.py`：
+1. 新增 `dswarm/swarm/lane_gate.py::WorkerLaneGate`，以两把 `asyncio.Semaphore` 作为 run-local
+   唯一容量所有者：ordinary = `max_workers`，review = `review_max_concurrent`。接口定稿为：
    ```python
-   class WorkerLaneGate:
-       def __init__(self, max_workers: int, review_max_concurrent: int) -> None
-       @staticmethod
-       def lane_for(mode: str) -> str          # "review" → review；其余（recon/explore/
-                                               #   bootstrap/respond/fallback/recovery）→ ordinary
-       async def acquire(self, mode: str) -> None   # 对应 semaphore，容量满则等待
-       def release(self, mode: str) -> None
-       def snapshot(self) -> dict              # {ordinary_active, review_active} 供 UI/telemetry
+   WorkerLaneGate(max_workers: int, review_max_concurrent: int)
+   lane_for(*, mode: str = "", worker_class: str = "") -> Literal["ordinary", "review"]
+   await acquire(*, mode="", worker_class="", stop_event=None, pause_event=None) -> WorkerLane
+   release(lane: WorkerLane) -> None
+   snapshot() -> {"ordinary_active": int, "review_active": int}
    ```
-   两把 `asyncio.Semaphore`：ordinary = `max_workers`，review = `review_max_concurrent`。
-2. `ReasonSwarm.__init__` 增参数 `review_max_concurrent: int = 1`；`swarm.py::
-   _run_reason_scheduler` 传 `self.review_policy.get("max_concurrent") or 1`。
-3. `_one` 改为：进入时 `await gate.acquire(decision.mode)`（**在 worker_factory 调用前**，
-   fallback/recovery/operator decision 全部经此门），`finally: gate.release(decision.mode)`。
-4. swarm.py 侧 `_maybe_start_review` 复用同一 gate 实例（Swarm 构造时创建并注入），保留
-   既有 reserved-capacity 测试语义。
+   `worker_class in {"review", "verifier"}` 与 review/verify mode 共用 reserved review lane；
+   其余 recon/explore/bootstrap/respond/fallback/recovery 归 ordinary lane。
+2. `Swarm` 构造唯一 `_worker_lane_gate` 并注入 `ReasonSwarm`，不再各自维护 semaphore；
+   `review_policy.max_concurrent=0` 原样保留并通过 `WorkerLaneDisabled` 明确拒绝，不使用 `or 1`。
+3. `ReasonSwarm._run_worker()` 在 `worker_factory` 之前 acquire、在 `finally` release，因此 initial
+   recon、fresh Reason intents、fallback、recovery 和 operator-directive decision 全部走同一 gate。
+   `DispatchDecision` 保留 `Intent.worker_class`，避免 verifier 被静默归入 ordinary lane。
+4. classic Swarm 的 direct review (`_maybe_start_review`) 与 operator spawn (`_apply_worker_cmds`)
+   也在 worker 构造前 acquire。构造异常、worker 异常、正常结束、kill/cancel，以及 task 在第一次
+   调度前被取消，均通过幂等释放闭包 + done callback 归还 permit。
+5. `ReviewCapacityMixin` 只读取 gate snapshot；`_active_review_tasks` 仅保留任务生命周期注册用途，
+   不再与 gate 双重计数。profile/account capacity 仍作为独立资格约束保留。
+6. semaphore 等待同时响应 task cancellation、`stop_event` 和 pause gate。取消与 permit 同一事件循环
+   turn 竞争时，会在清理任务 settled 后检查并归还“迟到成功”的 permit，防止隐性泄漏。
+
+**并发契约**
+
+```text
+ordinary_active <= max_workers
+review_active <= review_max_concurrent
+total_active <= max_workers + review_max_concurrent
+```
+
+这里 `max_workers` 是 ordinary lane 上限，不再被描述为包含 reserved reviewer/verifier 的全局总上限。
 
 **测试**
-- max_workers=2 + 4 个 ordinary decisions → 峰值并发恰为 2（asyncio 事件计数断言）。
-- ordinary 满员时 review 仍可启动（既有测试保持绿）。
-- 取消/异常/重试/恢复后 permit 释放：连续多轮后 `gate.snapshot()` 归零。
-- 验收映射：09 §10.5「三约束」「permit 释放不超发」。
+
+- `max_workers=2` + 4 个 ordinary decisions：峰值并发严格为 2。
+- verifier/review 共用独立 lane；ordinary 满员时 reviewer 仍可启动。
+- `review_max_concurrent=0` 明确禁用，不被提升为 1。
+- pause 不提前启动等待 worker；stop 与 task cancellation 可中断等待。
+- 普通取消、取消/permit 同 turn 竞态、worker/factory 异常和首次调度前取消均不泄漏。
+- direct review、operator spawn、ReasonSwarm 多轮结束后 `snapshot()` 归零；同一批连续 operator spawn 各自绑定正确 worker 与 permit。
+- classic Swarm 与 ReasonSwarm 使用同一 gate 实例。
+- 验收映射：09 §10.5「三约束」「permit 释放不超发」与 §12.4 八项修正条件。
 
 ---
 

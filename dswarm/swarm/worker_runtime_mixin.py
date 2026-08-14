@@ -13,6 +13,7 @@ from dswarm.solver.worker_profiles import base_engine_for_profile, direction_pro
 from dswarm.solver.workspace import ensure_workspace
 from dswarm.swarm.budget import WorkerBudgetExhausted
 from dswarm.swarm.errors import WorkerSpawnRejected
+from dswarm.swarm.lane_gate import WorkerLaneDisabled, WorkerLaneStopped
 
 
 class WorkerRuntimeMixin:
@@ -91,11 +92,15 @@ class WorkerRuntimeMixin:
     def _review_profile_limit(self, profile: dict) -> int:
         raw = profile.get("max_review_running")
         if raw in (None, "", 0):
-            raw = self.review_policy.get("max_concurrent") or 1
+            raw = self.review_policy.get("max_concurrent", 1)
         try:
             return max(0, int(raw))
         except (TypeError, ValueError):
-            return max(1, int(self.review_policy.get("max_concurrent") or 1))
+            fallback = self.review_policy.get("max_concurrent", 1)
+            try:
+                return max(0, int(fallback))
+            except (TypeError, ValueError):
+                return 1
 
     def _profile_available(self, profile: dict, role: "Optional[str]" = None) -> bool:
         pid = profile["id"]
@@ -748,18 +753,62 @@ class WorkerRuntimeMixin:
                                   reason="profile_capacity", engine=str(engine))
                     continue
                 try:
+                    lane = await self._worker_lane_gate.acquire(
+                        mode="bootstrap",
+                        worker_class="shell_agent",
+                        stop_event=getattr(self, "_reason_stop_event", None),
+                        pause_event=getattr(self, "_reason_pause_gate", None),
+                    )
+                except (WorkerLaneDisabled, WorkerLaneStopped) as exc:
+                    await emit_bb("worker_spawn_rejected", reason=str(exc),
+                                  engine=str(engine), phase="operator")
+                    continue
+                try:
                     w = self._make_cli_worker(engine, mode="bootstrap")
                 except WorkerSpawnRejected as exc:
+                    self._worker_lane_gate.release(lane)
                     await emit_bb("worker_spawn_rejected", reason=str(exc),
                                   engine=str(engine), phase="operator")
                     continue
                 except WorkerBudgetExhausted as exc:
+                    self._worker_lane_gate.release(lane)
                     await emit_bb(str(exc), spawned_total=self._spawned_total,
                                   max_total_workers=self.max_total_workers,
                                   cost_usd=self._current_cost_usd(),
                                   cost_budget_usd=self.cost_budget_usd)
                     continue
-                t = asyncio.create_task(w.run(), name=f"operator-{engine}")
+                except BaseException:
+                    self._worker_lane_gate.release(lane)
+                    raise
+
+                release_state = {"released": False}
+
+                def _release_lane_once(
+                    _lane=lane, _state=release_state,
+                ) -> None:
+                    if _state["released"]:
+                        return
+                    _state["released"] = True
+                    self._worker_lane_gate.release(_lane)
+
+                async def _run_operator_worker(
+                    _worker=w, _release=_release_lane_once,
+                ):
+                    try:
+                        return await _worker.run()
+                    finally:
+                        _release()
+
+                try:
+                    t = asyncio.create_task(
+                        _run_operator_worker(), name=f"operator-{engine}"
+                    )
+                except BaseException:
+                    _release_lane_once()
+                    raise
+                t.add_done_callback(
+                    lambda _task, _release=_release_lane_once: _release()
+                )
                 tasks[t] = engine
                 task_solvers[t] = w
                 await emit_bb("worker_spawned", worker=w.solver_id,

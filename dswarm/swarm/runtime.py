@@ -40,9 +40,12 @@ class SwarmWorkerRuntime:
     async def run(self, decision: DispatchDecision, profile: AgentProfile) -> Any:
         swarm = self.swarm
         mode = decision.mode or profile.mode or "explore"
+        lane = swarm._worker_lane_gate.lane_for(
+            mode=mode, worker_class=decision.worker_class
+        )
         role = (
             "recon" if mode == "recon"
-            else "review" if mode == "review"
+            else "review" if lane == "review"
             else "explore"
         )
         engine = profile.resolve_worker_profile(swarm.challenge.category)

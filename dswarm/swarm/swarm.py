@@ -50,6 +50,7 @@ from dswarm.solver.worker_profiles import (
 from dswarm.solver.workspace import cleanup_worker_scratch, ensure_workspace
 from dswarm.solver.container_exec import worker_image_for_profile
 from dswarm.swarm.insight_bus import InsightBus
+from dswarm.swarm.lane_gate import WorkerLaneGate
 from dswarm.swarm.stage_policy import StagePolicy
 from dswarm.swarm.shared_graph import (
     SharedGraph, SQLiteSharedGraph, canonicalize_lane, _is_runtime_infra_fact_text,
@@ -613,6 +614,15 @@ class Swarm(
         # deck draws one lane per worker (1st keeps the bare "cli-<engine>" id).
         self._label_seq: dict[str, int] = {}
         self.max_workers = max_workers
+        review_limit_raw = self.review_policy.get("max_concurrent", 1)
+        try:
+            review_limit = max(0, int(review_limit_raw))
+        except (TypeError, ValueError):
+            review_limit = 1
+        self._worker_lane_gate = WorkerLaneGate(
+            max_workers=max(0, int(max_workers)),
+            review_max_concurrent=review_limit,
+        )
         self.start_workers = start_workers
         self.reason_model = reason_model
         self.stall_seconds = stall_seconds
@@ -1506,6 +1516,7 @@ class Swarm(
             projector=projector,
             pause_event=pause_gate,
             planner_diagnostic=self.reason_planner_diagnostic,
+            lane_gate=self._worker_lane_gate,
         )
         try:
             out = await swarm.run()

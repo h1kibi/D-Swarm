@@ -657,7 +657,7 @@ def test_review_profile_capacity_is_isolated_from_explore_capacity(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_done_review_task_keeps_slot_until_profile_release(tmp_path):
+async def test_done_review_profile_stays_unavailable_until_account_release(tmp_path):
     ch = Challenge(
         id="profile-review-reap-window",
         name="profile-review-reap-window",
@@ -702,8 +702,13 @@ async def test_done_review_task_keeps_slot_until_profile_release(tmp_path):
     assert task.done()
     swarm._active_review_tasks.add(task)
 
-    assert swarm._review_capacity_available() is False
+    # Lane capacity is owned only by WorkerLaneGate; a lifecycle registry entry
+    # cannot consume a permit.  Per-profile account capacity remains an
+    # independent eligibility constraint until the account is released.
+    assert swarm._review_capacity_available() is True
     assert task in swarm._active_review_tasks
+    with pytest.raises(RuntimeError):
+        swarm._select_review_engine(["pi"])
 
     class Done:
         solver_id = "cli-pi-review"

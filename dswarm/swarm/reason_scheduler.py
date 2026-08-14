@@ -30,6 +30,7 @@ from dswarm.swarm.board import (
     PheromoneSettings,
 )
 from dswarm.solver.worker_profiles import direction_profile_name
+from dswarm.swarm.lane_gate import WorkerLaneGate
 from dswarm.solver.reason import ReasonResult
 
 WorkerFactory = Callable[
@@ -69,6 +70,8 @@ class ReasonSwarm:
         reason_debounce: float = 1.0,
         pause_event: Optional[asyncio.Event] = None,
         planner_diagnostic: Optional[dict[str, Any]] = None,
+        review_max_concurrent: int = 1,
+        lane_gate: Optional[WorkerLaneGate] = None,
     ) -> None:
         self.challenge = challenge
         self.board = board or MemoryBoard(challenge.id, pheromone=pheromone)
@@ -88,6 +91,10 @@ class ReasonSwarm:
         self.max_intents_per_reason = max(1, int(max_intents_per_reason))
         self.reason_debounce = float(reason_debounce)
         self.pause_event = pause_event
+        self.lane_gate = lane_gate or WorkerLaneGate(
+            max_workers=self.max_workers,
+            review_max_concurrent=max(0, int(review_max_concurrent)),
+        )
         self._last_reason: Optional[ReasonResult] = None
         self._executed: set[str] = set()
         self._fallback_executed = False
@@ -167,7 +174,16 @@ class ReasonSwarm:
     async def _run_worker(self, decision: DispatchDecision, profile: AgentProfile) -> Any:
         if self.worker_factory is None:
             raise RuntimeError("ReasonSwarm requires a worker_factory")
-        return await self.worker_factory(decision, profile)
+        lane = await self.lane_gate.acquire(
+            mode=decision.mode,
+            worker_class=decision.worker_class,
+            stop_event=self.stop_event,
+            pause_event=self.pause_event,
+        )
+        try:
+            return await self.worker_factory(decision, profile)
+        finally:
+            self.lane_gate.release(lane)
 
     def _provider_diag_from_outcome(self, outcome: Any, error: Optional[str]) -> dict[str, Any]:
         diag = getattr(outcome, "provider_error", None) or {}
@@ -247,7 +263,9 @@ class ReasonSwarm:
         """
         if self.graph is None:
             return
-        worker_class = "review" if decision.mode == "review" else "shell_agent"
+        worker_class = decision.worker_class or (
+            "review" if decision.mode == "review" else "shell_agent"
+        )
         try:
             self.graph.propose_intent(
                 actor="reason",
@@ -386,6 +404,7 @@ class ReasonSwarm:
                 profile=profile_id,
                 direction=it.direction or "",
                 goal=it.goal,
+                worker_class=it.worker_class,
                 from_facts=it.from_facts,
                 mode=mode,
                 priority=it.priority,

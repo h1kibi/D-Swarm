@@ -9,6 +9,7 @@ from typing import Any, Optional
 from dswarm.solver.worker_profiles import normalize_profile_roster
 from dswarm.swarm.budget import WorkerBudgetExhausted
 from dswarm.swarm.errors import WorkerSpawnRejected
+from dswarm.swarm.lane_gate import WorkerLaneDisabled, WorkerLaneStopped
 from dswarm.swarm.shared_graph import canonicalize_lane
 
 
@@ -295,22 +296,63 @@ class ReviewFlowMixin:
             await emit_bb("worker_spawn_rejected", reason=str(exc), phase="review")
             return False
         try:
+            lane = await self._worker_lane_gate.acquire(
+                mode="review",
+                worker_class="review",
+                stop_event=getattr(self, "_reason_stop_event", None),
+                pause_event=getattr(self, "_reason_pause_gate", None),
+            )
+        except (WorkerLaneDisabled, WorkerLaneStopped) as exc:
+            await emit_bb("worker_spawn_rejected", reason=str(exc), phase="review")
+            return False
+        try:
             w = self._make_cli_worker(
                 engine, mode="review", intent_goal=directive)
         except WorkerSpawnRejected as exc:
+            self._worker_lane_gate.release(lane)
             await emit_bb("worker_spawn_rejected", reason=str(exc),
                           engine=str(engine), phase="review")
             return False
         except WorkerBudgetExhausted as exc:
+            self._worker_lane_gate.release(lane)
             await emit_bb(str(exc), spawned_total=self._spawned_total,
                           max_total_workers=self.max_total_workers,
                           cost_usd=self._current_cost_usd(),
                           cost_budget_usd=self.cost_budget_usd)
             return False
-        t = asyncio.create_task(w.run(), name=f"review-{engine}")
+        except BaseException:
+            self._worker_lane_gate.release(lane)
+            raise
+
+        lane_released = False
+
+        def _release_lane_once() -> None:
+            nonlocal lane_released
+            if lane_released:
+                return
+            lane_released = True
+            self._worker_lane_gate.release(lane)
+
+        async def _run_review_worker():
+            try:
+                return await w.run()
+            finally:
+                _release_lane_once()
+
+        try:
+            t = asyncio.create_task(_run_review_worker(), name=f"review-{engine}")
+        except BaseException:
+            _release_lane_once()
+            raise
         tasks[t] = engine
         task_solvers[t] = w
         self._active_review_tasks.add(t)
+
+        def _review_done(done_task) -> None:
+            self._active_review_tasks.discard(done_task)
+            _release_lane_once()
+
+        t.add_done_callback(_review_done)
         self._review_workers_spawned += 1
         self._last_review_seq = seq
         self._completed_workers_since_review = 0
