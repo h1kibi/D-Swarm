@@ -65,6 +65,7 @@ def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
 
     assert env["HOME"] == f"{CONTAINER_WORKSPACE}/workers/_homes/cli-pi"
     assert env["DSWARM_BLACKBOARD_DB"] == f"{CONTAINER_WORKSPACE}/graph/shared_graph.db"
+    assert env["DSWARM_CHALLENGE_ID"] == "env-map"
 
 
 def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):

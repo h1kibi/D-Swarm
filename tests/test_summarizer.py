@@ -58,7 +58,8 @@ def test_fact_summary_written_back_to_payload():
     assert g.record_fact_summary(fact_seq=fs, summary="真flag在:3010后端") is True
     import json
     row = g._conn.execute("SELECT payload FROM events WHERE seq=?", (fs,)).fetchone()
-    assert json.loads(row[0])["summary"] == "真flag在:3010后端"
+    assert "summary" not in json.loads(row[0])  # immutable genesis row
+    assert g.effective_fact(fs)["summary"] == "真flag在:3010后端"
     # guards
     assert g.record_fact_summary(fact_seq=999999, summary="x") is False
     assert g.record_fact_summary(fact_seq=fs, summary="") is False
@@ -103,10 +104,11 @@ def test_summarize_node_stores_and_emits():
         node_kind="fact", fact_seq=fs, shared_graph=g,
         llm=_FakeLLM(), bus=bus, run_id="run-x", challenge_id="t1"))
     assert out == "真flag在:3010后端,需smuggling绕nginx"
-    # stored on the graph
+    # stored as a canonical transition, without mutating the genesis event
     import json
     row = g._conn.execute("SELECT payload FROM events WHERE seq=?", (fs,)).fetchone()
-    assert json.loads(row[0])["summary"] == out
+    assert "summary" not in json.loads(row[0])
+    assert g.effective_fact(fs)["summary"] == out
     # emitted exactly one NODE_SUMMARIZED carrying the gist + node id
     assert len(bus.events) == 1
     ev = bus.events[0]

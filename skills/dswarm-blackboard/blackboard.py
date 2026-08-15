@@ -360,22 +360,14 @@ def _has_table(c: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
-def _retired_fact_seqs(c: sqlite3.Connection) -> set:
-    """fact_seqs in a terminal lifecycle state (rejected/merged/superseded) — these
-    must NOT be shown to workers as evidence. Empty on an old DB without fact_states."""
-    if not _has_table(c, "fact_states"):
-        return set()
-    try:
-        rows = c.execute(
-            "SELECT fact_seq FROM fact_states "
-            "WHERE state IN ('rejected','merged','superseded') OR retired_seq IS NOT NULL"
-        ).fetchall()
-    except Exception:
-        return set()
-    return {int(r[0]) for r in rows}
-
-
 def _challenge_id(c: sqlite3.Connection) -> str:
+    # Prefer the coordinator-provided scope. A fresh graph has no event or intent
+    # row to infer it from, so writing with an empty challenge_id would hide the
+    # fact from the challenge-scoped fact_effective view.
+    explicit = (os.environ.get("DSWARM_CHALLENGE_ID") or "").strip()
+    if explicit:
+        return explicit
+
     # Pick the first NON-EMPTY challenge_id. Some events are written with an empty
     # challenge_id, and a bare `LIMIT 1` could grab one of those — then claim's
     # `WHERE challenge_id=?` matched nothing and always returned LOST even for an
@@ -396,24 +388,45 @@ def _challenge_id(c: sqlite3.Connection) -> str:
 
 def read_facts(verified_only: bool) -> None:
     c = _conn()
-    retired = _retired_fact_seqs(c)
-    q = ("SELECT seq, payload, verified, confidence FROM events "
-         "WHERE kind='fact_added' ORDER BY seq")
+    # M3 makes fact_effective the only safe read model: raw events contain the
+    # immutable candidate row while promotion/lifecycle state lives in later
+    # events. Never silently fall back to events.verified on an un-migrated DB.
+    view = c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='view' AND name='fact_effective'"
+    ).fetchone()
+    if view is None:
+        print("(blackboard requires explicit M3 database migration before facts can be read)")
+        return
+    cid = _challenge_id(c)
+    sql = (
+        "SELECT fact_text, fact_source, verified, confidence, retired, summary, state "
+        "FROM fact_effective WHERE challenge_id=?"
+    )
+    args: list[object] = [cid]
+    if verified_only:
+        sql += " AND verified=1"
+    sql += " ORDER BY fact_seq"
+    try:
+        rows = c.execute(sql, args).fetchall()
+    except sqlite3.DatabaseError as exc:
+        print(f"ERROR: effective fact view unavailable: {exc}", file=sys.stderr)
+        return
     out = []
-    for seq, payload, verified, conf in c.execute(q).fetchall():
-        if int(seq) in retired:
-            continue  # rejected/merged/superseded by review — not evidence
-        if verified_only and not verified:
+    for fact, source, verified, conf, retired, summary, state in rows:
+        if int(retired or 0):
             continue
-        d = json.loads(payload)
-        out.append({"fact": d.get("fact", ""), "source": d.get("source", ""),
-                    "verified": bool(verified), "confidence": conf})
+        out.append({
+            "fact": str(fact or ""), "source": str(source or ""),
+            "verified": bool(verified), "confidence": float(conf or 0.0),
+            "summary": str(summary or ""), "state": str(state or ""),
+        })
     if not out:
         print("(no facts on the board yet)")
         return
     for f in out:
         tag = "VERIFIED" if f["verified"] else f"candidate({f['confidence']:.1f})"
-        print(f"[{tag}] ({f['source']}) {f['fact']}")
+        summary = f" — {f['summary']}" if f["summary"] else ""
+        print(f"[{tag}] ({f['source']}) {f['fact']}{summary}")
 
 
 def read_flags() -> None:
@@ -531,16 +544,29 @@ def read_review() -> None:
             print(f"- #{seq} [{sev}/{kind}] {actor}:{route} {d.get('summary', '')}")
 
     challenged: list[tuple] = []
-    if _table_exists(c, "fact_reviews"):
+    view = c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='view' AND name='fact_effective'"
+    ).fetchone()
+    if view is not None:
+        cid = _challenge_id(c)
         challenged = c.execute(
-            "SELECT fact_seq, status, reason, verification_intent_id "
-            "FROM fact_reviews WHERE status='challenged' ORDER BY challenged_seq"
+            "SELECT f.fact_seq, f.fact_text, "
+            "json_extract(e.payload, '$.reason'), "
+            "json_extract(e.payload, '$.verification_intent_id') "
+            "FROM fact_effective f "
+            "LEFT JOIN events e ON e.seq=("
+            "SELECT MAX(e2.seq) FROM events e2 "
+            "WHERE e2.challenge_id=f.challenge_id "
+            "AND e2.kind='fact_challenged' "
+            "AND json_extract(e2.payload, '$.fact_seq')=f.fact_seq) "
+            "WHERE f.challenge_id=? AND f.state='challenged' AND f.retired=0 "
+            "ORDER BY e.seq",
+            (cid,),
         ).fetchall()
     if challenged:
         print("\n## Challenged facts — do NOT rely on these until verified")
-        for fact_seq, status, reason, verification_intent_id in challenged:
-            fact = _event_payload_by_seq(c, int(fact_seq)).get("fact", "")
-            print(f"- fact #{fact_seq}: {fact}")
+        for fact_seq, fact, reason, verification_intent_id in challenged:
+            print(f"- fact #{fact_seq}: {fact or ''}")
             print(f"  reason: {reason or ''}")
             if verification_intent_id:
                 print(f"  verify intent: {verification_intent_id}")

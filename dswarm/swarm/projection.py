@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from dswarm.core.events import Event, EventType, blackboard_delta_payload
-from dswarm.swarm.board import Board, Finding, FindingKind, StructuredFinding
+from dswarm.swarm.board import (
+    Board, Finding, FindingKind, ReplacementOutcome, StructuredFinding,
+)
 
 
 class BoardProjector:
@@ -87,32 +89,104 @@ class BoardProjector:
             source_seq=int(ev.get("seq") or 0),
         )
 
+    @staticmethod
+    def _project_effective_fact(item: dict[str, Any], promotion_seq: int) -> Optional[Finding]:
+        fact = str(item.get("fact_text") or "")
+        if not fact:
+            return None
+        finding_kind = str(item.get("finding_kind") or "") or FindingKind.TEXT_FACT
+        target = str(item.get("finding_target") or "") or fact
+        data = {
+            "fact": fact,
+            "verified": bool(item.get("verified")),
+            "confidence": float(item.get("confidence") or 0.0),
+            "source": str(item.get("source") or item.get("fact_source") or ""),
+            "artifact_id": str(item.get("artifact_id") or ""),
+            "witness": str(item.get("witness") or ""),
+            **dict(item.get("finding_data") or {}),
+            "promotion": {
+                "seq": int(promotion_seq),
+                "actor": str(item.get("promotion_actor") or ""),
+                "witness": str(item.get("witness") or ""),
+                "verifier": str(item.get("verifier") or ""),
+                "source": str(item.get("source") or item.get("fact_source") or ""),
+                "artifact_id": str(item.get("promotion_artifact_id") or ""),
+            },
+        }
+        return Finding(
+            challenge_id=str(item.get("challenge_id") or ""),
+            kind=finding_kind,
+            agent_name=str(item.get("promotion_actor") or item.get("fact_actor") or "worker"),
+            target=target,
+            payload=data,
+            source_seq=int(item.get("fact_seq") or 0),
+        )
+
     def sync(self, graph: Any) -> int:
-        events = graph.events_since(self.after_seq, kinds=("fact_added",))
-        last = self.after_seq
+        events = graph.events_since(
+            self.after_seq, kinds=("fact_added", "fact_verified")
+        )
         for ev in events:
             seq = int(ev.get("seq") or 0)
             if seq <= self.after_seq:
                 continue
-            projected = self.project_event(ev)
-            if projected is not None:
-                projected.challenge_id = projected.challenge_id or getattr(
-                    self.board, "challenge_id", ""
+            kind = str(ev.get("kind") or "")
+            if kind == "fact_verified":
+                payload = dict(ev.get("payload") or {})
+                fact_seq = int(payload.get("fact_seq") or 0)
+                effective = graph.effective_fact(fact_seq)
+                projected = (
+                    self._project_effective_fact(effective, seq)
+                    if effective is not None else None
                 )
-                finding = self.board.write_finding(
-                    challenge_id=projected.challenge_id,
-                    kind=projected.kind,
-                    agent_name=projected.agent_name,
-                    target=projected.target,
-                    payload=projected.payload,
-                    source_seq=seq,
-                )
-                self._emit_upsert(finding, seq)
-            last = max(last, seq)
-        self.after_seq = last
-        return last
+                if projected is not None:
+                    projected.challenge_id = projected.challenge_id or getattr(
+                        self.board, "challenge_id", ""
+                    )
+                    projection_key = f"fact:{fact_seq}:promotion:{seq}"
+                    result = self.board.replace_by_source(
+                        source_seq=fact_seq,
+                        finding=projected,
+                        projection_key=projection_key,
+                    )
+                    if result.outcome != ReplacementOutcome.ALREADY_APPLIED:
+                        transition = {
+                            "transition_seq": seq,
+                            "projection_key": projection_key,
+                        }
+                        if result.outcome == ReplacementOutcome.REPLACED:
+                            transition["supersedes_source_seq"] = fact_seq
+                        self._emit_upsert(result.finding, fact_seq, **transition)
+            else:
+                projected = self.project_event(ev)
+                if projected is not None:
+                    projected.challenge_id = projected.challenge_id or getattr(
+                        self.board, "challenge_id", ""
+                    )
+                    fact_seq = int(projected.source_seq or seq)
+                    projection_key = f"fact:{fact_seq}:base"
+                    result = self.board.replace_by_source(
+                        source_seq=fact_seq,
+                        finding=projected,
+                        projection_key=projection_key,
+                    )
+                    if result.outcome != ReplacementOutcome.ALREADY_APPLIED:
+                        transition = {"projection_key": projection_key}
+                        if result.outcome == ReplacementOutcome.REPLACED:
+                            transition["supersedes_source_seq"] = fact_seq
+                        self._emit_upsert(result.finding, fact_seq, **transition)
+            # Advance only after this event was fully projected (or deliberately
+            # skipped as malformed). Exceptions leave the cursor at the last
+            # successfully processed event so replay is safe.
+            self.after_seq = seq
+        return self.after_seq
 
-    def _emit_upsert(self, finding: Finding, source_seq: int) -> None:
+    def _emit_upsert(
+        self,
+        finding: Finding,
+        source_seq: int,
+        **transition: Any,
+    ) -> None:
         """Fire-and-forget ``finding_upserted`` delta (docs/07 §7.1).
 
         Carries only immutable parameters (base / half-life / created_at);
@@ -145,6 +219,7 @@ class BoardProjector:
                     pheromone_half_life_sec=int(finding.half_life_sec),
                     pheromone_created_at=created_at,
                     experimental=True,
+                    **transition,
                 ),
             )
             task = asyncio.get_running_loop().create_task(self._emit_safe(event))

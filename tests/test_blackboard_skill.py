@@ -35,7 +35,8 @@ def _run(db, *args, worker="cli-pi", intent_id="", cwd=None):
     # parent runs in UTF-8 mode (pytest -X utf8) and would otherwise try to
     # decode a GBK-cp936 console stream on a Chinese-locale Windows host.
     env = {**os.environ, "PYTHONUTF8": "1",
-           "DSWARM_BLACKBOARD_DB": str(db), "DSWARM_WORKER_ID": worker}
+           "DSWARM_BLACKBOARD_DB": str(db), "DSWARM_WORKER_ID": worker,
+           "DSWARM_CHALLENGE_ID": "c1"}
     # The SQLite skill tests must not inherit a developer's HTTP-mode settings.
     for key in ("DSWARM_BLACKBOARD_URL", "DSWARM_BLACKBOARD_RUN_ID",
                 "DSWARM_BLACKBOARD_TOKEN"):

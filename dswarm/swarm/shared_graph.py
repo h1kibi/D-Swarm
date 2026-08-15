@@ -40,6 +40,14 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from dswarm.models.solve_graph import Challenge, SolveGraph
 from dswarm.solver.result_codes import is_genuine_giveup
 from dswarm.swarm.board import StructuredFinding
+from dswarm.swarm.fact_events import (
+    FACT_EFFECTIVE_SELECT,
+    SCHEMA_USER_VERSION,
+    backup_database,
+    install_fact_event_contract,
+    require_supported_version,
+    user_version,
+)
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 
 
@@ -60,6 +68,8 @@ EV_POC_CONCLUDED = "poc_concluded"
 EV_REVIEW_FINDING = "review_finding"
 EV_FACT_CHALLENGED = "fact_challenged"
 EV_FACT_REVALIDATED = "fact_revalidated"
+EV_FACT_VERIFIED = "fact_verified"
+EV_FACT_SUMMARIZED = "fact_summarized"
 EV_ROUTE_SUPPRESSED = "route_suppressed"
 EV_ROUTE_REOPENED = "route_reopened"
 EV_BRANCH_SPLIT = "branch_split"
@@ -88,7 +98,7 @@ EV_GRAPH_COMPACTED = "graph_compacted"
 
 
 # A: fact lifecycle states. unresolved/challenged/revalidated keep the legacy
-# fact_reviews semantics; rejected/merged/superseded are the new terminal states.
+# Immutable lifecycle event semantics; rejected/merged/superseded are terminal states.
 FACT_STATE_UNRESOLVED = "unresolved"
 FACT_STATE_CHALLENGED = "challenged"
 FACT_STATE_REVALIDATED = "revalidated"
@@ -574,6 +584,7 @@ CREATE TABLE IF NOT EXISTS routes (
     reason         TEXT,
     until_policy   TEXT
 );
+-- Legacy, non-canonical review cache (intentionally unmaintained by M3).
 CREATE TABLE IF NOT EXISTS fact_reviews (
     fact_seq        INTEGER PRIMARY KEY,
     challenge_id    TEXT NOT NULL,
@@ -594,7 +605,8 @@ CREATE TABLE IF NOT EXISTS branches (
     created_seq   INTEGER NOT NULL,
     resolved_seq  INTEGER
 );
--- A: current lifecycle state per fact (fact_reviews stays the action history).
+-- Legacy compatibility tables retained so pre-M3 tools can still inspect/open the DB.
+-- M3 never writes or reads them; immutable events + fact_effective are canonical.
 CREATE TABLE IF NOT EXISTS fact_states (
     fact_seq      INTEGER PRIMARY KEY,
     challenge_id  TEXT NOT NULL,
@@ -620,7 +632,7 @@ CREATE TABLE IF NOT EXISTS fact_pins (
     reason        TEXT,
     pinned_seq    INTEGER NOT NULL
 );
--- A: fact merge edges (from_fact folded into to_fact).
+-- Legacy, non-canonical merge cache (intentionally unmaintained by M3).
 CREATE TABLE IF NOT EXISTS fact_merges (
     from_fact_seq INTEGER NOT NULL,
     to_fact_seq   INTEGER NOT NULL,
@@ -708,19 +720,27 @@ class SQLiteSharedGraph:
     # that a productive worker emitting many distinct findings isn't starved.
     CANDIDATE_CAP_PER_SOURCE_NOROUTE = 60
     MAX_LANE_DEFERRALS = 5
+    SUPPORTED_USER_VERSION = SCHEMA_USER_VERSION
 
     def __init__(self, db_path: str | Path, challenge: Challenge,
                  artifacts: Any = None) -> None:
         self.db_path = str(db_path)
         self.challenge = challenge
         self.artifacts = artifacts  # ArtifactStore, for the P-B gate
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        db_file = Path(self.db_path)
+        is_new_database = not db_file.exists() or db_file.stat().st_size == 0
+        db_file.parent.mkdir(parents=True, exist_ok=True)
         # (A) one connection + one-time PRAGMA. check_same_thread=False so the
         # async solver tasks (same loop, possibly different threads) can share it;
         # we guard writes with a lock since sqlite3 module objects aren't
         # thread-safe for concurrent use on one connection.
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._lock = threading.Lock()
+        try:
+            require_supported_version(self._conn, self.SUPPORTED_USER_VERSION)
+        except Exception:
+            self._conn.close()
+            raise
         cur = self._conn.cursor()
         cur.execute("PRAGMA journal_mode=DELETE")
         cur.execute("PRAGMA busy_timeout=5000")      # fixes lost-write: auto-queue
@@ -790,6 +810,10 @@ class SQLiteSharedGraph:
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
+        # Fresh databases start directly on the immutable event contract. Existing
+        # pre-v2 databases require an explicit, snapshotted migrate_to_v2() call.
+        if is_new_database or user_version(self._conn) == self.SUPPORTED_USER_VERSION:
+            install_fact_event_contract(self._conn)
 
     def _table_exists(self, name: str) -> bool:
         with self._lock:
@@ -798,6 +822,94 @@ class SQLiteSharedGraph:
                 (name,),
             ).fetchone()
         return row is not None
+
+    def _view_exists(self, name: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='view' AND name=?",
+                (name,),
+            ).fetchone()
+        return row is not None
+
+    def migrate_to_v2(self, *, backup_path: str | Path) -> Path:
+        """Install the immutable M3 event contract after taking a DB snapshot.
+
+        The version bump is the final migration write.  Historical transition
+        corruption raises with the offending event seq and leaves user_version
+        unchanged; the returned backup is the only supported rollback artifact.
+        """
+        with self._lock:
+            current = require_supported_version(
+                self._conn, self.SUPPORTED_USER_VERSION
+            )
+            backup = backup_database(self._conn, backup_path)
+            if current < self.SUPPORTED_USER_VERSION:
+                install_fact_event_contract(self._conn)
+            return backup
+
+    @staticmethod
+    def _effective_row(row: sqlite3.Row | tuple, columns: list[str]) -> dict[str, Any]:
+        item = dict(zip(columns, row))
+        for key in ("base_verified", "retired", "verified"):
+            item[key] = bool(item.get(key))
+        raw_finding = item.get("finding_data")
+        if isinstance(raw_finding, str):
+            try:
+                item["finding_data"] = json.loads(raw_finding)
+            except (TypeError, json.JSONDecodeError):
+                item["finding_data"] = {}
+        elif raw_finding is None:
+            item["finding_data"] = {}
+        return item
+
+    def effective_facts(self, *, verified_only: bool = False,
+                        active_only: bool = False) -> list[dict[str, Any]]:
+        """Return the typed effective fact projection without mutating genesis rows."""
+        source = "fact_effective" if self._view_exists("fact_effective") else f"({FACT_EFFECTIVE_SELECT})"
+        sql = f"SELECT * FROM {source} WHERE challenge_id=?"
+        params: list[Any] = [self.challenge.id]
+        if verified_only:
+            sql += " AND verified=1"
+        if active_only:
+            sql += " AND retired=0"
+        sql += " ORDER BY fact_seq"
+        with self._lock:
+            cur = self._conn.execute(sql, tuple(params))
+            columns = [str(col[0]) for col in cur.description]
+            rows = cur.fetchall()
+        return [self._effective_row(row, columns) for row in rows]
+
+    def effective_fact(self, fact_seq: int) -> Optional[dict[str, Any]]:
+        for item in self.effective_facts():
+            if int(item["fact_seq"]) == int(fact_seq):
+                return item
+        return None
+
+    def _require_fact_target(self, fact_seq: int) -> dict[str, Any]:
+        item = self.effective_fact(int(fact_seq))
+        if item is None:
+            raise ValueError(f"fact_seq {int(fact_seq)} is not a same-challenge fact_added event")
+        return item
+
+    def _append_fact_promotion(
+        self, *, actor: str, fact_seq: int, confidence: float,
+        artifact_id: Optional[str], witness: Optional[str], verifier: str, source: str,
+    ) -> int:
+        target = self._require_fact_target(fact_seq)
+        if target["base_verified"]:
+            return -1
+        payload = {
+            "fact_seq": int(fact_seq),
+            "confidence": float(confidence),
+            "witness": witness or "",
+            "verifier": verifier or "",
+            "source": source or target.get("fact_source") or "",
+        }
+        return self._append(
+            EV_FACT_VERIFIED, actor, payload, artifact_id=artifact_id,
+            verified=False, confidence=1.0,
+            dedupe_key=f"fact_verified::{int(fact_seq)}",
+        )
 
     # ── classmethod ctor ────────────────────────────────────────────────
     @classmethod
@@ -832,6 +944,11 @@ class SQLiteSharedGraph:
         inst._lock = threading.Lock()
         # URI mode=ro: open the file read-only at the SQLite VFS layer.
         inst._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        try:
+            require_supported_version(inst._conn, cls.SUPPORTED_USER_VERSION)
+        except Exception:
+            inst._conn.close()
+            raise
         cur = inst._conn.cursor()
         # query_only blocks ANY write DDL/DML even if a caller tried; belt+suspenders
         # on top of mode=ro. These PRAGMAs are read-only-safe.
@@ -861,9 +978,17 @@ class SQLiteSharedGraph:
                 self._conn.commit()
                 return int(cur.lastrowid or 0)
             except sqlite3.IntegrityError:
-                # dedupe_key collision → same event already appended; no-op.
                 self._conn.rollback()
-                return -1
+                # Only a real dedupe-key collision is an idempotent no-op.
+                # Trigger/schema violations remain visible to the caller.
+                if dedupe_key:
+                    row = self._conn.execute(
+                        "SELECT 1 FROM events WHERE challenge_id=? AND dedupe_key=?",
+                        (self.challenge.id, dedupe_key),
+                    ).fetchone()
+                    if row is not None:
+                        return -1
+                raise
 
     def add_evidence(self, *, actor: str, source: str, fact: str,
                      artifact_id: Optional[str] = None, verified: bool = False,
@@ -942,12 +1067,11 @@ class SQLiteSharedGraph:
                     (self.challenge.id, EV_FACT_ADDED, dk),
                 ).fetchone()
             if row and verified and not int(row[1] or 0):
-                with self._lock:
-                    self._conn.execute(
-                        "UPDATE events SET verified=1, confidence=? WHERE seq=?",
-                        (float(confidence), int(row[0])),
-                    )
-                    self._conn.commit()
+                self._append_fact_promotion(
+                    actor=actor, fact_seq=int(row[0]), confidence=float(confidence),
+                    artifact_id=artifact_id, witness=witness, verifier=verifier,
+                    source=source,
+                )
         product_seq = seq
         if product_seq <= 0 and iid:
             with self._lock:
@@ -1191,6 +1315,7 @@ class SQLiteSharedGraph:
     def challenge_fact(self, *, actor: str, fact_seq: int, reason: str,
                        verification_goal: str) -> dict:
         fact_seq = int(fact_seq)
+        self._require_fact_target(fact_seq)
         goal = (verification_goal or f"Verify fact #{fact_seq}: {reason}").strip()
         h = hashlib.sha1(f"{fact_seq}:{goal}".encode("utf-8", "ignore")).hexdigest()[:8]
         intent_id = f"I-verify-{fact_seq}-{h}"
@@ -1203,23 +1328,9 @@ class SQLiteSharedGraph:
         }
         seq = self._append(EV_FACT_CHALLENGED, actor, payload,
                            dedupe_key=f"fact-challenged::{fact_seq}::{payload['reason']}")
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO fact_reviews "
-                "(fact_seq, challenge_id, status, challenged_seq, reason, verification_intent_id) "
-                "VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(fact_seq) DO UPDATE SET "
-                " status='challenged', challenged_seq=excluded.challenged_seq, "
-                " reason=excluded.reason, verification_intent_id=excluded.verification_intent_id",
-                (fact_seq, self.challenge.id, "challenged",
-                 seq if seq > 0 else None, payload["reason"], intent_id),
-            )
-            self._upsert_fact_state(
-                fact_seq, FACT_STATE_CHALLENGED,
-                reason=payload["reason"], challenged_seq=seq if seq > 0 else None,
-                verification_intent_id=intent_id,
-                verified_effective=0, confidence_effective=0.4, updated_seq=seq)
-            self._conn.commit()
+        if seq <= 0:
+            return {"fact_seq": fact_seq, "verification_intent_id": intent_id,
+                    "seq": seq, "reason": payload["reason"]}
         self.propose_intent(
             actor=actor, intent_id=intent_id, goal=goal,
             payload={"worker_class": "verifier", "depends_on": [str(fact_seq)],
@@ -1231,6 +1342,7 @@ class SQLiteSharedGraph:
 
     def revalidate_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int:
         fact_seq = int(fact_seq)
+        self._require_fact_target(fact_seq)
         payload = {
             "fact_seq": fact_seq,
             "status": "revalidated",
@@ -1239,102 +1351,30 @@ class SQLiteSharedGraph:
         }
         seq = self._append(EV_FACT_REVALIDATED, actor, payload,
                            dedupe_key=f"fact-revalidated::{fact_seq}::{payload['reason']}")
-        # revalidate effectively restores the fact's verified verdict (defect-4: the
-        # legacy path wrote status but the snapshot still leaned on events.verified).
-        orig_verified, orig_conf = self._fact_origin_verdict(fact_seq)
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO fact_reviews "
-                "(fact_seq, challenge_id, status, revalidated_seq, reason) "
-                "VALUES (?,?,?,?,?) "
-                "ON CONFLICT(fact_seq) DO UPDATE SET "
-                " status='revalidated', revalidated_seq=excluded.revalidated_seq, "
-                " reason=excluded.reason",
-                (fact_seq, self.challenge.id, "revalidated",
-                 seq if seq > 0 else None, payload["reason"]),
-            )
-            self._upsert_fact_state(
-                fact_seq, FACT_STATE_REVALIDATED, reason=payload["reason"],
-                revalidated_seq=seq if seq > 0 else None,
-                verified_effective=1 if orig_verified else 0,
-                confidence_effective=orig_conf, updated_seq=seq)
-            self._conn.commit()
+        if seq <= 0:
+            return seq
         return seq
 
     # ── A: fact lifecycle (reject / merge / supersede) ──────────────────
-    def _fact_origin_verdict(self, fact_seq: int) -> tuple[bool, float]:
-        """The fact's original verified/confidence from the append-only event."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT verified, confidence FROM events WHERE seq=? AND kind=?",
-                (int(fact_seq), EV_FACT_ADDED),
-            ).fetchone()
-        if not row:
+    def _fact_base_verdict(self, fact_seq: int) -> tuple[bool, float]:
+        """The immutable genesis verdict folded with any promotion event."""
+        item = self.effective_fact(int(fact_seq))
+        if item is None:
             return (False, 0.0)
-        return (bool(row[0]), float(row[1] if row[1] is not None else 1.0))
-
-    def _upsert_fact_state(self, fact_seq: int, state: str, *,
-                           reason: str = "", verified_effective: Optional[int] = None,
-                           confidence_effective: Optional[float] = None,
-                           challenged_seq: Optional[int] = None,
-                           revalidated_seq: Optional[int] = None,
-                           rejected_seq: Optional[int] = None,
-                           merged_seq: Optional[int] = None,
-                           superseded_seq: Optional[int] = None,
-                           retired_seq: Optional[int] = None,
-                           verification_intent_id: Optional[str] = None,
-                           updated_seq: Optional[int] = None) -> None:
-        """Write the current lifecycle state for a fact. Caller holds self._lock.
-
-        Only non-None transition seqs / effective verdicts overwrite existing
-        columns (COALESCE), so a later reject doesn't blank an earlier challenge's
-        challenged_seq. `state`, `reason`, and effective verdicts always win."""
-        state = state if state in _FACT_STATES else FACT_STATE_UNRESOLVED
-        self._conn.execute(
-            "INSERT INTO fact_states "
-            "(fact_seq, challenge_id, state, verified_effective, confidence_effective, "
-            " reason, challenged_seq, revalidated_seq, rejected_seq, merged_seq, "
-            " superseded_seq, retired_seq, verification_intent_id, updated_seq) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(fact_seq) DO UPDATE SET "
-            " state=excluded.state, reason=excluded.reason, "
-            " verified_effective=COALESCE(excluded.verified_effective, fact_states.verified_effective), "
-            " confidence_effective=COALESCE(excluded.confidence_effective, fact_states.confidence_effective), "
-            " challenged_seq=COALESCE(excluded.challenged_seq, fact_states.challenged_seq), "
-            " revalidated_seq=COALESCE(excluded.revalidated_seq, fact_states.revalidated_seq), "
-            " rejected_seq=COALESCE(excluded.rejected_seq, fact_states.rejected_seq), "
-            " merged_seq=COALESCE(excluded.merged_seq, fact_states.merged_seq), "
-            " superseded_seq=COALESCE(excluded.superseded_seq, fact_states.superseded_seq), "
-            " retired_seq=COALESCE(excluded.retired_seq, fact_states.retired_seq), "
-            " verification_intent_id=COALESCE(excluded.verification_intent_id, fact_states.verification_intent_id), "
-            " updated_seq=COALESCE(excluded.updated_seq, fact_states.updated_seq)",
-            (int(fact_seq), self.challenge.id, state, verified_effective,
-             confidence_effective, reason or None, challenged_seq, revalidated_seq,
-             rejected_seq, merged_seq, superseded_seq, retired_seq,
-             verification_intent_id, updated_seq),
-        )
+        return (bool(item["base_verified"]), float(item.get("base_confidence") or 0.0))
 
     def reject_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int:
         """Mark a fact REJECTED — review proved it false. It is retired from the
         active candidate set and excluded from snapshots / Reason summaries, but the
         originating event stays (audit trail)."""
         fact_seq = int(fact_seq)
+        self._require_fact_target(fact_seq)
         payload = {"fact_seq": fact_seq, "status": FACT_STATE_REJECTED,
                    "reason": (reason or "").strip()[:1000], "rejected_by": actor}
         seq = self._append(EV_FACT_REJECTED, actor, payload,
                            dedupe_key=f"fact-rejected::{fact_seq}::{payload['reason']}")
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO fact_reviews (fact_seq, challenge_id, status, reason) "
-                "VALUES (?,?,?,?) ON CONFLICT(fact_seq) DO UPDATE SET "
-                " status='rejected', reason=excluded.reason",
-                (fact_seq, self.challenge.id, FACT_STATE_REJECTED, payload["reason"]),
-            )
-            self._upsert_fact_state(
-                fact_seq, FACT_STATE_REJECTED, reason=payload["reason"],
-                rejected_seq=seq if seq > 0 else None, retired_seq=seq if seq > 0 else None,
-                verified_effective=0, confidence_effective=0.0, updated_seq=seq)
-            self._conn.commit()
+        if seq <= 0:
+            return seq
         return seq
 
     def merge_fact(self, *, actor: str, from_fact_seq: int, to_fact_seq: int,
@@ -1344,30 +1384,15 @@ class SQLiteSharedGraph:
         from_seq, to_seq = int(from_fact_seq), int(to_fact_seq)
         if from_seq == to_seq:
             return -1
+        self._require_fact_target(from_seq)
+        self._require_fact_target(to_seq)
         payload = {"from_fact_seq": from_seq, "to_fact_seq": to_seq,
                    "status": FACT_STATE_MERGED, "reason": (reason or "").strip()[:1000],
                    "merged_by": actor}
         seq = self._append(EV_FACT_MERGED, actor, payload,
                            dedupe_key=f"fact-merged::{from_seq}::{to_seq}")
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO fact_merges "
-                "(from_fact_seq, to_fact_seq, challenge_id, merge_seq, reason) "
-                "VALUES (?,?,?,?,?)",
-                (from_seq, to_seq, self.challenge.id, seq if seq > 0 else 0,
-                 payload["reason"]),
-            )
-            self._conn.execute(
-                "INSERT INTO fact_reviews (fact_seq, challenge_id, status, reason) "
-                "VALUES (?,?,?,?) ON CONFLICT(fact_seq) DO UPDATE SET "
-                " status='merged', reason=excluded.reason",
-                (from_seq, self.challenge.id, FACT_STATE_MERGED, payload["reason"]),
-            )
-            self._upsert_fact_state(
-                from_seq, FACT_STATE_MERGED, reason=payload["reason"],
-                merged_seq=seq if seq > 0 else None, retired_seq=seq if seq > 0 else None,
-                verified_effective=0, updated_seq=seq)
-            self._conn.commit()
+        if seq <= 0:
+            return seq
         return seq
 
     def supersede_fact(self, *, actor: str, fact_seq: int, reason: str = "",
@@ -1375,24 +1400,17 @@ class SQLiteSharedGraph:
         """Mark a fact SUPERSEDED — a newer fact replaces it. Retired from the
         active set; kept for audit."""
         fact_seq = int(fact_seq)
+        self._require_fact_target(fact_seq)
+        if by_fact_seq is not None:
+            self._require_fact_target(int(by_fact_seq))
         payload = {"fact_seq": fact_seq, "status": FACT_STATE_SUPERSEDED,
                    "reason": (reason or "").strip()[:1000], "superseded_by": actor}
         if by_fact_seq is not None:
             payload["by_fact_seq"] = int(by_fact_seq)
         seq = self._append(EV_FACT_SUPERSEDED, actor, payload,
                            dedupe_key=f"fact-superseded::{fact_seq}::{payload['reason']}")
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO fact_reviews (fact_seq, challenge_id, status, reason) "
-                "VALUES (?,?,?,?) ON CONFLICT(fact_seq) DO UPDATE SET "
-                " status='superseded', reason=excluded.reason",
-                (fact_seq, self.challenge.id, FACT_STATE_SUPERSEDED, payload["reason"]),
-            )
-            self._upsert_fact_state(
-                fact_seq, FACT_STATE_SUPERSEDED, reason=payload["reason"],
-                superseded_seq=seq if seq > 0 else None, retired_seq=seq if seq > 0 else None,
-                verified_effective=0, updated_seq=seq)
-            self._conn.commit()
+        if seq <= 0:
+            return seq
         return seq
 
     def review_fact(self, *, actor: str, fact_seq: int, action: str,
@@ -1423,75 +1441,34 @@ class SQLiteSharedGraph:
         return {"action": act, "fact_seq": int(fact_seq), "seq": -1}
 
     def _fact_state_map(self) -> dict[int, dict]:
-        """fact_seq → {state, verified_effective, confidence_effective, retired}."""
-        if not self._table_exists("fact_states"):
-            return {}
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT fact_seq, state, verified_effective, confidence_effective, "
-                "retired_seq FROM fact_states WHERE challenge_id=?",
-                (self.challenge.id,),
-            ).fetchall()
+        """Effective lifecycle state folded solely from immutable event rows."""
         return {
-            int(r[0]): {
-                "state": str(r[1] or FACT_STATE_UNRESOLVED),
-                "verified_effective": (None if r[2] is None else bool(r[2])),
-                "confidence_effective": (None if r[3] is None else float(r[3])),
-                "retired": r[4] is not None,
+            int(item["fact_seq"]): {
+                "state": str(item.get("state") or FACT_STATE_UNRESOLVED),
+                "verified_effective": bool(item["verified"]),
+                "confidence_effective": float(item.get("confidence") or 0),
+                "retired": bool(item["retired"]),
             }
-            for r in rows
+            for item in self.effective_facts()
         }
 
     def active_candidates(self) -> list[dict]:
-        """Active (non-retired) UNRESOLVED/CHALLENGED candidate facts — the set the
-        planner should still weigh. Excludes verified, rejected, merged, superseded."""
-        texts = self._fact_text_by_seq()
-        states = self._fact_state_map()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
-                "ORDER BY seq",
-                (self.challenge.id, EV_FACT_ADDED),
-            ).fetchall()
-        out: list[dict] = []
-        for seq, verified in rows:
-            seq = int(seq)
-            if seq not in texts:
-                continue
-            st = states.get(seq, {})
-            state = st.get("state", FACT_STATE_UNRESOLVED)
-            if st.get("retired") or state in _FACT_TERMINAL_STATES:
-                continue
-            eff = st.get("verified_effective")
-            is_verified = bool(verified) if eff is None else eff
-            if is_verified and state != FACT_STATE_CHALLENGED:
-                continue
-            out.append({"fact_seq": seq, "fact": texts.get(seq, ""), "state": state})
-        return out
+        """Effective active candidate/challenged facts for planner review."""
+        return [
+            {"fact_seq": int(item["fact_seq"]), "fact": str(item.get("fact_text") or ""),
+             "state": str(item.get("state") or FACT_STATE_UNRESOLVED)}
+            for item in self.effective_facts(active_only=True)
+            if not item["verified"]
+            and not _is_runtime_infra_fact_text(item.get("fact_text", ""))
+        ]
 
     def verified_evidence(self) -> list[dict]:
-        """Facts that are verified (origin or revalidated) AND not retired."""
-        texts = self._fact_text_by_seq()
-        states = self._fact_state_map()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
-                "ORDER BY seq",
-                (self.challenge.id, EV_FACT_ADDED),
-            ).fetchall()
-        out: list[dict] = []
-        for seq, verified in rows:
-            seq = int(seq)
-            if seq not in texts:
-                continue
-            st = states.get(seq, {})
-            if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
-                continue
-            eff = st.get("verified_effective")
-            is_verified = bool(verified) if eff is None else eff
-            if is_verified:
-                out.append({"fact_seq": seq, "fact": texts.get(seq, "")})
-        return out
+        """Effective verified facts that are active and safe for consumers."""
+        return [
+            {"fact_seq": int(item["fact_seq"]), "fact": str(item.get("fact_text") or "")}
+            for item in self.effective_facts(verified_only=True, active_only=True)
+            if not _is_runtime_infra_fact_text(item.get("fact_text", ""))
+        ]
 
     def suppress_route(self, *, actor: str, route_hash: str, label: str = "",
                        reason: str = "", until: str = "new_evidence",
@@ -2553,30 +2530,30 @@ class SQLiteSharedGraph:
 
     # ── summaries (zh gist, written back once after deepseek-flash) ──────
     def record_fact_summary(self, *, fact_seq: int, summary: str) -> bool:
-        """Patch events.payload["summary"] for the fact at `fact_seq`.
+        """Append an immutable, first-write-wins summary transition.
 
-        events is append-only by design, but a gist is derived metadata, not a
-        new fact — so we read-modify-write the one row's JSON payload in place.
-        Returns True if the row was found and updated."""
-        if fact_seq is None or fact_seq <= 0 or not summary:
+        Same-value retries are successful idempotent retries.  A different
+        summary never overwrites the canonical first value and returns False.
+        """
+        clean = str(summary or "").strip()
+        if fact_seq is None or int(fact_seq) <= 0 or not clean:
             return False
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT payload FROM events WHERE seq=?", (fact_seq,)
-            ).fetchone()
-            if not row:
-                return False
-            try:
-                payload = json.loads(row[0]) if row[0] else {}
-            except (json.JSONDecodeError, TypeError):
-                payload = {}
-            payload["summary"] = summary
-            self._conn.execute(
-                "UPDATE events SET payload=? WHERE seq=?",
-                (json.dumps(payload, default=str), fact_seq),
-            )
-            self._conn.commit()
+        target = self.effective_fact(int(fact_seq))
+        if target is None:
+            return False
+        existing = target.get("summary")
+        if existing is not None:
+            return str(existing) == clean
+        seq = self._append(
+            EV_FACT_SUMMARIZED, "summarizer",
+            {"fact_seq": int(fact_seq), "summary": clean},
+            verified=False, confidence=1.0,
+            dedupe_key=f"fact_summarized::{int(fact_seq)}",
+        )
+        if seq > 0:
             return True
+        current = self.effective_fact(int(fact_seq))
+        return current is not None and str(current.get("summary") or "") == clean
 
     def record_intent_summary(self, *, intent_id: str, summary: str) -> bool:
         """Store the zh gist for an intent in intents.summary. Idempotent."""
@@ -3167,54 +3144,27 @@ class SQLiteSharedGraph:
         return [int(r[0]) for r in rows]
 
     def snapshot(self) -> SolveGraph:
-        """Materialize (C) the event log into a read-only SolveGraph view.
-
-        Facts in a TERMINAL lifecycle state (rejected/merged/superseded) are
-        dropped — they failed review and must not pollute the planner/worker view
-        or downstream writeups. challenged stays (shown, but de-verified)."""
+        """Materialize raw non-fact events plus the effective fact projection."""
         g = SolveGraph(challenge=self.challenge)
-        fact_reviews = self._fact_review_map()
-        fact_states = self._fact_state_map()
+        for fact in self.effective_facts(active_only=True):
+            text = str(fact.get("fact_text") or "")
+            if _is_runtime_infra_fact_text(text):
+                continue
+            g.add_evidence(
+                source=str(fact.get("source") or ""), fact=text,
+                artifact_id=fact.get("artifact_id"),
+                verified=bool(fact["verified"]),
+                confidence=float(fact.get("confidence") or 0),
+                source_solver=str(fact.get("fact_actor") or ""),
+                witness=fact.get("witness"), verifier=str(fact.get("verifier") or ""),
+            )
         for e in self.events():
             p = e["payload"]
-            if e["kind"] == EV_FACT_ADDED:
-                seq = int(e["seq"])
-                if _is_runtime_infra_fact_text(p.get("fact", "")):
-                    continue
-                st = fact_states.get(seq, {})
-                if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
-                    continue  # A: rejected/merged/superseded facts leave the view
-                status = fact_reviews.get(seq)
-                verified = bool(e["verified"])
-                confidence = e["confidence"]
-                if status == "challenged":
-                    verified = False
-                    confidence = min(float(confidence or 0.4), 0.4)
-                elif status == "revalidated":
-                    eff = st.get("verified_effective")
-                    verified = bool(e["verified"]) if eff is None else eff
-                g.add_evidence(
-                    source=p.get("source", ""), fact=p.get("fact", ""),
-                    artifact_id=e["artifact_id"],
-                    verified=verified, confidence=confidence,
-                    source_solver=p.get("source_solver", ""),
-                    witness=p.get("witness"), verifier=p.get("verifier", ""),
-                )
-            elif e["kind"] == EV_DEAD_END:
+            if e["kind"] == EV_DEAD_END:
                 g.mark_dead_end(p.get("reason", ""))
             elif e["kind"] == EV_FLAG_FOUND:
-                # multi-flag: ACCUMULATE (was a last-wins overwrite that lost every
-                # flag but the last). add_flag dedups + keeps flag==flags[0].
                 g.add_flag(p.get("flag"))
             elif e["kind"] == EV_FLAG_INVALIDATED:
-                # a false-positive flag was marked by the operator — drop just that
-                # one from the set (preserving any other collected flags) AND record
-                # it as permanently rejected. reject_flag is UNCONDITIONAL on the
-                # rejected set: a flag invalidated here stays rejected even if its
-                # EV_FLAG_FOUND has not yet replayed, or is re-emitted later by a
-                # reopened worker (add_flag refuses anything in rejected_flags). This
-                # closes the run-75379 invalidate→reopen→re-find→re-accept loop at the
-                # durable layer — survivable across worker respawn.
                 g.reject_flag(p.get("flag"))
         return g
 
@@ -3235,66 +3185,65 @@ class SQLiteSharedGraph:
         return base
 
     def _fact_seq_map(self) -> dict[str, int]:
-        """Map fact text → event seq for the most recent facts."""
-        active = self._active_fact_seq_set()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, json_extract(payload, '$.fact') "
-                "FROM events WHERE kind=? ORDER BY seq",
-                (EV_FACT_ADDED,),
-            ).fetchall()
-        return {text: seq for seq, text in rows
-                if text and int(seq) in active}
-
-    def _fact_text_by_seq(self, *, include_retired: bool = False) -> dict[int, str]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, json_extract(payload, '$.fact') "
-                "FROM events WHERE kind=? ORDER BY seq",
-                (EV_FACT_ADDED,),
-            ).fetchall()
-        active = None if include_retired else self._active_fact_seq_set()
+        """Map active effective fact text to its immutable genesis sequence."""
         return {
-            int(seq): str(text)
-            for seq, text in rows
-            if text
-            and not _is_runtime_infra_fact_text(text)
-            and (active is None or int(seq) in active)
+            str(item["fact_text"]): int(item["fact_seq"])
+            for item in self.effective_facts(active_only=True)
+            if item.get("fact_text")
+            and not _is_runtime_infra_fact_text(item.get("fact_text", ""))
         }
 
-    def _fact_review_map(self) -> dict[int, str]:
+    def _fact_text_by_seq(self, *, include_retired: bool = False) -> dict[int, str]:
+        """Read fact text from the effective projection, never a mutable cache table."""
+        return {
+            int(item["fact_seq"]): str(item.get("fact_text") or "")
+            for item in self.effective_facts(active_only=not include_retired)
+            if item.get("fact_text")
+            and not _is_runtime_infra_fact_text(item.get("fact_text", ""))
+        }
+
+    def _latest_fact_lifecycle_events(self) -> dict[int, dict[str, Any]]:
+        """Return latest immutable lifecycle event metadata per fact.
+
+        ``fact_effective`` owns state/verdict folding. This helper only exposes
+        human-facing audit fields (reason, verifier intent, merge target) that are
+        not part of the verdict decision.
+        """
+        kinds = (
+            EV_FACT_CHALLENGED, EV_FACT_REVALIDATED, EV_FACT_REJECTED,
+            EV_FACT_MERGED, EV_FACT_SUPERSEDED,
+        )
+        placeholders = ",".join("?" for _ in kinds)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT fact_seq, status FROM fact_reviews WHERE challenge_id=?",
-                (self.challenge.id,),
+                "SELECT seq, kind, payload FROM events "
+                f"WHERE challenge_id=? AND kind IN ({placeholders}) ORDER BY seq",
+                (self.challenge.id, *kinds),
             ).fetchall()
-        return {int(seq): str(status) for seq, status in rows}
+        out: dict[int, dict[str, Any]] = {}
+        for seq, kind, payload in rows:
+            try:
+                data = json.loads(payload or "{}") or {}
+            except (TypeError, json.JSONDecodeError):
+                continue
+            raw_fact_seq = data.get("from_fact_seq") if kind == EV_FACT_MERGED else data.get("fact_seq")
+            try:
+                fact_seq = int(raw_fact_seq)
+            except (TypeError, ValueError):
+                continue
+            out[fact_seq] = {
+                "seq": int(seq), "kind": str(kind), "payload": data,
+            }
+        return out
 
     def _active_fact_seq_set(self) -> set[int]:
-        """Fact seqs still usable as graph evidence.
-
-        Terminal lifecycle states (rejected/merged/superseded) are audit history only:
-        they must not participate in graph reachability, lineage display, or worker
-        neighborhood prompts. Challenged facts remain active candidates, but their
-        effective verified status is downgraded elsewhere.
-        """
-        states = self._fact_state_map()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, json_extract(payload, '$.fact') "
-                "FROM events WHERE challenge_id=? AND kind=?",
-                (self.challenge.id, EV_FACT_ADDED),
-            ).fetchall()
-        out: set[int] = set()
-        for seq_raw, fact_text in rows:
-            seq = int(seq_raw)
-            if _is_runtime_infra_fact_text(fact_text):
-                continue
-            st = states.get(seq, {})
-            if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
-                continue
-            out.add(seq)
-        return out
+        """Fact sequences still usable as graph evidence, from fact_effective."""
+        return {
+            int(item["fact_seq"])
+            for item in self.effective_facts(active_only=True)
+            if item.get("fact_text")
+            and not _is_runtime_infra_fact_text(item.get("fact_text", ""))
+        }
 
     def fact_seqs_for_texts(self, texts: list[str]) -> list[int]:
         """Resolve fact description strings to their event seq numbers."""
@@ -3454,12 +3403,10 @@ class SQLiteSharedGraph:
         password-shaped value via a keyword/pair pattern. A miss is fine — the raw
         fact still appears in the verified-facts section; a wrong row would mislead
         workers told to reuse it, so we prefer to emit nothing when unsure."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, json_extract(payload,'$.fact'), verified "
-                "FROM events WHERE kind=? ORDER BY seq",
-                (EV_FACT_ADDED,),
-            ).fetchall()
+        rows = [
+            (int(item["fact_seq"]), str(item.get("fact_text") or ""), bool(item["verified"]))
+            for item in self.effective_facts(active_only=True)
+        ]
         by_entity: dict[str, dict] = {}
         for seq, fact, verified in rows:
             if not verified or not fact:
@@ -3620,32 +3567,15 @@ class SQLiteSharedGraph:
     def _active_fact_seqs_by_verified(self, *, verified: bool,
                                       limit: Optional[int] = None,
                                       exclude_giveup_products: bool = False) -> list[int]:
-        states = self._fact_state_map()
-        active = self._active_fact_seq_set()
         blocked = self._giveup_product_fact_seqs() if exclude_giveup_products else set()
-        sql = "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? ORDER BY seq DESC"
-        params: list[Any] = [self.challenge.id, EV_FACT_ADDED]
+        facts = self.effective_facts(active_only=True)
         if limit is not None:
-            sql += " LIMIT ?"
-            params.append(int(limit))
-        with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-        out: list[int] = []
-        for seq_raw, raw_verified in rows:
-            seq = int(seq_raw)
-            if seq not in active or seq in blocked:
-                continue
-            st = states.get(seq, {})
-            state = st.get("state", FACT_STATE_UNRESOLVED)
-            if st.get("retired") or state in _FACT_TERMINAL_STATES:
-                continue
-            eff = st.get("verified_effective")
-            is_verified = bool(raw_verified) if eff is None else bool(eff)
-            if state == FACT_STATE_CHALLENGED:
-                is_verified = False
-            if is_verified == bool(verified):
-                out.append(seq)
-        return list(reversed(out))
+            facts = facts[-int(limit):]
+        return [
+            int(fact["fact_seq"]) for fact in facts
+            if int(fact["fact_seq"]) not in blocked
+            and bool(fact["verified"]) == bool(verified)
+        ]
 
     def _latest_verified_fact_seqs(self, limit: Optional[int] = None, *,
                                    exclude_giveup_products: bool = False) -> list[int]:
@@ -3717,28 +3647,17 @@ class SQLiteSharedGraph:
         active = self._active_fact_seq_set() - self._giveup_product_fact_seqs()
         if not active:
             return ""
-        states = self._fact_state_map()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, json_extract(payload,'$.source'), "
-                "json_extract(payload,'$.fact'), verified, confidence "
-                "FROM events WHERE challenge_id=? AND kind=? ORDER BY seq DESC LIMIT ?",
-                (self.challenge.id, EV_FACT_ADDED, int(limit)),
-            ).fetchall()
+        facts = self.effective_facts(active_only=True)[-int(limit):]
         lines: list[str] = []
-        for seq_raw, source, fact, raw_verified, confidence in reversed(rows):
-            seq = int(seq_raw)
-            if seq not in active or not fact:
+        for fact in facts:
+            seq = int(fact["fact_seq"])
+            text = str(fact.get("fact_text") or "")
+            if seq not in active or not text:
                 continue
-            st = states.get(seq, {})
-            eff = st.get("verified_effective")
-            is_verified = bool(raw_verified) if eff is None else bool(eff)
-            if st.get("state") == FACT_STATE_CHALLENGED:
-                is_verified = False
-            verdict = "verified" if is_verified else "candidate"
+            verdict = "verified" if fact["verified"] else "candidate"
             lines.append(
-                f"- [#{seq}] {verdict} ({source or 'unknown'}, "
-                f"confidence={float(confidence or 0):.2f}) {str(fact)[:220]}"
+                f"- [#{seq}] {verdict} ({fact.get('source') or 'unknown'}, "
+                f"confidence={float(fact.get('confidence') or 0):.2f}) {text[:220]}"
             )
         if not lines:
             return ""
@@ -3788,41 +3707,30 @@ class SQLiteSharedGraph:
                                max_dead_ends: Optional[int] = None) -> str:
         c = self.challenge
         lines = [f"# Challenge: {c.name} [{c.category}] ({c.points} pts)"]
-        fact_states = self._fact_state_map()
-        want = sorted(fact_seqs)
-        if want:
-            q = ",".join("?" for _ in want)
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT seq, json_extract(payload,'$.source'), "
-                    "json_extract(payload,'$.fact'), verified, confidence "
-                    f"FROM events WHERE kind=? AND seq IN ({q}) ORDER BY seq",
-                    (EV_FACT_ADDED, *want),
-                ).fetchall()
-            verified_lines: list[str] = []
-            candidate_lines: list[str] = []
-            for seq, source, fact, verified, confidence in rows:
-                if _is_runtime_infra_fact_text(fact):
-                    continue
-                st = fact_states.get(int(seq), {})
-                if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
-                    continue
-                line = f"- ({source or 'unknown'}) [#{int(seq)}] {str(fact)[:240]}"
-                if bool(verified):
-                    verified_lines.append(line)
-                else:
-                    candidate_lines.append(f"{line} [UNVERIFIED] confidence={float(confidence or 0):.2f}")
-            if verified_lines:
-                lines.append("\n## Confirmed evidence")
-                lines.extend(verified_lines)
-            if candidate_lines:
-                lines.append("\n## Candidates / needs verification")
-                lines.extend(candidate_lines)
+        wanted = {int(seq) for seq in fact_seqs}
+        verified_lines: list[str] = []
+        candidate_lines: list[str] = []
+        for fact in self.effective_facts(active_only=True):
+            seq = int(fact["fact_seq"])
+            if seq not in wanted or _is_runtime_infra_fact_text(fact.get("fact_text", "")):
+                continue
+            line = f"- ({fact.get('source') or 'unknown'}) [#{seq}] {str(fact.get('fact_text') or '')[:240]}"
+            if fact["verified"]:
+                verified_lines.append(line)
+            else:
+                candidate_lines.append(
+                    f"{line} [UNVERIFIED] confidence={float(fact.get('confidence') or 0):.2f}"
+                )
+        if verified_lines:
+            lines.append("\n## Confirmed evidence")
+            lines.extend(verified_lines)
+        if candidate_lines:
+            lines.append("\n## Candidates / needs verification")
+            lines.extend(candidate_lines)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT json_extract(payload,'$.reason') FROM events "
-                "WHERE kind=? ORDER BY seq",
-                (EV_DEAD_END,),
+                "WHERE kind=? ORDER BY seq", (EV_DEAD_END,),
             ).fetchall()
         reasons = [str(r[0]) for r in rows if r[0]]
         if max_dead_ends is not None:
@@ -4090,62 +3998,62 @@ class SQLiteSharedGraph:
         return "\n".join(lines)
 
     def challenged_facts(self) -> list[dict]:
-        texts = self._fact_text_by_seq()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT fact_seq, status, reason, verification_intent_id "
-                "FROM fact_reviews WHERE challenge_id=? AND status='challenged' "
-                "ORDER BY challenged_seq",
-                (self.challenge.id,),
-            ).fetchall()
-        return [
-            {"fact_seq": int(r[0]), "status": r[1], "reason": r[2] or "",
-             "verification_intent_id": r[3] or "", "fact": texts.get(int(r[0]), "")}
-            for r in rows
-        ]
+        lifecycle = self._latest_fact_lifecycle_events()
+        out: list[dict] = []
+        for item in self.effective_facts(active_only=False):
+            if item.get("state") != FACT_STATE_CHALLENGED or item.get("retired"):
+                continue
+            fact_seq = int(item["fact_seq"])
+            event = lifecycle.get(fact_seq, {})
+            payload = event.get("payload") or {}
+            out.append({
+                "fact_seq": fact_seq,
+                "status": FACT_STATE_CHALLENGED,
+                "reason": str(payload.get("reason") or ""),
+                "verification_intent_id": str(payload.get("verification_intent_id") or ""),
+                "fact": str(item.get("fact_text") or ""),
+            })
+        out.sort(key=lambda row: int(lifecycle.get(row["fact_seq"], {}).get("seq", row["fact_seq"])))
+        return out
 
     def revalidated_facts(self) -> list[dict]:
-        texts = self._fact_text_by_seq()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT fact_seq, status, reason FROM fact_reviews "
-                "WHERE challenge_id=? AND status='revalidated' ORDER BY revalidated_seq",
-                (self.challenge.id,),
-            ).fetchall()
-        return [
-            {"fact_seq": int(r[0]), "status": r[1], "reason": r[2] or "",
-             "fact": texts.get(int(r[0]), "")}
-            for r in rows
-        ]
+        lifecycle = self._latest_fact_lifecycle_events()
+        out: list[dict] = []
+        for item in self.effective_facts(active_only=False):
+            if item.get("state") != FACT_STATE_REVALIDATED:
+                continue
+            fact_seq = int(item["fact_seq"])
+            payload = lifecycle.get(fact_seq, {}).get("payload") or {}
+            out.append({
+                "fact_seq": fact_seq,
+                "status": FACT_STATE_REVALIDATED,
+                "reason": str(payload.get("reason") or ""),
+                "fact": str(item.get("fact_text") or ""),
+            })
+        out.sort(key=lambda row: int(lifecycle.get(row["fact_seq"], {}).get("seq", row["fact_seq"])))
+        return out
 
     def retired_facts(self, *, states: Optional[tuple[str, ...]] = None) -> list[dict]:
-        """Facts in a terminal lifecycle state (rejected/merged/superseded) — for the
-        review/audit board (kept visible but de-verified)."""
-        if not self._table_exists("fact_states"):
-            return []
-        want = states or (FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED)
-        texts = self._fact_text_by_seq(include_retired=True)
-        q = ",".join("?" for _ in want)
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT fact_seq, state, reason, merged_seq FROM fact_states "
-                f"WHERE challenge_id=? AND state IN ({q}) ORDER BY updated_seq",
-                (self.challenge.id, *want),
-            ).fetchall()
-        merges: dict[int, int] = {}
-        if self._table_exists("fact_merges"):
-            with self._lock:
-                mrows = self._conn.execute(
-                    "SELECT from_fact_seq, to_fact_seq FROM fact_merges WHERE challenge_id=?",
-                    (self.challenge.id,),
-                ).fetchall()
-            merges = {int(m[0]): int(m[1]) for m in mrows}
-        return [
-            {"fact_seq": int(r[0]), "state": r[1], "reason": r[2] or "",
-             "fact": texts.get(int(r[0]), ""),
-             "merged_into": merges.get(int(r[0]))}
-            for r in rows
-        ]
+        """Facts retired by canonical lifecycle events, kept for review/audit."""
+        want = set(states or (FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED))
+        lifecycle = self._latest_fact_lifecycle_events()
+        out: list[dict] = []
+        for item in self.effective_facts(active_only=False):
+            state = str(item.get("state") or FACT_STATE_UNRESOLVED)
+            if not item.get("retired") or state not in want:
+                continue
+            fact_seq = int(item["fact_seq"])
+            payload = lifecycle.get(fact_seq, {}).get("payload") or {}
+            merged_into = payload.get("to_fact_seq") if state == FACT_STATE_MERGED else None
+            out.append({
+                "fact_seq": fact_seq,
+                "state": state,
+                "reason": str(payload.get("reason") or ""),
+                "fact": str(item.get("fact_text") or ""),
+                "merged_into": int(merged_into) if merged_into is not None else None,
+            })
+        out.sort(key=lambda row: int(lifecycle.get(row["fact_seq"], {}).get("seq", row["fact_seq"])))
+        return out
 
     def suppressed_routes(self) -> list[dict]:
         with self._lock:

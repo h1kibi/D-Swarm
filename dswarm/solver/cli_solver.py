@@ -952,6 +952,8 @@ class CliSolver:
             sep=":" if self.container is not None else None,
         )
         env["DSWARM_WORKER_ID"] = self.solver_id
+        # Keep SQLite blackboard writes scoped even before the first event or intent.
+        env["DSWARM_CHALLENGE_ID"] = str(self.challenge.id)
         env["DSWARM_WORKER_TASK_KIND"] = self.task_kind or getattr(
             self.challenge, "category", ""
         )

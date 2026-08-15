@@ -12,6 +12,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, AsyncIterator, Optional, Protocol, runtime_checkable
 
 
@@ -48,19 +49,33 @@ class Finding:
     half_life_sec: int = 3600
     embedding: Optional[list[float]] = None
     source_seq: int = 0
+    projection_key: str = ""
     superseded_by: Optional[str] = None
     seq: int = 0
     created_at: float = field(default_factory=time.time)
 
     @property
     def finding_id(self) -> str:
-        return f"finding:{self.seq}"
+        return self.projection_key or f"finding:{self.seq}"
 
     def pheromone(self, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now
         age = max(0.0, now - self.created_at)
         half = max(1, int(self.half_life_sec))
         return max(0.0, min(1.0, float(self.pheromone_base) * (0.5 ** (age / half))))
+
+
+class ReplacementOutcome(str, Enum):
+    REPLACED = "replaced"
+    INSERTED_NO_PRIOR = "inserted_no_prior"
+    ALREADY_APPLIED = "already_applied"
+
+
+@dataclass(frozen=True)
+class ReplacementResult:
+    outcome: ReplacementOutcome
+    finding: Finding
+    superseded_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -146,6 +161,7 @@ class Board(Protocol):
         half_life_sec: int = 3600,
         embedding: Optional[list[float]] = None,
         source_seq: int = 0,
+        projection_key: str = "",
     ) -> Finding: ...
 
     def query_findings(self, predicate: FindingPredicate) -> list[Finding]: ...
@@ -157,6 +173,10 @@ class Board(Protocol):
     def commit_cursor(self, challenge_id: str, agent_name: str, last_seq: int) -> None: ...
 
     def supersede(self, old_id: str, new_id: str) -> None: ...
+
+    def replace_by_source(
+        self, *, source_seq: int, finding: Finding, projection_key: str
+    ) -> ReplacementResult: ...
 
     def budget(self, challenge_id: str) -> dict[str, Any]: ...
 
@@ -234,6 +254,7 @@ class MemoryBoard:
         self.pheromone = pheromone or PheromoneSettings.defaults()
         self._now = now or time.time
         self._findings: list[Finding] = []
+        self._projection_index: dict[str, Finding] = {}
         self._cursors: dict[tuple[str, str], int] = {}
         self._budgets: dict[str, dict[str, Any]] = {}
         self._agent_budgets: dict[tuple[str, str], dict[str, Any]] = {}
@@ -256,7 +277,11 @@ class MemoryBoard:
         half_life_sec: int = 3600,
         embedding: Optional[list[float]] = None,
         source_seq: int = 0,
+        projection_key: str = "",
     ) -> Finding:
+        key = str(projection_key or "")
+        if key and key in self._projection_index:
+            return self._projection_index[key]
         if kind == FindingKind.FLAG_FOUND:
             value = str(target or (payload or {}).get("flag") or "")
             existing = [
@@ -277,10 +302,13 @@ class MemoryBoard:
             half_life_sec=half if half_life_sec == 3600 else half_life_sec,
             embedding=embedding,
             source_seq=source_seq,
+            projection_key=key,
             seq=self._next_seq(),
             created_at=self._now(),
         )
         self._findings.append(f)
+        if key:
+            self._projection_index[key] = f
         for pred, q in list(self._subscribers):
             if pred.matches(f):
                 q.put_nowait(f)
@@ -321,6 +349,31 @@ class MemoryBoard:
         for f in self._findings:
             if f.finding_id == old_id:
                 f.superseded_by = new_id
+
+    def replace_by_source(
+        self, *, source_seq: int, finding: Finding, projection_key: str
+    ) -> ReplacementResult:
+        key = str(projection_key or "")
+        existing = self._projection_index.get(key) if key else None
+        if existing is not None:
+            return ReplacementResult(ReplacementOutcome.ALREADY_APPLIED, existing)
+        prior = [
+            item for item in self._findings
+            if item.source_seq == int(source_seq) and item.superseded_by is None
+        ]
+        replacement = self.write_finding(
+            challenge_id=finding.challenge_id or self.challenge_id, kind=finding.kind,
+            agent_name=finding.agent_name, target=finding.target, payload=finding.payload,
+            pheromone_base=finding.pheromone_base, half_life_sec=finding.half_life_sec,
+            embedding=finding.embedding, source_seq=int(source_seq), projection_key=key,
+        )
+        superseded_ids = tuple(item.finding_id for item in prior if item is not replacement)
+        for item in prior:
+            if item is not replacement:
+                item.superseded_by = replacement.finding_id
+        outcome = (ReplacementOutcome.REPLACED if superseded_ids
+                   else ReplacementOutcome.INSERTED_NO_PRIOR)
+        return ReplacementResult(outcome, replacement, superseded_ids)
 
     def budget(self, challenge_id: str) -> dict[str, Any]:
         row = self._budgets.setdefault(

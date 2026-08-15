@@ -125,41 +125,36 @@ total_active <= max_workers + review_max_concurrent
 
 ## M3 严格事件行不可变（09 §10.3.3 / §10.5 基线 8-10）
 
-**现状（已核实）**：全库恰好 2 处 `UPDATE events`——:943（candidate→verified promotion）、
-:2570（record_fact_summary 写回 payload）。按评审定稿：两者都改为投影/旁表，events 行
-永不可原位修改。
+**状态（2026-08-14）**：已按 RFC v3 和批准的实现计划落地。`events` 现在由
+`BEFORE UPDATE/DELETE` 触发器保护为 immutable event rows；`fact_verified` 与
+`fact_summarized` 是 promotion/summary 的 canonical 状态事件；`fact_effective` 是
+可从事件日志重建的统一 typed projection，包含 sticky retired、challenge+fact 双键绑定、
+promotion provenance 和 summary 字段。旧的 `fact_reviews`、`fact_states`、`fact_merges`
+表仅为兼容旧数据库/旧工具保留，M3 不再写入或读取它们。
 
-**设计**
+已完成的实现面：
 
-1. **测试先行** `tests/test_event_immutability.py`：
-   - 源码 guard：静态扫描 `dswarm/swarm/shared_graph.py`，断言不存在 `UPDATE events`
-     （评审要求"源码和 SQL guard 禁止所有 UPDATE events"）；
-   - 行为 guard：对一批事实执行 promotion/summary/review 后，对事件行做稳定哈希
-     （kind/actor/payload/verified/confidence/ts 的规范序列化），断言前后一致；
-   - replay guard：仅从 events 重放重建 snapshot，verified/summary 投影与直查一致。
-2. **promotion 移出 events**：新投影表
-   ```sql
-   CREATE TABLE IF NOT EXISTS fact_verifications (
-     fact_seq INTEGER PRIMARY KEY, verified INTEGER NOT NULL,
-     confidence REAL NOT NULL, by_seq INTEGER NOT NULL)
-   ```
-   `add_evidence` 的 promotion 分支改为 UPSERT 该表（投影表允许更新，注释明示
-   "materialized projection, not canonical event log"）；删除 :943 的 UPDATE。
-   `snapshot()`/`verified_evidence()`/`_fact_review_map` 读表（无行时回退 events 列，
-   兼容旧库）。
-3. **summary 移出 events**：新投影表
-   ```sql
-   CREATE TABLE IF NOT EXISTS fact_summaries (fact_seq INTEGER PRIMARY KEY, summary TEXT NOT NULL)
-   ```
-   `record_fact_summary` 改写该表；删除 :2570 的 UPDATE。`to_summary`/`_summary_for_fact_seqs`
-   读表；旧库已写进 payload 的 summary 通过一次性迁移或读时回退兼容。
-4. `intents`/`lane_locks` 等既有物化表更新**保留**，并在 AGENTS.md 补一句
-   "物化投影表可更新；canonical event log（events 表）不可"。
+1. `dswarm/swarm/fact_events.py`：v2 schema contract、26 列 `fact_effective` VIEW、
+   promotion/summary 唯一性、transition JSON/目标 guard、events immutable triggers、
+   migration preflight、user_version 检查和 backup API。
+2. `dswarm/swarm/shared_graph.py`：fresh DB 直接安装 contract；旧 DB 只能通过显式
+   `migrate_to_v2(backup_path=...)` 安装；生命周期写路径只追加事件；所有有效事实读取
+   走 `effective_fact(s)`。
+3. `dswarm/swarm/projection.py`、`board.py`、`postgres_board.py`：base/promotion
+   projection key、`replace_by_source` 幂等/替换协议、partial sync、失败不越 cursor、
+   replay 不重复写入或发 delta；无旧 Finding 时不伪造 `supersedes_source_seq`。
+4. `skills/dswarm-blackboard/blackboard.py`、worker 环境：challenge scope 显式传递，
+   `read_facts`/`read_review` 只读 `fact_effective`；未迁移数据库不静默回退到 raw
+   `events.verified`。`review_flow` 的候选计数 fallback 同样只读有效投影。
 
-**测试**：既有 test_shared_graph.py 全绿（语义不变是硬约束）；新 guard 三件套；
-旧库打开兼容（fixture 造一个带 in-place summary 的 DB）。
+验证覆盖：M3 专项、SharedGraph、Board projector、blackboard skill、lifecycle wiring、
+Reason/summary 回归和空凭据全量测试均纳入最终验证；Postgres 当前为 contract-level 测试，
+尚未在本机执行真实 Postgres 集成测试。实现基线和 28 项测试矩阵仍见
+[docs/11-m3-event-immutability-rfc.md](11-m3-event-immutability-rfc.md)。
 
-**验收映射**：09 §10.5「禁止所有 UPDATE events」「原行哈希不变」「replay 重建」。
+发布注意：当前工作区代码已经是 v2 contract（`user_version=2`）的 phase-2 实现；向
+GitHub 发布时应将数据库备份/显式迁移作为升级说明，不能宣称早于 phase-1 的旧二进制
+能够自动拒绝新数据库。
 
 ---
 

@@ -2862,6 +2862,7 @@ def test_container_runtime_prefers_mapped_shared_graph_db(
     env = sw._runtime_env_for("pi", "cli-pi", container=FakeContainer())
 
     assert env["DSWARM_BLACKBOARD_DB"] == "/home/kali/workspace/graph/shared_graph.db"
+    assert env["DSWARM_CHALLENGE_ID"] == challenge.id
     assert "DSWARM_BLACKBOARD_URL" not in env
     assert "DSWARM_BLACKBOARD_RUN_ID" not in env
     assert "DSWARM_BLACKBOARD_TOKEN" not in env

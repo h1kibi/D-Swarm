@@ -180,7 +180,8 @@ def test_projector_emits_finding_upserted_with_pheromone_params():
         assert p["kind"] == "finding_upserted"
         assert p["delta_type"] == "finding_upserted"
         assert p["actor"] == "projector"
-        assert p["finding_id"] == "finding:1"
+        assert p["finding_id"] == "fact:1:base"
+        assert p["projection_key"] == "fact:1:base"
         assert p["finding_kind"] == FindingKind.HTTP_ENDPOINT
         assert p["target"] == "https://app.test/login"
         assert p["payload"]["fact"] == "login endpoint"
@@ -232,3 +233,113 @@ def test_projector_emit_failure_does_not_break_sync():
         assert findings[0].target == "still projected"
 
     asyncio.run(main())
+
+
+def test_promotion_projection_replaces_once_and_replay_is_strict_noop(tmp_path):
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    async def main():
+        graph = SQLiteSharedGraph.open(
+            db_path=tmp_path / "graph.db",
+            challenge=Challenge(id="c-promote", name="c", category="web"),
+        )
+        fact_seq = graph.add_evidence(
+            actor="pi-web", source="curl", fact="admin endpoint", verified=False,
+            confidence=0.4,
+            finding=__import__("dswarm.swarm.board", fromlist=["StructuredFinding"]).StructuredFinding(
+                kind=FindingKind.HTTP_ENDPOINT, target="https://app/admin",
+                data={"status": 200},
+            ),
+        )
+        graph.add_evidence(
+            actor="pi-web", source="curl", fact="admin endpoint", verified=True,
+            confidence=0.93, artifact_id="art-proof", witness="curl 200", verifier="gate",
+        )
+        promotion_seq = graph.events_since(0, kinds=("fact_verified",))[0]["seq"]
+
+        board = MemoryBoard("c-promote")
+        bus = _CaptureBus()
+        projector = BoardProjector(board, bus=bus, run_id="run-promote", challenge_id="c-promote")
+        assert projector.sync(graph) == promotion_seq
+        await asyncio.sleep(0)
+
+        active = board.query_findings(FindingPredicate())
+        assert len(active) == 1
+        assert active[0].source_seq == fact_seq
+        assert active[0].payload["verified"] is True
+        assert active[0].payload["promotion"]["seq"] == promotion_seq
+        assert len(bus.events) == 2
+        assert bus.events[-1].payload["supersedes_source_seq"] == fact_seq
+        assert bus.events[-1].payload["transition_seq"] == promotion_seq
+
+        # Cold replay into the same board must be a strict no-op for both rows and deltas.
+        replay = BoardProjector(board, after_seq=0, bus=bus, run_id="run-promote", challenge_id="c-promote")
+        assert replay.sync(graph) == promotion_seq
+        await asyncio.sleep(0)
+        assert len(board.query_findings(FindingPredicate())) == 1
+        assert len(bus.events) == 2
+        graph.close()
+
+    asyncio.run(main())
+
+
+def test_promotion_partial_sync_without_base_does_not_claim_supersession(tmp_path):
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.swarm.board import StructuredFinding
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    async def main():
+        graph = SQLiteSharedGraph.open(
+            db_path=tmp_path / "partial-promotion.db",
+            challenge=Challenge(id="c-partial", name="c", category="web"),
+        )
+        fact_seq = graph.add_evidence(
+            actor="pi-web", source="curl", fact="admin endpoint", verified=False,
+            finding=StructuredFinding(kind=FindingKind.HTTP_ENDPOINT, target="https://app/admin"),
+        )
+        graph.add_evidence(
+            actor="pi-web", source="curl", fact="admin endpoint", verified=True,
+            confidence=0.93, artifact_id="art-proof", witness="curl 200", verifier="gate",
+        )
+        promotion_seq = graph.events_since(0, kinds=("fact_verified",))[0]["seq"]
+
+        board = MemoryBoard("c-partial")
+        bus = _CaptureBus()
+        projector = BoardProjector(
+            board, after_seq=fact_seq, bus=bus, run_id="run-partial", challenge_id="c-partial"
+        )
+        assert projector.sync(graph) == promotion_seq
+        await asyncio.sleep(0)
+        assert len(board.query_findings(FindingPredicate())) == 1
+        assert len(bus.events) == 1
+        assert "supersedes_source_seq" not in bus.events[0].payload
+        assert bus.events[0].payload["transition_seq"] == promotion_seq
+        graph.close()
+
+    asyncio.run(main())
+
+
+def test_projector_cursor_stays_before_failed_event():
+    class _FailingBoard(MemoryBoard):
+        def replace_by_source(self, *, source_seq, finding, projection_key):
+            if int(source_seq) == 2:
+                raise RuntimeError("projection write failed")
+            return super().replace_by_source(
+                source_seq=source_seq, finding=finding, projection_key=projection_key
+            )
+
+    board = _FailingBoard("c-fail")
+    graph = _ListGraph([
+        _event(1, payload={"fact": "first"}),
+        _event(2, payload={"fact": "second"}),
+    ])
+    projector = BoardProjector(board)
+    try:
+        projector.sync(graph)
+    except RuntimeError as exc:
+        assert str(exc) == "projection write failed"
+    else:
+        raise AssertionError("sync must surface projection failures")
+    assert projector.after_seq == 1
+    assert [f.target for f in board.query_findings(FindingPredicate())] == ["first"]

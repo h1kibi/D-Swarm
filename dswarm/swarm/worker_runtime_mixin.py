@@ -428,6 +428,9 @@ class WorkerRuntimeMixin:
         # 127.0.0.1:8000: that address is the worker container itself.  HTTP remains
         # available only when the operator explicitly supplied a URL (or when no
         # shared DB is available at all).
+        # The skill needs the challenge scope independently of graph contents; a
+        # fresh graph may have no event/intents yet.
+        env["DSWARM_CHALLENGE_ID"] = str(self.challenge.id)
         graph_db = getattr(self.shared_graph, "db_path", None)
         if graph_db:
             db_path = str(graph_db)

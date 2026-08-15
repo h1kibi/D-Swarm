@@ -73,9 +73,17 @@ class ReviewFlowMixin:
             # so its length IS the live unverified-candidate count.
             return len(self.shared_graph.active_candidates())
         except Exception:
+            # M3 fallback remains projection-only: raw ``events.verified`` is
+            # genesis metadata and cannot represent promotions or retirement.
             try:
-                return sum(1 for e in self.shared_graph.events()
-                           if e.get("kind") == "fact_added" and not e.get("verified"))
+                rows = self.shared_graph.effective_facts(active_only=True)
+                return sum(
+                    1
+                    for item in rows
+                    if str(item.get("state") or "") == "candidate"
+                    and not bool(item.get("verified"))
+                    and not bool(item.get("retired"))
+                )
             except Exception:
                 return 0
 

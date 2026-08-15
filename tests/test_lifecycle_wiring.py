@@ -6,6 +6,7 @@ edges (never compact an active intent) hold. See docs/AUDIT_intent_fact_accumula
 from __future__ import annotations
 
 from dswarm.models.solve_graph import Challenge
+from dswarm.swarm.review_flow import ReviewFlowMixin
 from dswarm.swarm.shared_graph import (
     EV_FACT_REJECTED,
     EV_INTENT_STATE_CHANGED,
@@ -192,3 +193,24 @@ def test_routeless_cap_does_not_block_verified(tmp_path):
     seq = g.add_evidence(actor="s1", source="x", fact="VERIFIED truth", verified=True)
     assert seq != -1
     g.close()
+
+
+def test_candidate_count_fallback_uses_effective_projection_not_raw_events():
+    class _Graph:
+        def active_candidates(self):
+            raise RuntimeError("primary helper unavailable")
+
+        def effective_facts(self, *, active_only=False):
+            assert active_only is True
+            return [
+                {"state": "candidate", "retired": False, "verified": False},
+                {"state": "verified", "retired": False, "verified": True},
+                {"state": "candidate", "retired": True, "verified": False},
+            ]
+
+        def events(self):
+            raise AssertionError("raw events are not a valid M3 fallback")
+
+    flow = ReviewFlowMixin()
+    flow.shared_graph = _Graph()
+    assert flow._candidate_fact_count() == 1
