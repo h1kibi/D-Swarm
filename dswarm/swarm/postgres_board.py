@@ -86,12 +86,42 @@ class PostgresBoard:
                     source_seq BIGINT,
                     projection_key TEXT,
                     superseded_by UUID,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    route_hash TEXT NOT NULL DEFAULT '',
+                    route_lineage TEXT NOT NULL DEFAULT '',
+                    event_ts DOUBLE PRECISION,
+                    projected_at DOUBLE PRECISION,
+                    pheromone_origin_ts DOUBLE PRECISION,
+                    fact_origin_ts DOUBLE PRECISION
                 )
                 """
             )
             cur.execute(
                 "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS projection_key TEXT"
+            )
+            cur.execute(
+                "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS route_hash "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS route_lineage "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS event_ts "
+                "DOUBLE PRECISION"
+            )
+            cur.execute(
+                "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS projected_at "
+                "DOUBLE PRECISION"
+            )
+            cur.execute(
+                "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS pheromone_origin_ts "
+                "DOUBLE PRECISION"
+            )
+            cur.execute(
+                "ALTER TABLE swarm_findings ADD COLUMN IF NOT EXISTS fact_origin_ts "
+                "DOUBLE PRECISION"
             )
             cur.execute(
                 """
@@ -149,14 +179,25 @@ class PostgresBoard:
 
     @staticmethod
     def _finding_from_row(row: tuple[Any, ...]) -> Finding:
+        if len(row) == 12:
+            row = (*row, "", "", None, None, None, None)
         (
             seq, challenge_id, agent_name, kind, target, data, base, half,
             source_seq, projection_key, superseded_by, created_at,
+            route_hash, route_lineage, event_ts, projected_at,
+            pheromone_origin_ts, fact_origin_ts,
         ) = row
         if isinstance(data, str):
             payload = json.loads(data or "{}")
         else:
             payload = dict(data or {})
+
+        def timestamp(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            converter = getattr(value, "timestamp", None)
+            return float(converter() if callable(converter) else value)
+
         return Finding(
             challenge_id=str(challenge_id),
             kind=str(kind),
@@ -167,9 +208,15 @@ class PostgresBoard:
             half_life_sec=int(half),
             source_seq=int(source_seq or 0),
             projection_key=str(projection_key or ""),
+            route_hash=str(route_hash or ""),
+            route_lineage=str(route_lineage or ""),
+            event_ts=timestamp(event_ts),
+            projected_at=timestamp(projected_at),
+            pheromone_origin_ts=timestamp(pheromone_origin_ts),
+            fact_origin_ts=timestamp(fact_origin_ts),
             superseded_by=str(superseded_by) if superseded_by else None,
             seq=int(seq),
-            created_at=created_at.timestamp(),
+            created_at=float(timestamp(created_at) or 0.0),
         )
 
     @staticmethod
@@ -177,7 +224,8 @@ class PostgresBoard:
         return (
             "seq, challenge_id, agent_name, finding_type, target, data, "
             "pheromone_base, half_life_sec, source_seq, projection_key, "
-            "superseded_by, created_at"
+            "superseded_by, created_at, route_hash, route_lineage, event_ts, "
+            "projected_at, pheromone_origin_ts, fact_origin_ts"
         )
 
     def write_finding(
@@ -193,6 +241,12 @@ class PostgresBoard:
         embedding: Optional[list[float]] = None,
         source_seq: int = 0,
         projection_key: str = "",
+        route_hash: str = "",
+        route_lineage: str = "",
+        event_ts: Optional[float] = None,
+        projected_at: Optional[float] = None,
+        pheromone_origin_ts: Optional[float] = None,
+        fact_origin_ts: Optional[float] = None,
     ) -> Finding:
         base, half = self.pheromone.lookup(kind)
         if pheromone_base != 1.0:
@@ -205,8 +259,11 @@ class PostgresBoard:
                 f"""
                 INSERT INTO swarm_findings
                   (challenge_id, agent_name, finding_type, target, data,
-                   pheromone_base, half_life_sec, embedding, source_seq, projection_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   pheromone_base, half_life_sec, embedding, source_seq, projection_key,
+                   route_hash, route_lineage, event_ts, projected_at,
+                   pheromone_origin_ts, fact_origin_ts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (challenge_id, projection_key)
                   WHERE projection_key IS NOT NULL
                 DO NOTHING
@@ -216,6 +273,12 @@ class PostgresBoard:
                     challenge_id, agent_name, kind, target,
                     json.dumps(payload or {}, ensure_ascii=False), base, effective_half,
                     embedding, source_seq or None, key or None,
+                    str(route_hash or ""), str(route_lineage or ""),
+                    float(event_ts) if event_ts is not None else None,
+                    float(projected_at) if projected_at is not None else time.time(),
+                    float(pheromone_origin_ts)
+                    if pheromone_origin_ts is not None else None,
+                    float(fact_origin_ts) if fact_origin_ts is not None else None,
                 ),
             )
             row = cur.fetchone()
@@ -277,8 +340,11 @@ class PostgresBoard:
                 f"""
                 INSERT INTO swarm_findings
                   (challenge_id, agent_name, finding_type, target, data,
-                   pheromone_base, half_life_sec, embedding, source_seq, projection_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   pheromone_base, half_life_sec, embedding, source_seq, projection_key,
+                   route_hash, route_lineage, event_ts, projected_at,
+                   pheromone_origin_ts, fact_origin_ts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (challenge_id, projection_key)
                   WHERE projection_key IS NOT NULL
                 DO NOTHING
@@ -289,6 +355,14 @@ class PostgresBoard:
                     finding.kind, finding.target,
                     json.dumps(finding.payload or {}, ensure_ascii=False), base,
                     effective_half, finding.embedding, int(source_seq), key,
+                    str(finding.route_hash or ""), str(finding.route_lineage or ""),
+                    float(finding.event_ts) if finding.event_ts is not None else None,
+                    float(finding.projected_at)
+                    if finding.projected_at is not None else time.time(),
+                    float(finding.pheromone_origin_ts)
+                    if finding.pheromone_origin_ts is not None else None,
+                    float(finding.fact_origin_ts)
+                    if finding.fact_origin_ts is not None else None,
                 ),
             )
             inserted = cur.fetchone()

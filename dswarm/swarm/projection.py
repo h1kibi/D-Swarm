@@ -42,6 +42,34 @@ class BoardProjector:
         self._emit_tasks: set[asyncio.Task] = set()
 
     @staticmethod
+    def _event_timestamp(ev: dict[str, Any]) -> Optional[float]:
+        value = ev.get("ts")
+        if value is None:
+            return None
+        converter = getattr(value, "timestamp", None)
+        try:
+            return float(converter() if callable(converter) else value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _route_observation(graph: Any, fact_seq: int) -> Optional[Any]:
+        resolver = getattr(graph, "route_lineage_for_fact", None)
+        if not callable(resolver):
+            return None
+        try:
+            return resolver(int(fact_seq))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _apply_route_observation(finding: Finding, observation: Optional[Any]) -> None:
+        if observation is None:
+            return
+        finding.route_hash = str(observation.effective_route_hash or "")
+        finding.route_lineage = str(observation.lineage or "unattributed")
+
+    @staticmethod
     def project_event(ev: dict[str, Any]) -> Optional[Finding]:
         kind = str(ev.get("kind") or "")
         if kind != "fact_added":
@@ -51,6 +79,7 @@ class BoardProjector:
         if not fact:
             return None
         actor = str(ev.get("actor") or "worker")
+        event_ts = BoardProjector._event_timestamp(ev)
         verified = bool(ev.get("verified"))
         confidence = float(ev.get("confidence") or 0.4)
         finding = StructuredFinding.from_dict(payload.get("finding"))
@@ -72,6 +101,9 @@ class BoardProjector:
                 target=target,
                 payload=data,
                 source_seq=int(ev.get("seq") or 0),
+                event_ts=event_ts,
+                pheromone_origin_ts=event_ts,
+                fact_origin_ts=event_ts,
             )
         return Finding(
             challenge_id=str(ev.get("challenge_id") or payload.get("challenge_id") or ""),
@@ -87,10 +119,19 @@ class BoardProjector:
                 "witness": payload.get("witness") or "",
             },
             source_seq=int(ev.get("seq") or 0),
+            event_ts=event_ts,
+            pheromone_origin_ts=event_ts,
+            fact_origin_ts=event_ts,
         )
 
     @staticmethod
-    def _project_effective_fact(item: dict[str, Any], promotion_seq: int) -> Optional[Finding]:
+    def _project_effective_fact(
+        item: dict[str, Any],
+        promotion_seq: int,
+        *,
+        promotion_ts: Optional[float] = None,
+        observation: Optional[Any] = None,
+    ) -> Optional[Finding]:
         fact = str(item.get("fact_text") or "")
         if not fact:
             return None
@@ -113,6 +154,9 @@ class BoardProjector:
                 "artifact_id": str(item.get("promotion_artifact_id") or ""),
             },
         }
+        fact_origin_ts = (
+            float(item["fact_ts"]) if item.get("fact_ts") is not None else None
+        )
         return Finding(
             challenge_id=str(item.get("challenge_id") or ""),
             kind=finding_kind,
@@ -120,6 +164,17 @@ class BoardProjector:
             target=target,
             payload=data,
             source_seq=int(item.get("fact_seq") or 0),
+            route_hash=(
+                str(observation.effective_route_hash or "")
+                if observation is not None else ""
+            ),
+            route_lineage=(
+                str(observation.lineage or "unattributed")
+                if observation is not None else ""
+            ),
+            event_ts=promotion_ts,
+            pheromone_origin_ts=promotion_ts,
+            fact_origin_ts=fact_origin_ts,
         )
 
     def sync(self, graph: Any) -> int:
@@ -135,8 +190,14 @@ class BoardProjector:
                 payload = dict(ev.get("payload") or {})
                 fact_seq = int(payload.get("fact_seq") or 0)
                 effective = graph.effective_fact(fact_seq)
+                observation = self._route_observation(graph, fact_seq)
                 projected = (
-                    self._project_effective_fact(effective, seq)
+                    self._project_effective_fact(
+                        effective,
+                        seq,
+                        promotion_ts=self._event_timestamp(ev),
+                        observation=observation,
+                    )
                     if effective is not None else None
                 )
                 if projected is not None:
@@ -160,6 +221,12 @@ class BoardProjector:
             else:
                 projected = self.project_event(ev)
                 if projected is not None:
+                    observation = self._route_observation(graph, projected.source_seq or seq)
+                    self._apply_route_observation(projected, observation)
+                    if observation is not None:
+                        projected.event_ts = float(observation.event_ts)
+                        projected.pheromone_origin_ts = float(observation.event_ts)
+                        projected.fact_origin_ts = float(observation.event_ts)
                     projected.challenge_id = projected.challenge_id or getattr(
                         self.board, "challenge_id", ""
                     )
@@ -198,7 +265,14 @@ class BoardProjector:
             return
         try:
             created_at = (
-                datetime.fromtimestamp(float(finding.created_at), tz=timezone.utc)
+                datetime.fromtimestamp(
+                    float(
+                        finding.pheromone_origin_ts
+                        if finding.pheromone_origin_ts is not None
+                        else finding.created_at
+                    ),
+                    tz=timezone.utc,
+                )
                 .isoformat()
                 .replace("+00:00", "Z")
             )

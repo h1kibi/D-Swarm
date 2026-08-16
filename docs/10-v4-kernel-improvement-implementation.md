@@ -415,7 +415,7 @@ recovery 各结算恰好一次；CostController/Board/UI 投影一致。
 
 ## M6 route lineage + telemetry（09 §10.3.6 / §10.5 route 1-4）
 
-**Status (2026-08-16): M6a-1 implemented and test-backed; M6a-2/M6b NOT implemented.**
+**Status (2026-08-16): M6a-1 and M6a-2 implemented and test-backed; M6b NOT implemented.**
 首轮复评审定 **Contract v1 reviewed — Revise before Go**（M6a 三阻断：多 intent
 lineage、orphan 禁止继承、短路解析无法冲突检测；M6b 四缺口：路径未选边、无 durable
 checkpoint、记录模型不足、埋点语义未定义）。Contract v2 已按评审意见逐条修订；实施顺序 =
@@ -498,6 +498,11 @@ fact_origin_ts: float | None = None   # promotion 时保留原事实时间供审
   `PostgresBoard`（schema 迁移、`_finding_columns`、`_finding_from_row`、`write_finding`、
   `replace_by_source`）全部保留新增字段；`projection.py` base/promotion 两条投影路径填
   event_ts 与 lineage；新增 MemoryBoard/PostgresBoard 一致性测试。
+
+实现记录（2026-08-16）：上述 Finding 六字段、旧投影衰减回退、MemoryBoard replacement、
+Postgres schema/row/write/replace 契约以及 base/promotion/cold-replay 投影测试均已落地；
+`fact_verified` 以 promotion event timestamp 刷新 pheromone，`fact_origin_ts` 保留 genesis
+事实时间。M6b sidecar telemetry、UI 与 ReplayClock harness 仍未开始。
 
 ## M6b — telemetry（sidecar，非 route 事实源）
 

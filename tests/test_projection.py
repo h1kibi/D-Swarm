@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from dswarm.core.events import EventType
 from dswarm.swarm.board import (
+    Finding,
     FindingKind,
     FindingPredicate,
     MemoryBoard,
@@ -343,3 +344,167 @@ def test_projector_cursor_stays_before_failed_event():
         raise AssertionError("sync must surface projection failures")
     assert projector.after_seq == 1
     assert [f.target for f in board.query_findings(FindingPredicate())] == ["first"]
+
+
+def test_finding_pheromone_uses_origin_timestamp_with_legacy_fallback():
+    routed = Finding(
+        challenge_id="c-time",
+        kind=FindingKind.TEXT_FACT,
+        pheromone_base=1.0,
+        half_life_sec=100,
+        created_at=900.0,
+        pheromone_origin_ts=1000.0,
+    )
+    legacy = Finding(
+        challenge_id="c-time",
+        kind=FindingKind.TEXT_FACT,
+        pheromone_base=1.0,
+        half_life_sec=100,
+        created_at=900.0,
+    )
+
+    assert routed.pheromone(now=1100.0) == 0.5
+    assert legacy.pheromone(now=1000.0) == 0.5
+
+
+def test_memory_board_replace_preserves_m6_lineage_and_time_fields():
+    board = MemoryBoard("c-m6", now=lambda: 2000.0)
+    finding = Finding(
+        challenge_id="c-m6",
+        kind=FindingKind.HTTP_ENDPOINT,
+        agent_name="pi-web",
+        target="https://target/admin",
+        route_hash="route-web",
+        route_lineage="inherited",
+        event_ts=1100.0,
+        projected_at=1200.0,
+        pheromone_origin_ts=1100.0,
+        fact_origin_ts=1000.0,
+        source_seq=17,
+    )
+
+    result = board.replace_by_source(
+        source_seq=17,
+        finding=finding,
+        projection_key="fact:17:promotion:22",
+    )
+
+    stored = result.finding
+    assert stored.route_hash == "route-web"
+    assert stored.route_lineage == "inherited"
+    assert stored.event_ts == 1100.0
+    assert stored.projected_at == 1200.0
+    assert stored.pheromone_origin_ts == 1100.0
+    assert stored.fact_origin_ts == 1000.0
+
+
+def test_projector_persists_route_lineage_and_canonical_event_times(tmp_path):
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.swarm.board import StructuredFinding
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    graph = SQLiteSharedGraph.open(
+        db_path=tmp_path / "m6-projection.db",
+        challenge=Challenge(id="c-m6-project", name="c", category="web"),
+    )
+    graph.propose_intent(
+        actor="reason",
+        intent_id="I-route",
+        goal="inspect admin",
+        payload={"route_hash": "web-admin"},
+    )
+    fact_seq = graph.add_evidence(
+        actor="pi-web",
+        source="curl",
+        fact="admin endpoint",
+        verified=False,
+        confidence=0.4,
+        intent_id="I-route",
+        finding=StructuredFinding(
+            kind=FindingKind.HTTP_ENDPOINT,
+            target="https://target/admin",
+        ),
+    )
+    base_event = next(
+        event for event in graph.events_since(0, kinds=("fact_added",))
+        if int(event["seq"]) == fact_seq
+    )
+    observation = graph.route_lineage_for_fact(fact_seq)
+
+    board = MemoryBoard("c-m6-project", now=lambda: 5000.0)
+    projector = BoardProjector(board, challenge_id="c-m6-project")
+    assert projector.sync(graph) == fact_seq
+    base = board.query_findings(FindingPredicate())[0]
+    assert base.route_hash == observation.effective_route_hash
+    assert base.route_lineage == "inherited"
+    assert base.event_ts == float(base_event["ts"])
+    assert base.pheromone_origin_ts == float(base_event["ts"])
+    assert base.fact_origin_ts == float(base_event["ts"])
+    assert base.projected_at == 5000.0
+
+    graph.add_evidence(
+        actor="pi-web",
+        source="curl",
+        fact="admin endpoint",
+        verified=True,
+        confidence=0.95,
+        artifact_id="art-proof",
+        witness="HTTP 200",
+        verifier="gate",
+    )
+    promotion_event = graph.events_since(fact_seq, kinds=("fact_verified",))[0]
+    assert projector.sync(graph) == int(promotion_event["seq"])
+    promoted = board.query_findings(FindingPredicate())[0]
+    assert promoted.route_hash == observation.effective_route_hash
+    assert promoted.route_lineage == "inherited"
+    assert promoted.event_ts == float(promotion_event["ts"])
+    assert promoted.pheromone_origin_ts == float(promotion_event["ts"])
+    assert promoted.fact_origin_ts == float(base_event["ts"])
+    assert promoted.projected_at == 5000.0
+    graph.close()
+
+
+def test_projector_cold_replay_preserves_m6_semantics(tmp_path):
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    graph = SQLiteSharedGraph.open(
+        db_path=tmp_path / "m6-replay.db",
+        challenge=Challenge(id="c-m6-replay", name="c", category="misc"),
+    )
+    fact_seq = graph.add_evidence(
+        actor="pi-misc",
+        source="stdout",
+        fact="stable replay fact",
+        verified=False,
+        route_hash="misc-replay",
+    )
+    graph.add_evidence(
+        actor="verifier",
+        source="stdout",
+        fact="stable replay fact",
+        verified=True,
+        confidence=0.9,
+        artifact_id="art-replay",
+        witness="confirmed",
+        verifier="gate",
+    )
+
+    online_board = MemoryBoard("c-m6-replay", now=lambda: 7000.0)
+    online = BoardProjector(online_board, challenge_id="c-m6-replay")
+    assert online.sync(graph) > fact_seq
+
+    replay_board = MemoryBoard("c-m6-replay", now=lambda: 7000.0)
+    replay = BoardProjector(replay_board, challenge_id="c-m6-replay")
+    assert replay.sync(graph) == online.after_seq
+
+    online_finding = online_board.query_findings(FindingPredicate())[0]
+    replay_finding = replay_board.query_findings(FindingPredicate())[0]
+    fields = (
+        "route_hash", "route_lineage", "event_ts", "projected_at",
+        "pheromone_origin_ts", "fact_origin_ts",
+    )
+    assert {name: getattr(online_finding, name) for name in fields} == {
+        name: getattr(replay_finding, name) for name in fields
+    }
+    graph.close()

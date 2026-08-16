@@ -50,6 +50,12 @@ class Finding:
     embedding: Optional[list[float]] = None
     source_seq: int = 0
     projection_key: str = ""
+    route_hash: str = ""
+    route_lineage: str = ""
+    event_ts: Optional[float] = None
+    projected_at: Optional[float] = None
+    pheromone_origin_ts: Optional[float] = None
+    fact_origin_ts: Optional[float] = None
     superseded_by: Optional[str] = None
     seq: int = 0
     created_at: float = field(default_factory=time.time)
@@ -60,7 +66,12 @@ class Finding:
 
     def pheromone(self, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now
-        age = max(0.0, now - self.created_at)
+        origin = (
+            self.pheromone_origin_ts
+            if self.pheromone_origin_ts is not None
+            else self.created_at
+        )
+        age = max(0.0, now - origin)
         half = max(1, int(self.half_life_sec))
         return max(0.0, min(1.0, float(self.pheromone_base) * (0.5 ** (age / half))))
 
@@ -162,6 +173,12 @@ class Board(Protocol):
         embedding: Optional[list[float]] = None,
         source_seq: int = 0,
         projection_key: str = "",
+        route_hash: str = "",
+        route_lineage: str = "",
+        event_ts: Optional[float] = None,
+        projected_at: Optional[float] = None,
+        pheromone_origin_ts: Optional[float] = None,
+        fact_origin_ts: Optional[float] = None,
     ) -> Finding: ...
 
     def query_findings(self, predicate: FindingPredicate) -> list[Finding]: ...
@@ -278,6 +295,12 @@ class MemoryBoard:
         embedding: Optional[list[float]] = None,
         source_seq: int = 0,
         projection_key: str = "",
+        route_hash: str = "",
+        route_lineage: str = "",
+        event_ts: Optional[float] = None,
+        projected_at: Optional[float] = None,
+        pheromone_origin_ts: Optional[float] = None,
+        fact_origin_ts: Optional[float] = None,
     ) -> Finding:
         key = str(projection_key or "")
         if key and key in self._projection_index:
@@ -292,6 +315,7 @@ class MemoryBoard:
             if existing:
                 return existing[0]
         base, half = self.pheromone.lookup(kind)
+        created_at = float(self._now())
         f = Finding(
             challenge_id=challenge_id,
             kind=kind,
@@ -303,8 +327,21 @@ class MemoryBoard:
             embedding=embedding,
             source_seq=source_seq,
             projection_key=key,
+            route_hash=str(route_hash or ""),
+            route_lineage=str(route_lineage or ""),
+            event_ts=float(event_ts) if event_ts is not None else None,
+            projected_at=(
+                float(projected_at) if projected_at is not None else created_at
+            ),
+            pheromone_origin_ts=(
+                float(pheromone_origin_ts)
+                if pheromone_origin_ts is not None else None
+            ),
+            fact_origin_ts=(
+                float(fact_origin_ts) if fact_origin_ts is not None else None
+            ),
             seq=self._next_seq(),
-            created_at=self._now(),
+            created_at=created_at,
         )
         self._findings.append(f)
         if key:
@@ -366,6 +403,10 @@ class MemoryBoard:
             agent_name=finding.agent_name, target=finding.target, payload=finding.payload,
             pheromone_base=finding.pheromone_base, half_life_sec=finding.half_life_sec,
             embedding=finding.embedding, source_seq=int(source_seq), projection_key=key,
+            route_hash=finding.route_hash, route_lineage=finding.route_lineage,
+            event_ts=finding.event_ts, projected_at=finding.projected_at,
+            pheromone_origin_ts=finding.pheromone_origin_ts,
+            fact_origin_ts=finding.fact_origin_ts,
         )
         superseded_ids = tuple(item.finding_id for item in prior if item is not replacement)
         for item in prior:
