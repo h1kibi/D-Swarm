@@ -11,6 +11,7 @@ import asyncio
 import os
 import re
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
@@ -21,6 +22,7 @@ from dswarm.core.provider_errors import (
     classify_provider_error,
 )
 from dswarm.models.solve_graph import Challenge
+from dswarm.swarm import energy, energy_capture
 from dswarm.swarm.agents import AgentProfile, AgentRegistry, DispatchDecision
 from dswarm.swarm.board import (
     Board,
@@ -36,6 +38,7 @@ from dswarm.solver.direction_rules import (
 from dswarm.solver.worker_profiles import direction_profile_name
 from dswarm.swarm.lane_gate import WorkerLaneGate
 from dswarm.solver.reason import ReasonResult
+from dswarm.swarm.priority import normalize_priority
 
 WorkerFactory = Callable[
     [DispatchDecision, AgentProfile],
@@ -76,6 +79,8 @@ class ReasonSwarm:
         planner_diagnostic: Optional[dict[str, Any]] = None,
         review_max_concurrent: int = 1,
         lane_gate: Optional[WorkerLaneGate] = None,
+        energy_trace_enabled: bool = False,
+        energy_trace_sink: Any = None,
     ) -> None:
         self.challenge = challenge
         self.board = board or MemoryBoard(challenge.id, pheromone=pheromone)
@@ -99,6 +104,17 @@ class ReasonSwarm:
             max_workers=self.max_workers,
             review_max_concurrent=max(0, int(review_max_concurrent)),
         )
+        # M7 offline energy telemetry (docs/10 Contract v9.2). Off by default;
+        # zero side effects unless explicitly enabled. Enabled without a sink
+        # is a construction error ("no sink, no capture").
+        self.energy_trace_enabled = bool(energy_trace_enabled)
+        self.energy_trace_sink = energy_trace_sink
+        if self.energy_trace_enabled and self.energy_trace_sink is None:
+            raise ValueError(
+                "energy_trace_enabled=True requires an energy_trace_sink "
+                "(EnergyTraceSink); construct the sink before the swarm")
+        # Cross-resume-unique trace identity component.
+        self._instance_uuid = str(uuid.uuid4())
         self._last_reason: Optional[ReasonResult] = None
         self._executed: set[str] = set()
         self._fallback_executed = False
@@ -280,6 +296,82 @@ class ReasonSwarm:
             "provider_batch_alert",
             stage="dispatch",
             **{k: v for k, v in alert.items() if k != "type"},
+        )
+
+    async def _record_energy_cycle(
+        self, fresh: list[DispatchDecision], cycle_id: str
+    ) -> None:
+        """M7 scheduler wiring step 2 (docs/10 v9.2): trace_id ->
+        cycle_started -> bounded capture -> EnergyDecisions -> cycle_trace.
+        Runs before _register_decision/dispatch; any failure only degrades the
+        telemetry sample, never the solve."""
+        run_id = self.run_id or self.challenge.id
+        trace_id = energy.make_trace_id(
+            run_id, self._instance_uuid, self._generation)
+        decision_ts = time.time()
+        self.energy_trace_sink.start_cycle(
+            trace_id, reason_cycle_id=cycle_id, decision_ts=decision_ts)
+        db_path = getattr(self.graph, "db_path", None)
+        if db_path:
+            snapshot = await asyncio.to_thread(
+                energy_capture.capture_energy_cycle_snapshot,
+                db_path, self.challenge.id)
+        else:
+            snapshot = energy.GraphCycleSnapshot(
+                graph_after_seq=0, observations=(), dead_ends=(),
+                complete=False, exclusion_reason="snapshot_unavailable",
+                observed_fact_count=0, captured_fact_count=0,
+                stored_fact_count=0)
+        decisions = tuple(
+            self._energy_decision(d, trace_id, cycle_id, index)
+            for index, d in enumerate(fresh))
+        trace = energy.CycleTrace(
+            schema_version=energy.SCHEMA_VERSION,
+            trace_id=trace_id,
+            reason_cycle_id=cycle_id,
+            decision_ts=decision_ts,
+            expected_decision_count=len(fresh),
+            decisions=decisions,
+            snapshot=snapshot,
+            complete=snapshot.complete and len(decisions) == len(fresh),
+            exclusion_reason=snapshot.exclusion_reason,
+            serialized_bytes=0,
+            serialized_bytes_attempted=None,
+        )
+        self.energy_trace_sink.write_trace(trace)
+
+    def _energy_decision(
+        self, decision: DispatchDecision, trace_id: str, cycle_id: str,
+        index: int,
+    ) -> energy.EnergyDecision:
+        """Field ownership is fully specified in docs/10 (no implementer
+        guessing): original_index is the zero-based fresh index, worker_lane
+        comes from lane_gate.lane_for, normalized_priority reuses
+        priority.normalize_priority (no second implementation), priority_scale
+        is frozen to "planner", decision_source to "reason"."""
+        lane = self.lane_gate.lane_for(
+            mode=decision.mode, worker_class=decision.worker_class)
+        route_hash = ""
+        if self.graph is not None:
+            try:
+                route_hash = self.graph.normalize_route_hash(
+                    decision.canonical_direction or decision.direction or "")
+            except Exception:
+                route_hash = ""
+        run_id = self.run_id or self.challenge.id
+        return energy.EnergyDecision(
+            decision_id=energy.decision_id_for(
+                run_id, trace_id, index, decision.intent_id, "reason"),
+            trace_id=trace_id,
+            reason_cycle_id=cycle_id,
+            intent_id=decision.intent_id,
+            route_hash=route_hash,
+            worker_lane=lane,
+            priority=float(decision.priority),
+            normalized_priority=normalize_priority(decision.priority),
+            priority_scale="planner",
+            original_index=index,
+            decision_source="reason",
         )
 
     def _register_decision(self, decision: DispatchDecision) -> None:
@@ -938,6 +1030,15 @@ class ReasonSwarm:
                         await _one(fallback)
                         continue
                     break
+                # M7 offline energy telemetry (docs/10 scheduler order step 2):
+                # after fresh is formed, BEFORE _register_decision/dispatch.
+                # cycle_started -> capture -> cycle_trace; sample failures never
+                # break the reason loop or reorder dispatch.
+                if self.energy_trace_enabled and self.energy_trace_sink is not None:
+                    try:
+                        await self._record_energy_cycle(fresh, cycle_id)
+                    except Exception:
+                        pass  # telemetry must never break the solve
                 for decision in fresh:
                     self._executed.add(decision.dedupe_key)
                     self._register_decision(decision)

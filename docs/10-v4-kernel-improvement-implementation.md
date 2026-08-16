@@ -629,42 +629,734 @@ M7（energy）输入 = M6a 的 `RouteObservation[]`（`eligible_for_energy` 已�
 
 ## M7 energy 离线实验（09 §10.3.7 / §10.5 energy 1-8）
 
-**现状（已核实）**：信息素数学在 `board.py`；无 route 级聚合；无 replay harness；
-`MemoryBoard` 已有虚拟时钟注入点。
+**Status (2026-08-16): Implemented — Contract v9.2 approved (Conditional Go closed), three
+commits landed, full suite green。**
+- M7-0：`dswarm/swarm/energy.py`（类型/枚举/validator/固定点序列化）+ `energy_capture.py`
+  （有界只读捕获：progress handler、fact_effective + promotion_ts JOIN、applied dead-end、
+  三计数）+ `energy_sidecar.py`（segment 轮转/partial tail 截断/两维 manifest/resume epoch
+  ack guard/恢复折叠/complete 派生谓词）+ `reason_scheduler.py` 接线（`energy_trace_enabled`
+  /`energy_trace_sink` 构造参数，fresh 后 cycle_started→capture→cycle_trace 两阶段，feature
+  off 零副作用）；测试 23-39/45-51/53-68/74-116/119-127。
+- M7-1：`route_energies`/`reorder_decisions` 三序列与 exact-equal 分组（`energy.py` 内）；
+  测试 1-22/69-73。
+- M7-2：`dswarm/swarm/energy_report.py`（离线 replay/只读折叠/两段归因指标/paired run-level
+  bootstrap/coverage 与 N/A 纪律报告）；测试 40-44/52/117-118。
+**实施边界保持：不接在线 DSWARM_ENERGY_TIEBREAK（另立 RFC）、不改生产派发顺序、不改
+provenance gate、不改 SharedGraph canonical 写语义；telemetry 样本失败不阻断派发；仅
+dataset/process resume 完整性 witness 无法持久化时在新实例派发前 fail-fast。**
 
-**设计**
+### 已核实的代码基线（v8 依据）
 
-1. `dswarm/swarm/energy.py`（纯函数，无 IO、无 LLM）：
-   ```python
-   @dataclass(frozen=True)
-   class EnergyConfig:
-       weights: dict[str, float] = {"verified_witness": 1.0, "verified": 0.6, "candidate": 0.3}
-       tau: float = 1800.0
-       dead_penalty: float = 0.5
-       dead_tau: float = 7200.0
-       actor_grouping: str = "max"     # 组内聚合 max|sum
-       exclude_housekeeping: bool = True   # verifier/review route 不参与
-   def route_energy(graph, now, cfg) -> dict[str, float]
-       # 1) identity dedupe（复用 _normalize_fact_identity）
-       # 2) 每项 clamp [0,1]
-       # 3) actor 分组：组内 max；跨组概率合并 1 - Π(1 - x)
-       # 4) dead-end：-dead_penalty * exp(-age/dead_tau)，同 route 多条取 max
-       # 5) flag_found route → 1.0
-   def energy_rank(decisions, energies, original_order) -> list
-       # key = (lane, planner_priority, energy if priority exactly equal else 0.0,
-       #        original_index)   ← exact-equal tie-break 唯一在线语义
-   ```
-2. `scripts/energy_ablation.py`：读 `shared_graph.db` 或 JSONL，`ReplayClock` 虚拟时间，
-   在每个 decision 时刻计算 energy vs baseline 顺序，输出 CSV + 报告（flag latency、
-   worker starts、tokens、route churn、多 seed、置信区间）。`DSWARM_ENERGY_TIEBREAK=1`
-   作为**离线验证通过后**的在线开关（仅 exact-equal，默认 0 = feature off 与 baseline
-   decision-for-decision 一致）。
-3. 复杂度：energy 增量缓存（按 fact_seq 失效），禁止每 tick 全量扫；基准测试记录。
+- `conclude_intent`（shared_graph.py:2966-3020）无条件追加 `EV_INTENT_CONCLUDED`，owner fence
+  （:2991 `AND (worker=? OR worker IS NULL)`）更新 `intents.result_seq`——迟到结论进日志不生效；
+- `journal_mode=DELETE` + `busy_timeout=5000`（shared_graph.py:780-781）；
+- Reason 真实派发序（reason_scheduler.py:832-837, 941-954）：`capped = decisions[:limit]` →
+  fresh 过滤（**保持模型序**）→ `_register_decision`/emit → `asyncio.gather`——**无
+  lane/scale/priority 重排**；
+- dispatchable queue 排序（shared_graph.py:4107-4110）：review 后置、operator 前置、
+  priority DESC、created_seq ASC——与 Reason fresh 派发序不同；
+- `fact_effective` VIEW 有 `fact_ts`/`promotion_seq`，**无 `promotion_ts`**（fact_events.py:77-118）；
+- `normalize_priority`（priority.py:24-41）：None/bool/非法字符串/NaN/Inf → 0.0；label 映射；
+  合法数值保持精度；
+- `_emit` 固定 `actor="reason"`（reason_scheduler.py:125-145）；UI reducer 只隔离
+  `kind == "metrics_summary"`（events.ts:691-693）；
+- `lane_for`：worker_class ∈ {review, verifier} → "review"，否则 "ordinary"（lane_gate.py:47-54）；
+- `DispatchDecision`（agents.py:33-53）无 `priority_scale` 字段（图上注册时计算）；M7 冻结为
+  "planner"。
 
-**测试**：纯函数单测（clamp/去相关/冷启动恒等=baseline 原序/稳定排序/dead-end 随时间减弱）；
-harness 对固定 fixture 两次运行输出逐字节一致。
+### M7-1 完整公式契约（v8：时间模型与三序列定稿）
 
-**验收映射**：09 §10.5 energy 全部 8 条。
+```python
+@dataclass(frozen=True)
+class EnergyConfig:
+    weights: Mapping[str, float]       # __post_init__：复制 + MappingProxyType + key 白名单
+                                       # （verified_witness/verified/candidate）+ finite + 缺 key 报错
+    tau: float = 1800.0                # > 0
+    dead_penalty: float = 0.5          # [0,1]
+    dead_tau: float = 7200.0           # > 0
+
+@dataclass(frozen=True)
+class RouteEnergy:
+    route_hash: str
+    positive: float                    # [0,1]
+    penalty: float                     # [0,1] 正值
+    energy: float                      # clamp(positive - penalty, 0, 1)
+    flag_captured: bool                # 报告标签，不进公式
+    raw_fact_count: int                # 排除后普查（universe 语义见下）
+    correlation_group_count: int       # 实际进入概率合并的组数
+    eligible: bool                     # := positive > 0（能否把 energy 抬到 0 以上）
+
+def route_energies(
+    observations: Sequence[EnergyObservationSnapshot],
+    dead_ends: Sequence[DeadEndObservationSnapshot],
+    config: EnergyConfig,
+    *,
+    as_of_ts: float,                              # finite epoch；仅用于衰减，不参与成员判定
+    captured_routes: frozenset[str] = frozenset(),
+) -> dict[str, RouteEnergy]:
+    # 成员判定在 capture 层按 seq 截止完成（v8 时间模型）；本层只做公式与数值校验
+    # 排除（公式层）：not eligible_for_energy / retired；全部数值 finite 校验
+    # tier：verified 且 bool(witness.strip()) → verified_witness；verified → verified；否则 candidate
+    # confidence = clamp_finite(obs.confidence, 0, 1)
+    # raw_score = weights[tier] * confidence
+    # decayed = clamp(raw_score, 0, 1) * exp(-age / tau)，age = max(0.0, as_of_ts - energy_origin_ts)
+    # correlation 组内：max(decayed)；route 内：1 - Π(1 - group_score)
+    # penalty：dead_penalty_i = dead_penalty * exp(-age / dead_tau)
+    #   route_penalty = max(dead_penalty_i for same route)   ← 正值取 max（永不求和）
+    # energy = clamp(positive - route_penalty, 0.0, 1.0)
+    # 参与规则：challenged 不进正贡献；revalidated 恢复 base verdict、不刷新 energy_origin_ts；
+    #   promotion 刷新 energy_origin_ts（promotion_ts）
+    # universe = {有贡献观测的 route} ∪ {有 applied dead-end 的 route} ∪ captured_routes；
+    #   dead-end-only / captured-only route → positive=0, energy=0, eligible=False
+    # standalone dead_end v1 audit-only（不产生 penalty）
+
+def reorder_decisions(
+    decisions: Sequence[EnergyDecision],
+    *,
+    enabled: bool,
+    energy_supplier: Callable[[], Mapping[str, RouteEnergy]],
+) -> list[EnergyDecision]:
+    # 三条序列（v8 定稿）：
+    #   production_order        = 输入序（= Reason fresh 真实派发序，模型序）
+    #   planner_baseline_order  = sort((lane_rank, scale_rank, -normalized_priority, original_index))
+    #   energy_order            = sort((lane_rank, scale_rank, -normalized_priority,
+    #                                   -energy_within_exact_group, original_index))
+    # enabled=False → 返回 production_order（逐元素 == 输入，与现网派发逐决策等价）、
+    #   supplier 调用次数严格 0
+    # exact_equal_group = (worker_lane, priority_scale, normalized_priority)；
+    #   normalized_priority = normalize_priority(decision.priority)（priority.py 复用，构造时冻结）；
+    #   equal 判定 = IEEE float ==（normalized 值）
+    # energy 只影响 exact-equal 组内顺序；不得跨 lane/scale/priority 重排
+    # M7 只接受 snapshot 输入，不读 SQLite、不 import SharedGraph（静态断言）
+```
+
+### 统一类型模型（v8：全展开，无 `...`、无"字段同 v6"）
+
+```python
+@dataclass(frozen=True)
+class EnergyObservationSnapshot:
+    fact_seq: int
+    fact_origin_ts: float                # = VIEW fact_ts（fact_added 事件 ts）
+    energy_origin_ts: float              # = promotion_ts（promotion_seq → events.seq）否则 fact_ts
+    route_hash: str
+    lineage: str
+    lineage_reason: str
+    inherited_intent_ids: tuple[str, ...]
+    state: str                           # 枚举见下
+    retired: bool
+    verified: bool
+    base_verified: bool
+    confidence: float                    # VIEW confidence（challenged → 0.4）
+    witness: str
+    artifact_id: str
+    source: str
+    actor: str
+    correlation_kind: str                # "artifact" | "fallback"
+    correlation_basis_hash: str
+    eligible_for_energy: bool            # 结构性：route_hash 非空 ∧ confidence finite ∧ lineage 已裁决
+    exclusion_reason: str                # "" | missing_route_hash | non_finite_confidence | lineage_unresolved
+
+@dataclass(frozen=True)
+class DeadEndObservationSnapshot:
+    intent_id: str
+    route_hash: str
+    result_seq: int                      # = intents.result_seq（applied conclusion，canonical）
+    concluded_ts: float                  # = applied conclusion 事件 ts（events.seq = result_seq）
+    result: str
+    genuine_giveup: bool
+    eligible_for_energy: bool            # applied ∧ genuine_giveup ∧ route_hash 非空
+    exclusion_reason: str                # "" | missing_route_hash | not_applied | not_genuine_giveup
+    conclusion_event_count: int          # 审计：该 intent 全部 conclude 事件数
+    ignored_stale_conclusion_count: int  # 审计：owner-fence 失败被忽略的迟到结论数
+
+@dataclass(frozen=True)
+class GraphCycleSnapshot:
+    graph_after_seq: int                 # = 同事务 MAX(seq)；因果截止唯一权威
+    observations: tuple[EnergyObservationSnapshot, ...]
+    dead_ends: tuple[DeadEndObservationSnapshot, ...]
+    complete: bool                       # 三层不变式见 sidecar 节
+    exclusion_reason: str
+    observed_fact_count: int             # 阶段 1 DB 读到的 fact 原始行数（P1-3）
+    captured_fact_count: int             # 阶段 2 成功构造的 observation 数（P1-3）
+    stored_fact_count: int               # 实际保存的 len(observations)；超限 stub = 0（P1-3）
+
+@dataclass(frozen=True)
+class EnergyDecision:
+    decision_id: str                     # blake2b(run_id|trace_id|original_index|intent_id|decision_source)
+    trace_id: str                        # m7-cycle::{run_id}::{instance_uuid}::{generation}
+    reason_cycle_id: str                 # UI 展示，不参与去重
+    intent_id: str
+    route_hash: str
+    worker_lane: str                     # "ordinary" | "review"（lane_gate.lane_for）
+    priority: float                      # 原始值（DispatchDecision.priority）
+    normalized_priority: float           # normalize_priority(priority)，构造时冻结
+    priority_scale: str                  # "planner"（M7 v1 只捕获 Reason fresh）
+    original_index: int                  # fresh 零基索引
+    decision_source: str                 # "reason"
+
+@dataclass(frozen=True)
+class CycleTrace:
+    schema_version: int
+    trace_id: str
+    reason_cycle_id: str
+    decision_ts: float                   # epoch（time.time()）
+    expected_decision_count: int
+    decisions: tuple[EnergyDecision, ...]
+    snapshot: GraphCycleSnapshot         # 内嵌，不手工复制
+    complete: bool
+    exclusion_reason: str
+    serialized_bytes: int
+    serialized_bytes_attempted: int | None
+
+# CycleTraceSummary：v8 删除——M7 v1 sidecar-only，不发 EventBus 摘要（见表述与 UI 边界）
+```
+
+**枚举与 validator（逐项定义，无实现者猜测）**：
+
+```text
+state                      ∈ {candidate, verified, challenged, revalidated, rejected, merged, superseded}
+correlation_kind           ∈ {artifact, fallback}
+observation.exclusion_reason ∈ {"", missing_route_hash, non_finite_confidence, lineage_unresolved}
+dead_end.exclusion_reason  ∈ {"", missing_route_hash, not_applied, not_genuine_giveup}
+worker_lane                ∈ {ordinary, review}；priority_scale ∈ {planner}（v1）
+decision_source            ∈ {reason}（v1）
+validator：全字段类型/枚举/finite/非负校验；decision_id 重算比对；违例 → complete=False 并拒收
+```
+
+**dead-end canonical 来源（阻断 3，已获批）**：只从 `intents.result_seq → events.seq` 读取
+applied conclusion（owner fence 已过滤迟到结论）；`MAX(intent_concluded.seq)` **禁用**；迟到
+结论仅计入 `ignored_stale_conclusion_count` 审计，**不得进 penalty**。
+
+### SQLite 捕获：内部有界执行（阻断 4/5 选边定稿 + v8 时间模型）
+
+**选边：阶段 1 直接读 M3 `fact_effective` VIEW**（不再"只取 raw rows"），不在 M7-0 重构
+M3 投影系统：
+
+```text
+专用只读连接（非主 _conn）：
+  PRAGMA query_only=ON
+  PRAGMA busy_timeout=250           # 短超时，防阻塞 blackboard writer
+  set_progress_handler(deadline_monotonic)   # 超时经 progress handler 中止 SQLite VM
+阶段 1（同一短事务，graph_after_seq = MAX(seq) 先读）：
+  BEGIN
+  1. SELECT MAX(seq) AS graph_after_seq
+  2. SELECT ... FROM fact_effective
+  3. JOIN events(seq = fact_effective.promotion_seq) → promotion_ts（显式 JOIN，v8 时间模型）
+  4. SELECT intent_products + intents（lineage，created_seq <= graph_after_seq）
+  5. SELECT applied conclusions：intents.result_seq IS NOT NULL
+     AND result_seq <= graph_after_seq → JOIN events(seq = result_seq) 取 concluded_ts
+  COMMIT
+阶段 2（事务外）：lineage 裁决 → correlation hash → dataclass → validator → 序列化/大小检查
+finally：rollback（若在事务）+ close
+```
+
+- **因果成员资格唯一权威 = seq**：graph_after_seq = 同事务 MAX(seq)；阶段 1 全部读取在同一
+  事务内完成，rollback-journal（DELETE）下写者被阻塞，所见行 seq ≤ graph_after_seq 恒成立；
+  **event_ts 不参与成员判定**（v7 测试 24 的 `event_ts > cursor` 量纲错误已修正）；
+- **时间戳只用于衰减**：fact_origin_ts = fact_ts；energy_origin_ts = promotion_ts（若
+  promotion_seq 非空）否则 fact_ts；concluded_ts = applied conclusion 事件 ts；ts 晚于
+  as_of_ts → age = max(0, ...) = 0（时钟偏差饱和，不做第二套成员权威）；
+- **asyncio 超时 ≠ SQLite 查询已停止**：真正的时限由 `capture_energy_cycle_snapshot()`
+  内部 deadline 实现；scheduler 可用 `asyncio.to_thread`，但不得只靠 `wait_for` 假装取消；
+- 任何失败（busy/超时/异常）→ `complete=False, exclusion_reason="snapshot_unavailable"`，
+  继续 dispatch，绝不 raise；不改 WAL/substrate；
+- 语义声明：snapshot 描述 capture 时刻的图状态（可能晚于 Reason 读图时刻，如实记录
+  graph_after_seq）；energy 归因以 capture 状态为准。
+
+### sidecar 崩溃恢复协议与 manifest 状态机（P0-1/2/4 定稿）
+
+```text
+// energy-cycle-traces.%06d.jsonl 行类型（每行一个 JSON，flush + fsync）
+{"kind":"cycle_started","trace_id":"...","schema_version":1,"reason_cycle_id":"...","decision_ts":...}
+{"kind":"cycle_trace","trace_id":"...", <CycleTrace 全部字段，或超限/失败 exclusion stub>}
+{"kind":"resume_epoch","resume_epoch_id":"UUID4","resume_ts":...,"prior_lifecycle":"...",
+ "prior_data_quality":"...","schema_version":1}
+```
+
+**durable attempt 协议（阻断 5）**：fresh 形成后顺序——1. 生成 trace_id；2. durable append
+`cycle_started`（flush + fsync）；3. capture snapshot；4. 构造 trace 或 exclusion stub；
+5. durable append `cycle_trace`（flush + fsync）；6. 之后才 `_register_decision()` 与 dispatch。
+
+**record append 失败契约（P0-2 定稿，cycle_started 与 cycle_trace 统一）**：
+- 任何 sidecar append/fsync 失败：捕获异常，绝不向 scheduler 外传播；**不阻断 dispatch**
+  （生产优先，telemetry 只损失实验样本）；
+- 进程内 recorder_dirty=True，且**内存 data_quality 即时下调**为 max(current, incomplete)
+  （与 durable 写成功与否无关）；exclusion_reasons += ["cycle_started_append_failed" |
+  "cycle_trace_append_failed"]；随后尝试 durable 降级 manifest（temp→flush→fsync→replace）；
+- cycle_trace 失败的特殊后果：已持久化的 cycle_started 在恢复扫描时成为 orphan started →
+  dataset 至少 incomplete（双保险：本进程降级 + 恢复孤儿判定）；
+- 本进程 finalize：只要 recorder_dirty=True，**禁止**写 finalized + clean（只能 finalized +
+  当前内存质量，即 ≥ incomplete）；
+- 降级 manifest 前再次崩溃 → 由 unclean reopen（下）接管；
+- 无论降级是否成功，继续原有 `_register_decision()`/dispatch 事件/gather 顺序。
+
+**resume guard（v9.2 P0 定稿，不受 energy_trace_enabled 控制）**：见术语节——guard 只针对
+**dataset/process resume**（为已结束/释放/丢失原 ReasonSwarm 实例的 run 新建 ReasonSwarm 并
+继续产生 Reason cycle）；同一实例内的 live HITL pause→resume 不触发 guard。guard 在任何
+Reason cycle/dispatch 前执行，**resume_epoch 始终先写（单一路径，既是正常协议也是兜底）**：
+
+```text
+0. 若原 lifecycle 已是 in_progress → 先按 unclean reopen 规则降级
+   （data_quality=max(current, incomplete)、exclusion_reasons += ["unclean_reopen"]）
+1. 生成 resume_epoch_id = UUID4
+2. durable append {"kind":"resume_epoch","resume_epoch_id":...,"resume_ts":...,
+   "prior_lifecycle":...,"prior_data_quality":...}（flush + fsync）
+   ← 唯一完整性 witness；resume_ts 仅审计/展示，不参与任何因果判定
+3. append 失败 → **fail-fast 拒绝本次 resume**（清晰报错，无 dispatch；操作者可重试）
+4. append 成功 → 尝试 manifest 翻转 lifecycle_status=in_progress：
+   - if energy_trace_enabled is False:
+       data_quality = max(data_quality, incomplete)
+       exclusion_reasons += ["resume_without_energy_trace"]
+   - if prior_data_quality != clean（enabled 但历史数据已降级）:
+       保持原 data_quality 与原 exclusion_reasons，**不**额外写 resume_without_energy_trace
+5. 翻转失败**也继续**（resume_epoch 已是 durable witness；翻转只是增强，不是前提）
+6. 之后才允许 Reason cycle / dispatch
+```
+
+- 边界说明：resume guard 是**数据集完整性门**，不是 telemetry 样本管线——样本级故障
+  （capture/cycle_started/cycle_trace/manifest 更新失败）不阻断 dispatch/stop/hint；唯一
+  fail-fast 点是 witness（resume_epoch）写不进去（否则恢复边界会静默漏记），且发生在新
+  实例产生任何派发之前；
+- 崩溃序分析：resume_epoch 前崩溃 → 无 dispatch，旧 finalized+clean 数据集仍真实；
+  resume_epoch 后、finalize 前崩溃 → last_resume_epoch_id 未被 ack（见 complete 谓词）→
+  非 complete；翻转成功后再崩溃 → unclean reopen 降级（双保险）。**所有路径均无
+  "complete 却缺 cycle"**；
+- finalize：durable 写 manifest 时把当前全局折叠的 last_resume_epoch_id 写入
+  `finalized_resume_epoch_id`（acknowledgment）；**因果确认用 epoch id，禁用墙钟比较**。
+
+**unclean reopen 规则（P0-1 定稿）**：reopen 时读到的 manifest 若 lifecycle_status ==
+in_progress（无论原因），在任何 Reason cycle/capture/`_register_decision`/dispatch 前：
+
+```text
+data_quality = max(data_quality, "incomplete")       # sticky
+exclusion_reasons += ["unclean_reopen"]              # set 语义去重
+durable_write_manifest(lifecycle_status="in_progress", data_quality, ...)
+```
+
+（resume guard 步骤 0 先执行同一降级；本规则亦可被 recorder 独立初始化路径调用，幂等：
+max() 单调 + 原因 set 去重。）
+
+- 只有 reopened 前已是 finalized 的 manifest 在合法 resume 时回到 in_progress 而**不**自动降级
+  （quality 保持原值）；但若该 resume 后再崩溃，下次 reopen 按本条降级；
+- 残余窗口（fresh 形成 → cycle_started 落盘前崩溃）：无 durable 记录，但 manifest 停在
+  in_progress → reopen 触发 unclean_reopen 降级 → **该 run 永久非 complete**；不存在
+  "宣称 complete 却缺 cycle" 的路径（v8 的推论由本规则落实）。
+
+**manifest 状态机（两维，阻断 6）**：
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "...",
+  "lifecycle_status": "in_progress | finalized",
+  "data_quality": "clean | incomplete | corrupt",
+  "exclusion_reasons": [],
+  "created_ts": 0.0, "finalized_ts": 0.0,
+  "finalized_resume_epoch_id": "",
+  "cycles_started": 12, "cycles_written": 11, "cycles_failed": 1, "cycles_excluded": 2,
+  "segment_count": 4,
+  "total_trace_bytes": 1234567,
+  "max_trace_bytes": 2097152, "max_run_trace_bytes": 268435456, "max_segment_bytes": 16777216,
+  "first_trace_id": "...", "last_trace_id": "..."
+}
+```
+
+- 初始（无 manifest 且无 segment）→ {in_progress, clean}；finalize：durable 写 finalized +
+  `finalized_resume_epoch_id` = 当前全局折叠的 last_resume_epoch_id（acknowledgment）；
+  finalized_ts/created_ts 仅审计展示，不参与任何判定；data_quality 单调只降不升；
+- **complete 是派生谓词，非存储态**（v9.2：因果确认用 epoch id，禁用墙钟比较）：
+  lifecycle_status=finalized ∧ data_quality=clean ∧
+  `finalized_resume_epoch_id == last_resume_epoch_id`（每次 resume 都必须被某次成功 finalize
+  acknowledge；无 resume 时两侧均为 ""）∧ 无 orphan started ∧ 无 corrupt 分类
+  （duplicate/trace-without-started）∧ 全部 trace.complete ∧ 无 malformed ∧
+  total ≤ MAX_RUN_TRACE_BYTES ∧ 计数恒等式成立；
+- **last_resume_epoch_id 是扫描派生状态，不持久化**（终审 P2 定稿）：manifest 只保存 finalize
+  时确认的 `finalized_resume_epoch_id`；任何 manifest 加载/重建都必须先按物理 append 顺序
+  折叠全部 segment 得到运行时 last_resume_epoch_id，再计算 complete——segment 是唯一
+  recovery truth，不存在可能过期的第二份权威副本；
+- manifest 缺失或损坏但 segment 已存在 → 重扫 segment 重建计数（并照常派生
+  last_resume_epoch_id），data_quality 至少 incomplete，**不得重建为 clean**。
+
+**manifest durability 协议（P0-4 定稿）**：
+
+```text
+1. 写同目录 temp 文件；2. flush(temp)；3. os.fsync(temp_fd)；4. os.replace(temp, manifest)；
+5. POSIX 上尽力 fsync(parent_directory)；Windows 上目录 fsync 不保证支持（如实声明平台保证）；
+6. 任一步失败：保留上一个 manifest；recorder_dirty=True；本进程不得产生 finalized+clean；
+   segment 保持 recovery truth；遗留 temp 文件尽力删除（清理失败不得覆盖主异常）。
+```
+
+**跨 segment 配对（P1-1 定稿）**：恢复/校验/计数一律做**全 run 全局折叠**——按 segment 编号
+升序扫描全部有效行，构建 started_by_trace_id / trace_by_trace_id / resume_epoch 序后，才计算
+orphan/duplicate/failed/计数恒等式。分类：started 无 trace → orphan（failed，quality ≥
+incomplete）；duplicate started → corrupt；duplicate trace → corrupt；**trace 无 started →
+corrupt**；cycle_started 与 cycle_trace 跨 segment 是合法状态。
+
+**resume_epoch 行协议（v9.2 定稿）**：
+- 唯一身份 = resume_epoch_id（UUID4）；duplicate 处理选边：**内容完全一致 → 幂等折叠（丢弃
+  重复行）**；同 id 内容不一致 → corrupt；malformed → corrupt（同中间 malformed 规则）；
+- 参与 MAX_SEGMENT_BYTES append 前预判（是 sidecar 行）；**不计入 total_trace_bytes**
+  （该字段只表 trace/stub 数据量）；
+- last_resume_epoch_id 按**物理 append 顺序**（segment 编号升序 + 行序）确定，**禁止按
+  resume_ts 排序**；跨 segment 是合法状态；
+- last_resume_epoch_id 由全量折叠派生（不持久化，终审 P2）；complete 要求
+  manifest.finalized_resume_epoch_id == last_resume_epoch_id。
+
+**三层 complete 不变式（互不推导）**：
+- snapshot.complete = 捕获事务成功 ∧ 全量读取 ∧ 未超 capture deadline ∧ snapshot validator
+  通过（**大小只在 trace 层判定**：canonical bytes ≤ MAX_TRACE_BYTES，v9.1 修订）；
+- trace.complete = snapshot.complete ∧ len(decisions) == expected_decision_count ∧
+  trace validator 通过 ∧ canonical bytes ≤ MAX_TRACE_BYTES；
+- dataset complete = 上节派生谓词。
+
+**字节计量：canonical record 与固定点算法（P0-3 定稿）**：
+
+```text
+canonical record = 包含 kind="cycle_trace" 的完整 JSONL object（envelope 计入计量）；
+计量单位 = UTF-8 字节，不含尾换行（非 ASCII/中文按 UTF-8 字节，非字符数）。
+
+完整 trace：
+  1. serialized_bytes_attempted = None
+  2. serialized_bytes 初值 0
+  3. canonical encode
+  4. serialized_bytes = encoded byte length
+  5. 重复 3-4 直到数值稳定（固定点）
+  6. 稳定长度 <= MAX_TRACE_BYTES → 写完整 record；> → 构造 stub
+
+迭代上限（防御，v9.1）：MAX_FIXED_POINT_ITERATIONS = 8；超限 → complete=False +
+exclusion_reason="size_fixed_point_failed"、data_quality 至少 incomplete、继续 dispatch
+（防编码器/schema 后续变化导致无限循环）。
+
+超限 stub：
+  serialized_bytes_attempted = 完整 record 的稳定长度
+  stub 的 serialized_bytes 对 stub record 独立再做固定点编码
+  stub 最终实际写入行长度必须 == 其 serialized_bytes（断言）
+```
+
+MAX_RUN_TRACE_BYTES = 256MiB，计量对象 = cycle_trace/stub 实际行内容（不含换行与 manifest；
+cycle_started 不计）。MAX_TRACE_BYTES = 2MiB。
+
+**fact 计数三拆（P1-3 定稿）**：
+- observed_fact_count = 阶段 1 DB 查询读到的 fact 原始行数；
+- captured_fact_count = 阶段 2 成功构造（lineage/correlation/validator 通过）的 observation 数；
+- stored_fact_count = 本 record 实际保存的 len(observations)（完整 trace = captured；
+  超限 stub = 0，且 captured > 0）。
+
+**超限 stub 内容**：保留 decisions 全量 + trace 元数据 + observed/captured_fact_count
+（stored_fact_count=0）；observations=()、dead_ends=()（体积来源丢弃）；complete=False +
+exclusion_reason。
+
+**segment 规则**：MAX_SEGMENT_BYTES = 16MiB；append 前预判
+current_size + len(line) + 1 > MAX_SEGMENT_BYTES → 换新段（cycle_started 与 cycle_trace 同规则
+参与预判）；编号 %06d 从 000000；reopen 取最高编号段，先尾部截断再续写；segment_count =
+磁盘存在的段文件数（含空段）。MAX_TRACE_BYTES(2MiB) < MAX_SEGMENT_BYTES(16MiB) → 合法 trace
+恒装入单段（契约断言）。
+
+**partial tail（定稿）**：仅最后一段最后一行可 partial；reopen 截断至最后一个 '\n' + fsync
+后允许 append；非最后段的 partial/malformed → corrupt；中间 malformed → 停止读取该行及后续
+全部段 → corrupt。
+
+**计数恒等式**（以全局折叠结果为准）：cycles_started = durable cycle_started 记录数；
+cycles_written = cycle_trace 行数（complete + stub）；cycles_failed = orphan started；
+cycles_excluded = trace.complete=False 的 stub 行；恒等式 cycles_started = cycles_written +
+cycles_failed、cycles_written = complete + excluded、excluded ≤ written。
+snapshot_unavailable/超限/validator 失败 = excluded stub（有 durable trace 行，非 failed）。
+
+### scheduler 接入时序与字段所有权（高优 1 定稿，v8 两阶段协议）
+
+```text
+1. _run_reason() → _decisions_from_reason() → capped/fresh 过滤完成（模型序）
+2. 若 M7 telemetry enabled 且 fresh 非空：
+   a. 生成 trace_id（m7-cycle::{run_id}::{instance_uuid}::{generation}）
+   b. durable append cycle_started（flush + fsync）
+   c. capture graph snapshot（to_thread + 内部 deadline）
+   d. 按 fresh 构造 EnergyDecision（normalized_priority 冻结）→ 构造 trace 或 exclusion stub
+   e. durable append cycle_trace（flush + fsync）
+3. 原有 _register_decision() + dispatch 事件
+4. 原有 gather，顺序完全不改变（fresh 模型序）
+```
+
+字段规则（无"实现者自行猜测"空间）：`expected_decision_count = len(fresh)`；
+`original_index` = fresh 零基索引；`worker_lane = lane_gate.lane_for(mode, worker_class)`；
+`normalized_priority = normalize_priority(decision.priority)`（priority.py 复用，不重实现）；
+`priority_scale = "planner"`（DispatchDecision 无该字段，图上注册时才计算——M7 冻结）；
+`decision_source = "reason"`；`route_hash` = 归一化 decision route。M7 v1 只捕获 fresh
+Reason 候选集。
+
+### 三序列与报告归因（阻断 4 定稿）
+
+- `production_order` = fresh 索引序（**真实派发序**，reason_scheduler.py:832-837/941-954
+  无重排，模型序）；
+- `planner_baseline_order` = sort(fresh, key=(lane_rank, scale_rank, −normalized_priority,
+  original_index))——对齐 dispatchable queue 语义（shared_graph.py:4107-4110）；
+- `energy_order` = sort(fresh, key=(lane_rank, scale_rank, −normalized_priority,
+  −energy_within_exact_group, original_index))；
+- 报告分两段：production→planner_baseline（**上下文，不归因 energy**）与
+  planner_baseline→energy（**energy 归因**）；displacement/reorder-count/churn/rank-corr/top-k
+  均按两段分别计算；zero-change run 指 planner_baseline→energy 段无重排；
+- enabled=False → production_order；**M7 v1 不把 production→planner 差异计入 energy 指标**。
+
+### M7 telemetry 开关（P1-2 定稿，v9.1 收窄零副作用）
+
+- 显式构造参数，不在 scheduler 内部散读环境变量：
+  `ReasonSwarm(..., energy_trace_enabled: bool = False, energy_trace_sink: EnergyTraceSink | None = None)`；
+- **零副作用仅对 fresh run 承诺**（v9.1）：enabled=False 且磁盘不存在该 run 的既有 M7
+  dataset（无 manifest、无 segment）→ 严格零副作用：不创建 metrics 目录、不创建 SQLite 专用
+  连接、不生成 trace_id、不做 canonical JSON、不调用 fsync；dispatch 与现网逐决策等价
+  （测试 103）；
+- enabled=True 且 sink=None → 构造报错（无落点不开采集）；
+- **resume 术语（v9.2 定稿）**：guard 只针对 **dataset/process resume** = 为已结束/释放/
+  丢失原 ReasonSwarm 实例的 run 新建 ReasonSwarm 并继续产生 Reason cycle（guard 在该新实例
+  任何 Reason cycle/dispatch 前执行）；**live operator resume** = 同一 ReasonSwarm 实例内
+  HITL pause→resume，只恢复派发，**不执行 guard、不写 resume_epoch、不改 manifest
+  lifecycle/quality**（guard 只在 recorder/dataset 初始化路径运行一次，pause 不重新初始化）；
+- **dataset resume 时 guard 不受开关控制**（v9.1）：disabled dataset resume → resume_epoch
+  先写 + 翻转 in_progress + quality ≥ incomplete + 原因 resume_without_energy_trace → 该数据
+  集此后永非 complete（测试 104 自 finalized+clean 起步验证）；witness 写失败 → fail-fast；
+- enabled dataset resume：正常 reopen 语义（finalized+clean → in_progress+clean 不自动降级，
+  resume_epoch 正常记录并由下次 finalize acknowledge）。
+- M7 离线 v1 仅由 benchmark harness 显式开启；Web/CLI 暴露另行接线。
+
+### 表述与 UI 边界（高优 2/3 定稿）
+
+- 全文将 "causal ablation" 统一改为 **"offline scheduling reorder estimate（离线调度重排
+  估计）"**——静态重排不证明 flag latency/token/worker starts/race/solve-rate；
+- 可输出（按 planner_baseline→energy 段归因；production→planner 段单独作上下文）：
+  submission-order displacement、exact-equal group reorder count、route churn、
+  rank correlation、top-k route composition、zero-change run ratio、coverage/incomplete/
+  corrupt 比例；`flag_latency/tokens_saved/worker_starts_saved/solve_rate_delta/race_outcome/
+  counterfactual_cost` 一律 N/A；paired bootstrap 只对这些离线重排指标做 CI；
+- **EventBus 选边（v8 定稿）：M7 v1 sidecar-only**——不发 EventBus 摘要、不调用 `_emit`
+  （其固定 actor="reason"，reason_scheduler.py:125-145，无法复用发空 actor）、删除
+  CycleTraceSummary 类型、不改 UI reducer（events.ts:691-693 的 metrics_summary 隔离不动）；
+  UI 展示另行 RFC。
+
+### 完整测试矩阵（127 项自包含清单，v9.2 终审；每项标注归属 M7-0/M7-1/M7-2）
+
+每项可仅凭本契约独立编码（1-55 语义覆盖 v3-v5/v6 全部条目；8/16/18/22/24/25/26/38/42/51/
+58-62/64 按 v8 修订；67-86 为 v8 新增；87-105 为 v9 新增；106-118 为 v9.1 新增；119-126 为
+v9.2 新增；127 为终审新增）。**测试所有权（终审修正，无重叠）**：M7-0 =
+23-39/45-51/53-68/74-116/119-127；M7-1 = 1-22/69-73；M7-2 = 40-44/52/117-118；每阶段只要求
+当时已存在且归属本阶段的测试绿（M7-0 不得要求提前实现 M7-1/M7-2 测试目标）。
+
+**1-22 M7-1 公式、配置与排序**
+1. EnergyConfig 拷贝输入映射 + MappingProxyType（构造后改原始映射不影响已构造实例）。
+2. 权重 key 白名单：未知 key → 构造报错。
+3. 权重 key 完整性：缺 verified_witness/verified/candidate 任一 → 构造报错。
+4. 权重非有限值（NaN/inf）→ 构造报错。
+5. tau>0 / dead_penalty∈[0,1] / dead_tau>0 域校验。
+6. confidence 域外 → clamp_finite 到 [0,1]。
+7. age = max(0, as_of_ts − energy_origin_ts)；未来 origin 不产生负 age。
+8. as_of_ts 非 finite 报错；**event_ts 不参与成员判定**（成员只按 seq，v8 时间模型）。
+9. eligible_for_energy=False 排除；route_hash 缺失/空排除。
+10. tier 判定顺序：verified_witness（witness.strip() 非空）> verified > candidate。
+11. raw_score = weight × confidence；decayed = clamp(raw,0,1) × exp(−age/tau)。
+12. correlation 组内 max（同 correlation_basis_hash 多观测）；跨组 1 − Π(1 − group_score)。
+13. dead penalty = dead_penalty × exp(−age/dead_tau)；同 route 多 dead-end **正值 max 合并**
+    （永不求和、永不超最强 penalty）。
+14. energy = clamp(positive − penalty, 0, 1)，恒 ≥ 0。
+15. flag_captured 仅报告标签，不进公式。
+16. retired 排除 / challenged 不进正贡献 / revalidated 恢复 base verdict 不刷新 origin /
+    promotion（promotion_ts）刷新 origin——四断一测；standalone dead_end（v1）audit-only
+    不产生 penalty。
+17. exact_equal_group = (worker_lane, priority_scale, normalized_priority)；equal 判定用
+    IEEE float ==（normalized 值）；跨组/跨 lane/跨 priority 永不重排。
+18. planner_baseline key = (lane_rank, scale_rank, −normalized_priority, original_index)。
+19. energy key = (lane_rank, scale_rank, −normalized_priority, −energy_within_exact_group,
+    original_index)。
+20. 无观测 route → energy 0 → 组内退回 planner_baseline 序；冷启动全零 → energy_order ==
+    planner_baseline_order（稳定排序，original_index 保持）。
+21. lane_rank ordinary=0 < review=1、scale_rank operator=0 < planner=1 全局保序。
+22. enabled=False → 返回 production_order（逐元素 == 输入，与现网派发逐决策等价）+
+    supplier 调用 0 次；模块不 import sqlite3/SharedGraph（静态断言）。
+
+**23-45 snapshot/sidecar/统计（v3-v5 语义）**
+23. 原子并发：writer 并发写时，捕获结果与 graph_after_seq 同快照一致（单事务）。
+24. **因果截止（v8 修订）**：graph_after_seq = 同事务 MAX(seq)；seq > graph_after_seq 的
+    transition/fact/结论不得进入快照；event_ts 不参与成员判定。
+25. 超限 stub（MAX_TRACE_BYTES=2MiB，v8 修订）：保留 decisions 全量 + 元数据 +
+    observed/captured_fact_count（stored_fact_count=0）；observations=()、dead_ends=()；
+    complete=False + exclusion_reason + serialized_bytes_attempted；超限数据不保留内存。
+26. **partial tail（v8 修订）**：仅最后一段最后一行可 partial；reopen 截断至最后一个 '\n'
+    + fsync 再续写；非最后段 partial → corrupt。
+27. validator：必填字段缺失/非法枚举 → 拒收。
+28. 显式序列化：CycleTrace → JSON 走显式编码函数，不依赖默认隐式契约。
+29. epoch ts：decision_ts 用 time.time() epoch，非 ISO 字符串。
+30. feature-off：capture 调用 0 次（不建连接）。
+31. 双模型已删：observations 单一权威，无 facts/routes 双集合。
+32. read transaction 不阻断 dispatch：capture 期间 stop/hint 响应、blackboard writer
+    不超 busy_timeout。
+33. capture 异常 → complete=False + snapshot_unavailable，继续 dispatch，绝不 raise。
+34. 两阶段：事务内无 hash/dataclass/归一化/序列化（静态断言）。
+35. M3 折叠语义：读 fact_effective VIEW；retired 后 state、challenged、revalidated 与 M3 一致。
+36. trace_id 跨恢复唯一：同 run 两实例 → 两条记录、decision_id 不冲突。
+37. sidecar run 内不删段（无 unlink）。
+38. 中间 malformed 完整行 → 停止读取后续 segment，data_quality=corrupt（v8 字段名）。
+39. 字节上限计量对象 = canonical CycleTrace JSON（不含尾换行）。
+40. paired run-level delta bootstrap：run 内 cycles 整体重采样，不独立抽。
+41. bootstrap 参数：seed=20260816、2000 次、95% percentile CI。
+42. run 资格分档（v8 修订）：不完整/corrupt 排除主 CI；完整但 planner_baseline→energy 无重排
+    → 零变化 run 纳入；单 cycle 超限 → run incomplete 仅进 coverage；run<5 → N/A、
+    5-19 → exploratory、≥20 → CI。
+43. N/A 纪律：flag_latency/tokens_saved/worker_starts_saved/solve_rate_delta/race/counterfactual
+    全部 N/A。
+44. coverage/incomplete/corrupt 比例统计输出。
+45. sidecar 去重键 = trace_id（非 reason_cycle_id）。
+
+**46-55 v6 新增（原文语义，47 修订）**
+46. resume cycle ID 碰撞：两实例同 run，trace_id/decision_id 不冲突、双记录保留。
+47. dead-end 截止（v7 修订保留）：canonical = intents.result_seq → events（≤ graph_after_seq）；
+    同 intent 多次 conclude 只取 applied 一次，其余计 ignored_stale_conclusion_count。
+48. read transaction 不阻断 dispatch。
+49. sidecar run 内不删 segment。
+50. 中间 malformed 行 → dataset corrupt。
+51. 完整 trace 字节上限（2MiB）+ stub 语义（保留 decisions/元数据/计数，丢
+    observations/dead_ends）。
+52. paired run-level delta bootstrap。
+53. 双模型已删（observations 单一权威）。
+54. 两阶段捕获（事务内无 hash/序列化——静态断言）。
+55. 日期已更新为 2026-08-16。
+
+**56-66 v7 新增（部分按 v8 修订）**
+56. dead-end 读 intents.result_seq 而非 MAX(seq)：迟到结论（owner-fence 失败）仅计审计数，
+    不进 penalty。
+57. progress-handler 超时中止 SQLite VM：事务不滞留、连接 finally close、
+    busy_timeout=250、query_only=ON。
+58. manifest 两维字段（v8 修订）：lifecycle_status + data_quality + cycles_started/written/
+    failed/excluded + segment_count + total_trace_bytes + 三个上限常量 + first/last_trace_id。
+59. dataset complete 派生谓词（v8 修订）：finalized ∧ clean ∧ 无孤儿 cycle_started ∧
+    全 trace.complete ∧ 无 malformed ∧ ≤256MiB ∧ 计数恒等式。
+60. resume 不提升（v8 修订）：quality 单调只降不升；reopen 前 durable 写 in_progress。
+61. trace 成功 + manifest 更新失败 → 重扫 segment 重建（trace_id 去重）。
+62. scheduler 顺序含两阶段协议（v8 修订）：fresh 形成 → cycle_started → capture →
+    cycle_trace/stub → 才 _register_decision/dispatch；字段来源：expected_decision_count=
+    len(fresh)、original_index 零基、worker_lane=lane_for、normalized_priority=
+    normalize_priority(priority)、priority_scale="planner"、decision_source="reason"。
+63. 表述统一：全文无 "causal ablation"，只用 "offline scheduling reorder estimate"。
+64. CycleTraceSummary 已删除（v8 修订）：sidecar-only——静态断言无该类型、无 _emit 调用、
+    无 UI reducer 改动。
+65. CycleTrace 内嵌 snapshot：无信息丢失、无手工复制字段。
+66. M7-1 公式契约自包含：测试 1-22 仅凭契约可独立编码。
+
+**67-86 v8 新增**
+67. 因果成员只按 seq：含"未来 ts"的已提交事件仍按 seq 入快照（量纲修正回归）。
+68. promotion ts JOIN：energy_origin_ts = events(seq=promotion_seq).ts；无 promotion →
+    fact_ts。
+69. normalized_priority 冻结：None/bool/非法字符串/NaN/Inf → 0.0；label 映射；合法数值保持
+    精度（复用 priority.normalize_priority——静态断言 import）。
+70. exact-equal 用 IEEE float ==（normalized 值）；energy.py 无第二套归一化。
+71. 三序列独立计算：production_order=输入序；planner_baseline_order 按 (lane_rank,
+    scale_rank, −normalized_priority, original_index)；energy_order 加 −energy。
+72. 归因分段：报告分别计算 production→planner_baseline 与 planner_baseline→energy；只有
+    后者进 energy 指标。
+73. enabled=False → production_order（与现网派发逐决策等价）+ supplier 0 次调用。
+74. 两阶段协议顺序：fresh 形成后先 durable cycle_started（flush+fsync）→ capture →
+    cycle_trace/stub → 才 _register_decision/dispatch（顺序断言）。
+75. 恢复扫描：cycle_started 无 cycle_trace → data_quality 永久 incomplete（sticky）。
+76. manifest 状态机：in_progress→finalized；quality 单调 clean<incomplete<corrupt；reopen
+    前 durable 写 in_progress。
+77. dataset complete 派生谓词（finalized ∧ clean ∧ 无孤儿 ∧ 全 complete ∧ 无 malformed ∧
+    ≤256MiB ∧ 恒等式）。
+78. 三层 complete 互不推导（snapshot/trace/dataset 各自独立用例）。
+79. 字节语义：attempted = 完整 canonical JSON 字节；serialized = 实际写入行字节；stub 保留
+    decisions+元数据+计数、丢 observations/dead_ends。
+80. segment 轮转：16MiB append 前预判；编号 000000；reopen 取最高段续写；segment_count
+    含空段。
+81. 单行容量断言：MAX_TRACE_BYTES(2MiB) < MAX_SEGMENT_BYTES(16MiB) → 合法 trace 恒装入
+    单段。
+82. partial tail：仅最后段最后行可 partial；reopen 截断至最后一个 '\n' + fsync；非最后段
+    partial → corrupt。
+83. 计数恒等式：started = written + failed；written = complete + excluded；excluded ≤
+    written；duplicate trace_id → corrupt。
+84. snapshot_unavailable = excluded stub（非 failed）；cycle_started append 失败 → v9 双层
+    处理：recorder_dirty + durable 降级（finalize 禁止 finalized+clean；崩溃由 unclean
+    reopen 接管）。
+85. EventBus 选边：v1 sidecar-only（无 _emit 调用、无 CycleTraceSummary、无 UI reducer
+    改动——静态断言）。
+86. RouteEnergy universe：raw_fact_count = 排除后普查（challenged 计入、retired 除外）；
+    correlation_group_count = 实际合并组数；dead-end-only / captured-only route 输出
+    positive=0、energy=0、eligible=False；eligible := positive>0；witness 用
+    bool(witness.strip())。
+
+**87-105 v9 新增（P0/P1 全覆盖）**
+87. unclean reopen：in_progress + clean → reopen 后 data_quality=incomplete（sticky）+ 原因
+    unclean_reopen；在任何 cycle/capture/dispatch 前完成。
+88. 合法 resume：finalized + clean → 回 in_progress 不自动降级（quality 保持 clean）。
+89. unclean reopen 后正常 finalize → 仍非 complete（quality incomplete sticky，只能写
+    finalized + incomplete）。
+90. cycle_started 零字节前 append 失败、进程正常 finalize → recorder_dirty → 禁止
+    finalized + clean。
+91. append 失败后立即崩溃 → 下次 reopen 走 unclean_reopen → 永久 incomplete。
+92. append 写出 partial tail 后失败 → reopen 截断 + unclean 降级（两条路径均非 complete）。
+93. manifest 降级写入本身失败 → recorder_dirty 保持 → finalize 不得写 finalized+clean。
+94. 固定点收敛：serialized_bytes 999→1000、9999→10000 位数边界迭代稳定，且 == 实际行字节。
+95. canonical record 含 kind envelope：2MiB 判定/segment 预判/run-total 用同一计量对象。
+96. 临界值：MAX−1/MAX/MAX+1 三态；stub serialized_bytes == 真实 UTF-8 行字节（断言）。
+97. 非 ASCII/中文字段按 UTF-8 字节计量（len(s.encode("utf-8"))，非字符数）。
+98. manifest 写协议：temp → flush → fsync → os.replace；POSIX 尽力 fsync parent；失败保留旧
+    manifest + recorder_dirty；Windows 目录 fsync 不保证（如实声明）。
+99. manifest 缺失/损坏但 segment 存在 → 重扫重建计数，quality ≥ incomplete，不得重建为 clean。
+100. 跨 segment 配对：全 run 按段号升序全局折叠后才算计数；cycle_started 与 cycle_trace
+    跨段是合法状态。
+101. 分类：duplicate started → corrupt；duplicate trace → corrupt；trace-without-started →
+    corrupt；orphan started → incomplete。
+102. cycle_started 参与 16MiB 容量预判；total_trace_bytes 只累计 cycle_trace/stub。
+103. energy_trace_enabled=False → 零副作用（不建目录/连接/trace_id/canonical JSON/fsync）+
+    dispatch 逐决策等价。
+104. disabled resume 自 finalized+clean 起步（v9.1 重写）：resume guard 不受开关控制 →
+    翻转 in_progress + quality ≥ incomplete + reason resume_without_energy_trace →
+    永非 complete（原"自保护停在 in_progress"表述作废——那需要 resume 前就是 in_progress）。
+105. fact 计数三拆：超限 stub captured_fact_count>0 ∧ stored_fact_count==0 ∧
+    len(observations)==0；完整 trace stored==captured。
+
+**106-118 v9.1 新增**
+106. cycle_trace 零字节前 append 失败 → dispatch 仍发生 + recorder_dirty + 内存质量 ≥
+    incomplete + 原因 cycle_trace_append_failed（异常不外传）。
+107. cycle_trace 写出 partial tail 后 fsync 失败 → dispatch 仍发生；reopen 截断 +
+    orphan started → sticky incomplete。
+108. cycle_trace 失败后正常 finalize → 禁止 finalized+clean。
+109. cycle_trace 失败后崩溃重开 → orphan started → sticky incomplete。
+110. resume_epoch 先写单路径（v9.2 修订）：append 失败 → fail-fast（清晰报错、无 dispatch、
+    可重试）；append 成功 + manifest 翻转失败 → 仍继续（witness 已 durable）。
+111. 翻转失败仍继续（v9.2 修订）：resume_epoch 已落盘 → 恢复折叠 last_resume_epoch_id 未被
+    ack → 非 complete（epoch id 判定，禁用墙钟）。
+112. guard 前崩溃序：resume 启动后、guard 完成前崩溃 → 无 dispatch 发生，旧
+    finalized+clean 数据集仍真实（不产生未采集派发）。
+113. enabled 合法 resume 不自动降级（finalized+clean → in_progress+clean，88 语义强化）。
+114. snapshot.complete 不含大小上限：大小只在 trace 层判定（canonical bytes ≤
+    MAX_TRACE_BYTES；契约断言）。
+115. 固定点迭代上限 8：超限 → complete=False + size_fixed_point_failed + 质量 ≥
+    incomplete + 继续 dispatch。
+116. 测试所有权：M7-0 测试收集不包含 M7-1/M7-2 条目（模块边界断言；M7-0 独立绿）。
+117. M7-2 报告确定性：同一数据集两次 replay → 指标逐位一致（seed=20260816 固定）。
+118. M7-2 两段归因：production→planner 段差异不计入 energy 指标（数值断言）。
+
+**119-126 v9.2 新增**
+119. 时钟回退回归：旧 finalized_ts(2000) > 新 resume_ts(1000) 但 finalized_resume_epoch_id
+    未 ack 新 epoch → 数据集非 complete（P0 回归，墙钟不参与判定）。
+120. resume_epoch 唯一身份 UUID4；duplicate 内容一致 → 幂等折叠；同 id 内容不一致 → corrupt。
+121. malformed resume_epoch → corrupt（同中间 malformed 规则）。
+122. resume_epoch 参与 16MiB append 前预判；不计入 total_trace_bytes。
+123. last_resume_epoch_id 按物理 append 顺序（segment 号 + 行序）确定，禁止按 resume_ts 排序。
+124. manifest 重建恢复 last_resume_epoch_id；complete 要求
+    finalized_resume_epoch_id == last（无 resume 时两侧均 ""）。
+125. live HITL pause→resume（同实例）：不写 resume_epoch、不改 quality/lifecycle。
+126. 多次 resume：E1 ack 后再 resume E2 → complete 只在 ack E2 后成立（顺序回归）。
+127. enabled resume + prior incomplete（终审 P1-2 回归）：quality 保持 incomplete、保留
+    历史原因、**不**新增 resume_without_energy_trace。
+
+### 实施顺序（v9.1 测试所有权重分）
+
+```
+M7-0（类型模型 + trace_id + 有界只读捕获（读 VIEW + promotion_ts JOIN）+ dead-end applied
+      结论 + 两阶段 sidecar + resume guard（epoch ack）+ manifest 两维状态机 + scheduler
+      顺序 + 测试 23-39/45-51/53-68/74-116/119-127）→ 全量绿（当时存在的全部测试）
+M7-1（EnergyConfig/route_energies/reorder_decisions 三序列 + 测试 1-22/69-73）→ 定向测试
+M7-2（replay/paired bootstrap/N/A 纪律报告 + 测试 40-44/52/117-118）→ 全量绿
+每阶段完成后跑当时存在的全量测试；M7-0 不要求提前实现 M7-1/M7-2 的测试目标。
+```
+
+在线 `DSWARM_ENERGY_TIEBREAK` 接线 = 独立在线 RFC（M7-2 报告达标后另审）。
 
 ---
 
