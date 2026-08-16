@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+import weakref
 
 import pytest
 
@@ -199,6 +200,30 @@ async def test_noncooperative_timeout_raises_isolation_failure_and_stops_second_
     assert len(calls) == 1
     release.set()
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_first_planner_instance_remains_alive_until_second_is_created(tmp_path):
+    first_ref = None
+
+    def factory(arm):
+        nonlocal first_ref
+
+        async def planner(_request):
+            return AdvisorPlannerResult(result=_result(f"route-{arm}"))
+
+        if first_ref is None:
+            first_ref = weakref.ref(planner)
+        else:
+            assert first_ref() is not None
+        return planner
+
+    outcome = await run_advisor_case(
+        _fixture(), case_root=tmp_path, planner_factory=factory,
+        timeout_s=1.0, cleanup_timeout_s=0.2,
+    )
+    assert outcome.baseline.call_outcome == "succeeded"
+    assert outcome.advisor.call_outcome == "succeeded"
 
 
 @pytest.mark.asyncio

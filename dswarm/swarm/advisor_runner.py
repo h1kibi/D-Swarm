@@ -221,7 +221,7 @@ def _append_or_fail(sink: AdvisorTraceSink, **kwargs: object) -> None:
 async def _execute_arm(
     *, fixture: AdvisorFixture, arm: ArmName, arm_index: int,
     summary: str, planner_factory: PlannerFactory,
-    seen_planners: set[int], sink: AdvisorTraceSink,
+    seen_planners: list[PlannerCallable], sink: AdvisorTraceSink,
     suggestion_id: str, timeout_s: float, cleanup_timeout_s: float,
     lifecycle: dict[str, object],
 ) -> AdvisorArmOutcome:
@@ -236,9 +236,12 @@ async def _execute_arm(
     request = _request_for(fixture, arm, summary)
     try:
         planner = planner_factory(arm)
-        if not callable(planner) or id(planner) in seen_planners:
+        if (not callable(planner)
+                or any(planner is prior for prior in seen_planners)):
             raise ValueError("planner_instance_not_fresh")
-        seen_planners.add(id(planner))
+        # Retain the actual callable until both arms are constructed.  Retaining
+        # only id(planner) permits CPython to recycle the first arm's id.
+        seen_planners.append(planner)
         coroutine = planner(request)
         if not asyncio.iscoroutine(coroutine):
             close = getattr(coroutine, "close", None)
@@ -481,7 +484,7 @@ async def run_advisor_case(
             summaries = {"baseline": fixture.graph_summary}
             if suggestion is not None:
                 summaries["advisor"] = build_experimental_summary(fixture, suggestion)
-            seen_planners: set[int] = set()
+            seen_planners: list[PlannerCallable] = []
             for index, arm in enumerate(order):
                 arm_outcome = await _execute_arm(
                     fixture=fixture, arm=arm, arm_index=index,
