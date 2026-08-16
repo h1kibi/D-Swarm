@@ -415,7 +415,7 @@ recovery 各结算恰好一次；CostController/Board/UI 投影一致。
 
 ## M6 route lineage + telemetry（09 §10.3.6 / §10.5 route 1-4）
 
-**Status (2026-08-16): M6a-1 and M6a-2 implemented and test-backed; M6b NOT implemented.**
+**Status (2026-08-16): M6a-1, M6a-2, and M6b-1 implemented and test-backed; M6b-2 NOT implemented.**
 首轮复评审定 **Contract v1 reviewed — Revise before Go**（M6a 三阻断：多 intent
 lineage、orphan 禁止继承、短路解析无法冲突检测；M6b 四缺口：路径未选边、无 durable
 checkpoint、记录模型不足、埋点语义未定义）。Contract v2 已按评审意见逐条修订；实施顺序 =
@@ -541,6 +541,12 @@ checkpoint 原子写（tmp + flush + fsync + `os.replace`）；重启时加载 c
 **事实源边界**：M7 的 route replay 读取由 immutable graph 构建的
 `RouteObservation[]`；MetricsSink 只是性能/运行统计 sidecar，**不是 route 事实源**
 （"metrics 不是 evidence"）。
+
+实施记录（2026-08-16）：`dswarm/swarm/route_telemetry.py` 已落地独立
+`RouteMetricRecord`/`MetricsSink`；路径、schema、sink-owned `record_seq`、进程内单写锁、
+5MB 轮转、3 代 retention、原子 checkpoint、重启增量 reconcile、`record_id` 去重与尾部
+partial-line 截断修复均有确定性测试。`aggregate_delta()` 只消费内存增量并在成功写入
+checkpoint 后清空；本阶段没有接入 graph/projector/worker/UI/Reason/gate，也没有生产埋点。
 
 ### M6b-2 埋点、聚合与 UI
 
