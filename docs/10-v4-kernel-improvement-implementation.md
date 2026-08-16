@@ -415,39 +415,191 @@ recovery 各结算恰好一次；CostController/Board/UI 投影一致。
 
 ## M6 route lineage + telemetry（09 §10.3.6 / §10.5 route 1-4）
 
-**现状（已核实）**：`BoardProjector.project_event` 只投影 `fact_added`；`Finding` 无
-`route_hash`、`created_at` 是投影时刻；`MemoryBoard(now=...)` 已支持虚拟时钟。
+**Status (2026-08-16): M6a-1 implemented and test-backed; M6a-2/M6b NOT implemented.**
+首轮复评审定 **Contract v1 reviewed — Revise before Go**（M6a 三阻断：多 intent
+lineage、orphan 禁止继承、短路解析无法冲突检测；M6b 四缺口：路径未选边、无 durable
+checkpoint、记录模型不足、埋点语义未定义）。Contract v2 已按评审意见逐条修订；实施顺序 =
+M6a-1 → M6a-2 → M6b-1 → M6b-2，每步独立提交、全量绿。已核实的关键代码事实：
+`intent_products` 主键为 `(intent_id, fact_seq)`（一个 fact 可关联多个 intent）；
+`add_evidence` 对不存在的 intent 写 `orphan_intent_id` 且**丢弃边**（注释
+"drop the edge"）；`PostgresBoard` 无 M6 字段（`created_at` 由 `NOW()` 生成）；UI reducer
+会把非空 actor 加进 worker 列表（events.ts:890-895）；真实 workspace 为
+`sessions/<safe_run_id>/workspace`。
 
-**设计**
+## M6a — lineage（两阶段 resolver + 双 Board 持久化）
 
-1. **lineage**（shared_graph.py 增只读 API）：
-   ```python
-   def route_lineage_for_fact(self, fact_seq: int) -> dict:
-       # {"route_hash": str, "lineage": "explicit|inherited|unattributed",
-       #  "reason": "payload_route_hash|intent_inherit:<intent_id>|no_intent|...",
-       #  "intent_id": str}
-   ```
-   优先级：payload.route_hash（explicit）→ intent_products→intents.route_hash
-   （inherited）→ 无（unattributed）。route-less 原因结构化枚举。
-2. **Finding 扩展**（board.py）：`route_hash/route_lineage/event_ts/projected_at`；
-   `BoardProjector` 投影时填 `event_ts=events.ts`（原始事件时间）与 `projected_at=now`。
-3. **独立 telemetry 载体** `dswarm/swarm/metrics.py`：
-   ```python
-   class MetricsSink:
-       def __init__(self, run_root: Path) -> None      # metrics/usage.jsonl append-only
-       def record_fact_write(self, actor, verified, route_lineage) -> None
-       def record_dedupe_hit(self, actor) -> None
-       def record_summary_size(self, n_chars) -> None
-       def aggregate_delta(self) -> dict               # 每 30s 一次低频聚合
-   ```
-   UI 只收 `metrics_summary` 低频 delta；**不写 evidence graph、不进 Reason prompt**。
-4. **virtual time replay**：`ReplayClock` 注入 Board/Projector；benchmark replay 固定
-   virtual 时间，两次重放结果一致。
+### M6a-1 RouteObservation 模型与 resolver（纯解析，不动 Board）
 
-**测试**：三类 lineage 区分与原因枚举；投影保留 event_ts；virtual time 重放两次一致；
-metrics 不产生任何 graph 事件；durable consumer 从 checkpoint 恢复不重复派生。
+```python
+@dataclass(frozen=True)
+class IntentRouteRef:
+    intent_id: str
+    route_hash: str
 
-**验收映射**：09 §10.5 route 与 telemetry 全部 4 条。
+@dataclass(frozen=True)
+class RouteObservation:
+    fact_seq: int
+    event_ts: float
+    explicit_route_hash: str = ""
+    inherited_routes: tuple[IntentRouteRef, ...] = ()
+    effective_route_hash: str = ""
+    lineage: str = "unattributed"      # explicit|inherited|unattributed|
+                                       #   explicit_conflict|inherited_conflict
+    reason: str = ""
+    attempted_orphan_intent_id: str = ""
+    attempted_orphan_route_hash: str = ""   # 仅供审计
+    eligible_for_energy: bool = False
+```
+
+**两阶段算法**（`shared_graph.py` 增
+`route_observations(fact_seqs) -> dict[int, RouteObservation]` 与单条
+`route_lineage_for_fact` 包装）：
+
+1. **独立采集**（互不短路）：
+   - explicit：`fact_added.payload.route_hash`（比较前使用现有 route normalization）；
+   - inherited（canonical 边）：`intent_products → intents.route_hash`，稳定排序
+     `ORDER BY intents.created_seq, intents.intent_id`（**禁止依赖无 ORDER BY 的返回顺序**）；
+   - inherited（旧记录兜底）：仅当 canonical product edge 完全缺失时，
+     `payload.intent_id → intents.route_hash`（reason=`payload_intent_inherit`）；
+   - orphan 审计：`payload.orphan_intent_id` → **只记录 attempted_orphan_*，绝不产生
+     inherited、绝不进入 energy 输入、绝不覆盖 explicit**
+     （reason=`orphan_intent_reference`）。
+2. **统一裁决**（比较前对 route_hash 归一化，防大小写/格式假冲突）：
+
+| 情况 | lineage | effective_route_hash | eligible_for_energy |
+|---|---|---|---|
+| 无 explicit，继承得唯一 route（含多 intent 同 route） | inherited | 该 route | true |
+| 多 intent 继承不同 route | inherited_conflict | `""` | **false**（不得随意挑一个给 M7） |
+| explicit 与全部 inherited 一致 | explicit | explicit | true |
+| explicit 与任一 inherited 不同 | explicit_conflict | explicit（保留，另存 inherited 全量） | false |
+| 无可信 route | unattributed | `""` | false |
+
+M6a-1 的实现必须保留全部 `IntentRouteRef`；orphan 引用即使后来出现同名 intent，也只能作为
+`attempted_orphan_*` 审计信息，不能复活已被内核主动丢弃的 lineage 边。
+
+### M6a-2 Finding 时间三拆 + 双 Board 持久化
+
+```python
+# Finding 增（board.py）
+route_hash: str = ""
+route_lineage: str = ""
+event_ts: float | None = None
+projected_at: float | None = None
+pheromone_origin_ts: float | None = None
+fact_origin_ts: float | None = None   # promotion 时保留原事实时间供审计
+```
+
+- `Finding.pheromone()` 用 `pheromone_origin_ts or created_at`（旧投影兼容）；
+- **promotion 时间语义选边**：`fact_verified` replacement Finding 的
+  `event_ts = pheromone_origin_ts = fact_verified.ts`（验证提升**刷新** pheromone 年龄），
+  原事实时间存 `fact_origin_ts = fact_added.ts` 供审计；base 投影用 `fact_added.ts`；
+- lineage 数据源统一走 M3 `fact_effective` 折叠，不另建事实 JOIN 模型；
+- **双 Board 完整持久化**：`MemoryBoard.write_finding/replace_by_source` 与
+  `PostgresBoard`（schema 迁移、`_finding_columns`、`_finding_from_row`、`write_finding`、
+  `replace_by_source`）全部保留新增字段；`projection.py` base/promotion 两条投影路径填
+  event_ts 与 lineage；新增 MemoryBoard/PostgresBoard 一致性测试。
+
+## M6b — telemetry（sidecar，非 route 事实源）
+
+### M6b-1 MetricsSink 独立持久化（先不接生产埋点）
+
+**路径定稿**：`run_root = RunManager.workspace_dir(run_id)` →
+`sessions/<safe_run_id>/workspace/metrics/route-telemetry.jsonl`
+（与证据图并列但不是 evidence；避开 M5 `usage` 账本语义）。
+
+**轮转 + retention**：单文件写锁；current 达到 5MB 时按
+flush → close → 高编号向低编号 `os.replace` → 新建 current 的顺序轮转；
+`retention_generations = 3`（`.1..3`，超代删除）。尾部 partial line 容错读取，不能让指标损坏
+反向阻断 graph、worker 或 projector。
+
+**durable checkpoint**：`metrics/route-telemetry.checkpoint.json`：
+
+```json
+{"schema_version": 1, "last_record_id": "...", "last_record_seq": 123,
+ "counters": {}, "partial_lines_ignored": 0}
+```
+
+checkpoint 原子写（tmp + flush + fsync + `os.replace`）；重启时加载 checkpoint，只扫描保留
+文件中的增量记录，按 `record_id` 去重，恢复内存 counter。`aggregate_delta()` 只消费内存
+增量 counter，**不得周期性重扫 JSONL**。
+
+**记录 schema**：
+
+```json
+{"schema_version": 1, "record_id": "fact_write:123:fact:45:base", "record_seq": 42,
+ "kind": "fact_appended", "run_id": "run-0001", "challenge_id": "chal",
+ "event_ts": 1755300000.0, "observed_at": 1755300000.2, "actor": "cli-pi-2",
+ "fact_seq": 45, "route_hash": "route-abc", "route_lineage": "inherited",
+ "lineage_reason": "intent_product", "intent_ids": ["I-a", "I-b"], "verified": true}
+```
+
+**事实源边界**：M7 的 route replay 读取由 immutable graph 构建的
+`RouteObservation[]`；MetricsSink 只是性能/运行统计 sidecar，**不是 route 事实源**
+（"metrics 不是 evidence"）。
+
+### M6b-2 埋点、聚合与 UI
+
+| kind | 触发点（best-effort，绝不 raise 进 graph/worker/projector） |
+|---|---|
+| `fact_appended` | `add_evidence()` 成功 append 且 `seq > 0` 之后 |
+| `dedupe_hit` | dedupe 使 `add_evidence()` 返回 `-1` 的确定分支 |
+| `summary_recorded` | `record_fact_summary()` 首次成功返回 `True` 之后 |
+| `fact_projected` | `BoardProjector.replace_by_source()` 结果非 `ALREADY_APPLIED` 之后 |
+| `fact_promoted` | `fact_verified` replacement 成功投影之后 |
+
+**BLACKBOARD_DELTA 边界**：`metrics_summary` delta 用**空 actor**（防 UI 把 `metrics`
+当 worker）；不创建 fact/intent/graph 节点、不写黑板 timeline；**Reason prompt 构造逐字节
+不变**。准确表述：零 SharedGraph canonical event，允许产生非证据性 SessionStore/UI
+telemetry event。新增 replay 测试，确保历史 metrics summary 不污染 worker 列表。
+
+**ReplayClock 契约**：
+
+```python
+class ReplayClock:
+    def set(self, ts: float) -> None
+    def now(self) -> float
+```
+
+离线 harness：从 immutable graph 构造 `RouteObservation[]` → 按 `(event_ts, fact_seq)`
+稳定排序 → 逐条 `ReplayClock.set` → `MemoryBoard` 用 `ReplayClock.now` →
+`projected_at` 用注入 clock → pheromone 恒用 `pheromone_origin_ts=event_ts` → 两次 replay
+产物完全一致。**仅 Board/Projector 注入可选 clock**；生产默认真实 clock；不改造
+SharedGraph 其余 `time.time()`；不要求 Postgres 虚拟 DB clock。
+
+### M6 红线
+
+- metrics 零 SharedGraph canonical event；
+- metrics 零 Reason prompt 影响；
+- metrics 零 provenance / flag gate 影响；
+- M7 只接收 `eligible_for_energy=True` 的 RouteObservation，不能从 sidecar metrics 反推 route。
+
+## 验收测试（24 项）
+
+M6a：1 多 intent 同 route→inherited 保留全部 ID；2 多 intent 异 route→inherited_conflict；
+3 explicit 与多 inherited 冲突保留全部值；4 查询/边插入顺序变化不改变 observation；
+5 orphan 永不产生 inherited；6 orphan route 永不进 energy 输入；
+7 MemoryBoard replace 保留全部 M6 字段；8 PostgresBoard roundtrip 保留全部字段；
+9 fact_added 用 fact event ts；10 fact_verified replacement 用 promotion ts（刷新 pheromone）；
+11 旧 Finding 缺字段时回退 `created_at` 衰减。
+
+M6b：12 真实 workspace 路径测试；13 5MB 确定性轮转；14 retention 上限；
+15 checkpoint 后重启不重复累计；16 checkpoint 落后时 reconcile；
+17 partial line 忽略并计数；18 metrics 目录不可写时 graph append 仍成功；
+19/20 metrics 开/关时 Reason prompt 逐字节一致 / gate 结果一致；
+21 metrics 不增加 SharedGraph event；22 metrics summary 只增加 SessionStore telemetry event；
+23 UI 不把 metrics actor 当 worker；24 两次 virtual replay 输出一致。
+
+## 实施顺序
+
+```
+M6a-1（RouteObservation + resolver，纯解析）→ 定向测试 → 提交
+M6a-2（Finding 字段 + 双 Board + 投影）→ 全量绿 → 提交
+M6b-1（MetricsSink 路径/轮转/checkpoint/schema，不接生产埋点）→ 定向测试 → 提交
+M6b-2（埋点 + 增量聚合 + UI reducer + ReplayClock harness + 红线回归）→ 全量绿 → 提交
+```
+
+M7（energy）输入 = M6a 的 `RouteObservation[]`（`eligible_for_energy` 已内置）；M6b 的重放
+确定性支撑其 ablation harness。
 
 ---
 

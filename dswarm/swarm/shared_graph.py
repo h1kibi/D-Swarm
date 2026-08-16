@@ -26,6 +26,7 @@ is NEVER reachable as a pluggable verifier here.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import hashlib
 import re
@@ -35,7 +36,7 @@ import time
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Iterable, Optional, Protocol, runtime_checkable
 
 from dswarm.models.solve_graph import Challenge, SolveGraph
 from dswarm.solver.result_codes import is_genuine_giveup
@@ -269,6 +270,26 @@ def canonicalize_lane(
     return f"{risk}:tcp:{clean_port}@{clean_host}", conf, reason
 
 
+@dataclass(frozen=True)
+class IntentRouteRef:
+    intent_id: str
+    route_hash: str
+
+
+@dataclass(frozen=True)
+class RouteObservation:
+    fact_seq: int
+    event_ts: float
+    explicit_route_hash: str = ""
+    inherited_routes: tuple[IntentRouteRef, ...] = ()
+    effective_route_hash: str = ""
+    lineage: str = "unattributed"
+    reason: str = ""
+    attempted_orphan_intent_id: str = ""
+    attempted_orphan_route_hash: str = ""
+    eligible_for_energy: bool = False
+
+
 @runtime_checkable
 class SharedGraph(Protocol):
     """Backend-swappable shared graph. Local = SQLite file; (future) cross-
@@ -280,6 +301,12 @@ class SharedGraph(Protocol):
                      verifier: str = "", route_hash: str = "",
                      intent_id: Optional[str] = None,
                      finding: Optional[StructuredFinding] = None) -> int: ...
+
+    def route_observations(
+        self, fact_seqs: Iterable[int]
+    ) -> dict[int, RouteObservation]: ...
+
+    def route_lineage_for_fact(self, fact_seq: int) -> RouteObservation: ...
 
     def add_dead_end(self, *, actor: str, reason: str) -> int: ...
 
@@ -897,6 +924,163 @@ class SQLiteSharedGraph:
         if item is None:
             raise ValueError(f"fact_seq {int(fact_seq)} is not a same-challenge fact_added event")
         return item
+
+    @classmethod
+    def _normalize_observed_route(cls, route_hash: Any) -> str:
+        value = str(route_hash or "").strip().lower()
+        if not value:
+            return ""
+        # normalize_route_hash() creates this fallback form when the input has
+        # no route tokens. Preserve that already-canonical identity instead of
+        # stripping the reserved ``route:`` prefix on a second normalization.
+        if re.fullmatch(r"route:[0-9a-f]{10}", value):
+            return value
+        return cls.normalize_route_hash(value)
+
+    def route_observations(
+        self, fact_seqs: Iterable[int]
+    ) -> dict[int, RouteObservation]:
+        """Resolve explicit and inherited route lineage for canonical facts.
+
+        Product edges and payload references are collected independently before
+        resolution so explicit/inherited conflicts remain visible. Orphan intent
+        references are audit-only and can never recreate a dropped lineage edge.
+        """
+        requested = tuple(dict.fromkeys(int(seq) for seq in fact_seqs))
+        if not requested:
+            return {}
+
+        placeholders = ",".join("?" for _ in requested)
+        source = (
+            "fact_effective"
+            if self._view_exists("fact_effective")
+            else f"({FACT_EFFECTIVE_SELECT})"
+        )
+        with self._lock:
+            fact_rows = self._conn.execute(
+                f"SELECT fe.fact_seq, fe.fact_ts, fe.route_hash, "
+                "json_extract(e.payload,'$.intent_id'), "
+                "json_extract(e.payload,'$.orphan_intent_id') "
+                f"FROM {source} fe JOIN events e ON e.seq=fe.fact_seq "
+                f"WHERE fe.challenge_id=? AND fe.fact_seq IN ({placeholders}) "
+                "ORDER BY fe.fact_seq",
+                (self.challenge.id, *requested),
+            ).fetchall()
+            product_rows = self._conn.execute(
+                "SELECT ip.fact_seq, i.intent_id, i.route_hash "
+                "FROM intent_products ip "
+                "JOIN intents i ON i.intent_id=ip.intent_id "
+                "AND i.challenge_id=? "
+                f"WHERE ip.fact_seq IN ({placeholders}) "
+                "ORDER BY ip.fact_seq, i.created_seq, i.intent_id",
+                (self.challenge.id, *requested),
+            ).fetchall()
+
+            referenced_ids = {
+                str(value).strip()
+                for row in fact_rows
+                for value in (row[3], row[4])
+                if str(value or "").strip()
+            }
+            intent_routes: dict[str, str] = {}
+            if referenced_ids:
+                id_placeholders = ",".join("?" for _ in referenced_ids)
+                rows = self._conn.execute(
+                    "SELECT intent_id, route_hash FROM intents "
+                    f"WHERE challenge_id=? AND intent_id IN ({id_placeholders})",
+                    (self.challenge.id, *sorted(referenced_ids)),
+                ).fetchall()
+                intent_routes = {
+                    str(intent_id): self._normalize_observed_route(route_hash)
+                    for intent_id, route_hash in rows
+                }
+
+        products_by_fact: dict[int, list[IntentRouteRef]] = {}
+        for fact_seq, intent_id, route_hash in product_rows:
+            products_by_fact.setdefault(int(fact_seq), []).append(
+                IntentRouteRef(
+                    intent_id=str(intent_id),
+                    route_hash=self._normalize_observed_route(route_hash),
+                )
+            )
+
+        observations: dict[int, RouteObservation] = {}
+        for fact_seq, fact_ts, raw_explicit, raw_intent_id, raw_orphan_id in fact_rows:
+            seq = int(fact_seq)
+            explicit = self._normalize_observed_route(raw_explicit)
+            inherited = list(products_by_fact.get(seq, ()))
+            inherited_reason = "intent_product"
+
+            payload_intent_id = str(raw_intent_id or "").strip()
+            if not inherited and payload_intent_id:
+                inherited.append(
+                    IntentRouteRef(
+                        intent_id=payload_intent_id,
+                        route_hash=intent_routes.get(payload_intent_id, ""),
+                    )
+                )
+                inherited_reason = "payload_intent_inherit"
+
+            orphan_intent_id = str(raw_orphan_id or "").strip()
+            orphan_route = (
+                intent_routes.get(orphan_intent_id, "") if orphan_intent_id else ""
+            )
+            inherited_values = {ref.route_hash for ref in inherited if ref.route_hash}
+
+            effective = ""
+            lineage = "unattributed"
+            reason = (
+                "orphan_intent_reference"
+                if orphan_intent_id
+                else "no_route_attribution"
+            )
+            eligible = False
+            if explicit:
+                effective = explicit
+                if any(route != explicit for route in inherited_values):
+                    lineage = "explicit_conflict"
+                    reason = "explicit_inherited_conflict"
+                else:
+                    lineage = "explicit"
+                    reason = (
+                        "explicit_matches_inherited"
+                        if inherited_values
+                        else "explicit_route"
+                    )
+                    eligible = True
+            elif len(inherited_values) > 1:
+                lineage = "inherited_conflict"
+                reason = "inherited_route_conflict"
+            elif len(inherited_values) == 1:
+                effective = next(iter(inherited_values))
+                lineage = "inherited"
+                reason = inherited_reason
+                eligible = True
+            elif inherited:
+                reason = inherited_reason
+
+            observations[seq] = RouteObservation(
+                fact_seq=seq,
+                event_ts=float(fact_ts),
+                explicit_route_hash=explicit,
+                inherited_routes=tuple(inherited),
+                effective_route_hash=effective,
+                lineage=lineage,
+                reason=reason,
+                attempted_orphan_intent_id=orphan_intent_id,
+                attempted_orphan_route_hash=orphan_route,
+                eligible_for_energy=eligible,
+            )
+        return observations
+
+    def route_lineage_for_fact(self, fact_seq: int) -> RouteObservation:
+        seq = int(fact_seq)
+        observation = self.route_observations([seq]).get(seq)
+        if observation is None:
+            raise ValueError(
+                f"fact_seq {seq} is not a same-challenge fact_added event"
+            )
+        return observation
 
     def _append_fact_promotion(
         self, *, actor: str, fact_seq: int, confidence: float,
