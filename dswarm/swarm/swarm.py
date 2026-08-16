@@ -69,6 +69,7 @@ from dswarm.swarm.health import (
     _health_cache_put,
 )
 from dswarm.swarm.projection import BoardProjector
+from dswarm.swarm.route_telemetry import MetricsSink
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 from dswarm.swarm.reason_scheduler import ReasonSwarm
 from dswarm.swarm.review_capacity import ReviewCapacityMixin
@@ -462,6 +463,7 @@ class Swarm(
         fallback_usage_writer: Optional[UsageWriter] = None,
         spawn_guard: Optional[SpawnGuard] = None,
         budget_gate: Optional[Any] = None,
+        metrics_sink: Optional[Any] = None,
     ) -> None:
         self.challenge = challenge
         self.lineup = lineup
@@ -690,28 +692,38 @@ class Swarm(
         self.hitl_inbox = hitl_inbox
         self.worker_cmds = worker_cmds
         # P-A: ONE shared, event-sourced, evidence-bearing graph for the swarm.
-        # InsightBus stays the write-NOTIFY channel; this is the persistent
-        # global state every solver writes to (and reason/flywheel read from).
+        # Route telemetry is an independent best-effort sidecar: failure to create
+        # its directory must never disable or prevent opening the canonical graph.
+        self._graph_dir = Path(graph_dir) if graph_dir is not None else None
+        self._route_metrics = metrics_sink
+        if self._route_metrics is None:
+            try:
+                metrics_root = (
+                    self._graph_dir.parent
+                    if self._graph_dir is not None
+                    else self.sandbox.root / self.run_id
+                )
+                self._route_metrics = MetricsSink(metrics_root, run_id=self.run_id)
+            except Exception:
+                self._route_metrics = None
+
         self.shared_graph: Optional[SharedGraph] = None
         try:
             # graph_dir (web driver) keeps the DB OUTSIDE sandbox.root so it
             # survives sandbox.shutdown_all()'s rmtree of the sandbox root. Falls
             # back to the sandbox tree when unset (TUI / tests, where ephemeral
             # is fine).
-            if graph_dir is not None:
-                base = Path(graph_dir)
-                base.mkdir(parents=True, exist_ok=True)
-                db_path = base / "shared_graph.db"
+            if self._graph_dir is not None:
+                self._graph_dir.mkdir(parents=True, exist_ok=True)
+                db_path = self._graph_dir / "shared_graph.db"
             else:
                 db_path = self.sandbox.root / self.run_id / "shared_graph.db"
-            # remember where durable per-run state lives (sibling of graph/) so a
-            # post-solve standby can find winner.json + the shared graph again.
-            self._graph_dir = Path(graph_dir) if graph_dir is not None else None
             self.shared_graph = SQLiteSharedGraph.open(
                 db_path=db_path, challenge=challenge, artifacts=artifacts,
+                metrics_sink=self._route_metrics,
             )
         except Exception:
-            # shared graph is additive — never block solving if it can't open.
+            # The shared graph is additive; never block solving if it cannot open.
             self.shared_graph = None
         self._last_graph_event_seq = 0
         self._graph_bridge_failures: dict[int, int] = {}
@@ -1493,9 +1505,10 @@ class Swarm(
         hitl_task = None
         if self.hitl_inbox is not None:
             hitl_task = asyncio.create_task(self._drain_hitl(), name="reason-hitl-drain")
-        projector = BoardProjector(board, after_seq=0, bus=self.bus,
-                                   run_id=self.run_id,
-                                   challenge_id=self.challenge.id)
+        projector = BoardProjector(
+            board, after_seq=0, bus=self.bus, run_id=self.run_id,
+            challenge_id=self.challenge.id, metrics_sink=self._route_metrics,
+        )
         if self.shared_graph is not None:
             try:
                 projector.sync(self.shared_graph)

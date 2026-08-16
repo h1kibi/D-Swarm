@@ -202,4 +202,24 @@ describe("reduce", () => {
     expect(s.chat.at(-1)?.content).toContain("额度/认证/模型配置");
   });
 
+
+  it("keeps historical metrics summaries out of workers and the evidence timeline", () => {
+    const before = emptyDeck("run-test");
+    const after = reduce(
+      before,
+      ev(EventType.BLACKBOARD_DELTA, {
+        kind: "metrics_summary",
+        actor: "metrics",
+        records_total: 4,
+        verified_total: 2,
+        by_kind: { fact_appended: 2, fact_projected: 2 },
+      }, { solver_id: "metrics" }),
+    );
+
+    expect(after.blackboard.workers).toEqual([]);
+    expect(after.blackboard.events).toEqual([]);
+    expect(after.model.nodes.map((node) => node.id)).toEqual(["challenge"]);
+    expect(after.blackboard.routeMetrics?.records_total).toBe(4);
+  });
+
 });

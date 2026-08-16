@@ -801,6 +801,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         from dswarm.solver.result import ArtifactStore
         from dswarm.solver.types import SolverConfig
         from dswarm.swarm.shared_graph import SQLiteSharedGraph
+        from dswarm.swarm.route_telemetry import MetricsSink
 
         action = (cmd.get("action") or "ask").lower()
 
@@ -901,13 +902,19 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 account_root=(str(account_root) if account_root is not None else None),
             )
 
-        # re-open the persisted shared graph (verified facts / dead-ends / flag).
+        # Re-open the persisted shared graph (verified facts / dead-ends / flag).
+        # Metrics remain a sibling sidecar and may degrade independently.
+        route_metrics = None
+        try:
+            route_metrics = MetricsSink(root, run_id=run.run_id)
+        except Exception:
+            route_metrics = None
         shared_graph = None
         try:
             graph_dir.mkdir(parents=True, exist_ok=True)
             shared_graph = SQLiteSharedGraph.open(
                 db_path=graph_dir / "shared_graph.db", challenge=challenge,
-                artifacts=arts)
+                artifacts=arts, metrics_sink=route_metrics)
         except Exception:
             shared_graph = None
 

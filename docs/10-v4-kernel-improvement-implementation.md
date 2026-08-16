@@ -415,7 +415,7 @@ recovery 各结算恰好一次；CostController/Board/UI 投影一致。
 
 ## M6 route lineage + telemetry（09 §10.3.6 / §10.5 route 1-4）
 
-**Status (2026-08-16): M6a-1, M6a-2, and M6b-1 implemented and test-backed; M6b-2 NOT implemented.**
+**Status (2026-08-16): M6a-1 / M6a-2 / M6b-1 / M6b-2 implemented and test-backed; M6 complete.**
 首轮复评审定 **Contract v1 reviewed — Revise before Go**（M6a 三阻断：多 intent
 lineage、orphan 禁止继承、短路解析无法冲突检测；M6b 四缺口：路径未选边、无 durable
 checkpoint、记录模型不足、埋点语义未定义）。Contract v2 已按评审意见逐条修订；实施顺序 =
@@ -576,6 +576,19 @@ class ReplayClock:
 `projected_at` 用注入 clock → pheromone 恒用 `pheromone_origin_ts=event_ts` → 两次 replay
 产物完全一致。**仅 Board/Projector 注入可选 clock**；生产默认真实 clock；不改造
 SharedGraph 其余 `time.time()`；不要求 Postgres 虚拟 DB clock。
+
+实现记录（2026-08-16）：五类生产埋点已接入 SharedGraph 与 BoardProjector；真实 Web
+运行使用 `workspace/metrics/route-telemetry.jsonl`，standby reopen 同样恢复 sidecar，任何
+目录、append 或 aggregate 故障均被隔离，不能阻塞 canonical graph 或 projection。每次实际
+dedupe collision 使用独立 `record_id`，避免同一事实的多次命中被错误折叠。
+`metrics_summary` 仅通过 EventBus/SessionStore 作为非证据事件发出，actor 为空；Web reducer
+将其隔离在 `blackboard.routeMetrics`，不创建 worker、timeline、solver、fact、intent 或 graph
+节点。`route_replay.py` 已提供只读 immutable graph、忽略 telemetry sidecar 的
+`ReplayClock` 确定性 harness。红线回归覆盖 metrics 开/关时 canonical events、
+`to_reason_summary()` 与 Reason prompt 完全一致，且 provenance gate 未改动。
+
+验证记录（2026-08-16）：`uv run pytest -q` exit 0；Web UI `npm test` 为 18 files /
+136 tests 全绿；`npx tsc --noEmit` exit 0；`npm run build` 完成 production build。
 
 ### M6 红线
 

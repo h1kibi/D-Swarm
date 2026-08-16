@@ -354,6 +354,18 @@ export interface BlackboardEvent {
   ts: number;
   label: string;         // pre-rendered one-line summary for the timeline
 }
+export interface RouteMetricsSummary {
+  records_total: number;
+  verified_total: number;
+  by_kind: Record<string, number>;
+  by_lineage: Record<string, number>;
+  by_route: Record<string, {
+    records_total: number;
+    verified_total: number;
+    by_kind: Record<string, number>;
+  }>;
+}
+
 export interface BlackboardView {
   intents: BlackboardIntent[];
   facts: BlackboardFact[];
@@ -368,6 +380,7 @@ export interface BlackboardView {
   flags?: string[];                    // every distinct flag captured (multi-flag)
   events: BlackboardEvent[];           // append-only timeline
   workers: string[];                   // distinct actors seen (for lanes/legend)
+  routeMetrics?: RouteMetricsSummary;  // non-evidence telemetry snapshot
 }
 
 export interface DeckState {
@@ -662,6 +675,9 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       unverifiedFlags: [...(prev.blackboard.unverifiedFlags ?? [])],
       events: [...prev.blackboard.events],
       workers: [...prev.blackboard.workers],
+      routeMetrics: prev.blackboard.routeMetrics
+        ? { ...prev.blackboard.routeMetrics }
+        : undefined,
       flag: prev.blackboard.flag,
       flags: [...(prev.blackboard.flags ?? [])],
     },
@@ -671,8 +687,10 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
   };
   const m = s.model;
   const sid = ev.solver_id || "";
-  if (sid) ensureSolverNode(m, sid);
   const p = ev.payload || {};
+  const isMetricsSummary =
+    ev.event_type === EventType.BLACKBOARD_DELTA && p.kind === "metrics_summary";
+  if (sid && !isMetricsSummary) ensureSolverNode(m, sid);
   switch (ev.event_type) {
     case EventType.RUN_STARTED: {
       // RUN_STARTED fires once PER worker; only the first one opens the thread.
@@ -888,12 +906,42 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
     }
     case EventType.BLACKBOARD_DELTA: {
       const bb = s.blackboard;
-      const actor = p.actor ?? sid ?? "";
-      if (actor && !bb.workers.includes(actor)) bb.workers = [...bb.workers, actor];
+      const actor = isMetricsSummary ? "" : (p.actor ?? sid ?? "");
+      if (!isMetricsSummary && actor && !bb.workers.includes(actor)) {
+        bb.workers = [...bb.workers, actor];
+      }
       const tlabel = (txt: string) => {
         bb.events = [...bb.events, { id: gid("bbe"), kind: p.kind, actor, ts: ev.ts, label: txt }].slice(-300);
       };
       switch (p.kind) {
+        case "metrics_summary": {
+          const countMap = (value: unknown): Record<string, number> => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+            return Object.fromEntries(
+              Object.entries(value).map(([key, raw]) => [key, Number(raw ?? 0)]),
+            );
+          };
+          const byRoute: RouteMetricsSummary["by_route"] = {};
+          if (p.by_route && typeof p.by_route === "object" && !Array.isArray(p.by_route)) {
+            for (const [route, raw] of Object.entries(p.by_route as Record<string, unknown>)) {
+              if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+              const row = raw as Record<string, unknown>;
+              byRoute[route] = {
+                records_total: Number(row.records_total ?? 0),
+                verified_total: Number(row.verified_total ?? 0),
+                by_kind: countMap(row.by_kind),
+              };
+            }
+          }
+          bb.routeMetrics = {
+            records_total: Number(p.records_total ?? 0),
+            verified_total: Number(p.verified_total ?? 0),
+            by_kind: countMap(p.by_kind),
+            by_lineage: countMap(p.by_lineage),
+            by_route: byRoute,
+          };
+          break;
+        }
         case "intent_proposed": {
           const fromFacts: number[] = Array.isArray(p.from_facts)
             ? p.from_facts.filter((seq: any) => typeof seq === "number" && seq > 0)

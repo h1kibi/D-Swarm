@@ -33,6 +33,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -50,6 +51,7 @@ from dswarm.swarm.fact_events import (
     user_version,
 )
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
+from dswarm.swarm.route_telemetry import RouteMetricRecord
 from dswarm.solver.direction_rules import sanitize_raw_direction
 
 
@@ -754,10 +756,12 @@ class SQLiteSharedGraph:
     SUPPORTED_USER_VERSION = SCHEMA_USER_VERSION
 
     def __init__(self, db_path: str | Path, challenge: Challenge,
-                 artifacts: Any = None) -> None:
+                 artifacts: Any = None, metrics_sink: Any = None) -> None:
         self.db_path = str(db_path)
         self.challenge = challenge
         self.artifacts = artifacts  # ArtifactStore, for the P-B gate
+        # M6 telemetry is a best-effort sidecar, never an evidence source.
+        self._metrics_sink = metrics_sink
         db_file = Path(self.db_path)
         is_new_database = not db_file.exists() or db_file.stat().st_size == 0
         db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1105,8 +1109,8 @@ class SQLiteSharedGraph:
     # ── classmethod ctor ────────────────────────────────────────────────
     @classmethod
     def open(cls, *, db_path: str | Path, challenge: Challenge,
-             artifacts: Any = None) -> "SQLiteSharedGraph":
-        return cls(db_path, challenge, artifacts)
+             artifacts: Any = None, metrics_sink: Any = None) -> "SQLiteSharedGraph":
+        return cls(db_path, challenge, artifacts, metrics_sink)
 
     @classmethod
     def open_readonly(cls, *, db_path: str | Path, challenge: Challenge) -> "SQLiteSharedGraph":
@@ -1181,6 +1185,49 @@ class SQLiteSharedGraph:
                         return -1
                 raise
 
+    def _record_route_metric(
+        self,
+        *,
+        kind: str,
+        record_id: str,
+        fact_seq: int,
+        actor: str,
+        event_ts: Optional[float] = None,
+        verified: Optional[bool] = None,
+    ) -> None:
+        """Append one M6 sidecar record without affecting graph semantics."""
+        sink = self._metrics_sink
+        if sink is None or int(fact_seq or 0) <= 0:
+            return
+        try:
+            observation = self.route_lineage_for_fact(int(fact_seq))
+            if event_ts is None:
+                event_ts = float(observation.event_ts)
+            if verified is None:
+                effective = self.effective_fact(int(fact_seq)) or {}
+                verified = bool(effective.get("verified"))
+            sink.append(
+                RouteMetricRecord(
+                    record_id=record_id,
+                    kind=kind,
+                    challenge_id=self.challenge.id,
+                    event_ts=float(event_ts),
+                    observed_at=time.time(),
+                    actor=str(actor or ""),
+                    fact_seq=int(fact_seq),
+                    route_hash=str(observation.effective_route_hash or ""),
+                    route_lineage=str(observation.lineage or "unattributed"),
+                    lineage_reason=str(observation.reason or ""),
+                    intent_ids=tuple(
+                        ref.intent_id for ref in observation.inherited_routes
+                    ),
+                    verified=bool(verified),
+                )
+            )
+        except Exception:
+            # Metrics must never turn a successful graph operation into a failure.
+            pass
+
     def add_evidence(self, *, actor: str, source: str, fact: str,
                      artifact_id: Optional[str] = None, verified: bool = False,
                      confidence: float = 1.0, witness: Optional[str] = None,
@@ -1246,32 +1293,26 @@ class SQLiteSharedGraph:
         seq = self._append(EV_FACT_ADDED, actor, payload,
                            artifact_id=artifact_id, verified=verified,
                            confidence=confidence, dedupe_key=dk)
+        duplicate_fact_seq = -1
         if seq <= 0:
-            # collided with an existing fact of the same identity. The echo is dropped
-            # — but if THIS write is verified and the row already there is a candidate,
-            # promote it (guards the rare case where the marker candidate raced in
-            # before the skill's verified copy). Then attach the product edge below.
+            # The write collided with an existing fact identity. Preserve the
+            # canonical fact seq for telemetry and optional intent-product linking.
             with self._lock:
                 row = self._conn.execute(
                     "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
                     "AND dedupe_key=? ORDER BY seq LIMIT 1",
                     (self.challenge.id, EV_FACT_ADDED, dk),
                 ).fetchone()
+            duplicate_fact_seq = int(row[0]) if row else -1
+            # If this duplicate carries stronger verified evidence, append the
+            # immutable promotion transition rather than mutating the base fact.
             if row and verified and not int(row[1] or 0):
                 self._append_fact_promotion(
-                    actor=actor, fact_seq=int(row[0]), confidence=float(confidence),
-                    artifact_id=artifact_id, witness=witness, verifier=verifier,
-                    source=source,
+                    actor=actor, fact_seq=duplicate_fact_seq,
+                    confidence=float(confidence), artifact_id=artifact_id,
+                    witness=witness, verifier=verifier, source=source,
                 )
-        product_seq = seq
-        if product_seq <= 0 and iid:
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT seq FROM events WHERE challenge_id=? AND kind=? "
-                    "AND dedupe_key=? ORDER BY seq LIMIT 1",
-                    (self.challenge.id, EV_FACT_ADDED, dk),
-                ).fetchone()
-            product_seq = int(row[0]) if row else -1
+        product_seq = seq if seq > 0 else duplicate_fact_seq
         if product_seq > 0 and iid:
             with self._lock:
                 self._conn.execute(
@@ -1280,6 +1321,22 @@ class SQLiteSharedGraph:
                     (iid, product_seq),
                 )
                 self._conn.commit()
+        if seq > 0:
+            self._record_route_metric(
+                kind="fact_appended",
+                record_id=f"fact_write:{seq}:fact:{seq}:base",
+                fact_seq=seq,
+                actor=actor,
+                verified=verified,
+            )
+        elif product_seq > 0:
+            self._record_route_metric(
+                kind="dedupe_hit",
+                record_id=f"dedupe:{uuid.uuid4().hex}:fact:{product_seq}",
+                fact_seq=product_seq,
+                actor=actor,
+                event_ts=time.time(),
+            )
         return seq
 
     def add_dead_end(self, *, actor: str, reason: str) -> int:
@@ -2749,6 +2806,20 @@ class SQLiteSharedGraph:
             dedupe_key=f"fact_summarized::{int(fact_seq)}",
         )
         if seq > 0:
+            event_ts = None
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT ts FROM events WHERE seq=?", (int(seq),)
+                ).fetchone()
+            if row is not None:
+                event_ts = float(row[0])
+            self._record_route_metric(
+                kind="summary_recorded",
+                record_id=f"summary:{seq}:fact:{int(fact_seq)}",
+                fact_seq=int(fact_seq),
+                actor="summarizer",
+                event_ts=event_ts,
+            )
             return True
         current = self.effective_fact(int(fact_seq))
         return current is not None and str(current.get("summary") or "") == clean

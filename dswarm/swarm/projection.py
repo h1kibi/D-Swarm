@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -10,6 +11,7 @@ from dswarm.core.events import Event, EventType, blackboard_delta_payload
 from dswarm.swarm.board import (
     Board, Finding, FindingKind, ReplacementOutcome, StructuredFinding,
 )
+from dswarm.swarm.route_telemetry import RouteMetricRecord
 
 
 class BoardProjector:
@@ -33,12 +35,14 @@ class BoardProjector:
         bus: Optional[Any] = None,
         run_id: Optional[str] = None,
         challenge_id: Optional[str] = None,
+        metrics_sink: Optional[Any] = None,
     ) -> None:
         self.board = board
         self.after_seq = int(after_seq or 0)
         self.bus = bus
         self.run_id = run_id
         self.challenge_id = challenge_id
+        self.metrics_sink = metrics_sink
         self._emit_tasks: set[asyncio.Task] = set()
 
     @staticmethod
@@ -177,6 +181,73 @@ class BoardProjector:
             fact_origin_ts=fact_origin_ts,
         )
 
+    def _record_projection_metric(
+        self,
+        *,
+        kind: str,
+        record_id: str,
+        finding: Finding,
+        fact_seq: int,
+        observation: Optional[Any],
+    ) -> None:
+        sink = self.metrics_sink
+        if sink is None:
+            return
+        try:
+            event_ts = (
+                float(finding.event_ts)
+                if finding.event_ts is not None else time.time()
+            )
+            sink.append(
+                RouteMetricRecord(
+                    record_id=record_id,
+                    kind=kind,
+                    challenge_id=(
+                        self.challenge_id or finding.challenge_id or "unknown"
+                    ),
+                    event_ts=event_ts,
+                    observed_at=time.time(),
+                    actor=str(finding.agent_name or ""),
+                    fact_seq=int(fact_seq),
+                    route_hash=str(finding.route_hash or ""),
+                    route_lineage=str(finding.route_lineage or "unattributed"),
+                    lineage_reason=(
+                        str(observation.reason or "")
+                        if observation is not None else ""
+                    ),
+                    intent_ids=(
+                        tuple(ref.intent_id for ref in observation.inherited_routes)
+                        if observation is not None else ()
+                    ),
+                    verified=bool((finding.payload or {}).get("verified", False)),
+                )
+            )
+        except Exception:
+            # Projection is canonical; telemetry is deliberately best-effort.
+            pass
+
+    def _emit_metrics_summary(self) -> None:
+        if self.bus is None or self.metrics_sink is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            delta = self.metrics_sink.aggregate_delta()
+            if not delta:
+                return
+            event = Event(
+                event_type=EventType.BLACKBOARD_DELTA,
+                run_id=self.run_id or self.challenge_id or "",
+                challenge_id=self.challenge_id or None,
+                payload=blackboard_delta_payload(
+                    "metrics_summary", actor="", **delta
+                ),
+            )
+            task = loop.create_task(self._emit_safe(event))
+            self._emit_tasks.add(task)
+            task.add_done_callback(self._emit_tasks.discard)
+        except Exception:
+            pass
+
     def sync(self, graph: Any) -> int:
         events = graph.events_since(
             self.after_seq, kinds=("fact_added", "fact_verified")
@@ -217,6 +288,13 @@ class BoardProjector:
                         }
                         if result.outcome == ReplacementOutcome.REPLACED:
                             transition["supersedes_source_seq"] = fact_seq
+                        self._record_projection_metric(
+                            kind="fact_promoted",
+                            record_id=f"projection:{projection_key}",
+                            finding=result.finding,
+                            fact_seq=fact_seq,
+                            observation=observation,
+                        )
                         self._emit_upsert(result.finding, fact_seq, **transition)
             else:
                 projected = self.project_event(ev)
@@ -241,11 +319,19 @@ class BoardProjector:
                         transition = {"projection_key": projection_key}
                         if result.outcome == ReplacementOutcome.REPLACED:
                             transition["supersedes_source_seq"] = fact_seq
+                        self._record_projection_metric(
+                            kind="fact_projected",
+                            record_id=f"projection:{projection_key}",
+                            finding=result.finding,
+                            fact_seq=fact_seq,
+                            observation=observation,
+                        )
                         self._emit_upsert(result.finding, fact_seq, **transition)
             # Advance only after this event was fully projected (or deliberately
             # skipped as malformed). Exceptions leave the cursor at the last
             # successfully processed event so replay is safe.
             self.after_seq = seq
+        self._emit_metrics_summary()
         return self.after_seq
 
     def _emit_upsert(
