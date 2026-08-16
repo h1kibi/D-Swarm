@@ -31,11 +31,16 @@ def graph(tmp_path):
     return g
 
 
-def seed_fact(g, *, fact, route, ts, confidence=0.8, verified=0, actor="w1",
-              artifact_id=None, witness=None):
+def seed_fact(g, *, fact, route="", ts, confidence=0.8, verified=0, actor="w1",
+              artifact_id=None, witness=None, intent_id=None,
+              orphan_intent_id=None):
     payload = {"fact": fact, "source": "output", "route_hash": route}
     if witness:
         payload["witness"] = witness
+    if intent_id:
+        payload["intent_id"] = intent_id
+    if orphan_intent_id:
+        payload["orphan_intent_id"] = orphan_intent_id
     with g._lock:
         g._conn.execute(
             "INSERT INTO events (ts, challenge_id, actor, kind, payload, "
@@ -185,7 +190,7 @@ def test_47_and_56_dead_end_reads_applied_result_seq(graph):
     fact_seq = snap.observations[0].fact_seq
     seed_intent(graph, "intent-1", created_seq=snap.graph_after_seq + 1)
     seed_product(graph, "intent-1", fact_seq)
-    # stale (earlier) conclusion first, applied (later) second — result_seq
+    # stale (earlier) conclusion first, applied (later) second 鈥?result_seq
     # points at the EARLIER seq so MAX(seq) would pick the stale one.
     stale_seq = seed_conclusion_event(
         graph, "intent-1", "dead_end", ts=20.0)
@@ -227,8 +232,97 @@ def test_lineage_from_intent_products(graph):
     seed_product(graph, "intent-9", fact_seq)
     snap = capture(graph)
     obs = {o.fact_seq: o for o in snap.observations}[fact_seq]
-    assert obs.lineage_reason == "product_edge"
+    assert obs.lineage == "explicit"
+    assert obs.lineage_reason == "explicit_matches_inherited"
     assert obs.inherited_intent_ids == ("intent-9",)
+
+
+def test_capture_inherits_unique_route_from_product_edge(graph):
+    seed_fact(graph, fact="inherited", ts=10.0)
+    fact_seq = capture(graph).observations[0].fact_seq
+    seed_intent(graph, "intent-a", route_hash="JWT")
+    seed_product(graph, "intent-a", fact_seq)
+
+    obs = capture(graph).observations[0]
+    assert obs.route_hash == "jwt"
+    assert obs.lineage == "inherited"
+    assert obs.lineage_reason == "intent_product"
+    assert obs.inherited_intent_ids == ("intent-a",)
+    assert obs.eligible_for_energy is True
+
+
+def test_capture_preserves_same_route_multi_intent_lineage(graph):
+    seed_fact(graph, fact="shared", ts=10.0)
+    fact_seq = capture(graph).observations[0].fact_seq
+    seed_intent(graph, "intent-b", route_hash="JWT")
+    seed_intent(graph, "intent-a", route_hash="jwt")
+    seed_product(graph, "intent-b", fact_seq)
+    seed_product(graph, "intent-a", fact_seq)
+
+    obs = capture(graph).observations[0]
+    assert obs.route_hash == "jwt"
+    assert obs.lineage == "inherited"
+    assert obs.inherited_intent_ids == ("intent-b", "intent-a")
+    assert obs.eligible_for_energy is True
+
+
+def test_capture_excludes_inherited_and_explicit_conflicts(graph):
+    seed_fact(graph, fact="multi-conflict", ts=10.0)
+    first_seq = capture(graph).observations[0].fact_seq
+    seed_intent(graph, "intent-a", route_hash="jwt")
+    seed_intent(graph, "intent-b", route_hash="sqli")
+    seed_product(graph, "intent-a", first_seq)
+    seed_product(graph, "intent-b", first_seq)
+
+    seed_fact(graph, fact="explicit-conflict", route="rev", ts=11.0)
+    second_seq = max(o.fact_seq for o in capture(graph).observations)
+    seed_product(graph, "intent-a", second_seq)
+
+    by_seq = {o.fact_seq: o for o in capture(graph).observations}
+    inherited = by_seq[first_seq]
+    assert inherited.route_hash == ""
+    assert inherited.lineage == "inherited_conflict"
+    assert inherited.lineage_reason == "inherited_route_conflict"
+    assert inherited.eligible_for_energy is False
+    assert inherited.exclusion_reason == "lineage_unresolved"
+    explicit = by_seq[second_seq]
+    assert explicit.route_hash == "rev"
+    assert explicit.lineage == "explicit_conflict"
+    assert explicit.lineage_reason == "explicit_inherited_conflict"
+    assert explicit.eligible_for_energy is False
+    assert explicit.exclusion_reason == "lineage_unresolved"
+
+
+def test_capture_uses_payload_fallback_but_never_orphan_reference(graph):
+    seed_intent(graph, "intent-payload", route_hash="jwt")
+    seed_intent(graph, "intent-orphan", route_hash="sqli")
+    seed_fact(graph, fact="legacy", ts=10.0, intent_id="intent-payload")
+    seed_fact(graph, fact="orphan", ts=11.0, orphan_intent_id="intent-orphan")
+
+    by_fact = {o.fact_seq: o for o in capture(graph).observations}
+    ordered = [by_fact[key] for key in sorted(by_fact)]
+    payload, orphan = ordered
+    assert payload.route_hash == "jwt"
+    assert payload.lineage == "inherited"
+    assert payload.lineage_reason == "payload_intent_inherit"
+    assert payload.inherited_intent_ids == ("intent-payload",)
+    assert payload.eligible_for_energy is True
+    assert orphan.route_hash == ""
+    assert orphan.lineage == "unattributed"
+    assert orphan.lineage_reason == "orphan_intent_reference"
+    assert orphan.inherited_intent_ids == ()
+    assert orphan.eligible_for_energy is False
+
+
+def test_invalid_fact_row_marks_snapshot_incomplete(graph):
+    seed_fact(graph, fact="bad-confidence", route="jwt", ts=10.0,
+              confidence="bad")
+    snap = capture(graph)
+    assert snap.complete is False
+    assert snap.exclusion_reason == "snapshot_invalid_rows"
+    assert snap.observed_fact_count == 1
+    assert snap.captured_fact_count == 0
+    assert snap.stored_fact_count == 0
 
 
 # ------------------------------------------------------------------ 32/33/57
@@ -294,3 +388,24 @@ def test_34_and_54_phase1_has_no_phase2_work():
         if isinstance(node, ast.Name) and node.id in banned:
             raise AssertionError(
                 f"phase 1 references phase-2 symbol: {node.id}")
+
+
+def test_malformed_applied_conclusion_marks_snapshot_incomplete(graph):
+    seed_intent(graph, "intent-malformed", route_hash="route:a")
+    with graph._lock:
+        cur = graph._conn.execute(
+            "INSERT INTO events (ts, challenge_id, actor, kind, payload) "
+            "VALUES (?,?,?,?,?)",
+            (20.0, graph.challenge.id, "w1", "intent_concluded", "{bad-json"),
+        )
+        graph._conn.execute(
+            "UPDATE intents SET result_seq=?, status='done' WHERE intent_id=?",
+            (int(cur.lastrowid or 0), "intent-malformed"),
+        )
+        graph._conn.commit()
+
+    snap = capture(graph)
+
+    assert snap.complete is False
+    assert snap.exclusion_reason == "snapshot_invalid_rows"
+    assert snap.dead_ends == ()

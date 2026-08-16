@@ -48,8 +48,10 @@ def _obs(fact_seq, route, confidence=0.8, basis=None, energy_origin_ts=1000.0):
 
 def _decision(trace_id, index, route, priority=0.5):
     intent_id = f"i{index}"
+    parts = trace_id.split("::", 3)
+    run_id = parts[1] if len(parts) >= 4 else "r1"
     return EnergyDecision(
-        decision_id=decision_id_for("r1", trace_id, index, intent_id, "reason"),
+        decision_id=decision_id_for(run_id, trace_id, index, intent_id, "reason"),
         trace_id=trace_id, reason_cycle_id="reason-1", intent_id=intent_id,
         route_hash=route, worker_lane="ordinary", priority=priority,
         normalized_priority=priority, priority_scale="planner",
@@ -94,13 +96,41 @@ def test_40_and_52_paired_bootstrap_resamples_whole_runs():
     estimates = [
         RunEnergyEstimate(run_id=f"r{i}", dataset_status="complete",
                           mean_top_k_energy_gain=0.1 * (i + 1))
-        for i in range(6)]
+        for i in range(20)]
     result = paired_bootstrap(estimates)
-    assert result["n_runs"] == 6
+    assert result["n_runs"] == 20
     assert result["resamples"] == BOOTSTRAP_RESAMPLES
-    assert result["mean"] == pytest.approx(0.35)
+    assert result["mean"] == pytest.approx(1.05)
     # CI brackets the population mean (percentile interval)
     assert result["lower"] <= result["mean"] <= result["upper"]
+
+
+def test_bootstrap_thresholds_do_not_fake_confidence_intervals(monkeypatch):
+    class ForbiddenRandom:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("bootstrap RNG must not run below 20 qualified runs")
+
+    monkeypatch.setattr("dswarm.swarm.energy_report.random.Random", ForbiddenRandom)
+    tiny = [RunEnergyEstimate(
+        run_id=f"tiny-{i}", dataset_status="complete",
+        mean_top_k_energy_gain=0.1,
+    ) for i in range(4)]
+    exploratory = [RunEnergyEstimate(
+        run_id=f"explore-{i}", dataset_status="complete",
+        mean_top_k_energy_gain=0.2,
+    ) for i in range(6)]
+
+    tiny_result = paired_bootstrap(tiny)
+    assert tiny_result["mean"] is None
+    assert tiny_result["lower"] is None
+    assert tiny_result["upper"] is None
+    assert tiny_result["resamples"] == 0
+
+    exploratory_result = paired_bootstrap(exploratory)
+    assert exploratory_result["mean"] == pytest.approx(0.2)
+    assert exploratory_result["lower"] is None
+    assert exploratory_result["upper"] is None
+    assert exploratory_result["resamples"] == 0
 
 
 def test_41_bootstrap_parameters_fixed():
@@ -206,3 +236,57 @@ def test_117_energy_reorder_shows_in_replay(tmp_path):
     assert estimate.mean_displacement_planner_to_energy == 4.0
     assert estimate.mean_top_k_energy_gain == pytest.approx(0.6)
     assert estimate.zero_change_cycles == 0
+
+
+def test_report_rejects_in_progress_dataset(tmp_path):
+    sink = EnergyTraceSink(tmp_path / "run", run_id="r1", challenge_id="t1",
+                           enabled=True)
+    _write_cycle(sink, "m7-cycle::r1::inst::0", ["route:a"])
+    estimate = build_run_estimate(tmp_path / "run", run_id="r1", config=CFG)
+    assert estimate.dataset_status == "incomplete"
+    assert estimate.cycles_used == 0
+
+
+def test_report_rejects_missing_manifest_and_unacked_resume(tmp_path):
+    import uuid
+
+    sink = EnergyTraceSink(tmp_path / "run", run_id="r1", challenge_id="t1",
+                           enabled=True)
+    _write_cycle(sink, "m7-cycle::r1::inst::0", ["route:a"])
+    assert sink.finalize() is True
+    manifest = tmp_path / "run" / "metrics" / "energy-cycle-traces.manifest.json"
+    saved = manifest.read_bytes()
+    manifest.unlink()
+    missing = build_run_estimate(tmp_path / "run", run_id="r1", config=CFG)
+    assert missing.dataset_status == "incomplete"
+    manifest.write_bytes(saved)
+
+    epoch = {
+        "kind": "resume_epoch",
+        "resume_epoch_id": str(uuid.uuid4()),
+        "resume_ts": 1001.0,
+        "prior_lifecycle": "finalized",
+        "prior_data_quality": "clean",
+        "schema_version": SCHEMA_VERSION,
+    }
+    line = json.dumps(epoch, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert sink._append_line(line, failure_reason=None) is True
+    unacked = build_run_estimate(tmp_path / "run", run_id="r1", config=CFG)
+    assert unacked.dataset_status == "incomplete"
+    assert unacked.cycles_used == 0
+
+
+def test_report_ignores_unrecognized_segment_filenames(tmp_path):
+    _complete_run(tmp_path, "canonical", [(["route:a"], [], None)])
+    metrics = tmp_path / "canonical" / "metrics"
+    canonical_segment = sorted(metrics.glob("energy-cycle-traces.*.jsonl"))[0]
+    rogue_segment = metrics / "energy-cycle-traces.rogue.jsonl"
+    rogue_segment.write_bytes(canonical_segment.read_bytes())
+
+    estimate = build_run_estimate(
+        tmp_path / "canonical", run_id="canonical", config=CFG
+    )
+
+    assert estimate.dataset_status == "complete"
+    assert estimate.cycles_written == 1
+    assert estimate.cycles_used == 1

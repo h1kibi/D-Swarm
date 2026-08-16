@@ -641,6 +641,21 @@ commits landed, full suite green。**
   测试 1-22/69-73。
 - M7-2：`dswarm/swarm/energy_report.py`（离线 replay/只读折叠/两段归因指标/paired run-level
   bootstrap/coverage 与 N/A 纪律报告）；测试 40-44/52/117-118。
+- M7 补足质检：M7 capture 与 M6 `resolve_route_observation()` 共用同一 lineage 裁决；
+  sidecar/report 共用 canonical trace parser 与 segment 选择规则，finalized manifest 必须与实际
+  segment fold 对账；malformed fact/promotion/applied conclusion 令 snapshot fail-closed；
+  cold-start、`flag_captured` 与 bootstrap 阈值边界已补齐。
+- 独立 benchmark harness：`dswarm/swarm/energy_benchmark.py` +
+  `scripts/energy_benchmark.py`。operator-local factory 必须返回 `EnergyBenchmarkSuite`，且 case 的
+  `run_id` 必须与其构造的 `ReasonSwarm.run_id` 一致：
+
+  ```bash
+  uv run python scripts/energy_benchmark.py package.module:build_suite
+  uv run python scripts/energy_benchmark.py package.module:build_suite --output report.json
+  ```
+
+  输出 kind 固定为 `m7_offline_scheduling_reorder_estimate`；harness 不读取线上 energy 开关，
+  不接 Web/UI，不改变 Reason 生产派发顺序。
 **实施边界保持：不接在线 DSWARM_ENERGY_TIEBREAK（另立 RFC）、不改生产派发顺序、不改
 provenance gate、不改 SharedGraph canonical 写语义；telemetry 样本失败不阻断派发；仅
 dataset/process resume 完整性 witness 无法持久化时在新实例派发前 fail-fast。**

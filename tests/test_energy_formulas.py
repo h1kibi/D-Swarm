@@ -216,8 +216,14 @@ def test_14_energy_clamped_non_negative():
 # ---------------------------------------------------------------- 15/16 rules
 
 def test_15_flag_captured_is_label_only():
-    out = route_energies([_obs()], [], CFG, as_of_ts=1000.0)
-    assert out["route:a"].flag_captured is False
+    uncaptured = route_energies([_obs()], [], CFG, as_of_ts=1000.0)
+    captured = route_energies(
+        [_obs()], [], CFG, as_of_ts=1000.0,
+        captured_routes=frozenset({"route:a"}),
+    )
+    assert uncaptured["route:a"].flag_captured is False
+    assert captured["route:a"].flag_captured is True
+    assert captured["route:a"].energy == uncaptured["route:a"].energy
 
 
 def test_16_participation_rules():
@@ -286,15 +292,19 @@ def test_19_energy_key_shape():
 
 
 def test_20_unobserved_route_and_cold_start_fall_back_to_baseline():
-    decisions = [_decision(index=0, priority=0.5, route="route:x"),
-                 _decision(index=1, priority=0.5, route="route:y")]
+    decisions = [_decision(index=0, priority=0.2, route="route:x"),
+                 _decision(index=1, priority=0.8, route="route:y")]
     baseline = planner_baseline_order(decisions)
     out = reorder_decisions(decisions, enabled=True,
                             energy_supplier=lambda: {})
     assert out == baseline  # cold start: full-zero energies
+    equal_priority = [
+        _decision(index=0, priority=0.5, route="route:x"),
+        _decision(index=1, priority=0.5, route="route:y"),
+    ]
     energies = {"route:x": type("E", (), {"energy": 0.9})()}
-    out2 = energy_order(decisions, energies)
-    # route:y has no energy -> 0 -> x first
+    out2 = energy_order(equal_priority, energies)
+    # route:y has no energy -> 0 -> x first inside the exact-equal group
     assert [d.route_hash for d in out2] == ["route:x", "route:y"]
 
 

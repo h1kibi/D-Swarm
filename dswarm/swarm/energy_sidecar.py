@@ -18,6 +18,7 @@ Implements the crash-recovery protocol from docs/10 Contract v9.2:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -35,7 +36,9 @@ from dswarm.swarm.energy import (
     CycleTrace,
     SizeFixedPointError,
     build_size_stub,
+    cycle_trace_from_row,
     encode_cycle_trace_line,
+    validate_cycle_trace,
 )
 
 MANIFEST_NAME = "energy-cycle-traces.manifest.json"
@@ -104,6 +107,161 @@ class EnergyDatasetFold:
         return self.cycles_started == self.cycles_written + self.cycles_failed
 
 
+@dataclass(frozen=True)
+class EnergyDatasetQualification:
+    """Side-effect-free qualification result for offline replay."""
+
+    status: str
+    fold: EnergyDatasetFold
+    reasons: tuple[str, ...] = ()
+
+
+def _is_non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def energy_segment_paths(run_root: str | Path) -> list[Path]:
+    """Return canonical M7 segment files in physical segment order."""
+
+    metrics_dir = Path(run_root) / "metrics"
+    if not metrics_dir.exists():
+        return []
+    segments = [
+        path for path in metrics_dir.glob(f"{SEGMENT_PREFIX}.*.jsonl")
+        if _SEGMENT_RE.match(path.name)
+    ]
+    segments.sort(key=lambda path: int(_SEGMENT_RE.match(path.name).group(1)))
+    return segments
+
+
+def _valid_uuid4(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value.lower()
+
+
+def _valid_cycle_started(record: dict[str, Any]) -> bool:
+    return (
+        record.get("kind") == "cycle_started"
+        and record.get("schema_version") == SCHEMA_VERSION
+        and isinstance(record.get("trace_id"), str)
+        and bool(record["trace_id"].strip())
+        and isinstance(record.get("reason_cycle_id"), str)
+        and bool(record["reason_cycle_id"].strip())
+        and isinstance(record.get("decision_ts"), (int, float))
+        and not isinstance(record.get("decision_ts"), bool)
+        and math.isfinite(float(record["decision_ts"]))
+    )
+
+
+def _valid_resume_epoch(record: dict[str, Any]) -> bool:
+    return (
+        record.get("kind") == "resume_epoch"
+        and record.get("schema_version") == SCHEMA_VERSION
+        and _valid_uuid4(record.get("resume_epoch_id"))
+        and isinstance(record.get("resume_ts"), (int, float))
+        and not isinstance(record.get("resume_ts"), bool)
+        and math.isfinite(float(record["resume_ts"]))
+        and record.get("prior_lifecycle") in {
+            LIFECYCLE_IN_PROGRESS, LIFECYCLE_FINALIZED
+        }
+        and record.get("prior_data_quality") in {
+            QUALITY_CLEAN, QUALITY_INCOMPLETE, QUALITY_CORRUPT
+        }
+    )
+
+
+def _manifest_errors(manifest: Any, *, run_id: str) -> list[str]:
+    if not isinstance(manifest, dict):
+        return ["manifest_not_object"]
+    errors: list[str] = []
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        errors.append("manifest_schema_version")
+    if manifest.get("run_id") != run_id:
+        errors.append("manifest_run_id")
+    if manifest.get("lifecycle_status") not in {
+        LIFECYCLE_IN_PROGRESS, LIFECYCLE_FINALIZED
+    }:
+        errors.append("manifest_lifecycle_status")
+    if manifest.get("data_quality") not in {
+        QUALITY_CLEAN, QUALITY_INCOMPLETE, QUALITY_CORRUPT
+    }:
+        errors.append("manifest_data_quality")
+    reasons = manifest.get("exclusion_reasons")
+    if not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+        errors.append("manifest_exclusion_reasons")
+    for name in ("created_ts", "finalized_ts"):
+        value = manifest.get(name)
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(float(value))):
+            errors.append(f"manifest_{name}")
+    for name in (
+        "cycles_started", "cycles_written", "cycles_failed",
+        "cycles_excluded", "segment_count", "total_trace_bytes",
+        "max_trace_bytes", "max_run_trace_bytes", "max_segment_bytes",
+    ):
+        if not _is_non_negative_int(manifest.get(name)):
+            errors.append(f"manifest_{name}")
+    for name in ("finalized_resume_epoch_id", "first_trace_id", "last_trace_id"):
+        if not isinstance(manifest.get(name), str):
+            errors.append(f"manifest_{name}")
+    return errors
+
+
+def _manifest_fold_errors(
+    manifest: dict[str, Any],
+    fold: EnergyDatasetFold,
+    *,
+    segment_count: int,
+) -> list[str]:
+    """Verify that a finalized manifest describes the folded segment truth."""
+
+    if manifest.get("lifecycle_status") != LIFECYCLE_FINALIZED:
+        return []
+    expected = {
+        "cycles_started": fold.cycles_started,
+        "cycles_written": fold.cycles_written,
+        "cycles_failed": fold.cycles_failed,
+        "cycles_excluded": fold.cycles_excluded,
+        "segment_count": segment_count,
+        "total_trace_bytes": fold.total_trace_bytes,
+        "first_trace_id": fold.first_trace_id,
+        "last_trace_id": fold.last_trace_id,
+    }
+    return [
+        f"manifest_{name}_mismatch"
+        for name, value in expected.items()
+        if manifest.get(name) != value
+    ]
+
+
+def _dataset_complete_from(
+    manifest: dict[str, Any], fold: EnergyDatasetFold, *,
+    segment_count: int, dirty: bool = False,
+) -> bool:
+    if dirty:
+        return False
+    if manifest.get("lifecycle_status") != LIFECYCLE_FINALIZED:
+        return False
+    if _manifest_fold_errors(manifest, fold, segment_count=segment_count):
+        return False
+    if manifest.get("data_quality") != QUALITY_CLEAN:
+        return False
+    if str(manifest.get("finalized_resume_epoch_id") or "") != fold.last_resume_epoch_id:
+        return False
+    if fold.corrupt or fold.orphan_started:
+        return False
+    if fold.cycles_written != fold.cycles_complete:
+        return False
+    if fold.total_trace_bytes > MAX_RUN_TRACE_BYTES:
+        return False
+    return fold.identity_holds
+
+
 class EnergyTraceSink:
     """Run-scoped sidecar writer + dataset integrity gate (docs/10 M7)."""
 
@@ -151,14 +309,7 @@ class EnergyTraceSink:
         return bool(self._segment_files())
 
     def _segment_files(self) -> list[Path]:
-        if not self.metrics_dir.exists():
-            return []
-        out: list[Path] = []
-        for path in self.metrics_dir.glob(f"{SEGMENT_PREFIX}.*.jsonl"):
-            if _SEGMENT_RE.match(path.name):
-                out.append(path)
-        out.sort(key=lambda p: int(_SEGMENT_RE.match(p.name).group(1)))
-        return out
+        return energy_segment_paths(self.run_root)
 
     def _segment_path(self, index: int) -> Path:
         return self.metrics_dir / f"{SEGMENT_PREFIX}.{index:06d}.jsonl"
@@ -169,8 +320,8 @@ class EnergyTraceSink:
         """temp -> flush -> fsync -> replace; fsync parent dir on POSIX (best
         effort). Failure keeps the previous manifest and marks the recorder
         dirty (no finalized+clean can ever be claimed)."""
+        temp = self.manifest_path.with_suffix(".json.tmp")
         try:
-            temp = self.manifest_path.with_suffix(".json.tmp")
             payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":"))
             with temp.open("w", encoding="utf-8") as handle:
@@ -189,7 +340,18 @@ class EnergyTraceSink:
                     pass  # directory fsync is best-effort, unsupported on Windows
             return True
         except Exception:
+            # Sticky in-memory downgrade: later storage recovery must never turn
+            # an unproven recording interval back into finalized+clean. Avoid
+            # _downgrade_quality() here because it may lead callers to retry the
+            # same manifest write recursively.
             self._dirty = True
+            self._quality = _max_quality(self._quality, QUALITY_INCOMPLETE)
+            reasons = self._manifest.get("exclusion_reasons") or []
+            if "manifest_write_failed" not in reasons:
+                self._manifest["exclusion_reasons"] = [
+                    *reasons, "manifest_write_failed"
+                ]
+            self._manifest["data_quality"] = self._quality
             try:  # best-effort cleanup must not mask the primary failure
                 temp.unlink(missing_ok=True)
             except Exception:
@@ -403,6 +565,66 @@ class EnergyTraceSink:
         obj._current_segment = 0
         return obj.fold()
 
+    @classmethod
+    def readonly_qualification(
+        cls, run_root: str | Path, *, run_id: str
+    ) -> EnergyDatasetQualification:
+        """Qualify a dataset without resume guards, truncation, or writes."""
+        root = Path(run_root)
+        fold = cls.readonly_fold(root, run_id=run_id)
+        manifest_path = root / "metrics" / MANIFEST_NAME
+        segments = energy_segment_paths(root)
+        segments_exist = bool(segments)
+        if not manifest_path.exists():
+            status = "incomplete" if segments_exist else "missing"
+            return EnergyDatasetQualification(
+                status=status, fold=fold, reasons=("manifest_missing",)
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return EnergyDatasetQualification(
+                status="corrupt", fold=fold, reasons=("manifest_corrupt",)
+            )
+        errors = _manifest_errors(manifest, run_id=run_id)
+        if errors:
+            return EnergyDatasetQualification(
+                status="corrupt", fold=fold, reasons=tuple(errors)
+            )
+        if fold.corrupt:
+            return EnergyDatasetQualification(
+                status="corrupt", fold=fold, reasons=tuple(fold.reasons)
+            )
+        segment_count = len(segments)
+        consistency_errors = _manifest_fold_errors(
+            manifest, fold, segment_count=segment_count
+        )
+        if consistency_errors:
+            return EnergyDatasetQualification(
+                status="corrupt", fold=fold, reasons=tuple(consistency_errors)
+            )
+        if _dataset_complete_from(
+            manifest, fold, segment_count=segment_count
+        ):
+            return EnergyDatasetQualification(status="complete", fold=fold)
+        reasons = list(fold.reasons)
+        reasons.extend(f"orphan:{trace_id}" for trace_id in fold.orphan_started)
+        if manifest.get("lifecycle_status") != LIFECYCLE_FINALIZED:
+            reasons.append("manifest_not_finalized")
+        if manifest.get("data_quality") != QUALITY_CLEAN:
+            reasons.append("manifest_not_clean")
+        if str(manifest.get("finalized_resume_epoch_id") or "") != fold.last_resume_epoch_id:
+            reasons.append("resume_epoch_unacknowledged")
+        if fold.cycles_written != fold.cycles_complete:
+            reasons.append("excluded_cycle_present")
+        if fold.total_trace_bytes > MAX_RUN_TRACE_BYTES:
+            reasons.append("run_trace_size_limit")
+        if not fold.identity_holds:
+            reasons.append("count_identity_violation")
+        return EnergyDatasetQualification(
+            status="incomplete", fold=fold, reasons=tuple(dict.fromkeys(reasons))
+        )
+
     def fold(self) -> EnergyDatasetFold:
         with self._lock:
             return self._fold()
@@ -410,8 +632,8 @@ class EnergyTraceSink:
     def _fold(self) -> EnergyDatasetFold:
         fold = EnergyDatasetFold()
         segments = self._segment_files()
-        started: dict[str, int] = {}
-        traces: dict[str, int] = {}
+        started: dict[str, dict[str, Any]] = {}
+        traces: dict[str, CycleTrace] = {}
         seen_epochs: dict[str, str] = {}  # id -> raw line (identical-dup check)
         last_segment_index = len(segments) - 1
         stop_scan = False
@@ -447,31 +669,72 @@ class EnergyTraceSink:
                 kind = record.get("kind")
                 if kind == "cycle_started":
                     trace_id = str(record.get("trace_id") or "")
-                    started[trace_id] = started.get(trace_id, 0) + 1
-                    if started[trace_id] > 1:
+                    duplicate = trace_id in started
+                    if not _valid_cycle_started(record):
+                        fold.corrupt = True
+                        fold.reasons.append("invalid_cycle_started")
+                        stop_scan = True
+                    elif duplicate:
                         fold.corrupt = True
                         fold.reasons.append("duplicate_started")
                         stop_scan = True
+                    else:
+                        started[trace_id] = record
+                    if stop_scan:
                         break
                 elif kind == "cycle_trace":
                     trace_id = str(record.get("trace_id") or "")
-                    traces[trace_id] = traces.get(trace_id, 0) + 1
-                    if traces[trace_id] > 1:
+                    duplicate = trace_id in traces
+                    try:
+                        trace = cycle_trace_from_row(record)
+                        validation_errors = validate_cycle_trace(
+                            trace, run_id=self.run_id
+                        )
+                        canonical_line, canonical_length = encode_cycle_trace_line(trace)
+                        if validation_errors:
+                            raise ValueError(",".join(validation_errors))
+                        if canonical_length != len(line) or canonical_line != line:
+                            raise ValueError("non_canonical_cycle_trace")
+                    except Exception:
+                        # Preserve the trace identity for the final
+                        # trace-without-started classification when available.
+                        if trace_id and trace_id not in traces:
+                            traces[trace_id] = None  # type: ignore[assignment]
+                        fold.corrupt = True
+                        fold.reasons.append("invalid_cycle_trace")
+                        stop_scan = True
+                        break
+                    if duplicate:
                         fold.corrupt = True
                         fold.reasons.append("duplicate_trace")
                         stop_scan = True
                         break
+                    started_record = started.get(trace_id)
+                    if started_record is not None and (
+                        trace.reason_cycle_id != started_record["reason_cycle_id"]
+                        or trace.decision_ts != float(started_record["decision_ts"])
+                    ):
+                        fold.corrupt = True
+                        fold.reasons.append("cycle_identity_mismatch")
+                        stop_scan = True
+                        break
+                    traces[trace_id] = trace
                     fold.total_trace_bytes += len(line)
                     fold.last_trace_id = trace_id
                     if not fold.first_trace_id:
                         fold.first_trace_id = trace_id
                     fold.cycles_written += 1
-                    if bool(record.get("complete")):
+                    if trace.complete:
                         fold.cycles_complete += 1
                     else:
                         fold.cycles_excluded += 1
                 elif kind == "resume_epoch":
-                    epoch_id = str(record.get("resume_epoch_id") or "")
+                    if not _valid_resume_epoch(record):
+                        fold.corrupt = True
+                        fold.reasons.append("invalid_resume_epoch")
+                        stop_scan = True
+                        break
+                    epoch_id = str(record["resume_epoch_id"])
                     line_text = line.decode("utf-8")
                     if epoch_id in seen_epochs:
                         if seen_epochs[epoch_id] != line_text:
@@ -508,6 +771,10 @@ class EnergyTraceSink:
         when the recorder is dirty (docs/10 append-failure contract)."""
         with self._lock:
             fold = self._fold()
+            if self._dirty:
+                self._downgrade_quality(
+                    QUALITY_INCOMPLETE, "recorder_dirty"
+                )
             if fold.corrupt:
                 self._downgrade_quality(QUALITY_CORRUPT, "fold_corrupt")
             if fold.orphan_started:
@@ -529,23 +796,10 @@ class EnergyTraceSink:
     def dataset_complete(self) -> bool:
         """Derived predicate (docs/10): never a stored state."""
         with self._lock:
-            manifest = self._manifest
-            fold = self._fold()
-            if manifest.get("lifecycle_status") != LIFECYCLE_FINALIZED:
-                return False
-            if manifest.get("data_quality") != QUALITY_CLEAN:
-                return False
-            if str(manifest.get("finalized_resume_epoch_id") or "") != fold.last_resume_epoch_id:
-                return False
-            if fold.corrupt or fold.orphan_started:
-                return False
-            if fold.cycles_written != fold.cycles_complete:
-                return False
-            if fold.total_trace_bytes > MAX_RUN_TRACE_BYTES:
-                return False
-            if not fold.identity_holds:
-                return False
-            return True
+            return _dataset_complete_from(
+                self._manifest, self._fold(),
+                segment_count=len(self._segment_files()), dirty=self._dirty,
+            )
 
     def manifest_snapshot(self) -> dict[str, Any]:
         with self._lock:

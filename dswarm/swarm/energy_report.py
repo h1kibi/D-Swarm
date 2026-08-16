@@ -34,12 +34,13 @@ from dswarm.swarm.energy import (
     energy_order,
     planner_baseline_order,
     route_energies,
+    cycle_trace_from_row,
 )
 from dswarm.swarm.energy_sidecar import (
     MANIFEST_NAME,
-    SEGMENT_PREFIX,
     EnergyDatasetFold,
     EnergyTraceSink,
+    energy_segment_paths,
 )
 
 BOOTSTRAP_SEED = 20260816
@@ -123,87 +124,6 @@ def _spearman(a: Sequence[int], b: Sequence[int]) -> float:
     return cov / var
 
 
-def cycle_trace_from_row(row: dict[str, Any]) -> CycleTrace:
-    """Reconstruct a CycleTrace from a canonical sidecar record."""
-    snap_row = row["snapshot"]
-    observations = tuple(
-        EnergyObservationSnapshot(
-            fact_seq=int(o["fact_seq"]),
-            fact_origin_ts=float(o["fact_origin_ts"]),
-            energy_origin_ts=float(o["energy_origin_ts"]),
-            route_hash=str(o["route_hash"]),
-            lineage=str(o["lineage"]),
-            lineage_reason=str(o["lineage_reason"]),
-            inherited_intent_ids=tuple(str(i) for i in o["inherited_intent_ids"]),
-            state=str(o["state"]),
-            retired=bool(o["retired"]),
-            verified=bool(o["verified"]),
-            base_verified=bool(o["base_verified"]),
-            confidence=float(o["confidence"]),
-            witness=str(o["witness"]),
-            artifact_id=str(o["artifact_id"]),
-            source=str(o["source"]),
-            actor=str(o["actor"]),
-            correlation_kind=str(o["correlation_kind"]),
-            correlation_basis_hash=str(o["correlation_basis_hash"]),
-            eligible_for_energy=bool(o["eligible_for_energy"]),
-            exclusion_reason=str(o["exclusion_reason"]),
-        )
-        for o in snap_row["observations"])
-    dead_ends = tuple(
-        DeadEndObservationSnapshot(
-            intent_id=str(d["intent_id"]),
-            route_hash=str(d["route_hash"]),
-            result_seq=int(d["result_seq"]),
-            concluded_ts=float(d["concluded_ts"]),
-            result=str(d["result"]),
-            genuine_giveup=bool(d["genuine_giveup"]),
-            eligible_for_energy=bool(d["eligible_for_energy"]),
-            exclusion_reason=str(d["exclusion_reason"]),
-            conclusion_event_count=int(d["conclusion_event_count"]),
-            ignored_stale_conclusion_count=int(d["ignored_stale_conclusion_count"]),
-        )
-        for d in snap_row["dead_ends"])
-    snapshot = GraphCycleSnapshot(
-        graph_after_seq=int(snap_row["graph_after_seq"]),
-        observations=observations,
-        dead_ends=dead_ends,
-        complete=bool(snap_row["complete"]),
-        exclusion_reason=str(snap_row["exclusion_reason"]),
-        observed_fact_count=int(snap_row["observed_fact_count"]),
-        captured_fact_count=int(snap_row["captured_fact_count"]),
-        stored_fact_count=int(snap_row["stored_fact_count"]),
-    )
-    decisions = tuple(
-        EnergyDecision(
-            decision_id=str(d["decision_id"]),
-            trace_id=str(d["trace_id"]),
-            reason_cycle_id=str(d["reason_cycle_id"]),
-            intent_id=str(d["intent_id"]),
-            route_hash=str(d["route_hash"]),
-            worker_lane=str(d["worker_lane"]),
-            priority=float(d["priority"]),
-            normalized_priority=float(d["normalized_priority"]),
-            priority_scale=str(d["priority_scale"]),
-            original_index=int(d["original_index"]),
-            decision_source=str(d["decision_source"]),
-        )
-        for d in row["decisions"])
-    return CycleTrace(
-        schema_version=int(row.get("schema_version", SCHEMA_VERSION)),
-        trace_id=str(row["trace_id"]),
-        reason_cycle_id=str(row["reason_cycle_id"]),
-        decision_ts=float(row["decision_ts"]),
-        expected_decision_count=int(row["expected_decision_count"]),
-        decisions=decisions,
-        snapshot=snapshot,
-        complete=bool(row["complete"]),
-        exclusion_reason=str(row["exclusion_reason"]),
-        serialized_bytes=int(row["serialized_bytes"]),
-        serialized_bytes_attempted=row.get("serialized_bytes_attempted"),
-    )
-
-
 def replay_dataset(run_root: str | Path, *, run_id: str,
                    config: EnergyConfig, top_k: int = 3) -> tuple[
         list[CycleReplay], EnergyDatasetFold]:
@@ -212,8 +132,7 @@ def replay_dataset(run_root: str | Path, *, run_id: str,
     Reading is strictly side-effect free: the fold uses the read-only path
     (no resume guard, no manifest mutation)."""
     fold = EnergyTraceSink.readonly_fold(run_root, run_id=run_id)
-    segments = sorted((Path(run_root) / "metrics").glob(
-        f"{SEGMENT_PREFIX}.*.jsonl"))
+    segments = energy_segment_paths(run_root)
     replays: list[CycleReplay] = []
     for segment in segments:
         raw = segment.read_bytes()
@@ -281,18 +200,22 @@ def replay_dataset(run_root: str | Path, *, run_id: str,
 def build_run_estimate(run_root: str | Path, *, run_id: str,
                        config: EnergyConfig, top_k: int = 3) -> RunEnergyEstimate:
     """One run's offline reorder estimate with dataset qualification."""
-    replays, fold = replay_dataset(run_root, run_id=run_id, config=config,
-                                   top_k=top_k)
-    status = "missing"
-    if fold.cycles_started or fold.cycles_written or fold.orphan_started:
-        status = "corrupt" if fold.corrupt else "incomplete"
-    if not fold.corrupt and not fold.orphan_started and fold.cycles_written:
-        status = "complete"
+    qualification = EnergyTraceSink.readonly_qualification(
+        run_root, run_id=run_id
+    )
+    fold = qualification.fold
+    replays: list[CycleReplay] = []
+    if qualification.status == "complete":
+        replays, fold = replay_dataset(
+            run_root, run_id=run_id, config=config, top_k=top_k
+        )
     estimate = RunEnergyEstimate(
         run_id=run_id,
-        dataset_status=status,
-        exclusion_reasons=list(fold.reasons) + [
-            f"orphan:{t}" for t in fold.orphan_started],
+        dataset_status=qualification.status,
+        exclusion_reasons=list(dict.fromkeys([
+            *qualification.reasons, *fold.reasons,
+            *(f"orphan:{t}" for t in fold.orphan_started),
+        ])),
         cycles_started=fold.cycles_started,
         cycles_written=fold.cycles_written,
         cycles_used=len(replays),
@@ -349,10 +272,15 @@ def paired_bootstrap(run_estimates: Sequence[RunEnergyEstimate], *,
     qualified = [e for e in run_estimates
                  if e.dataset_status == "complete"
                  and e.mean_top_k_energy_gain is not None]
-    if not qualified:
-        return {"n_runs": 0, "lower": None, "upper": None, "mean": None,
-                "resamples": resamples, "seed": seed, "percentile": percentile}
     deltas = [e.mean_top_k_energy_gain for e in qualified]
+    n_runs = len(deltas)
+    if n_runs < 5:
+        return {"n_runs": n_runs, "lower": None, "upper": None, "mean": None,
+                "resamples": 0, "seed": seed, "percentile": percentile}
+    if n_runs < 20:
+        return {"n_runs": n_runs, "lower": None, "upper": None,
+                "mean": sum(deltas) / n_runs, "resamples": 0,
+                "seed": seed, "percentile": percentile}
     rng = random.Random(seed)
     sample_means: list[float] = []
     for _ in range(resamples):
@@ -363,7 +291,7 @@ def paired_bootstrap(run_estimates: Sequence[RunEnergyEstimate], *,
     high_pct = 100.0 - low_pct
     lower = sample_means[max(0, int(resamples * low_pct / 100.0) - 1)]
     upper = sample_means[min(resamples - 1, int(resamples * high_pct / 100.0))]
-    return {"n_runs": len(qualified), "lower": lower, "upper": upper,
+    return {"n_runs": n_runs, "lower": lower, "upper": upper,
             "mean": sum(deltas) / len(deltas), "resamples": resamples,
             "seed": seed, "percentile": percentile}
 

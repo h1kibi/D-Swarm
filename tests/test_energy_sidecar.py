@@ -213,7 +213,7 @@ def test_51_and_79_oversize_stub_written_with_exact_bytes(tmp_path,
 
 def test_84_snapshot_unavailable_is_excluded_stub_not_failed(tmp_path):
     sink = _sink(tmp_path)
-    sink.start_cycle("t1", reason_cycle_id="r", decision_ts=1.0)
+    sink.start_cycle("t1", reason_cycle_id="reason-1", decision_ts=1234567.0)
     trace = _trace("t1", complete=False, reason="snapshot_unavailable")
     assert sink.write_trace(trace) is True
     fold = sink.fold()
@@ -630,7 +630,7 @@ def test_120_epoch_duplicate_identical_idempotent_mismatch_corrupt(tmp_path):
     metrics = tmp_path / "run" / "metrics"
     seg = _segments(tmp_path)[0]
     epoch_line = json.dumps({
-        "kind": "resume_epoch", "resume_epoch_id": "e-dup",
+        "kind": "resume_epoch", "resume_epoch_id": "123e4567-e89b-42d3-a456-426614174000",
         "resume_ts": 1.0, "prior_lifecycle": "finalized",
         "prior_data_quality": "clean", "schema_version": 1},
         sort_keys=True, separators=(",", ":"))
@@ -638,7 +638,7 @@ def test_120_epoch_duplicate_identical_idempotent_mismatch_corrupt(tmp_path):
         handle.write(epoch_line.encode() + b"\n")  # identical duplicate
     fold = sink.fold()
     assert fold.corrupt is False
-    assert fold.last_resume_epoch_id == "e-dup"
+    assert fold.last_resume_epoch_id == "123e4567-e89b-42d3-a456-426614174000"
     with seg.open("ab") as handle:
         handle.write(epoch_line.replace('"clean"', '"incomplete"').encode()
                      + b"\n")
@@ -733,3 +733,83 @@ def test_85_energy_sidecar_is_bus_free():
     assert "EventType" not in src
     assert "_emit" not in src
     assert "blackboard_delta" not in src
+
+
+def test_manifest_write_failure_is_sticky_after_storage_recovers(tmp_path, monkeypatch):
+    sink = _sink(tmp_path)
+    original_replace = sidecar_mod.os.replace
+    calls = {"count": 0}
+
+    def fail_once(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("simulated manifest replace failure")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(sidecar_mod.os, "replace", fail_once)
+    assert sink._write_manifest(sink.manifest_snapshot()) is False
+    assert sink.dirty is True
+    _full_cycle(sink)
+    assert sink.finalize() is True
+    assert sink.manifest_snapshot()["data_quality"] == "incomplete"
+    assert sink.dataset_complete() is False
+
+
+def test_fold_rejects_valid_json_with_invalid_cycle_schema(tmp_path):
+    metrics = tmp_path / "run" / "metrics"
+    metrics.mkdir(parents=True)
+    segment = metrics / "energy-cycle-traces.000000.jsonl"
+    segment.write_text(
+        '{"kind":"cycle_started","trace_id":"x"}\n'
+        '{"kind":"cycle_trace","trace_id":"x","complete":true}\n',
+        encoding="utf-8",
+    )
+    fold = EnergyTraceSink.readonly_fold(tmp_path / "run", run_id="r1")
+    assert fold.corrupt is True
+    assert "invalid_cycle_started" in fold.reasons
+
+
+def test_fold_rejects_semantically_invalid_resume_epoch(tmp_path):
+    sink = _sink(tmp_path)
+    _full_cycle(sink)
+    segment = _segments(tmp_path)[-1]
+    with segment.open("ab") as handle:
+        handle.write(
+            b'{"kind":"resume_epoch","resume_epoch_id":"",'
+            b'"resume_ts":1.0,"prior_lifecycle":"finalized",'
+            b'"prior_data_quality":"clean","schema_version":1}\n'
+        )
+    fold = sink.fold()
+    assert fold.corrupt is True
+    assert "invalid_resume_epoch" in fold.reasons
+
+
+def test_readonly_qualification_rejects_missing_finalized_segments(tmp_path):
+    sink = _sink(tmp_path)
+    _full_cycle(sink)
+    assert sink.finalize() is True
+    _segments(tmp_path)[0].unlink()
+
+    qualification = EnergyTraceSink.readonly_qualification(
+        tmp_path / "run", run_id="r1",
+    )
+
+    assert qualification.status == "corrupt"
+    assert "manifest_cycles_started_mismatch" in qualification.reasons
+
+
+def test_readonly_qualification_rejects_manifest_counter_tampering(tmp_path):
+    sink = _sink(tmp_path)
+    _full_cycle(sink)
+    assert sink.finalize() is True
+    manifest_path = tmp_path / "run" / "metrics" / sidecar_mod.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cycles_written"] = 99
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    qualification = EnergyTraceSink.readonly_qualification(
+        tmp_path / "run", run_id="r1",
+    )
+
+    assert qualification.status == "corrupt"
+    assert "manifest_cycles_written_mismatch" in qualification.reasons

@@ -425,6 +425,87 @@ def build_size_stub(trace: CycleTrace, *, full_attempted_bytes: int) -> CycleTra
     )
 
 
+def cycle_trace_from_row(row: dict[str, Any]) -> CycleTrace:
+    """Reconstruct a CycleTrace from a canonical sidecar record."""
+    snap_row = row["snapshot"]
+    observations = tuple(
+        EnergyObservationSnapshot(
+            fact_seq=int(o["fact_seq"]),
+            fact_origin_ts=float(o["fact_origin_ts"]),
+            energy_origin_ts=float(o["energy_origin_ts"]),
+            route_hash=str(o["route_hash"]),
+            lineage=str(o["lineage"]),
+            lineage_reason=str(o["lineage_reason"]),
+            inherited_intent_ids=tuple(str(i) for i in o["inherited_intent_ids"]),
+            state=str(o["state"]),
+            retired=bool(o["retired"]),
+            verified=bool(o["verified"]),
+            base_verified=bool(o["base_verified"]),
+            confidence=float(o["confidence"]),
+            witness=str(o["witness"]),
+            artifact_id=str(o["artifact_id"]),
+            source=str(o["source"]),
+            actor=str(o["actor"]),
+            correlation_kind=str(o["correlation_kind"]),
+            correlation_basis_hash=str(o["correlation_basis_hash"]),
+            eligible_for_energy=bool(o["eligible_for_energy"]),
+            exclusion_reason=str(o["exclusion_reason"]),
+        )
+        for o in snap_row["observations"])
+    dead_ends = tuple(
+        DeadEndObservationSnapshot(
+            intent_id=str(d["intent_id"]),
+            route_hash=str(d["route_hash"]),
+            result_seq=int(d["result_seq"]),
+            concluded_ts=float(d["concluded_ts"]),
+            result=str(d["result"]),
+            genuine_giveup=bool(d["genuine_giveup"]),
+            eligible_for_energy=bool(d["eligible_for_energy"]),
+            exclusion_reason=str(d["exclusion_reason"]),
+            conclusion_event_count=int(d["conclusion_event_count"]),
+            ignored_stale_conclusion_count=int(d["ignored_stale_conclusion_count"]),
+        )
+        for d in snap_row["dead_ends"])
+    snapshot = GraphCycleSnapshot(
+        graph_after_seq=int(snap_row["graph_after_seq"]),
+        observations=observations,
+        dead_ends=dead_ends,
+        complete=bool(snap_row["complete"]),
+        exclusion_reason=str(snap_row["exclusion_reason"]),
+        observed_fact_count=int(snap_row["observed_fact_count"]),
+        captured_fact_count=int(snap_row["captured_fact_count"]),
+        stored_fact_count=int(snap_row["stored_fact_count"]),
+    )
+    decisions = tuple(
+        EnergyDecision(
+            decision_id=str(d["decision_id"]),
+            trace_id=str(d["trace_id"]),
+            reason_cycle_id=str(d["reason_cycle_id"]),
+            intent_id=str(d["intent_id"]),
+            route_hash=str(d["route_hash"]),
+            worker_lane=str(d["worker_lane"]),
+            priority=float(d["priority"]),
+            normalized_priority=float(d["normalized_priority"]),
+            priority_scale=str(d["priority_scale"]),
+            original_index=int(d["original_index"]),
+            decision_source=str(d["decision_source"]),
+        )
+        for d in row["decisions"])
+    return CycleTrace(
+        schema_version=int(row.get("schema_version", SCHEMA_VERSION)),
+        trace_id=str(row["trace_id"]),
+        reason_cycle_id=str(row["reason_cycle_id"]),
+        decision_ts=float(row["decision_ts"]),
+        expected_decision_count=int(row["expected_decision_count"]),
+        decisions=decisions,
+        snapshot=snapshot,
+        complete=bool(row["complete"]),
+        exclusion_reason=str(row["exclusion_reason"]),
+        serialized_bytes=int(row["serialized_bytes"]),
+        serialized_bytes_attempted=row.get("serialized_bytes_attempted"),
+    )
+
+
 def decision_id_matches(decision: EnergyDecision, run_id: str) -> bool:
     expected = decision_id_for(run_id, decision.trace_id, decision.original_index,
                                decision.intent_id, decision.decision_source)
@@ -537,7 +618,7 @@ def route_energies(
             positive=positive,
             penalty=penalty,
             energy=energy,
-            flag_captured=False,
+            flag_captured=route in captured_routes,
             raw_fact_count=census.get(route, 0),
             correlation_group_count=group_count,
             eligible=positive > 0.0,
@@ -590,5 +671,5 @@ def reorder_decisions(
         return list(decisions)
     energies = energy_supplier()
     if not energies:
-        return list(decisions)
+        return planner_baseline_order(decisions)
     return energy_order(decisions, energies)
