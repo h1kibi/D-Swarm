@@ -158,57 +158,211 @@ GitHub 发布时应将数据库备份/显式迁移作为升级说明，不能宣
 
 ---
 
-## M4 direction diagnostics（09 §10.3.4 / §10.5 方向路由 1-4）
+## M4 direction diagnostics（09 §10.3.4 / §10.5 direction routing 1-4）
 
-**现状（已核实）**：`parse_reason_reply` 直接 `canonical_direction(raw)`，非法值进
-scheduler 前已成空串；`_decisions_from_reason` 拿不到原始词；方向规则散在
-`worker_profiles.py`（映射表/镜像 tag/account id）与未来关键词表之间。
+**Status (2026-08-15): implemented and verified.** The deterministic registry,
+parser diagnostics, scheduler fallback, event payload, SQLite projection, operator
+telemetry, and compatibility tests are in place. The M4 implementation does not
+change the provenance gate or the M3 immutable-event contract.
 
-**设计**
+**Contract**
 
-1. 新模块 `dswarm/solver/direction_rules.py`——**单一权威 registry**（typed fields）：
-   ```python
-   @dataclass(frozen=True)
-   class DirectionSpec:
-       canonical: str            # web|pwn|rev|crypto|misc|forensics|aisec
-       profile: str              # pi-web ...
-       image_tag: str
-       account_id: str
-       aliases: tuple[str, ...]  # ("reverse",) for rev
-       keywords: tuple[str, ...] # ("rsa","factor","discrete log",...) for crypto
-   class DirectionRegistry:
-       def canonicalize(self, raw: str) -> tuple[str, str]   # (canonical, resolution)
-       def suggest(self, goal: str, brief: str) -> tuple[str, str] | None  # 关键词高置信
-       def profile_for(self, canonical: str) -> str
-       def image_for(self, canonical: str) -> str
+1. `DirectionRegistry` owns only stable direction vocabulary: canonical IDs,
+   aliases, fallback keywords, and default profile IDs. It deliberately does not
+   own image tags, credential accounts, endpoints, runtime selection, or other
+   deployment facts; those remain in the existing profile/runtime resolvers.
+2. `raw_direction` is sanitized at the parser boundary: control characters are
+   removed, surrounding whitespace is trimmed, and the value is capped at 40
+   characters before it reaches an event or UI.
+3. `canonicalize()` uses these resolutions:
+   - empty input → `empty`;
+   - `auto`, `any`, `unknown`, or `unclear` → `explicit_auto`;
+   - a canonical ID → `explicit_canonical`;
+   - a registered alias (for example `reverse`) → `recognized_alias`;
+   - any other non-empty value → `invalid`.
+   A lower-case canonical direction is never classified as `explicit_auto`.
+4. `_decisions_from_reason` applies mechanical fallback only to `empty`,
+   `explicit_auto`, or `invalid`. A keyword match produces
+   `mechanical_fallback`; without a match, the challenge category produces
+   `category_fallback`. A valid canonical or alias result is never replaced by a
+   keyword suggestion. Every fallback is retained in operator-visible telemetry
+   as a `direction_override` delta.
+5. Diagnostics travel through the complete chain:
+   `Intent → DispatchDecision → intent_proposed payload → intents projection →
+   dispatchable_intents()`. The event payload includes `direction`,
+   `canonical_direction`, `raw_direction`, and `direction_resolution`.
+6. New dataclass fields are appended with defaults so existing positional fixtures
+   remain compatible. Programmatic legacy intents are canonicalized at the
+   scheduler boundary, so `direction="reverse"` resolves to `rev` with
+   `recognized_alias`.
+
+**Implementation**
+
+- `dswarm/solver/direction_rules.py`: typed static registry, canonicalization,
+  sanitization, and deterministic keyword suggestions.
+- `dswarm/solver/worker_profiles.py`: compatibility wrappers delegated to the
+  registry.
+- `dswarm/solver/reason.py`: parser-boundary raw/canonical diagnostics on each
+  `Intent`.
+- `dswarm/swarm/agents.py`: appended diagnostics on `DispatchDecision`.
+- `dswarm/swarm/reason_scheduler.py`: canonicalization, permitted fallback,
+  registration payload, operator delta, and scheduler telemetry.
+- `dswarm/swarm/shared_graph.py`: intent schema/projection and dispatch exposure.
+
+**Tests**: `tests/test_direction_diagnostics.py` covers registry resolution,
+input sanitation, parser preservation, valid-direction precedence, fallback,
+operator telemetry, event/projection parity, and legacy alias compatibility.
+The M4 acceptance mapping is 09 §10.5 direction-routing items 1-4.
+
+### M4.1 operator primary direction (CTF) — 操作员主方向选择
+
+> **Status (2026-08-15): implemented and verified.** The finalized contract is implemented in the
+> kernel, Web backend, and UI in that order. CTF-only direction handling is isolated from pentest/mock
+> paths and does not touch the provenance gate. Deterministic backend, scheduler, recovery, and UI
+> tests cover the contract.
+
+**优先级链（定稿）**
+
+```text
+模型合法 canonical / alias  （复合题 per-intent 分流）
+  > 操作员合法方向            （run 级主方向：initial recon + 模型方向空/非法时的兜底）
+  > 机械关键词 fallback
+  > category fallback
+  > pi-worker
+```
+
+**五项已确认语义**
+
+1. **值域**：操作员方向接受 canonical + 已注册 alias（`rev`/`reverse`/`ai_sec`/`ai-security`…），
+   API 边界统一 canonicalize 后写入 `Challenge.direction`；非法值（`banana`、`../pwn`、
+   控制字符、>40 字符）→ 置空 + 结构化 warning（`event=invalid_operator_direction,
+   run_id, raw_direction, normalized_direction=""`），**不进入** Challenge/Intent/worker
+   profile/黑板路由字段。
+2. **`direction_source` 新字段**：`model|operator|keyword|category|default`，与
+   `direction_resolution`（模型解析/回退状态，沿用已实现的
+   empty/explicit_auto/explicit_canonical/recognized_alias/invalid/mechanical_fallback/
+   category_fallback）**分离**——resolution 解释"模型说了什么、为何回退"，source 解释
+   "最终派发为什么走这个方向"。示例：
+   ```json
+   {"raw_direction": "", "canonical_direction": "", "direction_resolution": "empty",
+    "resolved_direction": "pwn", "direction_source": "operator"}
    ```
-   `worker_profiles.py` 的 `DIRECTION_PROFILE`/`canonical_direction`/`direction_image` 改为
-   委托 registry（导出函数保留，调用方零改动）。
-2. `Intent` 增字段（09 §10.3.4 逐 Intent 建模）：
-   ```python
-   raw_direction: str = ""          # 进事件/UI 前限长 40
-   direction_resolution: str = ""   # empty|explicit_auto|recognized_alias|invalid|
-                                    #   mechanical_fallback|category_fallback
-   ```
-   `parse_reason_reply` 填充：raw 空→`empty`；canonical==raw.lower()→`explicit_auto`；
-   别名命中→`recognized_alias`；canonical 空且 raw 非空→`invalid`。
-3. `_decisions_from_reason`：canonical 空或 `invalid` 时调 `registry.suggest(goal, brief)`
-   → 命中标 `mechanical_fallback`；仍空 → category → `category_fallback`。**合法模型输出
-   永不覆盖**（只记 telemetry）。
-4. `propose_intent` payload 携带 `raw_direction/direction_resolution`；
-   `dispatchable_intents` 返回；fallback 覆盖发生时 `_emit_bb("direction_override", ...)`
-   发操作员可见 delta。
+3. **命名**：`recognized_alias` 保持，不改 `alias`（与已实现契约/测试/事件兼容）。
+4. **Category 与 Direction 两个值域分离**：Category 保持 Challenge Literal
+   （web/pwn/**reverse**/crypto/forensics/misc）；Direction 用
+   auto/web/pwn/rev/crypto/misc/forensics/aisec。**并修复存量 bug**：`LaunchForm.tsx` 的
+   Category 下拉当前含 `"rev"`，而 `Challenge.category` Literal 不接受 `"rev"`，
+   `drivers.py:352` 无归一化——从 UI 启动 rev 题会 Pydantic 校验失败。修复 = UI 改用
+   `"reverse"` + 后端对存量 `"rev"`（历史 session 文件）做归一化兜底。
+5. **恢复会话（/resolve）字段存在性语义**：请求**无** `direction` 字段 → 保留历史方向；
+   `{"direction": ""}` → 显式恢复 auto（清除历史方向）；显式值 → 覆盖。**不得**用
+   `ch.get("direction") or old`（会把显式 `""` 误判为未传）。
 
-**测试**：混合多 intent（crypto 合法 / "reversing" 非法 / 空）各自 diagnostics 正确；
-"reversing"→invalid+raw 保留+mechanical_fallback 生效；"extract RSA key from binary"
-（crypto 关键词命中但模型已给合法 rev）→ 模型值保留；decision→profile→engine→runtime
-全链路（扩展既有 `test_reason_decisions_route_direction_to_profile`）。
+**initial recon 专属规则**：recon 是直接构造的 `DispatchDecision`，不走 Reason——方向 =
+操作员合法方向 > category；**不经过关键词 fallback**（操作员已明确主方向）。recon 的
+diagnostics：`direction_resolution` 保持解析语义，`direction_source = operator|category`。
 
-**验收映射**：09 §10.5 方向路由全部 4 条。
+**direction_override delta**（最终方向 ≠ 模型声明时写入黑板，操作员可见）：
+
+```json
+{"intent_id": "...", "raw_direction": "...", "model_canonical_direction": "",
+ "operator_direction": "pwn", "resolved_direction": "pwn",
+ "direction_source": "operator", "reason": "model_direction_empty"}
+```
+
+触发条件：模型方向为空/`auto`/非法而操作员方向生效；空/非法而关键词生效；category 兜底；
+initial recon 用操作员方向覆盖 category。模型给合法方向 → 只记正常 diagnostics，不写 override。
+
+**边界**：CTF 读 `challenge.direction`；pentest 不读不写不派发；mock 流不因新字段改变事件
+序列；`gate.py` 与 anti-laundering 完全不动——方向是路由信息，永远不是 flag 证据。
+
+**实施点**
+
+- `dswarm/models/solve_graph.py`：`Challenge.direction: str = ""`（字段末尾，默认空）。
+- `dswarm/swarm/reason_scheduler.py`：`_decisions_from_reason` 套用优先级链（模型合法 →
+  操作员 → 关键词 → category → pi-worker）；initial recon 用操作员方向；`direction_source`
+  贯穿 `DispatchDecision → propose_intent payload → dispatchable_intents`。
+- `apps/web/drivers.py` / `apps/web/routes/runs.py`：边界 canonicalize + 非法置空 warning；
+  `/resolve` 按存在性语义处理 direction。
+- `apps/web/ui/components/LaunchForm.tsx`：新增 Direction 下拉（auto + 七方向，默认 auto；
+  auto → 空串）+ Category 值域修复（`reverse`）。
+- 测试：`test_direction_diagnostics.py` 扩展（操作员兜底、模型合法胜出、recon 来源、
+  override delta、非法输入置空）；web 边界测试（alias canonicalize、存在性语义）；UI vitest。
 
 ---
 
 ## M5 token accounting 重设计（09 §10.3.5 / §10.5 token 1-6）
+
+**状态更新（2026-08-15）**：§12.7 判定本模块 **Redesign before Go**；唯一账本契约
+（[docs/14](14-m5-unique-ledger-rfc.md)）的 v1/v2 评审见
+[docs/15](15-m5-unique-ledger-rfc-review.md) 与
+[docs/16](16-m5-unique-ledger-rfc-v2-review.md)，v3 第三轮评审见
+[docs/17](17-m5-unique-ledger-rfc-v3-review.md)，v4 第四轮评审见
+[docs/18](18-m5-unique-ledger-rfc-v4-review.md)，v4.1 第五轮最终评审见
+[docs/19](19-m5-unique-ledger-rfc-v4-1-review.md)。**RFC v4.1 已批准实施**（docs/14 当前版，
+自包含实施规范）：完整恢复 per-worker token/bridge/互斥/预算/reconciliation，拆分
+`call_outcome`/`usage_status`，统一 `UsageJournal`，定稿 checked durability、postflight fail-stop、
+完整 canonical identity、per-worker exec-env token 接线与 `SpawnGuard`，并以测试矩阵 1–30
+锁定。Phase 1–6 已按顺序完成，30 项验收矩阵已逐项核对并有确定性测试或全量回归证据。
+不得新增二次计费路径或修改 provenance gate、anti-laundering、shared evidence graph 事实语义。**
+
+**Phase 1 实施进展（2026-08-15）**：已完成 `SessionStore.append_checked`、`EventBus.emit_checked` 双算法、paired critical sink，以及 `RunManager.create()` / `_fresh_bus()` 重接线。确定性测试覆盖 checked failure 不可见、retry 新 seq/同 usage_id、真实 `flush+fsync`、non-critical failure 隔离、无 double-append 与 fresh-bus 保持；相关回归及全量 `uv run pytest -q` 均绿色。**Phase 1 验收完成。**
+
+**Phase 2 实施进展（2026-08-15）**：已新增 run-scoped `UsageJournal`、不可变 `UsageCall` / `UsageRecord`、统一 `AccountingUnavailable` preflight 契约，并完成 started/finished 两阶段 `flush+fsync`、同路径并发写锁、started-only → `interrupted/unknown/None` 崩溃折叠与 canonical usage_id 幂等 reconcile。质检进一步锁定未知账户必须为 `None`、provider/fallback producer 与 usage status 互斥，以及损坏 started 行统一 fail-stop 为 `UsageJournalCorrupt`。测试矩阵 11–15、Phase 1/SessionStore/Web 相关回归及全量 `uv run pytest -q` 均以退出码 0 通过。**Phase 2 验收完成，允许进入 Phase 3。**
+
+**Phase 3 实施进展（2026-08-15）**：已完成 `WorkerClaims` 与 ModelGateway per-worker token API（`issue_worker`、claims 查询、按 token/worker/run 分层撤销）及 1024 hard cap；同一 run 的 worker/review/recon/BTW token 不再互撤，入口 claims 为不可变快照，达到上限时拒绝新签发且不驱逐存量 token。普通 Swarm worker、review/recon worker、容器 BTW 均已注入各自 `DSWARM_TASK_TOKEN`，显式 endpoint profile 不签 gateway token；构造失败、worker runtime finally、run teardown 均有撤销保护。新增确定性测试覆盖 claims/env 对齐、兄弟 worker 隔离、scope、rollback、finally、显式 endpoint 和 run 清理；旧生产路径不再调用 legacy `issue()` / `revoke()` / `token_for_run()`。Phase 3 定向回归及全量 `uv run pytest -q` 均以退出码 0 通过。**Phase 3 验收完成，允许进入 Phase 4；本阶段未接入 usage producer、USAGE_RECORDED、ledger_state、SpawnGuard 或预算门。**
+
+**Phase 4 实施进展（2026-08-15）**：已完成 producer wiring 与 invocation identity 接线：internal producer 通过 run-scoped `UsageWriter` 覆盖 Reason/Titler/Summarizer/BTW 等内部 LLM 调用，非 gateway 的 Pi/CLI 路径通过 fallback writer 记录 `invocation_aggregate`；`CliResult` 携带稳定 `invocation_id`，retry 不重复生成。ModelGateway、`LLMClient`、Titler、Summarizer、BTW 与 `Swarm` 的注入路径已完成确定性覆盖，未改变现有 `COST_UPDATE` 消费协议。Phase 4 专项回归 `tests/test_phase4_wiring.py` 与相关模型/事件/LLM/Web 测试均通过，**Phase 4 验收完成。**
+
+**Phase 5 实施进展（2026-08-15）**：已完成 usage ledger 到预算执行点的接线：`USAGE_RECORDED` 经 `UsageLedger` 幂等折叠后进入 profile/account 双 `ProfileBudgetGate`，`_make_cli_worker()` 在真正创建 worker 前执行预算检查，预算拒绝不会增加 `_spawned_total`。`BUDGET_ACTION` 可重放恢复 blocker，`BUDGET_ALERT` 对 warn/cap 边沿去重；新增 `GET /api/runs/{run_id}/budget` 快照接口。Run 创建/重启恢复会在 run 注册后恢复预算配置，journal-only usage 会在 spawn 前 reconcile；journal reconcile 或 canonical append 失败会将 ledger/SpawnGuard 置为 `failed`，阻止后续 provider call 与 spawn，但 `stop`/`finalize` 仍可执行。新增 `tests/test_phase5_ledger.py` 17 项确定性测试，Phase 5 专项测试 `17 passed`，相关 Phase 4/EventBus/ModelGateway/LLM/Web 回归 100 项通过；随后全量 `uv run pytest -q --maxfail=1 --disable-warnings` 通过。**Phase 5 验收完成，允许进入 Phase 6。**
+
+**Phase 6 实施进展（2026-08-16）：已完成预算可观测性与账本恢复闭环。** 新增 `POST /api/runs/{run_id}/budget/rebuild`，由 `RunManager.rebuild_ledger()` 统一执行 rebuilding → replay/reconcile → ready/failed 状态转换；重建失败会保留 `stop`/`finalize` 可用，并通过 503 与 UI 告警反馈。前端新增 `BudgetStatusPanel` 与 `budgetStatus` 纯函数投影，在 Inspector 中展示 global tokens/calls、unknown/estimated usage、profile/account 独立预算、blocked 状态和 ledger state；账本 failed 时可直接触发恢复。新增 404/503/recovery API 边界测试与前端投影测试。验证证据：`tests/test_phase5_ledger.py` 18 项通过、前端 Vitest 18 files/135 tests 通过、Next production build 编译与类型检查通过；全量 `uv run pytest -q --maxfail=1 --disable-warnings` 通过。**Phase 6 验收完成，M5 最终验收闭环。**
+
+
+
+### M5 v4.1 最终验收矩阵（2026-08-16）
+
+以下矩阵将 RFC §8 的 30 项要求映射到工作区中的确定性测试；“PASS”表示该契约已有
+直接测试或由对应的端到端回归覆盖。M5 不改变 provenance gate、anti-laundering、
+shared evidence graph 的事实语义。
+
+| # | 结果 | 验收证据 |
+|---:|:---:|---|
+| 1 | PASS | `tests/test_phase5_ledger.py::test_usage_ledger_rebuilds_five_projections_idempotently`；`test_budget_gate_replays_duplicate_usage_and_actions_without_double_charge` |
+| 2 | PASS | `tests/test_usage_journal.py::test_fallback_cannot_claim_provider_call_identity`；`test_usage_status_must_match_producer_contract`；gateway/internal/fallback wiring 回归 |
+| 3 | PASS | `tests/test_llm.py::test_streaming_usage_writer_does_not_double_record_legacy_cost`；`tests/test_event_bus.py::test_sink_exception_does_not_block_fanout`；前端事件 reducer 回归 |
+| 4 | PASS | `tests/test_modelgateway.py::test_per_worker_tokens_in_same_run_do_not_revoke_each_other`；`test_token_revoke_apis_are_scoped`；Swarm worker finally/teardown 测试 |
+| 5 | PASS | `tests/test_modelgateway.py::test_gateway_journal_records_claims_and_canonical_event`；`tests/test_swarm.py::test_container_workers_receive_independent_claimed_tokens_and_release_only_self` |
+| 6 | PASS | `tests/test_event_bus.py::test_emit_checked_failure_is_not_visible_and_retry_uses_new_seq` |
+| 7 | PASS | 同上：retry 使用新 Event/new seq，`usage_id` 仍由 ledger 幂等折叠 |
+| 8 | PASS | `tests/test_web_server.py::test_run_manager_checked_sink_survives_fresh_bus_without_double_append` |
+| 9 | PASS | `tests/test_event_bus.py::test_append_checked_flushes_fsync_and_propagates_failure`；`tests/test_usage_journal.py::test_started_is_fsynced_before_mock_upstream_receives_request` |
+| 10 | PASS | `tests/test_event_bus.py::test_paired_session_store_sink_avoids_double_append` |
+| 11 | PASS | `tests/test_usage_journal.py::test_started_is_fsynced_before_mock_upstream_receives_request`；gateway 顺序测试 |
+| 12 | PASS | `tests/test_usage_journal.py::test_started_only_reconciles_to_interrupted_unknown_without_zero_cost` |
+| 13 | PASS | `tests/test_usage_journal.py::test_started_prewrite_failure_is_accounting_unavailable_before_upstream`；gateway fail-closed 测试 |
+| 14 | PASS | `tests/test_usage_journal.py::test_concurrent_journal_instances_serialize_same_file_writes` |
+| 15 | PASS | `tests/test_usage_journal.py::test_reconcile_is_idempotent_by_usage_id`；ledger reconcile 回归 |
+| 16 | PASS | `tests/test_modelgateway.py::test_gateway_provider_error_gets_terminal_unknown`；`tests/test_llm.py::test_llm_usage_writer_records_provider_error_before_reraising` |
+| 17 | PASS | `tests/test_phase5_ledger.py::test_ledger_reconcile_failure_blocks_spawn_but_allows_stop_finalize`；budget rebuild 503/ready 测试 |
+| 18 | PASS | `tests/test_phase4_wiring.py::test_cli_result_exposes_invocation_id`；`test_run_cli_assigns_invocation_id`；fallback retry wiring |
+| 19 | PASS | `tests/test_phase5_ledger.py::test_spawn_guard_blocks_failed_and_waits_for_rebuild`；Swarm budget rejection/stop/finalize 回归 |
+| 20 | PASS | `tests/test_modelgateway.py::test_token_hard_cap_rejects_without_evicting_active_tokens` |
+| 21 | PASS | `tests/test_modelgateway.py::test_gateway_call_keeps_entry_claims_after_token_revoke` |
+| 22 | PASS | `tests/test_llm.py::test_llm_usage_writer_records_durable_success_and_canonical_event`；`test_llm_usage_writer_records_provider_error_before_reraising`；`test_llm_usage_writer_records_timeout_terminal`；Titler/Summarizer 注入测试 |
+| 23 | PASS | `tests/test_web_server.py::test_btw_container_uses_independent_gateway_token_and_revokes_it` |
+| 24 | PASS | `tests/test_phase5_ledger.py::test_usage_ledger_rebuilds_five_projections_idempotently`；replay/rebuild 回归 |
+| 25 | PASS | `tests/test_phase5_ledger.py::test_profile_budget_alerts_are_edge_triggered`；`test_budget_action_is_durable_semantics` |
+| 26 | PASS | `tests/test_phase5_ledger.py::test_budget_resume_without_explicit_action_does_not_clear_blocker`；无参数 resume 不解除预算 blocker |
+| 27 | PASS | `tests/test_phase5_ledger.py::test_profile_budget_gate_has_independent_profile_and_account_blockers`；billing 维度 spawn 测试 |
+| 28 | PASS | `tests/test_phase5_ledger.py::test_run_manager_budget_snapshot_endpoint` |
+| 29 | PASS | `tests/test_phase5_ledger.py::test_run_manager_budget_rebuild_endpoint_restores_ready_state`；404/503 边界测试 |
+| 30 | PASS | `uv run pytest -q --disable-warnings`、前端 Vitest、Next production build、`git diff --check`；provenance/gate 回归保持绿色 |
+
+**最终状态：M5 Phase 1–6 施工完成，RFC v4.1 的 30 项验收矩阵 PASS。**
+
+
+以下为被 RFC 取代的旧稿（保留作对照）：
 
 **现状（已核实）**：`SolveOutcome` 无 token 字段；`CliSolver._tokens_spent()` 存在但只用于
 生命周期事件；`ReasonSwarm._one` 结算 `tokens=0`；`MemoryBoard.charge_agent` 仅累计+warned；

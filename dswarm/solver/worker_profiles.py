@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from dswarm.solver.direction_rules import DEFAULT_DIRECTION_REGISTRY
+
 
 VALID_BASE_ENGINES = ("pi",)
 DEFAULT_WORKER_IMAGE = "ctf-swarm-pi:0.2.0"
@@ -22,30 +24,17 @@ DEFAULT_ROLES = ["recon", "bootstrap", "explore", "respond", "review"]
 # hook: its own worker image (Kali base + direction config layer), prompt, skill
 # extensions and (optionally) its own base_url / credential account. The
 # `reverse` challenge category maps to the `rev` direction image tag.
-DIRECTIONS = ("web", "pwn", "rev", "crypto", "misc", "forensics", "aisec")
+DIRECTIONS = DEFAULT_DIRECTION_REGISTRY.directions
 DIRECTION_PROFILE = {
-    "web": "pi-web",
-    "pwn": "pi-pwn",
-    "rev": "pi-rev",
-    "reverse": "pi-rev",
-    "crypto": "pi-crypto",
-    "misc": "pi-misc",
-    "forensics": "pi-forensics",
-    "aisec": "pi-aisec",
-    "ai_sec": "pi-aisec",
+    name: DEFAULT_DIRECTION_REGISTRY.profile_for(name)
+    for name in DIRECTIONS
 }
+for _spec in (
+    DEFAULT_DIRECTION_REGISTRY.spec_for(name) for name in DIRECTIONS
+):
+    if _spec:
+        DIRECTION_PROFILE.update({alias: _spec.profile for alias in _spec.aliases})
 
-_CANONICAL_DIRECTION = {
-    "web": "web",
-    "pwn": "pwn",
-    "rev": "rev",
-    "reverse": "rev",
-    "crypto": "crypto",
-    "misc": "misc",
-    "forensics": "forensics",
-    "aisec": "aisec",
-    "ai_sec": "aisec",
-}
 
 # Route A ships a generic pi base plus one direction-tagged worker image per
 # category. The base tag remains the fallback for the generic pi-worker profile.
@@ -61,22 +50,21 @@ _DIRECTION_IMAGE_TAG = {
 
 
 def direction_profile_name(direction: str) -> str:
-    """Map a direction/category value to its worker profile id ("" when unknown)."""
-    return DIRECTION_PROFILE.get((direction or "").strip().lower(), "")
+    """Map a direction/category value to its default worker profile id."""
+    canonical, _resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(direction)
+    return DEFAULT_DIRECTION_REGISTRY.profile_for(canonical)
 
 
 def canonical_direction(value: Any) -> str:
-    """Normalize a direction/category value to the canonical direction id
-    (web/pwn/rev/crypto/misc/forensics/aisec); "" when unknown or "unclear"."""
-    raw = str(value or "").strip().lower()
-    if raw in ("", "unclear", "unknown", "auto", "any"):
-        return ""
-    return _CANONICAL_DIRECTION.get(raw, "")
+    """Normalize a direction/category value through the shared registry."""
+    canonical, _resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(value)
+    return canonical
 
 
 def direction_image(direction: str) -> str:
-    """The worker image tag for a direction, e.g. the unified Kali image."""
-    return _DIRECTION_IMAGE_TAG.get((direction or "").strip().lower(), "")
+    """The worker image tag for a direction, resolved after canonicalization."""
+    canonical = canonical_direction(direction)
+    return _DIRECTION_IMAGE_TAG.get(canonical, "")
 
 
 def direction_account_id(direction: str) -> str:

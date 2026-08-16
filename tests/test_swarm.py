@@ -2793,7 +2793,6 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     sw = _coordinator_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=wroot,
     )
-    sw._gateway_token = "task-token"
     monkeypatch.delenv("DSWARM_GATEWAY_URL", raising=False)
     monkeypatch.delenv("DSWARM_BLACKBOARD_URL", raising=False)
     monkeypatch.setenv("DSWARM_MODEL_GATEWAY_PORT", "19101")
@@ -2809,7 +2808,9 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
             return (path.replace(str(tmp_path / "workspace"), "/home/kali/workspace")
                     .replace("\\", "/"))
 
-    env = sw._runtime_env_for("pi", "cli-pi", container=_FakeContainer())
+    env = sw._runtime_env_for(
+        "pi", "cli-pi", container=_FakeContainer(), task_token="task-token"
+    )
 
     assert env["HOME"] == "/home/kali/workspace/homes/cli-pi"
     assert env["PI_CODING_AGENT_DIR"] == "/home/kali/workspace/homes/cli-pi/.pi/agent"
@@ -2836,6 +2837,236 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
                         / "extensions" / "dswarm-worker-provider.ts")
     assert runtime_provider.is_file()
     assert 'readSecret("OPENAI_API_KEY")' in runtime_provider.read_text(encoding="utf-8")
+
+
+
+def _patch_fake_container_worker(monkeypatch, gateway, *, cli_solver=None):
+    """Install deterministic container/gateway seams for per-worker token tests."""
+    from dswarm.solver.modelgateway import ModelGateway
+    import dswarm.solver.cli_solver as cli_solver_module
+    import dswarm.solver.container_exec as container_exec
+
+    class FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return "/container/" + str(path).replace("\\", "/").replace(":", "")
+
+    monkeypatch.setattr(ModelGateway, "instance", staticmethod(lambda: gateway))
+    monkeypatch.setattr(
+        Swarm, "_container_for_engine",
+        lambda self, engine, profile=None: FakeContainer(),
+    )
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", lambda path: None)
+    if cli_solver is not None:
+        monkeypatch.setattr(cli_solver_module, "CliSolver", cli_solver)
+    return FakeContainer
+
+
+def test_container_workers_receive_independent_claimed_tokens_and_release_only_self(
+    challenge, tmp_path, monkeypatch,
+):
+    from dswarm.solver.modelgateway import ModelGateway
+
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+    seen = []
+
+    class FakeCliSolver:
+        def __init__(self, *args, **kwargs):
+            self.solver_id = kwargs["solver_label"]
+            self.worker_env = kwargs["worker_env"]
+            seen.append(self)
+
+    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container",
+        worker_root=tmp_path / "workspace" / "workers",
+    )
+
+    first = sw._make_cli_worker("pi", mode="bootstrap")
+    review = sw._make_cli_worker("pi", mode="review")
+    recon = sw._make_cli_worker("pi", mode="bootstrap", profile_role="recon")
+
+    assert len(seen) == 3
+    tokens = [first.gateway_token, review.gateway_token, recon.gateway_token]
+    assert all(tokens)
+    assert len(set(tokens)) == 3
+    claims = [gateway.claims_for_token(token) for token in tokens]
+    assert [claim.token_scope for claim in claims] == ["worker", "review", "recon"]
+    assert all(claim.run_id == sw.run_id for claim in claims)
+    assert all(claim.challenge_id == challenge.id for claim in claims)
+    assert [claim.solver_id for claim in claims] == [
+        first.solver_id, review.solver_id, recon.solver_id,
+    ]
+    assert len({claim.worker_instance_id for claim in claims}) == 3
+    assert [item.worker_env["DSWARM_TASK_TOKEN"] for item in seen] == tokens
+    assert all(item.worker_env["DEEPSEEK_API_KEY"] == token for item, token in zip(seen, tokens))
+
+    sw._release_worker_account(first)
+    assert first.gateway_token is None
+    assert gateway.claims_for_token(tokens[0]) is None
+    assert gateway.claims_for_token(tokens[1]) is not None
+    assert gateway.claims_for_token(tokens[2]) is not None
+
+
+@pytest.mark.asyncio
+async def test_worker_runtime_finally_revokes_only_completed_worker_token(
+    challenge, tmp_path, monkeypatch,
+):
+    from dswarm.solver.modelgateway import ModelGateway
+    from dswarm.solver.types import SolveOutcome
+    from dswarm.swarm.agents import AgentProfile, DispatchDecision
+    from dswarm.swarm.runtime import SwarmWorkerRuntime
+
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+    created = []
+
+    class FakeCliSolver:
+        def __init__(self, *args, **kwargs):
+            self.solver_id = kwargs["solver_label"]
+            self.worker_env = kwargs["worker_env"]
+            created.append(self)
+
+        async def run(self):
+            return SolveOutcome(False, None, 1, None, "worker complete")
+
+    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, engines=["pi"], worker_backend="container",
+        worker_root=tmp_path / "workspace" / "workers",
+    )
+    sibling = sw._make_cli_worker("pi", mode="bootstrap")
+    sibling_token = sibling.gateway_token
+
+    runtime = SwarmWorkerRuntime(sw, healthy=["pi"])
+    outcome = await runtime.run(
+        DispatchDecision(
+            intent_id="I-token-finally", profile="pi",
+            goal="finish and release", mode="explore",
+        ),
+        AgentProfile(id="pi", worker_profile="pi", mode="explore"),
+    )
+
+    completed = created[-1]
+    completed_token = completed.worker_env["DSWARM_TASK_TOKEN"]
+    assert outcome.reason == "worker complete"
+    assert completed.gateway_token is None
+    assert gateway.claims_for_token(completed_token) is None
+    assert gateway.claims_for_token(sibling_token) is not None
+
+
+def test_container_worker_constructor_failure_rolls_back_its_token(
+    challenge, tmp_path, monkeypatch,
+):
+    from dswarm.solver.modelgateway import ModelGateway
+
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+
+    class ExplodingCliSolver:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("fake worker construction failed")
+
+    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=ExplodingCliSolver)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container",
+        worker_root=tmp_path / "workspace" / "workers",
+    )
+
+    with pytest.raises(RuntimeError, match="fake worker construction failed"):
+        sw._make_cli_worker("pi", mode="bootstrap")
+
+    assert gateway.token_for_run(sw.run_id) is None
+    assert gateway._tokens == {}
+    assert gateway._run_tokens == {}
+
+
+def test_worker_account_claim_failure_rolls_back_gateway_token(
+    challenge, tmp_path, monkeypatch,
+):
+    from dswarm.solver.modelgateway import ModelGateway
+
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+
+    class FakeCliSolver:
+        def __init__(self, *args, **kwargs):
+            self.solver_id = kwargs["solver_label"]
+            self.worker_env = kwargs["worker_env"]
+
+    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container",
+        worker_root=tmp_path / "workspace" / "workers",
+    )
+
+    def fail_claim(*args, **kwargs):
+        raise RuntimeError("account claim failed")
+
+    monkeypatch.setattr(sw, "_claim_worker_account", fail_claim)
+
+    with pytest.raises(RuntimeError, match="account claim failed"):
+        sw._make_cli_worker("pi", mode="bootstrap")
+
+    assert gateway.token_for_run(sw.run_id) is None
+    assert gateway._tokens == {}
+    assert gateway._run_tokens == {}
+
+
+def test_explicit_endpoint_container_worker_does_not_issue_gateway_token(
+    challenge, tmp_path, monkeypatch,
+):
+    from dswarm.solver.modelgateway import ModelGateway
+
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+
+    class FakeCliSolver:
+        def __init__(self, *args, **kwargs):
+            self.solver_id = kwargs["solver_label"]
+            self.worker_env = kwargs["worker_env"]
+
+    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container",
+        worker_root=tmp_path / "workspace" / "workers",
+    )
+    profile = {
+        "id": "pi-custom",
+        "engine": "pi",
+        "transport": "pi_cli",
+        "base_url": "https://llm.example/v1",
+        "api_key_ref": "CUSTOM_API_KEY",
+    }
+    monkeypatch.setattr(sw, "_profile_for_engine", lambda engine, role=None: profile)
+
+    worker = sw._make_cli_worker("pi", mode="bootstrap")
+
+    assert worker.gateway_token is None
+    assert "DSWARM_TASK_TOKEN" not in worker.worker_env
+    assert worker.worker_env["DSWARM_PI_PROVIDER"] == "dswarm-worker"
+    assert worker.worker_env["OPENAI_BASE_URL"] == "https://llm.example/v1"
+    assert gateway._tokens == {}
+
+
+@pytest.mark.asyncio
+async def test_run_teardown_revokes_all_tokens_for_run(challenge, tmp_path, monkeypatch):
+    from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
+    from dswarm.solver.types import SolveOutcome
+
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+    token = gateway.issue_worker(WorkerClaims(
+        run_id="teardown-run", challenge_id=challenge.id,
+        worker_instance_id="late-worker", solver_id="cli-pi",
+        profile_id="pi", configured_account_id=None, token_scope="worker",
+    ))
+    monkeypatch.setattr(ModelGateway, "instance", staticmethod(lambda: gateway))
+    sw = _coordinator_swarm(challenge, tmp_path)
+    sw.run_id = "teardown-run"
+    monkeypatch.setattr(sw, "_reconcile_blackboard_skill", lambda: asyncio.sleep(0))
+    async def finish():
+        return SolveOutcome(False, None, 0, None, "stopped")
+    monkeypatch.setattr(sw, "_run_reason_scheduler", finish)
+
+    outcome = await sw.run()
+
+    assert outcome.solved is False
+    assert gateway.claims_for_token(token) is None
 
 
 # ── review-policy sanitization ───────────────────────────────────────────────

@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -164,11 +165,16 @@ async def btw(run_id: str, request: Request) -> Any:
                         read_timeout,
                         _env_float("DSWARM_BTW_LLM_OVERALL_TIMEOUT", 35.0),
                     )
+                    btw_usage_writer = mgr.internal_usage_writer(
+                        run, solver_id="btw", profile_id="btw",
+                    )
                     async with LLMClient(
                         api_key=api_key,
                         base_url=base_url,
                         timeout=read_timeout,
                         overall_timeout=overall_timeout,
+                        usage_writer=btw_usage_writer,
+                        usage_context=btw_usage_writer.context,
                     ) as client:
                         result = await client.chat(
                             model=BTW_MODEL,
@@ -295,6 +301,8 @@ async def btw(run_id: str, request: Request) -> Any:
         worker_root.mkdir(parents=True, exist_ok=True)
         workdir = worker_root / f"{transport}-{int(time.time() * 1000)}"
         workdir.mkdir(parents=True, exist_ok=True)
+        gateway_token = None
+        gateway = None
         try:
             if backend == "container":
                 from dswarm.solver.container_exec import (
@@ -370,16 +378,29 @@ async def btw(run_id: str, request: Request) -> Any:
                 )
 
             if container is not None:
-                # Container Pi workers authenticate through the local model
-                # gateway. Reuse the run token when the swarm is active;
-                # ModelGateway.issue() revokes an existing token and would
-                # otherwise break ordinary workers in the same run.
-                from dswarm.solver.modelgateway import ModelGateway
+                # Every BTW side worker receives an independent token and revokes
+                # only that token in finally; ordinary run workers are unaffected.
+                from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
 
-                gw = ModelGateway.instance()
-                gw.account_root = str(account_root)
-                gw.sessions_root = str(mgr.sessions_root)
-                gateway_token = gw.token_for_run(run_id) or gw.issue(run_id)
+                gateway = ModelGateway.instance()
+                gateway.account_root = str(account_root)
+                gateway.sessions_root = str(mgr.sessions_root)
+                gateway.configure_usage_bridge(
+                    bus=run.bus, loop=asyncio.get_running_loop(), run_id=run_id,
+                )
+                worker_instance_id = uuid.uuid4().hex
+                gateway_token = gateway.issue_worker(WorkerClaims(
+                    run_id=run_id,
+                    challenge_id=run_id,
+                    worker_instance_id=worker_instance_id,
+                    solver_id=f"btw-{transport}",
+                    profile_id=str((profile or {}).get("id") or selected),
+                    configured_account_id=(
+                        str((profile or {}).get("credential_account")).strip() or None
+                        if (profile or {}).get("credential_account") is not None else None
+                    ),
+                    token_scope="btw",
+                ))
                 worker_env["DEEPSEEK_API_KEY"] = gateway_token
                 worker_env.pop("DEEPSEEK_API_KEY_FILE", None)
                 worker_env["DSWARM_TASK_TOKEN"] = gateway_token
@@ -416,6 +437,11 @@ async def btw(run_id: str, request: Request) -> Any:
                 detail = raw_error or type(e).__name__
             yield {"data": json.dumps({"error": detail[:300]}, ensure_ascii=False)}
         finally:
+            if gateway is not None and gateway_token:
+                try:
+                    gateway.revoke_token(gateway_token)
+                except Exception:
+                    pass
             this_task = asyncio.current_task()
             if this_task is not None:
                 limiter.release(run_id, this_task)

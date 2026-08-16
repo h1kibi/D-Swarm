@@ -1,11 +1,11 @@
-"""Run drivers — turn a /start request body into a coroutine that emits onto the
+"""Run drivers 鈥?turn a /start request body into a coroutine that emits onto the
 run's bus. Keeps the HTTP layer (server.py) ignorant of solving internals.
 
 Kinds:
   - "swarm" (DEFAULT): the REAL solver swarm (pi CLI executor) against a
     challenge spec. Needs a live target (URL in the prompt /
     challenge.target) and the pi CLI (host) + worker images (container).
-  - "mock": scripts the canned event stream (no model, no target) — UI dev / e2e
+  - "mock": scripts the canned event stream (no model, no target) 鈥?UI dev / e2e
     ONLY. Must be asked for explicitly (kind:"mock"); it is no longer the default.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import re
 import os
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -27,6 +28,9 @@ from apps.web.worker_config import (
 )
 from dswarm.solver.credential_accounts import account_store_root
 from dswarm.core.runtime_env import is_web_container
+from dswarm.solver.direction_rules import (
+    normalize_operator_direction as _canonicalize_operator_direction,
+)
 from dswarm.solver.worker_profiles import (
     base_engine_for_profile,
     normalize_profile_roster,
@@ -39,13 +43,26 @@ if TYPE_CHECKING:
 Driver = Callable[[Run], Awaitable[None]]
 
 
+LOG = logging.getLogger(__name__)
+
+
+def normalize_operator_direction(value: Any) -> tuple[str, str]:
+    """Normalize a CTF operator direction before it enters the kernel."""
+    canonical, resolution = _canonicalize_operator_direction(value)
+    if resolution == "invalid":
+        LOG.warning(
+            "invalid_operator_direction raw=%r resolution=%s",
+            value, resolution,
+        )
+    return canonical, resolution
+
 
 def _format_missing(p: dict, h: "ProfileHealth") -> str:
     """Reconstruct the historical `missing` string from a kernel verdict so any
     log/operator reading it sees the same tokens as before the unification:
-      - binding failure → `<id>:<account_id or '<missing>'>`
-      - endpoint-profile probe failure → `<name>:endpoint:<detail>`
-      - other probe failure → `<name>:probe:<detail>`
+      - binding failure 鈫?`<id>:<account_id or '<missing>'>`
+      - endpoint-profile probe failure 鈫?`<name>:endpoint:<detail>`
+      - other probe failure 鈫?`<name>:probe:<detail>`
     The string is display-only (never parsed), but its readability is the point.
     """
     if h.layer == "binding":
@@ -63,7 +80,7 @@ def _missing_profile_accounts(
     sessions_root: Path,
     llm_providers: list[dict] | None = None,
 ) -> list[str]:
-    """Dispatch precheck — now a thin wrapper over the profile_health kernel so it
+    """Dispatch precheck 鈥?now a thin wrapper over the profile_health kernel so it
     can never disagree with the settings self-check. Same two-pass cost profile:
     the kernel does cheap binding inline and only fires the slow CLI hello when a
     profile `needs_auth_probe`; we fan out across profiles so the dispatch path
@@ -152,7 +169,7 @@ def _reject_legacy_swarm_fields(body: dict[str, Any]) -> None:
 
 def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
     _reject_legacy_swarm_fields(body or {})
-    # Real solving is the DEFAULT now — the deck launches the CLI executor swarm.
+    # Real solving is the DEFAULT now 鈥?the deck launches the CLI executor swarm.
     # "mock" is opt-in (UI dev / e2e only).
     kind = (body or {}).get("kind", "swarm")
     if kind == "mock":
@@ -166,7 +183,7 @@ def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
 # The conversation-first deck lets the operator DESCRIBE a challenge in prose
 # instead of filling a form: "Flag's behind layers of encoding at
 # http://host/secret". The swarm infers category/target/name from that prompt.
-# This is a deliberately small heuristic — the real planner refines it; this just
+# This is a deliberately small heuristic 鈥?the real planner refines it; this just
 # seeds the Challenge so a run can start from one sentence.
 
 _CATEGORY_HINTS: list[tuple[str, tuple[str, ...]]] = [
@@ -260,7 +277,7 @@ def _infer_challenge(body: dict[str, Any]) -> dict[str, Any]:
         if m:
             ch["target"] = m.group(0).rstrip(".,;)")
     if not ch.get("name"):
-        # first few words, slugified — a readable thread-rail label
+        # first few words, slugified 鈥?a readable thread-rail label
         words = re.findall(r"[A-Za-z0-9]+", prompt)[:4]
         ch["name"] = "-".join(w.lower() for w in words) or "challenge"
     body["challenge"] = ch
@@ -268,7 +285,7 @@ def _infer_challenge(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def _idle_driver(body: dict[str, Any]) -> Driver:
-    """Keeps a run's bus open without solving — used to drive HITL/manual flows
+    """Keeps a run's bus open without solving 鈥?used to drive HITL/manual flows
     (and as a smoke target). Stays alive until cancelled."""
     async def drive(run: Run) -> None:
         import asyncio
@@ -297,20 +314,20 @@ def _mock_driver(body: dict[str, Any]) -> Driver:
 
 def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
     """The REAL solver: a shelled-CLI swarm (pi) against the challenge. No DeepSeek
-    key — CliSolver runs the pi CLI and still gates every flag through the real
+    key 鈥?CliSolver runs the pi CLI and still gates every flag through the real
     provenance check.
 
     Knobs from the request body (all optional):
       challenge.{name,category,target,description,flag_format}  (inferred from prompt)
-      cli_engine: "pi"                        — worker engine (pi only)
+      cli_engine: "pi"                        鈥?worker engine (pi only)
       legacy race/coordinator fields are rejected at the API boundary; the only
       runtime path is ReasonSwarm.
-      offline: bool (default False)           — deny worker web tools (clean eval);
+      offline: bool (default False)           鈥?deny worker web tools (clean eval);
                                                 also denies the KB unless `kb` is set
-      kb: bool (default: True online / False offline) — let the worker query the KB
-      n_solvers: int (default 2)              — bootstrap lineup size
-      engines: list[str] (default = worker-config roster) — engine roster
-      start_workers: int (default len(engines)) — bootstrap workers (one per engine)
+      kb: bool (default: True online / False offline) 鈥?let the worker query the KB
+      n_solvers: int (default 2)              鈥?bootstrap lineup size
+      engines: list[str] (default = worker-config roster) 鈥?engine roster
+      start_workers: int (default len(engines)) 鈥?bootstrap workers (one per engine)
     """
     async def drive(run: Run) -> None:
         import os
@@ -329,7 +346,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # /misc). The worker stages them into its cwd. Keep only paths that exist so
         # a stray entry can't crash the run.
         attachments = [a for a in (ch.get("attachments") or []) if Path(a).exists()]
-        # engagement mode: "ctf" (default, flag-driven) or "pentest" (goal-driven —
+        # engagement mode: "ctf" (default, flag-driven) or "pentest" (goal-driven 鈥?
         # find + prove vulnerabilities in scope). Body may carry it at top level or
         # under challenge.* ; default keeps every CTF dispatch byte-identical.
         mode = (ch.get("mode") or body.get("mode") or "ctf")
@@ -338,7 +355,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # multi-flag: thread expected_flags + multi_flag so a ladder/collection
         # challenge SAVES every flag without finishing on the first (run-10070's
         # 22-level ladder otherwise registered as single-flag). multi_flag is the
-        # mode bit; expected_flags is the optional count (<=1 in multi-flag mode →
+        # mode bit; expected_flags is the optional count (<=1 in multi-flag mode 鈫?
         # collect until operator STOP / no-progress pause). body.* wins over ch.*.
         expected_flags = int(body.get("expected_flags")
                              or ch.get("expected_flags") or 1)
@@ -346,10 +363,14 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                           if body.get("multi_flag") is not None
                           else ch.get("multi_flag", False))
         flag_format, flag_format_hint, flag_format_wrapper = _flag_format_fields(ch, body)
+        operator_direction = ""
+        if mode == "ctf" and "direction" in ch:
+            operator_direction, _ = normalize_operator_direction(ch.get("direction"))
         challenge = Challenge(
             id=run.run_id,
             name=ch.get("name", run.run_id),
             category=ch.get("category", "web"),
+            direction=operator_direction,
             points=ch.get("points", 0),
             description=ch.get("description", ""),
             target=ch.get("target"),
@@ -372,7 +393,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         offline = bool(body.get("offline", False))
         web_access = not offline
         # offline implies NO KB (a clean black-box eval denies every external
-        # dependency, KB included) — but `kb` can still be set explicitly to
+        # dependency, KB included) 鈥?but `kb` can still be set explicitly to
         # override either way. Default KB on only when online.
         kb = bool(body.get("kb", not offline))
         n = int(body.get("n_solvers", 2))
@@ -407,7 +428,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         default_sw = wc.get("start_workers") or len(engines)
         start_workers = int(body.get("start_workers", default_sw))
         max_workers = int(body.get("max_workers", wc.get("max_workers", 10)))
-        # wall-clock cap. ABSENT → the Swarm default (infinite: the interactive deck
+        # wall-clock cap. ABSENT 鈫?the Swarm default (infinite: the interactive deck
         # never gives up on its own; only solve / operator-stop ends it). A batch
         # eval, which is unattended, MUST pass a finite budget so a hard challenge
         # can't run forever. `0`/None/negative are treated as "no cap" too.
@@ -439,7 +460,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 body["cost_budget_usd"] or 0.0)
         # worker execution backend: "local" (host subprocess) or "container" (each
         # worker in the run's Kali tool container). Request body wins, else config,
-        # else env, else default — with the container_dockerexec alias, invalid
+        # else env, else default 鈥?with the container_dockerexec alias, invalid
         # fallback, and the web-container override all owned by the single resolver
         # so the settings health endpoints resolve the SAME effective backend.
         worker_backend = resolve_worker_backend(
@@ -452,9 +473,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             # The precheck runs a real per-profile health probe (a synchronous
             # `subprocess.run` that shells the CLI for a one-turn hello) for any
             # profile that needs an account/endpoint. That can take seconds per
-            # engine, so it MUST run off the event loop — otherwise a relaunch
+            # engine, so it MUST run off the event loop 鈥?otherwise a relaunch
             # (`/resolve`) freezes the whole single-threaded uvicorn loop while it
-            # probes (the "resolve → backend hangs" symptom). to_thread it.
+            # probes (the "resolve 鈫?backend hangs" symptom). to_thread it.
             import asyncio
             precheck_profiles = _selected_profiles(engines, worker_profiles) or worker_profiles
             missing_accounts = await asyncio.to_thread(
@@ -474,14 +495,14 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             root = mgr.workspace_dir(run.run_id)
         else:
             root = Path(tempfile.mkdtemp(prefix="dswarm-web-"))
-        # sbx is the sandbox root — sandbox.shutdown_all() rmtree's it at run end,
+        # sbx is the sandbox root 鈥?sandbox.shutdown_all() rmtree's it at run end,
         # so NOTHING durable may live under it. arts + graph are SIBLINGS of sbx so
         # they persist (the shared_graph.db is the run's queryable fact graph).
         sandbox = SandboxManager(bus=run.bus, root=root / "sbx")
         arts = ArtifactStore(root=root / "arts")
         graph_dir = root / "graph"
-        # worker_root is a SIBLING of sbx (NOT under it) so each CLI worker's cwd —
-        # staged attachments, agent-extracted files, PoCs — lives under the run's
+        # worker_root is a SIBLING of sbx (NOT under it) so each CLI worker's cwd 鈥?
+        # staged attachments, agent-extracted files, PoCs 鈥?lives under the run's
         # sessions/{id}/workspace/ and survives sandbox.shutdown_all()'s rmtree of
         # sbx. It's cleaned up with the run (RunManager.delete drops sessions/{id}).
         worker_root = root / "workers"
@@ -502,8 +523,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     severity="info",
                     code="offline_endpoint_compat",
                     message=(
-                        "检测到自定义 Worker Endpoint，已自动关闭严格离线评测网络隔离；"
-                        "外部搜索/KB 仍按配置禁用。"
+                        "custom worker endpoint detected; strict offline network isolation is disabled. "
+                        "External search and KB remain controlled by configuration."
                     ),
                     offline_requested=True,
                     strict_offline_effective=False,
@@ -521,6 +542,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         llm_cm = None
         llm = None
         reason_planner_diagnostic: dict[str, Any] = {}
+        reason_usage_writer = None
         if reason_swarm:
             from apps.web.reason_llm import (
                 base_url_host,
@@ -553,6 +575,17 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 }
                 if resolved.get("has_api_key"):
                     timeout = float(planner_profile.get("timeout") or 120)
+                    reason_usage_writer = (
+                        mgr.internal_usage_writer(
+                            run,
+                            solver_id="reason",
+                            profile_id="planner",
+                            configured_account_id=(
+                                str(resolved.get("credential_account") or "").strip() or None
+                            ),
+                        )
+                        if mgr is not None else None
+                    )
                     llm_cm = LLMClient(
                         api_key=str(resolved.get("api_key") or ""),
                         base_url=str(resolved.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
@@ -560,6 +593,11 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                         overall_timeout=max(timeout + 30.0, timeout),
                         cost=run.cost,
                         bus=run.bus,
+                        usage_writer=reason_usage_writer,
+                        usage_context=(
+                            reason_usage_writer.context
+                            if reason_usage_writer is not None else None
+                        ),
                     )
                     llm = await llm_cm.__aenter__()
                 else:
@@ -578,7 +616,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                         ),
                     ))
             except Exception as exc:  # noqa: BLE001
-                # no key / client unavailable → coordinator Reason will no-op,
+                # no key / client unavailable 鈫?coordinator Reason will no-op,
                 # bootstrap workers still run. Never block the run on this.
                 diag = classify_llm_exception(exc)
                 reason_planner_diagnostic = {
@@ -592,10 +630,14 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 llm_cm = None
                 llm = None
 
-        # §16 flywheel store (optional; recall prior + distill on solve)
+        # 搂16 flywheel store (optional; recall prior + distill on solve)
         from dswarm.learning.distill import TemplateStore
         knowledge = TemplateStore(root=os.environ.get("DSWARM_KNOWLEDGE_DIR", "knowledge"))
 
+        fallback_usage_writer = (
+            mgr.fallback_usage_writer(run, solver_id="cli-worker", profile_id="worker")
+            if mgr is not None else None
+        )
         swarm = Swarm(
             challenge, default_lineup(n), llm=llm, sandbox=sandbox,
             bus=run.bus, cost=run.cost, artifacts=arts,
@@ -621,6 +663,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 account_store_root(mgr.sessions_root) if mgr is not None else None
             ),
             blackboard_token=getattr(run, "blackboard_token", ""),
+            fallback_usage_writer=fallback_usage_writer,
+            spawn_guard=getattr(run, "spawn_guard", None),
+            budget_gate=getattr(run, "budget_gate", None),
         )
         try:
             out = await swarm.run()
@@ -637,10 +682,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
 # After a run finishes (or the server restarted), a human follow-up no longer has
 # a live swarm to reach. The standby driver COLD-STARTS a single worker from disk:
 # it reads winner.json (the winning worker's CLI session) + the persisted
-# shared_graph, resumes that SAME session, and serves one command — answer a
+# shared_graph, resumes that SAME session, and serves one command 鈥?answer a
 # question, mark the flag a false-positive and keep solving, or write a writeup.
 # Everything it needs is durable, so this works identically before and after a
-# server restart. No winner.json (old run) → degrade to a fresh worker seeded with
+# server restart. No winner.json (old run) 鈫?degrade to a fresh worker seeded with
 # the board context.
 
 def _standby_profile_for(engine: str, worker_profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -762,7 +807,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         if mgr is not None:
             root = mgr.workspace_dir(run.run_id)
         else:
-            return  # no workspace → nothing durable to resume from
+            return  # no workspace 鈫?nothing durable to resume from
 
         graph_dir = root / "graph"
         winner_path = root / "winner.json"
@@ -791,10 +836,15 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                             break
             except Exception:
                 ch = {}
+        recovery_mode = ch.get("mode", "ctf")
+        recovery_direction = ""
+        if recovery_mode == "ctf" and "direction" in ch:
+            recovery_direction, _ = normalize_operator_direction(ch.get("direction"))
         challenge = Challenge(
             id=run.run_id,
             name=ch.get("name", run.name or run.run_id),
             category=ch.get("category", run.category or "web"),
+            direction=recovery_direction,
             points=ch.get("points", 0),
             description=ch.get("description", ""),
             target=ch.get("target"),
@@ -878,7 +928,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
 
         flag = (_flag_from_operator_cmd() if action == "mark_false" else "") or stored_flag
         # multi-flag: the flags already collected (from winner.json), minus the one
-        # the operator is marking false — so a mark_false re-solve worker is seeded
+        # the operator is marking false 鈥?so a mark_false re-solve worker is seeded
         # with the SURVIVING flags and re-finds only the missing one, not the rest.
         prior_flags = list(winner.get("flags") or run.flags or ([stored_flag] if stored_flag else []))
         if action == "mark_false":
@@ -904,7 +954,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                     await _emit_bb("intent_reopened", intent_id=iid)
                 await _emit_bb("flag_invalidated", flag=flag)
                 from dswarm.core.events import Event, EventType
-                # tell the rail this run is solving again (status → running)
+                # tell the rail this run is solving again (status 鈫?running)
                 await run.bus.emit(Event(
                     event_type=EventType.RUN_REOPENED, run_id=run.run_id,
                     challenge_id=challenge.id, payload={"flag": flag}))
@@ -930,6 +980,10 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             container=container,
         )
 
+        fallback_usage_writer = (
+            mgr.fallback_usage_writer(run, solver_id=solver_label, profile_id=transport)
+            if mgr is not None else None
+        )
         worker = CliSolver(
             None, challenge, bus=run.bus, cost=run.cost, artifacts=arts,
             config=SolverConfig(), run_id=run.run_id, shared_graph=shared_graph,
@@ -944,6 +998,8 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             solver_label=solver_label,
             container=container,
             worker_env=worker_env,
+            fallback_usage_writer=fallback_usage_writer,
+            spawn_guard=getattr(run, "spawn_guard", None),
         )
         try:
             out = await worker.run()

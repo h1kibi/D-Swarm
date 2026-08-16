@@ -1,6 +1,7 @@
 """Sprint 0.2 acceptance: bus fan-out ordering, Last-Event-ID resume, JSONL replay."""
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -267,3 +268,117 @@ async def test_remove_sink_detaches(tmp_path: Path) -> None:
     await bus.emit(_ev(2))
     assert seen == [1], "a removed sink must not receive later events"
     assert bus.remove_sink(sink) is False      # idempotent: already gone
+
+
+async def test_emit_checked_failure_is_not_visible_and_retry_uses_new_seq() -> None:
+    """A failed critical write consumes its seq but remains invisible everywhere."""
+    bus = EventBus()
+    attempts = 0
+    non_critical_seen: list[int] = []
+
+    async def normal_sink(_event: Event) -> None:
+        raise AssertionError("paired normal sink must not run for emit_checked")
+
+    async def checked_sink(_event: Event) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("durable append failed")
+
+    async def non_critical_sink(event: Event) -> None:
+        non_critical_seen.append(event.seq)
+
+    bus.add_critical_sink(normal_sink, checked_sink)
+    bus.add_sink(non_critical_sink)
+
+    live = bus.subscribe()
+    live_next = asyncio.create_task(anext(live))
+    await asyncio.sleep(0)
+
+    first = _ev(1)
+    first.payload["usage_id"] = "usage::run-1::test::call-1"
+    with pytest.raises(OSError, match="durable append failed"):
+        await bus.emit_checked(first)
+
+    assert non_critical_seen == []
+    assert not live_next.done(), "failed checked event must not fan out"
+
+    retry = _ev(2)
+    retry.payload["usage_id"] = first.payload["usage_id"]
+    delivered = await bus.emit_checked(retry)
+    assert delivered is not first
+    assert delivered.payload["usage_id"] == first.payload["usage_id"]
+    assert delivered.seq == 2
+    assert (await asyncio.wait_for(live_next, timeout=1)).payload["i"] == 2
+    await live.aclose()
+
+    backlog = bus.subscribe(last_event_id=0)
+    replayed = await asyncio.wait_for(anext(backlog), timeout=1)
+    assert replayed.seq == 2
+    assert replayed.payload["i"] == 2
+    await backlog.aclose()
+    assert non_critical_seen == [2]
+
+
+async def test_emit_checked_ignores_non_critical_sink_failure_after_durability() -> None:
+    bus = EventBus()
+    durable: list[int] = []
+
+    async def normal_sink(_event: Event) -> None:
+        raise AssertionError("paired normal sink must be skipped")
+
+    async def checked_sink(event: Event) -> None:
+        durable.append(event.seq)
+
+    async def boom(_event: Event) -> None:
+        raise RuntimeError("non-critical sink failed")
+
+    bus.add_critical_sink(normal_sink, checked_sink)
+    bus.add_sink(boom)
+
+    live = bus.subscribe()
+    live_next = asyncio.create_task(anext(live))
+    await asyncio.sleep(0)
+    emitted = await bus.emit_checked(_ev(9))
+
+    assert durable == [1]
+    assert (await asyncio.wait_for(live_next, timeout=1)) is emitted
+    await live.aclose()
+
+
+async def test_append_checked_flushes_fsync_and_propagates_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore(root=tmp_path)
+    fsync_fds: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        fsync_fds.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    await store.append_checked(_ev(1))
+
+    assert len(fsync_fds) == 1
+    assert [event.payload["i"] async for event in store.replay("run-1")] == [1]
+
+    def failing_fsync(_fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        await store.append_checked(_ev(2))
+
+
+async def test_paired_session_store_sink_avoids_double_append(tmp_path: Path) -> None:
+    bus = EventBus()
+    store = SessionStore(root=tmp_path)
+    bus.add_critical_sink(store.sink, store.append_checked)
+
+    await bus.emit_checked(_ev(1))
+    await bus.emit(_ev(2))
+
+    replayed = [event async for event in store.replay("run-1")]
+    assert [event.payload["i"] for event in replayed] == [1, 2]
+    assert [event.seq for event in replayed] == [1, 2]

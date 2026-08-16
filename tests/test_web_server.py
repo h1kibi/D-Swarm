@@ -21,7 +21,7 @@ import uvicorn
 
 from apps.web.run_manager import RunManager
 from apps.web.server import create_app
-from dswarm.core.events import EventType
+from dswarm.core.events import Event, EventType
 from dswarm.models.solve_graph import Challenge
 from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
@@ -377,7 +377,7 @@ async def test_btw_readonly_httpx_read_timeout_is_normalized(tmp_path, monkeypat
     assert frames[-1] == {"done": True}
 
 
-async def test_btw_container_reuses_gateway_token_and_sets_pi_runtime(
+async def test_btw_container_uses_independent_gateway_token_and_revokes_it(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
@@ -395,12 +395,19 @@ async def test_btw_container_reuses_gateway_token_and_sets_pi_runtime(
         account_root = None
         sessions_root = None
 
-        def token_for_run(self, run_id: str) -> str:
-            assert run_id == "btw-container-run"
-            return "reused-task-token"
+        def __init__(self) -> None:
+            self.claims = None
+            self.revoked: list[str] = []
 
-        def issue(self, run_id: str) -> str:
-            raise AssertionError("BTW must not revoke an active run token")
+        def configure_usage_bridge(self, **kwargs) -> None:
+            self.bridge_config = kwargs
+
+        def issue_worker(self, claims) -> str:
+            self.claims = claims
+            return "btw-task-token"
+
+        def revoke_token(self, token: str) -> None:
+            self.revoked.append(token)
 
     fake_gateway = FakeGateway()
     seen: dict[str, object] = {}
@@ -445,12 +452,15 @@ async def test_btw_container_reuses_gateway_token_and_sets_pi_runtime(
 
     assert resp.status_code == 200
     env = seen["env"]
-    assert env["DSWARM_TASK_TOKEN"] == "reused-task-token"  # type: ignore[index]
-    assert env["DEEPSEEK_API_KEY"] == "reused-task-token"  # type: ignore[index]
+    assert env["DSWARM_TASK_TOKEN"] == "btw-task-token"  # type: ignore[index]
+    assert env["DEEPSEEK_API_KEY"] == "btw-task-token"  # type: ignore[index]
     assert env["DSWARM_PI_PROVIDER"] == "ctf-gateway"  # type: ignore[index]
     assert env["DSWARM_GATEWAY_URL"].endswith("/v1")  # type: ignore[index]
     assert env["DSWARM_WORKER_MODEL"] == "deepseek-v4-flash"  # type: ignore[index]
     assert seen["container"] is not None
+    assert fake_gateway.claims.run_id == "btw-container-run"
+    assert fake_gateway.claims.token_scope == "btw"
+    assert fake_gateway.revoked == ["btw-task-token"]
 
 async def test_hitl_post_is_accepted_and_echoed(server) -> None:
     async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
@@ -1307,3 +1317,28 @@ def test_run_manager_emits_provider_batch_alert_for_repeated_runtime_failures(tm
     assert alert["category"] == "insufficient_quota"
     assert alert["count"] == 3
     assert alert["should_pause_dispatch"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_manager_checked_sink_survives_fresh_bus_without_double_append(
+    tmp_path: Path,
+) -> None:
+    manager = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = manager.create("checked-fresh-bus")
+
+    await run.bus.emit_checked(Event(
+        event_type=EventType.TEXT_MESSAGE_DELTA,
+        run_id=run.run_id,
+        payload={"text": "before"},
+    ))
+    await run.bus.close()
+    manager._fresh_bus(run)
+    await run.bus.emit_checked(Event(
+        event_type=EventType.TEXT_MESSAGE_DELTA,
+        run_id=run.run_id,
+        payload={"text": "after"},
+    ))
+
+    replayed = [event async for event in run.store.replay(run.run_id)]
+    assert [event.payload["text"] for event in replayed] == ["before", "after"]
+    assert [event.seq for event in replayed] == [1, 2]

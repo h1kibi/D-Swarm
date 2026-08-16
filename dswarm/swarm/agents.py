@@ -45,6 +45,12 @@ class DispatchDecision:
     surface_target: str = ""
     task_kind: str = ""
     host_scan: bool = False
+    # M4 diagnostics appended for positional fixture compatibility.
+    raw_direction: str = ""
+    canonical_direction: str = ""
+    direction_resolution: str = ""
+    # Final routing authority: model/operator/keyword/category/default.
+    direction_source: str = ""
 
 
 class AgentRegistry:

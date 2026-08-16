@@ -26,6 +26,7 @@ from dswarm.core.events import (
     Event, EventType, hitl_translated_payload, node_summarized_payload,
 )
 from dswarm.core.llm import LLMClient
+from dswarm.core.usage_journal import UsageContext, UsageWriter
 
 SUMMARY_MODEL = "deepseek-v4-flash"
 # Translation of a worker's hand-raise; same cheap/fast tier as the node gist. The
@@ -126,6 +127,9 @@ async def summarize_node(
     bus: Optional[EventBus] = None,
     run_id: Optional[str] = None,
     challenge_id: Optional[str] = None,
+    solver_id: Optional[str] = None,
+    usage_writer: Optional[UsageWriter] = None,
+    usage_context: Optional[UsageContext] = None,
 ) -> str:
     """Compute a zh gist for one node, STORE it, and emit NODE_SUMMARIZED.
 
@@ -137,7 +141,7 @@ async def summarize_node(
     summary = fallback_summary(text)
     owns_llm = llm is None
     try:
-        client = llm or LLMClient()
+        client = llm or LLMClient(usage_writer=usage_writer, usage_context=usage_context)
         try:
             resp = await client.chat(
                 model=SUMMARY_MODEL,
@@ -155,6 +159,7 @@ async def summarize_node(
                 stream=False,
                 run_id=run_id,
                 challenge_id=challenge_id,
+                solver_id=solver_id,
             )
             summary = _clean(resp.content, text)
         finally:
@@ -196,6 +201,8 @@ async def translate_need(
     bus: Optional[EventBus] = None,
     run_id: Optional[str] = None,
     challenge_id: Optional[str] = None,
+    usage_writer: Optional[UsageWriter] = None,
+    usage_context: Optional[UsageContext] = None,
 ) -> str:
     """Translate a worker's hand-raise (NEED_INPUT) into zh and emit HITL_TRANSLATED.
 
@@ -210,7 +217,7 @@ async def translate_need(
     zh = ""
     owns_llm = llm is None
     try:
-        client = llm or LLMClient()
+        client = llm or LLMClient(usage_writer=usage_writer, usage_context=usage_context)
         try:
             resp = await client.chat(
                 model=model or TRANSLATE_MODEL,

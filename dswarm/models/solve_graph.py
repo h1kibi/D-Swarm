@@ -55,6 +55,9 @@ class Challenge(BaseModel):
     id: str
     name: str
     category: Category
+    # Optional CTF operator routing override. Empty means auto/follow category;
+    # pentest code paths deliberately ignore this field.
+    direction: str = ""
     points: int = 0
     description: str = ""
     attachments: list[str] = Field(default_factory=list)

@@ -33,6 +33,8 @@ from dswarm.core.event_bus import EventBus
 from dswarm.core.runtime_env import is_web_container
 from dswarm.core.events import Event, EventType, blackboard_delta_payload
 from dswarm.core.llm import LLMClient, ModelSpec
+from dswarm.core.usage_journal import UsageWriter
+from dswarm.core.usage_ledger import SpawnGuard
 from dswarm.models.solve_graph import Challenge
 from dswarm.sandbox.manager import SandboxManager
 from dswarm.solver.result import ArtifactStore
@@ -456,10 +458,18 @@ class Swarm(
         llm_profiles: "Optional[dict[str, Any]]" = None,
         llm_providers: "Optional[list[dict[str, Any]]]" = None,
         reason_planner_diagnostic: "Optional[dict[str, Any]]" = None,
+        usage_writer: Optional[UsageWriter] = None,
+        fallback_usage_writer: Optional[UsageWriter] = None,
+        spawn_guard: Optional[SpawnGuard] = None,
+        budget_gate: Optional[Any] = None,
     ) -> None:
         self.challenge = challenge
         self.lineup = lineup
         self.llm = llm
+        self.usage_writer = usage_writer
+        self.fallback_usage_writer = fallback_usage_writer
+        self.spawn_guard = spawn_guard
+        self.budget_gate = budget_gate
         self.sandbox = sandbox
         self.bus = bus
         self.cost = cost
@@ -591,9 +601,6 @@ class Swarm(
         self._container_runtime_id = ""  # runtime profile id the container was built with (#11)
         self._container_unavailable = False
         # route A P3: per-run model-gateway task token (issued when the run container
-        # comes up; injected into worker env; revoked at teardown). None while the
-        # run has no container (local backend / before first spawn).
-        self._gateway_token: "Optional[str]" = None
         self._blackboard_token = blackboard_token or os.environ.get("DSWARM_BLACKBOARD_TOKEN", "").strip() or None
         self._runtime_degraded: list[dict[str, Any]] = []
         # engines dropped from the roster by a dispatch-time health-check failure
@@ -1394,16 +1401,13 @@ class Swarm(
                     await asyncio.to_thread(teardown_container, self.run_id, remove=True)
                 except Exception:
                     pass
-            # route A P3: revoke the run's model-gateway task token — a revoked
-            # token makes every subsequent gateway call 401, even if a worker
-            # container outlives the run somehow.
-            if self._gateway_token:
-                try:
-                    from dswarm.solver.modelgateway import ModelGateway
-                    ModelGateway.instance().revoke(self.run_id)
-                except Exception:
-                    pass
-                self._gateway_token = None
+            # Defense in depth: worker finally paths revoke individual tokens;
+            # run teardown removes any token left by a crash/late construction.
+            try:
+                from dswarm.solver.modelgateway import ModelGateway
+                ModelGateway.instance().revoke_run(self.run_id)
+            except Exception:
+                pass
 
     @staticmethod
     def _cancel_solver(solver: Any) -> None:
@@ -1847,7 +1851,8 @@ class Swarm(
             asyncio.create_task(summarize_node(
                 goal, node_kind="intent", intent_id=intent_id,
                 shared_graph=self.shared_graph, llm=self.llm,
-                bus=self.bus, run_id=self.run_id, challenge_id=self.challenge.id))
+                bus=self.bus, run_id=self.run_id, challenge_id=self.challenge.id,
+                solver_id="summarizer", usage_writer=self.usage_writer))
         except RuntimeError:
             pass
 

@@ -1,9 +1,13 @@
-"use client";
+﻿"use client";
 
 import { useState } from "react";
+import { buildLaunchChallengePayload } from "./launchPayload";
+
+const CATEGORY_OPTIONS = ["web", "crypto", "reverse", "pwn", "forensics", "misc"] as const;
+const DIRECTION_OPTIONS = ["auto", "web", "pwn", "rev", "crypto", "misc", "forensics", "aisec"] as const;
 
 /**
- * Launch a run — a "new project" form, scoped to a CTF challenge spec.
+ * Launch a run 鈥?a "new project" form, scoped to a CTF challenge spec.
  * Two modes: a real swarm (needs DSWARM_DEEPSEEK_API_KEY on the backend) or a
  * keyless mock stream for UI/e2e. The body shape matches drivers.build_driver.
  */
@@ -15,7 +19,8 @@ export function LaunchForm({
   disabled?: boolean;
 }) {
   const [name, setName] = useState("target");
-  const [category, setCategory] = useState("web");
+  const [category, setCategory] = useState<(typeof CATEGORY_OPTIONS)[number]>("web");
+  const [direction, setDirection] = useState<(typeof DIRECTION_OPTIONS)[number]>("auto");
   const [target, setTarget] = useState("http://127.0.0.1:8000");
   const [description, setDescription] = useState("Solve the web challenge.");
   const [hints, setHints] = useState("");
@@ -26,14 +31,15 @@ export function LaunchForm({
       onStart({ kind: "mock" });
       return;
     }
-    const desc = hints.trim()
-      ? `${description.trim()}\n\nHints:\n${hints.trim()}`
-      : description.trim();
-    onStart({
-      kind: "swarm",
-      n_solvers: nSolvers,
-      challenge: { name: name.trim() || "target", category, description: desc, target: target.trim() || undefined },
-    });
+    onStart(buildLaunchChallengePayload({
+      name,
+      category,
+      direction,
+      target,
+      description,
+      hints,
+      nSolvers,
+    }));
   };
 
   return (
@@ -45,9 +51,17 @@ export function LaunchForm({
         </label>
         <label>
           <span>Category</span>
-          <select value={category} onChange={(e) => setCategory(e.target.value)}>
-            {["web", "crypto", "rev", "pwn", "forensics", "misc"].map((c) => (
+          <select value={category} onChange={(e) => setCategory(e.target.value as (typeof CATEGORY_OPTIONS)[number])}>
+            {CATEGORY_OPTIONS.map((c) => (
               <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Direction (optional override)</span>
+          <select value={direction} onChange={(e) => setDirection(e.target.value as (typeof DIRECTION_OPTIONS)[number])}>
+            {DIRECTION_OPTIONS.map((value) => (
+              <option key={value} value={value}>{value === "auto" ? "auto (follow category)" : value}</option>
             ))}
           </select>
         </label>
@@ -72,7 +86,7 @@ export function LaunchForm({
         </label>
       </div>
       <div className="launch-actions">
-        <button className="primary" disabled={disabled} onClick={() => launch("swarm")}>▶ Launch swarm</button>
+        <button className="primary" disabled={disabled} onClick={() => launch("swarm")}>鈻?Launch swarm</button>
         <button disabled={disabled} onClick={() => launch("mock")} title="keyless demo stream">Run mock</button>
       </div>
     </div>

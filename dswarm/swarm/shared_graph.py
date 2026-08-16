@@ -49,6 +49,7 @@ from dswarm.swarm.fact_events import (
     user_version,
 )
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
+from dswarm.solver.direction_rules import sanitize_raw_direction
 
 
 # ── event types (C: append-only log) ─────────────────────────────────────────
@@ -509,6 +510,9 @@ CREATE TABLE IF NOT EXISTS intents (
     goal          TEXT NOT NULL,
     worker_class  TEXT NOT NULL DEFAULT 'code',
     direction     TEXT,
+    raw_direction TEXT,
+    direction_resolution TEXT,
+    direction_source TEXT,
     route_hash    TEXT,
     branch_id     TEXT,
     lane_key      TEXT,
@@ -795,6 +799,9 @@ class SQLiteSharedGraph:
             "ALTER TABLE intents ADD COLUMN directive_id TEXT",
             "ALTER TABLE intents ADD COLUMN result_detail TEXT",
             "ALTER TABLE intents ADD COLUMN direction TEXT",
+            "ALTER TABLE intents ADD COLUMN raw_direction TEXT",
+            "ALTER TABLE intents ADD COLUMN direction_resolution TEXT",
+            "ALTER TABLE intents ADD COLUMN direction_source TEXT",
         ):
             try:
                 self._conn.execute(ddl)
@@ -2493,6 +2500,9 @@ class SQLiteSharedGraph:
         resource_key = str(payload.get("resource_key") or "").strip()
         directive_id = str(payload.get("directive_id") or "").strip()
         direction = str(payload.get("direction") or "").strip()
+        raw_direction = sanitize_raw_direction(payload.get("raw_direction"))
+        direction_resolution = str(payload.get("direction_resolution") or "").strip()
+        direction_source = str(payload.get("direction_source") or "").strip()
         seq = self._append(EV_INTENT_PROPOSED, actor,
                           {"intent_id": intent_id, "goal": goal,
                            **payload, "worker_class": worker_class,
@@ -2500,23 +2510,27 @@ class SQLiteSharedGraph:
                            "lane_key": lane_key, "risk_class": risk_class,
                            "resource_key": resource_key, "directive_id": directive_id,
                            "direction": direction,
+                           "raw_direction": raw_direction,
+                           "direction_resolution": direction_resolution,
+                           "direction_source": direction_source,
                            "priority": priority,
                            "priority_scale": priority_scale},
                           dedupe_key=f"intent::{intent_id}")
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO intents "
-                "(intent_id, challenge_id, goal, worker_class, route_hash, branch_id, "
-                " lane_key, risk_class, priority, priority_scale, status, "
-                " dispatch_state, created_seq, "
-                " resource_key, directive_id, direction) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,'open','active',?,?,?,?)",
+                "(intent_id, challenge_id, goal, worker_class, direction, raw_direction, "
+                " direction_resolution, direction_source, route_hash, branch_id, lane_key, risk_class, "
+                " priority, priority_scale, status, dispatch_state, created_seq, "
+                " resource_key, directive_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open','active',?,?,?)",
                 (intent_id, self.challenge.id, goal, worker_class,
+                 direction or None, raw_direction or None,
+                 direction_resolution or None, direction_source or None,
                  route_hash or None, branch_id or None,
                  lane_key or None, risk_class if lane_key else None, priority,
                  priority_scale, seq if seq > 0 else 0, resource_key or None,
-                 directive_id or None,
-                 direction or None),
+                 directive_id or None),
             )
             if from_fact_seqs:
                 for fs in from_fact_seqs:
@@ -3822,14 +3836,16 @@ class SQLiteSharedGraph:
         if now is None:
             now = time.time()
         cols = (
-            "intent_id", "goal", "worker_class", "direction", "route_hash",
-            "branch_id", "priority", "priority_scale", "lane_key", "risk_class",
-            "resource_key",
+            "intent_id", "goal", "worker_class", "direction", "canonical_direction",
+            "raw_direction", "direction_resolution", "direction_source",
+            "route_hash", "branch_id",
+            "priority", "priority_scale", "lane_key", "risk_class", "resource_key",
         )
         with self._lock:
             rows = self._conn.execute(
-                "SELECT intent_id, goal, worker_class, direction, route_hash, branch_id, "
-                "priority, priority_scale, lane_key, risk_class, resource_key FROM intents "
+                "SELECT intent_id, goal, worker_class, direction, direction, raw_direction, "
+                "direction_resolution, direction_source, route_hash, branch_id, priority, priority_scale, "
+                "lane_key, risk_class, resource_key FROM intents "
                 "WHERE challenge_id=? AND dispatch_state='active' AND (status='open' "
                 "   OR (status='claimed' AND lease_until IS NOT NULL "
                 "       AND lease_until < ?)) "
@@ -3846,6 +3862,10 @@ class SQLiteSharedGraph:
             item["goal"] = str(item.get("goal") or "")
             item["worker_class"] = str(item.get("worker_class") or "code")
             item["direction"] = str(item.get("direction") or "")
+            item["canonical_direction"] = str(item.get("canonical_direction") or item["direction"] or "")
+            item["raw_direction"] = sanitize_raw_direction(item.get("raw_direction"))
+            item["direction_resolution"] = str(item.get("direction_resolution") or "")
+            item["direction_source"] = str(item.get("direction_source") or "")
             item["route_hash"] = str(item.get("route_hash") or "")
             item["branch_id"] = str(item.get("branch_id") or "")
             item["priority"] = normalize_priority(item.get("priority"))
@@ -3901,12 +3921,13 @@ class SQLiteSharedGraph:
         reason cycle produces no fresh intents, so an operator hint becomes a
         claimable, focused direction instead of being orphaned.
         """
-        cols = ("intent_id", "goal", "worker_class", "direction", "priority",
-                "priority_scale", "directive_id")
+        cols = ("intent_id", "goal", "worker_class", "direction",
+                "canonical_direction", "raw_direction", "direction_resolution",
+                "direction_source", "priority", "priority_scale", "directive_id")
         with self._lock:
             rows = self._conn.execute(
-                "SELECT intent_id, goal, worker_class, direction, priority, "
-                "priority_scale, directive_id "
+                "SELECT intent_id, goal, worker_class, direction, direction, "
+                "raw_direction, direction_resolution, direction_source, priority, priority_scale, directive_id "
                 "FROM intents WHERE directive_id IS NOT NULL AND directive_id<>'' "
                 "AND status='open' AND dispatch_state='active' "
                 "ORDER BY CASE priority_scale WHEN 'operator' THEN 0 ELSE 1 END, "

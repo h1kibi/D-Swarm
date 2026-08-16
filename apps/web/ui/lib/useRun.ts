@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, DSwarmEvent, emptyDeck, reduce } from "./events";
 import { readKey, writeKey, removeKey } from "./storage";
+import type { BudgetSnapshot } from "@/components/budgetStatus";
 
 /**
  * API base. Empty string = same-origin: `run.sh web` serves the production
@@ -105,6 +106,89 @@ export async function authTicket(): Promise<string> {
 export type RunStatus = "draft" | "queued" | "running" | "paused" | "solved" | "finished" | "failed" | "cancelled";
 
 export const isDraftRunId = (id: string) => id.startsWith("draft-");
+
+export async function fetchBudgetSnapshot(runId: string, signal?: AbortSignal): Promise<BudgetSnapshot> {
+  const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/budget`, { signal });
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) {
+    throw new Error(String(data?.detail || `budget request failed (${res.status})`));
+  }
+  return data as BudgetSnapshot;
+}
+
+export async function rebuildBudget(runId: string): Promise<BudgetSnapshot> {
+  const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/budget/rebuild`, { method: "POST" });
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) {
+    throw new Error(String(data?.detail || `budget rebuild failed (${res.status})`));
+  }
+  return data as BudgetSnapshot;
+}
+
+export function useBudgetSnapshot(runId: string, pollMs = 4000) {
+  const [snapshot, setSnapshot] = useState<BudgetSnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [rebuilding, setRebuilding] = useState(false);
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    if (!runId || isDraftRunId(runId)) return null;
+    setLoading(true);
+    try {
+      const next = await fetchBudgetSnapshot(runId, signal);
+      if (!signal?.aborted) {
+        setSnapshot(next);
+        setError(null);
+      }
+      return next;
+    } catch (err) {
+      if (!signal?.aborted) setError(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, [runId]);
+
+  useEffect(() => {
+    if (!runId || isDraftRunId(runId)) {
+      setSnapshot(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    let alive = true;
+    const poll = async () => {
+      if (!alive) return;
+      await refresh(controller.signal);
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), Math.max(1000, pollMs));
+    return () => {
+      alive = false;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [runId, pollMs, refresh]);
+
+  const rebuild = useCallback(async () => {
+    if (!runId || isDraftRunId(runId) || rebuilding) return null;
+    setRebuilding(true);
+    setError(null);
+    try {
+      const next = await rebuildBudget(runId);
+      setSnapshot(next);
+      return next;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      throw err;
+    } finally {
+      setRebuilding(false);
+    }
+  }, [runId, rebuilding]);
+
+  return { snapshot, loading, error, rebuilding, refresh, rebuild };
+}
 
 /** One run as the thread rail lists it (matches RunManager.Run.summary()). */
 export interface RunSummary {

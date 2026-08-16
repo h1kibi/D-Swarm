@@ -345,6 +345,7 @@ class ReviewFlowMixin:
             try:
                 return await w.run()
             finally:
+                self._release_worker_account(w)
                 _release_lane_once()
 
         try:

@@ -174,6 +174,7 @@ def _which_all(name: str) -> list[str]:
 class CliResult:
     """One CLI run's outcome, normalized across engines."""
     text: str                       # the agent's final response / transcript tail
+    invocation_id: Optional[str] = None  # stable id for this CLI invocation aggregate
     session: Optional[str] = None   # session id, for a resume/conclude turn
     cost_usd: Optional[float] = None
     # token usage for this run, when the engine reports it. None == not reported.
@@ -1266,10 +1267,13 @@ def run_cli(driver: CliDriver, argv: list[str], *, cwd: str, timeout: int,
     `container`: if a ContainerHandle is given, the worker runs INSIDE that
     isolated Docker container (can't read the host bench tree) instead of bare on
     the host. None → host subprocess (default, unchanged)."""
+    invocation_id = uuid.uuid4().hex
     if container is not None:
         from dswarm.solver.container_exec import run_cli_container
-        return run_cli_container(driver, argv, handle=container, cwd=cwd,
-                                 timeout=timeout, env=env)
+        result = run_cli_container(driver, argv, handle=container, cwd=cwd,
+                                   timeout=timeout, env=env)
+        result.invocation_id = invocation_id
+        return result
     t0 = time.time()
     run_env = {**os.environ, **env} if env else None
     try:
@@ -1282,9 +1286,11 @@ def run_cli(driver: CliDriver, argv: list[str], *, cwd: str, timeout: int,
         res = driver.parse(out or "", err or "")
         res.timed_out = True
         res.elapsed_s = time.time() - t0
+        res.invocation_id = invocation_id
         return res
     res = driver.parse(proc.stdout or "", proc.stderr or "")
     res.elapsed_s = time.time() - t0
+    res.invocation_id = invocation_id
     return res
 
 
@@ -1326,12 +1332,15 @@ def run_cli_streaming(
     isolated Docker container; all control (cancel/steer/pause) routes in via
     `docker exec kill`. None → host subprocess (default, unchanged).
     """
+    invocation_id = uuid.uuid4().hex
     if container is not None:
         from dswarm.solver.container_exec import run_cli_streaming_container
-        return run_cli_streaming_container(
+        result = run_cli_streaming_container(
             driver, argv, handle=container, cwd=cwd, timeout=timeout,
             on_step=on_step, env=env, cancel_event=cancel_event,
             on_proc=on_proc, steer_event=steer_event, paused_event=paused_event)
+        result.invocation_id = invocation_id
+        return result
     import subprocess as _sp
 
     t0 = time.time()
@@ -1487,4 +1496,5 @@ def run_cli_streaming(
     res.cancelled = cancelled
     res.steered = steered
     res.elapsed_s = time.time() - t0
+    res.invocation_id = invocation_id
     return res

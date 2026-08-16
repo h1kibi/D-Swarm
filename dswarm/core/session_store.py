@@ -1,4 +1,4 @@
-"""Durable event log — append every event to JSONL (one file per run), replay later.
+﻿"""Durable event log 鈥?append every event to JSONL (one file per run), replay later.
 
 This is what makes "replay any challenge's full solve after the match" work.
 It registers as a sink on the EventBus so persistence is automatic.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -42,10 +43,32 @@ class SessionStore:
             with path.open("a", encoding="utf-8") as f:
                 f.write(line)
 
+    async def append_checked(self, event: Event) -> None:
+        """Append an event and force it to durable storage before returning."""
+        path = self._path(event.run_id)
+        line = event.model_dump_json() + "\n"
+        async with self._lock_for(event.run_id):
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+
     # EventBus sink signature
     async def sink(self, event: Event) -> None:
         await self.append(event)
 
+    def read_events(self, run_id: str) -> list[Event]:
+        """Synchronously read a run event log for startup projection rebuilds."""
+        path = self._path(run_id)
+        if not path.exists():
+            return []
+        events: list[Event] = []
+        with path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if raw:
+                    events.append(Event.model_validate_json(raw))
+        return events
     async def replay(self, run_id: str) -> AsyncIterator[Event]:
         path = self._path(run_id)
         if not path.exists():
@@ -130,15 +153,15 @@ class SessionStore:
     def summary(self, run_id: str) -> dict:
         """Cheap one-run digest for the deck's thread rail (name/category/won/flag).
 
-        Scans the persisted JSONL without reconstructing deck state — pulls the
+        Scans the persisted JSONL without reconstructing deck state 鈥?pulls the
         challenge identity from run.started and the verdict from run.finished /
         the FlagFound insight. Returns zeros for a run with no events yet.
 
         Multi-flag aware: carries flags(list)/expected_flags/multi_flag through so a
         rehydrated multi-flag run isn't flattened to a single-flag look-alike. `solved`
         is computed by MODE:
-          - single-flag (or mode unknown): a FlagFound is enough to mark solved — this
-            keeps the "ghost run" fallback (FlagFound but no RUN_FINISHED → still
+          - single-flag (or mode unknown): a FlagFound is enough to mark solved 鈥?this
+            keeps the "ghost run" fallback (FlagFound but no RUN_FINISHED 鈫?still
             shows solved after restart);
           - multi-flag PARTIAL (collected < expected): a FlagFound does NOT mark solved
             (one of three flags is not a win).
@@ -186,14 +209,14 @@ class SessionStore:
                     if "multi_flag" in ch:
                         summary["multi_flag"] = bool(ch["multi_flag"])
                 elif et == "run.titled":
-                    # ChatGPT-style auto-title persisted on the run — survives restart
+                    # ChatGPT-style auto-title persisted on the run 鈥?survives restart
                     summary["name"] = p.get("title") or summary["name"]
                 elif et == "run.finished":
                     summary["finished"] = True
                     finished_solved = bool(p.get("solved"))
                     _add_flag(p.get("flags") or p.get("flag"))
                     # run.finished may carry the authoritative mode (the single-solver
-                    # _emit_finished does not — default fallbacks above cover that).
+                    # _emit_finished does not 鈥?default fallbacks above cover that).
                     if p.get("expected_flags"):
                         summary["expected_flags"] = int(p["expected_flags"])
                     if "multi_flag" in p:
@@ -214,13 +237,13 @@ class SessionStore:
         summary["flags"] = flags
         summary["flag"] = flags[0] if flags else None
 
-        # ── verdict, by mode ────────────────────────────────────────────────
+        # 鈹€鈹€ verdict, by mode 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         if finished_solved is not None:
             summary["solved"] = finished_solved  # explicit verdict wins
         elif flags:
             # no RUN_FINISHED on disk (ghost run) but flags were found. Single-flag /
             # unknown-mode: a found flag is a win. Multi-flag: only a win once the
-            # full set is collected (partial ≠ solved).
+            # full set is collected (partial 鈮?solved).
             if summary["multi_flag"]:
                 summary["solved"] = len(flags) >= summary["expected_flags"]
             else:
@@ -228,7 +251,7 @@ class SessionStore:
         return summary
 
     def summaries(self) -> list[dict]:
-        """All persisted runs, newest-activity first — feeds the rail's Recent."""
+        """All persisted runs, newest-activity first 鈥?feeds the rail's Recent."""
         out = [self.summary(rid) for rid in self.list_runs()]
         out.sort(key=lambda s: s.get("ts", 0.0), reverse=True)
         return out

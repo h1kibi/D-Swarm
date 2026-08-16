@@ -27,6 +27,10 @@ class EventBus:
         self._subscribers: set[asyncio.Queue[Event]] = set()
         self._ring: deque[Event] = deque(maxlen=ring_size)
         self._sinks: list[Callable[[Event], Awaitable[None]]] = []
+        self._critical_sink: tuple[
+            Callable[[Event], Awaitable[None]],
+            Callable[[Event], Awaitable[None]],
+        ] | None = None
         self._closed = False
 
     # -- producer side -----------------------------------------------------
@@ -65,6 +69,37 @@ class EventBus:
                 await q.put(event)
         return event
 
+    async def emit_checked(self, event: Event) -> Event:
+        """Durably persist a critical event before making it observable.
+
+        The paired checked sink runs first under the publish lock. If it fails,
+        the assigned sequence is intentionally left as a gap and the event is not
+        added to the replay ring, passed to ordinary sinks, or fanned out. Once
+        durability succeeds, ordinary non-critical sinks remain best-effort.
+        """
+        async with self._lock:
+            self._seq += 1
+            object.__setattr__(event, "seq", self._seq)
+            critical = self._critical_sink
+            if critical is None:
+                raise RuntimeError("emit_checked requires a critical sink")
+            normal_sink, checked_sink = critical
+            await checked_sink(event)
+
+            self._ring.append(event)
+            subs = list(self._subscribers)
+            sinks = list(self._sinks)
+            for sink in sinks:
+                if sink is normal_sink:
+                    continue
+                try:
+                    await sink(event)
+                except Exception:
+                    pass
+            for q in subs:
+                await q.put(event)
+        return event
+
     @property
     def current_seq(self) -> int:
         return self._seq
@@ -72,6 +107,17 @@ class EventBus:
     # -- durable sinks (SessionStore plugs in here) ------------------------
     def add_sink(self, sink: Callable[[Event], Awaitable[None]]) -> None:
         self._sinks.append(sink)
+
+    def add_critical_sink(
+        self,
+        normal_sink: Callable[[Event], Awaitable[None]],
+        checked_sink: Callable[[Event], Awaitable[None]],
+    ) -> None:
+        """Register the sole paired normal/durable sink for this bus."""
+        if self._critical_sink is not None:
+            raise RuntimeError("critical sink already registered")
+        self._critical_sink = (normal_sink, checked_sink)
+        self._sinks.append(normal_sink)
 
     def remove_sink(self, sink: Callable[[Event], Awaitable[None]]) -> bool:
         """Detach a previously-added sink (L3). Returns True if it was present. The

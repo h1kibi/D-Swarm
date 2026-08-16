@@ -24,6 +24,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from dswarm.models.solve_graph import SolveGraph
+from dswarm.solver.direction_rules import (
+    DEFAULT_DIRECTION_REGISTRY,
+    sanitize_raw_direction,
+)
 from dswarm.solver.worker_profiles import canonical_direction
 
 
@@ -56,14 +60,29 @@ class Intent:
     requires_recon: bool = False
     task_kind: str = ""
     host_scan: bool = False
+    # M4 diagnostics are appended to preserve existing positional fixtures.
+    raw_direction: str = ""
+    canonical_direction: str = ""
+    direction_resolution: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.canonical_direction:
+            self.canonical_direction = self.direction
+        elif not self.direction:
+            self.direction = self.canonical_direction
+        self.raw_direction = sanitize_raw_direction(self.raw_direction)
 
     def to_payload(self) -> dict:
+        canonical = self.canonical_direction or self.direction
         return {"worker_class": self.worker_class, "depends_on": self.depends_on,
                 "rationale": self.rationale, "route_hash": self.route_hash,
                 "branch_id": self.branch_id, "lane_key": self.lane_key,
                 "risk_class": self.risk_class, "resource_key": self.resource_key,
                 "dup_of": self.dup_of, "reopen_because": self.reopen_because,
-                "profile": self.profile, "direction": self.direction,
+                "profile": self.profile, "direction": canonical,
+                "canonical_direction": canonical,
+                "raw_direction": self.raw_direction,
+                "direction_resolution": self.direction_resolution,
                 "mode": self.mode,
                 "surface_target": self.surface_target,
                 "priority": self.priority, "requires_recon": self.requires_recon,
@@ -353,6 +372,8 @@ def parse_reason_reply(text: str, *, max_intents: int = 4) -> ReasonResult:
             wc = "code"
         from_raw = raw.get("from", [])
         from_facts = [int(x) for x in from_raw if isinstance(x, (int, float))]
+        raw_direction = sanitize_raw_direction(raw.get("direction"))
+        canonical, resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(raw_direction)
         intents.append(Intent(
             intent_id=str(raw.get("id") or f"I{i+1}"),
             goal=goal, worker_class=wc,
@@ -367,7 +388,10 @@ def parse_reason_reply(text: str, *, max_intents: int = 4) -> ReasonResult:
             dup_of=str(raw.get("dup_of") or "").strip(),
             reopen_because=str(raw.get("reopen_because") or "").strip(),
             profile=str(raw.get("profile") or "").strip(),
-            direction=canonical_direction(raw.get("direction")),
+            direction=canonical,
+            canonical_direction=canonical,
+            raw_direction=raw_direction,
+            direction_resolution=resolution,
             mode=str(raw.get("mode") or "").strip(),
             surface_target=str(raw.get("surface_target") or "").strip(),
             priority=float(raw.get("priority") or 0.5),

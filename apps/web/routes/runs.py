@@ -24,6 +24,44 @@ async def list_runs(request: Request, archived: int = 0) -> Any:
     return {"runs": request.app.state.manager.list_runs(include_archived=bool(archived))}
 
 
+@router.get("/{run_id}/budget")
+async def budget_snapshot(run_id: str, request: Request) -> Any:
+    """Return the run-scoped ledger and profile/account budget projections."""
+    run = request.app.state.manager.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    ledger = run.ledger.snapshot() if run.ledger is not None else {
+        "run_id": run_id, "ledger_state": "unavailable", "ledger_error": "ledger_unavailable",
+    }
+    return {
+        "run_id": run_id,
+        "ledger": ledger,
+        "budget": run.budget_gate.snapshot(),
+        "ledger_state": getattr(run.spawn_guard, "ledger_state", ledger.get("ledger_state")),
+        "ledger_error": getattr(run.spawn_guard, "ledger_error", ledger.get("ledger_error")),
+    }
+
+
+@router.post("/{run_id}/budget/rebuild")
+async def rebuild_budget(run_id: str, request: Request) -> Any:
+    """Replay the run ledger and recover journal-only usage records."""
+    manager = request.app.state.manager
+    if manager.get(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        run = await manager.rebuild_ledger(run_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc) or "ledger_rebuild_failed") from exc
+    ledger = run.ledger.snapshot() if run.ledger is not None else {}
+    return {
+        "run_id": run_id,
+        "ledger": ledger,
+        "budget": run.budget_gate.snapshot(),
+        "ledger_state": getattr(run.spawn_guard, "ledger_state", ledger.get("ledger_state")),
+        "ledger_error": getattr(run.spawn_guard, "ledger_error", ledger.get("ledger_error")),
+    }
+
+
 @router.patch("/{run_id}")
 async def update_run(run_id: str, request: Request) -> Any:
     body = await _require_dict_body(request)
@@ -122,6 +160,7 @@ async def start_run(run_id: str, request: Request) -> Any:
     # later "继续解题" does not silently resolve against a different global
     # configuration.
     request.app.state.manager.remember_dispatch(run_id, body)
+    request.app.state.manager.configure_budget(run_id, body)
     await request.app.state.manager.start(run_id, driver)
 
     # ChatGPT-style auto-title: if the operator gave no explicit name, kick off
@@ -136,9 +175,21 @@ async def start_run(run_id: str, request: Request) -> Any:
             titler_profile = llm_profiles.get("titler") or {}
             title_model = titler_profile.get("model")
             title_base_url = titler_profile.get("base_url") or None
+            title_usage_writer = request.app.state.manager.internal_usage_writer(
+                run,
+                solver_id="titler",
+                profile_id="titler",
+                configured_account_id=(
+                    str(titler_profile.get("credential_account") or "").strip() or None
+                ),
+            )
             asyncio.create_task(
-                generate_title(prompt, bus=run.bus, run_id=run_id,
-                               model=title_model, base_url=title_base_url)
+                generate_title(
+                    prompt, bus=run.bus, run_id=run_id,
+                    model=title_model, base_url=title_base_url,
+                    usage_writer=title_usage_writer,
+                    usage_context=title_usage_writer.context,
+                )
             )
 
     # P4: the scheduler may have queued this run (concurrency cap) — surface

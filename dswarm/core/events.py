@@ -1,4 +1,4 @@
-"""Typed event schema — the single contract between the agent core and any frontend.
+﻿"""Typed event schema — the single contract between the agent core and any frontend.
 
 AG-UI-style ordered, typed event stream. Web and TUI are dumb subscribers; they
 never call the core directly, they only subscribe to these events and post HITL.
@@ -54,6 +54,7 @@ class EventType(str, Enum):
     #   fact/intent node landed (graph + blackboard swap the truncated raw text for
     #   the gist; the raw stays in a <details> on the card)
     COST_UPDATE = "cost.update"
+    USAGE_RECORDED = "usage.recorded"  # canonical per-provider-call usage record
     STALLED = "guard.stalled"
     GUIDANCE_INJECTED = "coordinator.guidance"
     HITL_REQUEST = "hitl.request"  # agent asks a human to decide
@@ -64,6 +65,8 @@ class EventType(str, Enum):
     #   phase_changed/stalled/exited) — finer than WORKER_STATUS online/offline
     PROVIDER_ERROR = "provider.error"  # LLM/provider/runtime failure diagnostic for operator feedback
     PROVIDER_BATCH_ALERT = "provider.batch_alert"  # many provider errors in a sliding window
+    BUDGET_ALERT = "budget.alert"  # profile/account/run budget warning or block
+    BUDGET_ACTION = "budget.action"  # durable raise_cap/override action
 
 
 class Event(BaseModel):

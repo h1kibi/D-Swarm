@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from typing import Any, Optional
 
 from dswarm.core.runtime_env import is_web_container
@@ -228,6 +229,17 @@ class WorkerRuntimeMixin:
         self._active_account_by_solver[solver_id] = account_id
 
     def _release_worker_account(self, solver: Any) -> None:
+        token = getattr(solver, "gateway_token", None)
+        if token:
+            try:
+                from dswarm.solver.modelgateway import ModelGateway
+                ModelGateway.instance().revoke_token(token)
+            except Exception:
+                pass
+            try:
+                solver.gateway_token = None
+            except Exception:
+                pass
         sid = getattr(solver, "solver_id", "")
         pid = self._active_profile_by_solver.pop(sid, None)
         role_bucket = self._active_profile_role_by_solver.pop(sid, "worker")
@@ -266,6 +278,7 @@ class WorkerRuntimeMixin:
         *,
         container: "Optional[object]",
         profile: "Optional[dict]" = None,
+        task_token: str | None = None,
     ) -> dict[str, str]:
         """Per-worker runtime env: Credential Account plus isolated HOME."""
         from dswarm.swarm.swarm import (
@@ -407,10 +420,10 @@ class WorkerRuntimeMixin:
         # provider that reads DSWARM_TASK_TOKEN / DSWARM_GATEWAY_URL; the explicit
         # DSWARM_PI_PROVIDER keeps selection deterministic. Overrides the account
         # FILE injection (the raw key must never cross into the container).
-        if container is not None and self._gateway_token and not explicit_endpoint:
-            env["DEEPSEEK_API_KEY"] = self._gateway_token
+        if container is not None and task_token and not explicit_endpoint:
+            env["DEEPSEEK_API_KEY"] = task_token
             env.pop("DEEPSEEK_API_KEY_FILE", None)
-            env["DSWARM_TASK_TOKEN"] = self._gateway_token
+            env["DSWARM_TASK_TOKEN"] = task_token
             env["DSWARM_GATEWAY_URL"] = os.environ.get(
                 "DSWARM_GATEWAY_URL",
                 f"http://host.docker.internal:{os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
@@ -548,16 +561,14 @@ class WorkerRuntimeMixin:
             # Remember the runtime captured by this active Run. Later Workers
             # intentionally inherit this container instead of mutating or replacing it.
             self._container_runtime_id = requested_rt_id
-            # route A P3: issue the per-run model-gateway task token. The worker
-            # container authenticates to the gateway with THIS token (baked into the
-            # env as DEEPSEEK_API_KEY); the REAL upstream key never leaves the host.
+            # Start/configure the process gateway here; each worker receives its
+            # own token later in _make_cli_worker once its immutable identity exists.
             from dswarm.solver.modelgateway import ModelGateway
             gw = ModelGateway.instance()
             gw.account_root = (str(self.credential_accounts_root)
                                if self.credential_accounts_root is not None else None)
             if self.workspace_root is not None:
                 gw.sessions_root = str(self.workspace_root.parent)
-            self._gateway_token = gw.issue(self.run_id)
         except Exception as exc:  # noqa: BLE001
             self._container_unavailable = True
             self._record_runtime_degraded(
@@ -572,6 +583,9 @@ class WorkerRuntimeMixin:
                          intent_id: str = "", timeout_override: "Optional[int]" = None,
                          profile_role: "Optional[str]" = None,
                          task_kind: str = "", host_scan: bool = False):
+        guard = getattr(self, "spawn_guard", None)
+        if guard is not None:
+            guard.check_now(operation="spawn")
         from dswarm.solver.cli_solver import CliSolver
 
         # Resolve the profile FIRST — BEFORE charging the spawn budget. A missing
@@ -603,6 +617,23 @@ class WorkerRuntimeMixin:
         if self.worker_profiles and profile is None:
             raise WorkerSpawnRejected(
                 f"no available worker profile for {engine} role={role}")
+        budget_gate = getattr(self, "budget_gate", None)
+        if budget_gate is not None and profile is not None:
+            profile_id = str(profile.get("name") or profile.get("id") or engine or role)
+            # Account blocking is keyed by observed billing identity. A configured
+            # credential account is not treated as billing identity until a provider
+            # usage record confirms it, preventing false pre-call blocks.
+            billing_account = (
+                profile.get("billing_account_id")
+                or profile.get("billing_account")
+            )
+            verdict = budget_gate.authorize(
+                profile_id=profile_id,
+                account_id=str(billing_account).strip() if billing_account else None,
+            )
+            if not verdict.allowed:
+                raise WorkerSpawnRejected(
+                    f"budget blocked profile={profile_id}: {verdict.reason or 'budget_cap'}")
 
         # Budget is charged ONLY after we know we'll actually build a worker.
         self._reserve_worker_spawn()
@@ -652,38 +683,82 @@ class WorkerRuntimeMixin:
 
         workdir = self._alloc_workdir(engine)
         container = self._container_for_engine(engine, profile)
-        from dswarm.solver.cli_driver import driver_for
-        worker = CliSolver(
-            None, self.challenge, bus=self.bus, cost=self.cost,
-            artifacts=self.artifacts, config=self.config, run_id=self.run_id,
-            insight=self.insight, knowledge=self.knowledge,
-            shared_graph=self.shared_graph, engine=transport,
-            driver=driver_for(profile or transport),
-            web_access=self.web_access, kb=self.kb,
-            workdir=workdir,
-            mode=mode, intent_goal=intent_goal, intent_id=intent_id,
-            solver_label=label, **kw,
-            # hand the worker the operator's standing guidance + any one-shot
-            # intent-level guidance so its (single) prompt already carries VPS/SSH
-            # creds, corrections, etc. (copy: the worker must not mutate the
-            # coordinator's canonical list).
-            standing_guidance=guidance_for_worker,
-            # multi-flag: seed the already-found set so a re-bootstrapped worker's
-            # turn-1 prompt lists the flags the run already has and hunts the rest
-            # (empty for a single-flag run → no effect).
-            found_flags=list(self._found_flags),
-            # swarm sub-worker: its end is worker-level (WORKER_FINISHED), NOT the
-            # run's. The coordinator owns the single run-level RUN_FINISHED so a
-            # worker ending mid-run doesn't make the deck show "已结束" while the
-            # coordinator is still re-bootstrapping (the run-7345 bug).
-            lifecycle_scope="worker",
-            # container backend (None → local host subprocess, default).
-            container=container,
-            worker_env=self._runtime_env_for(transport, label, container=container, profile=profile),
-            task_kind=task_kind,
-            host_scan=host_scan,
+        worker_instance_id = uuid.uuid4().hex
+        gateway_token = None
+        explicit_endpoint = bool(
+            (profile or {}).get("base_url")
+            or (profile or {}).get("api_key_ref")
+            or (profile or {}).get("provider_ref")
         )
-        self._claim_worker_account(worker.solver_id, transport, profile, role=role)
+        if container is not None and not explicit_endpoint:
+            from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
+            gateway_token = ModelGateway.instance().issue_worker(WorkerClaims(
+                run_id=self.run_id,
+                challenge_id=str(self.challenge.id),
+                worker_instance_id=worker_instance_id,
+                solver_id=label,
+                profile_id=str((profile or {}).get("id") or engine),
+                configured_account_id=(
+                    str((profile or {}).get("credential_account")).strip() or None
+                    if (profile or {}).get("credential_account") is not None else None
+                ),
+                token_scope=(
+                    "review" if role == "review" else
+                    "recon" if role == "recon" else "worker"
+                ),
+            ))
+        from dswarm.solver.cli_driver import driver_for
+        try:
+            worker = CliSolver(
+                None, self.challenge, bus=self.bus, cost=self.cost,
+                artifacts=self.artifacts, config=self.config, run_id=self.run_id,
+                insight=self.insight, knowledge=self.knowledge,
+                shared_graph=self.shared_graph, engine=transport,
+                driver=driver_for(profile or transport),
+                web_access=self.web_access, kb=self.kb,
+                usage_writer=self.usage_writer,
+                fallback_usage_writer=self.fallback_usage_writer,
+                workdir=workdir,
+                mode=mode, intent_goal=intent_goal, intent_id=intent_id,
+                solver_label=label, **kw,
+                # hand the worker the operator's standing guidance + any one-shot
+                # intent-level guidance so its (single) prompt already carries VPS/SSH
+                # creds, corrections, etc. (copy: the worker must not mutate the
+                # coordinator's canonical list).
+                standing_guidance=guidance_for_worker,
+                # multi-flag: seed the already-found set so a re-bootstrapped worker's
+                # turn-1 prompt lists the flags the run already has and hunts the rest
+                # (empty for a single-flag run → no effect).
+                found_flags=list(self._found_flags),
+                # swarm sub-worker: its end is worker-level (WORKER_FINISHED), NOT the
+                # run's. The coordinator owns the single run-level RUN_FINISHED so a
+                # worker ending mid-run doesn't make the deck show "已结束" while the
+                # coordinator is still re-bootstrapping (the run-7345 bug).
+                lifecycle_scope="worker",
+                # container backend (None → local host subprocess, default).
+                container=container,
+                worker_env=self._runtime_env_for(
+                    transport, label, container=container, profile=profile,
+                    task_token=gateway_token,
+                ),
+                task_kind=task_kind,
+                host_scan=host_scan,
+            )
+        except BaseException:
+            if gateway_token:
+                from dswarm.solver.modelgateway import ModelGateway
+                ModelGateway.instance().revoke_token(gateway_token)
+            raise
+        worker.worker_instance_id = worker_instance_id
+        worker.gateway_token = gateway_token
+        try:
+            self._claim_worker_account(worker.solver_id, transport, profile, role=role)
+        except BaseException:
+            # Token issuance happens before profile/account admission.  If the
+            # admission hook fails, release the worker-local token as well as any
+            # partial accounting state it may have installed before raising.
+            self._release_worker_account(worker)
+            raise
         if converted:
             # D: claim the pre-empted open intent atomically under THIS worker's
             # solver_id (so conclude's owner-fence accepts exactly this worker).
@@ -800,6 +875,7 @@ class WorkerRuntimeMixin:
                     try:
                         return await _worker.run()
                     finally:
+                        self._release_worker_account(_worker)
                         _release()
 
                 try:

@@ -29,6 +29,10 @@ from dswarm.swarm.board import (
     MemoryBoard,
     PheromoneSettings,
 )
+from dswarm.solver.direction_rules import (
+    DEFAULT_DIRECTION_REGISTRY,
+    sanitize_raw_direction,
+)
 from dswarm.solver.worker_profiles import direction_profile_name
 from dswarm.swarm.lane_gate import WorkerLaneGate
 from dswarm.solver.reason import ReasonResult
@@ -111,6 +115,7 @@ class ReasonSwarm:
         self._max_recovery_attempts = int(
             os.environ.get("DSWARM_WORKER_PROVIDER_RECOVERY_ATTEMPTS", "2") or 2)
         self._paused_profiles: set[str] = set()
+        self._direction_overrides: list[dict[str, Any]] = []
         self._provider_errors = ProviderErrorAggregator(
             window_s=float(os.environ.get("DSWARM_PROVIDER_ERROR_WINDOW_S", "60") or 60),
             fatal_threshold=int(os.environ.get("DSWARM_PROVIDER_FATAL_THRESHOLD", "3") or 3),
@@ -157,18 +162,42 @@ class ReasonSwarm:
         if not rows:
             return None
         row = rows[0]
-        direction = str(row.get("direction") or "").strip()
+        stored_direction = sanitize_raw_direction(row.get("direction"))
+        raw_direction = sanitize_raw_direction(row.get("raw_direction"))
+        source_direction = raw_direction or stored_direction
+        canonical_direction, resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+            source_direction
+        )
+        if not canonical_direction and stored_direction:
+            canonical_direction, resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                stored_direction
+            )
+        # Only a canonicalized operator value may enter the scheduler.  In
+        # particular, never fall back to the raw stored value: an old or
+        # externally-written invalid direction must not leak into decisions or
+        # audit events.
+        operator_selected = bool(canonical_direction)
+        direction = canonical_direction or ""
+        if not direction:
+            category, category_resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                self.challenge.category
+            )
+            direction = category or self.challenge.category
+            resolution = category_resolution if category else "category_fallback"
         return DispatchDecision(
             intent_id=str(row["intent_id"]),
             goal=str(row.get("goal") or ""),
-            profile=direction_profile_name(direction or self.challenge.category)
-            or "pi-worker",
+            profile=direction_profile_name(direction) or "pi-worker",
             direction=direction,
             mode="explore",
             priority=float(row.get("priority") or 0.5),
             dedupe_key=f"operator:{row.get('directive_id') or row['intent_id']}",
             task_kind=self.challenge.category,
             host_scan=False,
+            raw_direction=raw_direction,
+            canonical_direction=direction,
+            direction_resolution=resolution,
+            direction_source="operator" if operator_selected else "category",
         )
 
     async def _run_worker(self, decision: DispatchDecision, profile: AgentProfile) -> Any:
@@ -275,6 +304,10 @@ class ReasonSwarm:
                     "worker_class": worker_class,
                     "profile": decision.profile,
                     "direction": decision.direction,
+                    "canonical_direction": decision.canonical_direction or decision.direction,
+                    "raw_direction": decision.raw_direction,
+                    "direction_resolution": decision.direction_resolution,
+                    "direction_source": decision.direction_source,
                     "mode": decision.mode,
                     "priority": decision.priority,
                     "dedupe_key": decision.dedupe_key,
@@ -391,18 +424,93 @@ class ReasonSwarm:
         return result
 
     def _decisions_from_reason(self, result: ReasonResult) -> list[DispatchDecision]:
+        """Resolve intents using the M4.1 authority chain.
+
+        ``direction_resolution`` preserves what the model declared and how it
+        parsed. ``direction_source`` records the authority that supplied the
+        final dispatch direction. Operator direction is CTF-only and never
+        overrides a valid model direction.
+        """
         out: list[DispatchDecision] = []
+        operator_direction = ""
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            operator_direction, _ = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                getattr(self.challenge, "direction", "")
+            )
+
         for it in result.intents:
             mode = it.mode or ("recon" if it.requires_recon else "explore")
+            raw_direction = sanitize_raw_direction(it.raw_direction)
+            declared_direction = sanitize_raw_direction(
+                it.direction or it.canonical_direction
+            )
+            source_direction = raw_direction or declared_direction
+            model_direction, model_resolution = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                source_direction
+            )
+
+            # A raw direction and an explicitly supplied canonical direction are
+            # both diagnostics. If they disagree, do not silently choose one.
+            declared_canonical = sanitize_raw_direction(it.canonical_direction)
+            if raw_direction and declared_canonical:
+                declared_value, _ = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                    declared_canonical
+                )
+                if (declared_value and model_direction
+                        and declared_value != model_direction):
+                    model_direction = ""
+                    model_resolution = "invalid"
+
+            direction = model_direction
+            direction_source = "model" if model_direction else ""
+            resolution = model_resolution
+            override_reason = ""
+
+            if not model_direction and model_resolution in {
+                "empty", "explicit_auto", "invalid"
+            }:
+                if operator_direction:
+                    direction = operator_direction
+                    direction_source = "operator"
+                    override_reason = {
+                        "empty": "model_direction_empty",
+                        "explicit_auto": "model_direction_explicit_auto",
+                        "invalid": "model_direction_invalid",
+                    }[model_resolution]
+                else:
+                    suggested = DEFAULT_DIRECTION_REGISTRY.suggest(
+                        it.goal, getattr(it, "rationale", "")
+                    )
+                    if suggested is not None:
+                        direction, resolution = suggested
+                        direction_source = "keyword"
+                        override_reason = "keyword_fallback"
+                    else:
+                        category_direction, _ = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                            self.challenge.category
+                        )
+                        direction = category_direction or sanitize_raw_direction(
+                            self.challenge.category
+                        )
+                        direction_source = "category" if direction else "default"
+                        resolution = "category_fallback"
+                        override_reason = "category_fallback"
+
+            if not direction:
+                direction = ""
+                direction_source = "default"
+
             profile_id = (
-                direction_profile_name(it.direction)
+                DEFAULT_DIRECTION_REGISTRY.profile_for(direction)
+                or direction_profile_name(direction)
+                or it.profile
                 or direction_profile_name(self.challenge.category)
                 or "pi-worker"
             )
             decision = DispatchDecision(
                 intent_id=it.intent_id,
                 profile=profile_id,
-                direction=it.direction or "",
+                direction=direction,
                 goal=it.goal,
                 worker_class=it.worker_class,
                 from_facts=it.from_facts,
@@ -419,8 +527,30 @@ class ReasonSwarm:
                 surface_target=it.surface_target,
                 task_kind=it.task_kind or self.challenge.category,
                 host_scan=it.host_scan,
+                raw_direction=raw_direction,
+                canonical_direction=direction,
+                direction_resolution=resolution,
+                direction_source=direction_source,
             )
             out.append(decision)
+
+            # Emit only when the effective route differs from the model's
+            # dispatchable declaration. A valid model direction never emits an
+            # override, even when an operator direction is present.
+            if direction != model_direction and override_reason:
+                self._direction_overrides.append({
+                    "intent_id": decision.intent_id,
+                    "goal": decision.goal,
+                    "raw_direction": raw_direction,
+                    "model_direction": model_direction,
+                    "previous_direction": declared_direction,
+                    "operator_direction": operator_direction,
+                    "canonical_direction": direction,
+                    "direction": direction,
+                    "direction_resolution": model_resolution,
+                    "direction_source": direction_source,
+                    "reason": override_reason,
+                })
         return out
 
     def _flags_complete(self) -> bool:
@@ -474,12 +604,29 @@ class ReasonSwarm:
             f"Initial recon of {self.challenge.name} [{self.challenge.category}] "
             "and full attack-surface mapping."
         )
+        operator_direction = ""
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            operator_direction, _ = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+                getattr(self.challenge, "direction", "")
+            )
+        category_direction, _ = DEFAULT_DIRECTION_REGISTRY.canonicalize(
+            self.challenge.category
+        )
+        recon_direction = operator_direction or category_direction or ""
+        recon_source = "operator" if operator_direction else (
+            "category" if category_direction else "default"
+        )
         recon_profile = self.agents.resolve(
-            direction_profile_name(self.challenge.category) or "pi-worker"
+            DEFAULT_DIRECTION_REGISTRY.profile_for(recon_direction)
+            or direction_profile_name(recon_direction)
+            or "pi-worker"
         )
         recon_decision = DispatchDecision(
             intent_id="recon-initial",
             profile=recon_profile.id,
+            direction=recon_direction,
+            canonical_direction=recon_direction,
+            direction_source=recon_source,
             goal=recon_goal,
             mode="recon",
             priority=1.0,
@@ -496,6 +643,8 @@ class ReasonSwarm:
             intent_id=recon_decision.intent_id,
             goal=recon_goal,
             profile=recon_profile.id,
+            direction=recon_decision.direction,
+            direction_source=recon_decision.direction_source,
             task_kind=recon_decision.task_kind,
         )
         t1 = time.monotonic()
@@ -547,7 +696,14 @@ class ReasonSwarm:
                 result = await self._run_reason()
                 if getattr(result, "goal_met", False):
                     break
+                override_start = len(self._direction_overrides)
                 decisions = self._decisions_from_reason(result)
+                for override in self._direction_overrides[override_start:]:
+                    await self._emit(
+                        "direction_override",
+                        stage="reason",
+                        **override,
+                    )
 
                 async def _one(decision: DispatchDecision) -> None:
                     profile = self.agents.resolve(decision.profile)
@@ -660,6 +816,11 @@ class ReasonSwarm:
                         mode=decision.mode,
                         priority=decision.priority,
                         profile=decision.profile,
+                        direction=decision.direction,
+                        canonical_direction=decision.canonical_direction,
+                        raw_direction=decision.raw_direction,
+                        direction_resolution=decision.direction_resolution,
+                        direction_source=decision.direction_source,
                         surface_target=decision.surface_target,
                         task_kind=decision.task_kind,
                         host_scan=decision.host_scan,

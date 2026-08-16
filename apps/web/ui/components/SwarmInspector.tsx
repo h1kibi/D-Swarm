@@ -28,6 +28,8 @@ import type { ArtifactView } from "@/components/ArtifactPanel";
 import { HitlCard } from "@/components/HitlCard";
 import { Icon } from "@/components/Icon";
 import { workerColor, workerInitial, workerShortLabel } from "@/lib/workers";
+import { BudgetStatus } from "@/components/BudgetStatusPanel";
+import type { BudgetSnapshot } from "@/components/budgetStatus";
 
 /**
  * Live Swarm Inspector (docs/07 §5.5) — the right column. Default Workers view:
@@ -385,6 +387,11 @@ export function SwarmInspector({
   minWidth,
   maxWidth,
   defaultWidth,
+  budgetSnapshot,
+  budgetLoading,
+  budgetRebuilding,
+  budgetError,
+  onRebuildBudget,
 }: {
   deck: DeckState;
   running: boolean;
@@ -400,6 +407,11 @@ export function SwarmInspector({
   minWidth: number;
   maxWidth: number;
   defaultWidth: number;
+  budgetSnapshot?: BudgetSnapshot | null;
+  budgetLoading?: boolean;
+  budgetRebuilding?: boolean;
+  budgetError?: string | null;
+  onRebuildBudget?: () => void | Promise<void>;
 }) {
   const t = useT();
   const [tab, setTab] = useState<Tab>("workers");
@@ -572,6 +584,13 @@ export function SwarmInspector({
       </div>
 
       <div className="swarm-body">
+        <BudgetStatus
+          snapshot={budgetSnapshot}
+          loading={budgetLoading}
+          rebuilding={budgetRebuilding}
+          error={budgetError}
+          onRebuild={onRebuildBudget}
+        />
         {tab === "workers" && (
           <>
             <div className="swarm-count">

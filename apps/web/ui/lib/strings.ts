@@ -974,6 +974,25 @@ export const STRINGS: Dict = {
   "op.draftHint": { zh: "先在上方描述一道题并派发，然后在这里指挥蜂群。", en: "Describe a challenge and dispatch it above, then command the swarm here." },
   "op.stopConfirm": { zh: "停止当前运行？历史记录保留。", en: "Stop this run? Its history is kept." },
 
+  // ---- budget / ledger status (M5 Phase 6) ----
+  "budget.title": { zh: "预算与账本", en: "Budget & ledger" },
+  "budget.ledgerReady": { zh: "账本就绪", en: "Ledger ready" },
+  "budget.ledgerRebuilding": { zh: "账本恢复中", en: "Ledger rebuilding" },
+  "budget.ledgerFailed": { zh: "账本需要恢复", en: "Ledger recovery required" },
+  "budget.ledgerUnavailable": { zh: "账本不可用", en: "Ledger unavailable" },
+  "budget.rebuild": { zh: "重建账本", en: "Rebuild ledger" },
+  "budget.rebuilding": { zh: "恢复中…", en: "Rebuilding…" },
+  "budget.rebuildSuccess": { zh: "账本已恢复", en: "Ledger recovered" },
+  "budget.rebuildFailed": { zh: "账本恢复失败", en: "Ledger recovery failed" },
+  "budget.tokens": { zh: "令牌", en: "tokens" },
+  "budget.calls": { zh: "调用 {n}", en: "{n} calls" },
+  "budget.unknownCalls": { zh: "未知用量 {n}", en: "{n} unknown" },
+  "budget.estimatedCalls": { zh: "估算 {n}", en: "{n} estimated" },
+  "budget.profile": { zh: "配置", en: "profile" },
+  "budget.account": { zh: "计费账户", en: "account" },
+  "budget.blocked": { zh: "已阻断", en: "blocked" },
+  "budget.unavailable": { zh: "预算状态暂不可用", en: "Budget status unavailable" },
+
   // ---- pheromone (Phase 5, docs/07 §P0-4/§6.3) — scheduling heat ONLY,
   // never merged with truth status / confidence; N/A for legacy sessions ----
   "pheromone.label": { zh: "信息素", en: "Pheromone" },

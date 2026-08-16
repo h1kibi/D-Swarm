@@ -31,9 +31,49 @@ from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.events import Event, EventType, hitl_response_payload
 from dswarm.core.session_store import SessionStore
+from dswarm.core.usage_journal import UsageContext, UsageJournal, UsageRecord, UsageWriter
+from dswarm.core.usage_ledger import SpawnGuard, UsageLedger
+from dswarm.swarm.budget import ProfileBudgetGate
 from dswarm.solver.credential_accounts import ensure_pi_account_from_env
 
 LOG = logging.getLogger(__name__)
+
+
+def merge_resolve_dispatch(
+    saved: dict[str, Any] | None,
+    body: dict[str, Any] | None,
+    historical_challenge: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge a continuation request without losing an operator direction.
+
+    Direction uses presence semantics: an omitted field preserves the saved
+    operator choice, an explicit empty string resets to ``auto``, and a value
+    replaces the saved choice. Other challenge fields retain the historical
+    challenge before applying explicit request overrides.
+    """
+    saved_body = dict(saved or {})
+    request_body = dict(body or {})
+    saved_ch = saved_body.get("challenge")
+    saved_ch = dict(saved_ch) if isinstance(saved_ch, dict) else {}
+    historical = dict(historical_challenge or {})
+    request_ch = request_body.get("challenge")
+    request_ch = dict(request_ch) if isinstance(request_ch, dict) else {}
+    challenge = {**saved_ch, **historical, **request_ch}
+    # ``direction`` has three-state presence semantics rather than ordinary
+    # historical merge semantics: an explicit request wins, otherwise retain
+    # the saved operator choice, and only use the historical value when no
+    # saved choice exists.  This prevents replay metadata from silently
+    # changing the operator's selected route during /resolve.
+    if "direction" in request_ch:
+        challenge["direction"] = request_ch["direction"]
+    elif "direction" in saved_ch:
+        challenge["direction"] = saved_ch["direction"]
+    elif "direction" in historical:
+        challenge["direction"] = historical["direction"]
+    else:
+        challenge.pop("direction", None)
+    merged = {**saved_body, **request_body, "challenge": challenge}
+    return merged
 
 
 @dataclass
@@ -42,6 +82,10 @@ class Run:
     bus: EventBus
     cost: CostController
     store: SessionStore
+    usage_journal: UsageJournal | None = None
+    ledger: UsageLedger | None = None
+    spawn_guard: SpawnGuard | None = None
+    budget_gate: ProfileBudgetGate = field(default_factory=ProfileBudgetGate)
     hitl: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
     # operator worker commands (spawn/kill a specific engine) the coordinator drains
     worker_cmds: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
@@ -682,19 +726,112 @@ class RunManager:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def configure_budget(self, run_id: str, body: dict[str, Any] | None) -> None:
+        """Apply explicit run budget settings without replacing usage projections."""
+        run = self.runs.get(run_id)
+        if run is None:
+            return
+        body = dict(body or {})
+        nested = body.get("budget") if isinstance(body.get("budget"), dict) else {}
+        profile_caps = body.get("profile_budget_caps", nested.get("profile_budget_caps"))
+        account_caps = body.get("account_budget_caps", nested.get("account_budget_caps"))
+        warn_ratio = body.get("budget_warn_ratio", nested.get("warn_ratio"))
+        if isinstance(profile_caps, dict):
+            run.budget_gate.profile_caps = {
+                str(key): float(value) for key, value in profile_caps.items()
+                if value is not None and float(value) >= 0
+            }
+        if isinstance(account_caps, dict):
+            run.budget_gate.account_caps = {
+                str(key): float(value) for key, value in account_caps.items()
+                if value is not None and float(value) >= 0
+            }
+        if warn_ratio is not None:
+            run.budget_gate.warn_ratio = min(1.0, max(0.0, float(warn_ratio)))
+        # Re-apply durable projection records after cap configuration. The gate is
+        # deliberately not recreated, so idempotent/action state remains intact.
+        if run.ledger is not None:
+            run.budget_gate.rebuild(
+                run.ledger.records.values(), run.ledger.budget_actions
+            )
+
+    @staticmethod
+    def _budget_alert_payload(run: Run, alert: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "kind": "budget_threshold",
+            "run_id": run.run_id,
+            **dict(alert),
+        }
+
+    async def _emit_budget_alert(self, run: Run, alert: dict[str, Any]) -> None:
+        try:
+            await run.bus.emit(Event(
+                event_type=EventType.BUDGET_ALERT,
+                run_id=run.run_id,
+                payload=self._budget_alert_payload(run, alert),
+            ))
+        except Exception:
+            LOG.debug("failed to emit budget alert for %s", run.run_id, exc_info=True)
+
+    def _apply_accounting_event(self, run: Run, event: Event) -> tuple[dict[str, Any], ...]:
+        """Fold canonical accounting events into the ledger and budget gate.
+
+        The ledger remains the idempotency authority.  A duplicate canonical usage
+        event therefore cannot double-charge the profile/account budget projection.
+        Alert emission is deferred by the caller because this method runs inside a
+        bus sink and must never recursively await ``bus.emit``.
+        """
+        if run.ledger is None:
+            return ()
+        if event.event_type is EventType.USAGE_RECORDED:
+            accepted = run.ledger.apply_event(event)
+            if not accepted:
+                return ()
+            record = UsageRecord(**dict(event.payload or {}))
+            verdict = run.budget_gate.apply(record)
+            return verdict.alerts
+        if event.event_type is EventType.BUDGET_ACTION:
+            run.ledger.apply_event(event)
+            run.budget_gate.apply_action(dict(event.payload or {}))
+        return ()
+
+    def _schedule_budget_alerts(self, run: Run, alerts: tuple[dict[str, Any], ...]) -> None:
+        for alert in alerts:
+            task = asyncio.create_task(self._emit_budget_alert(run, alert))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
     def create(self, run_id: str) -> Run:
         if run_id in self.runs:
             return self.runs[run_id]
         bus = EventBus()
         store = SessionStore(root=self.sessions_root)
         self._sync_bus_seq(bus, store=store, run_id=run_id)
-        bus.add_sink(store.sink)
+        bus.add_critical_sink(store.sink, store.append_checked)
         self._seq += 1
+        journal = UsageJournal(self.sessions_root / f"{run_id}-usage-journal.jsonl")
+        ledger = UsageLedger(run_id=run_id)
+        # Startup projection rebuild is synchronous and happens before a handle is
+        # exposed to any spawn path. A failed replay leaves the guard failed so
+        # stop/finalize remain available while new provider calls are rejected.
+        try:
+            ledger.rebuild(store.read_events(run_id), journal=journal)
+        except Exception as exc:
+            ledger.mark_failed(str(exc))
+        guard = SpawnGuard()
+        if ledger.state == "failed":
+            guard.mark_failed(ledger.ledger_error or "ledger_rebuild_failed")
+        elif ledger.pending_recovery_records():
+            # Journal recovery is projected in memory first, then canonicalized
+            # through the checked event path before any provider/spawn operation.
+            guard.mark_rebuilding()
         run = Run(
             run_id=run_id, bus=bus, cost=CostController(bus=bus), store=store,
+            usage_journal=journal, ledger=ledger, spawn_guard=guard,
+            budget_gate=ProfileBudgetGate(),
             created_seq=self._seq,
             blackboard_token=secrets.token_urlsafe(32),
         )
+        self._configure_gateway_bridge(run)
         # Restore the non-secret dispatch sidecar when this handle is created
         # after a backend restart. The helper is intentionally best-effort: old
         # runs simply have no sidecar and resolve falls back to their challenge.
@@ -707,6 +844,14 @@ class RunManager:
             self._seq += 1
             run.updated_seq = self._seq
             run.updated_at = ev.ts
+            try:
+                alerts = self._apply_accounting_event(run, ev)
+                self._schedule_budget_alerts(run, alerts)
+            except Exception as exc:
+                if run.ledger is not None:
+                    run.ledger.mark_failed(str(exc))
+                if run.spawn_guard is not None:
+                    run.spawn_guard.mark_failed(str(exc))
             if ev.event_type is EventType.RUN_STARTED:
                 ch = ev.payload.get("challenge", {}) or {}
                 run.started = True
@@ -798,8 +943,88 @@ class RunManager:
 
         bus.add_sink(_meta_sink)
         self.runs[run_id] = run
+        # Restore caps/actions only after the Run is registered; configure_budget
+        # resolves the live handle from self.runs during restart rehydration.
+        self.configure_budget(run_id, run.dispatch_body)
         self._apply_meta(run)
         return run
+
+    def _configure_gateway_bridge(self, run: Run) -> None:
+        """Attach the process-wide gateway to this run's owner loop and bus.
+
+        The HTTP gateway serves multiple runs from worker threads, while each run
+        owns its own asyncio EventBus. Registration is keyed by ``run_id`` and is
+        repeated when a closed bus is rebuilt. Synchronous maintenance callers do
+        not have an owner loop yet, so registration is deferred for that path.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        from dswarm.solver.modelgateway import ModelGateway
+        from dswarm.solver.credential_accounts import account_store_root
+
+        gateway = ModelGateway.instance()
+        gateway.account_root = str(account_store_root(self.sessions_root))
+        gateway.sessions_root = str(self.sessions_root)
+        gateway.configure_usage_bridge(bus=run.bus, loop=loop, run_id=run.run_id)
+
+    def internal_usage_writer(
+        self,
+        run: Run,
+        *,
+        solver_id: str | None = None,
+        profile_id: str | None = None,
+        configured_account_id: str | None = None,
+        worker_instance_id: str | None = None,
+    ) -> UsageWriter:
+        """Create an internal-producer writer sharing this run's journal."""
+        journal = getattr(run, "usage_journal", None) or UsageJournal(
+            self.sessions_root / f"{run.run_id}-usage-journal.jsonl"
+        )
+        run.usage_journal = journal
+        return UsageWriter(
+            journal,
+            bus=run.bus,
+            context=UsageContext(
+                run_id=run.run_id,
+                challenge_id=run.run_id,
+                worker_instance_id=worker_instance_id,
+                solver_id=solver_id,
+                profile_id=profile_id,
+                configured_account_id=configured_account_id,
+                billing_account_id=None,
+                producer="internal",
+            ),
+        )
+
+    def fallback_usage_writer(
+        self,
+        run: Run,
+        *,
+        solver_id: str | None = None,
+        profile_id: str | None = None,
+        worker_instance_id: str | None = None,
+    ) -> UsageWriter:
+        """Create the non-gateway CLI invocation-aggregate writer."""
+        journal = getattr(run, "usage_journal", None) or UsageJournal(
+            self.sessions_root / f"{run.run_id}-usage-journal.jsonl"
+        )
+        run.usage_journal = journal
+        return UsageWriter(
+            journal,
+            bus=run.bus,
+            context=UsageContext(
+                run_id=run.run_id,
+                challenge_id=run.run_id,
+                worker_instance_id=worker_instance_id,
+                solver_id=solver_id,
+                profile_id=profile_id,
+                configured_account_id=None,
+                billing_account_id=None,
+                producer="fallback",
+            ),
+        )
 
     def board_token(self, run_id: str) -> str:
         run = self.get(run_id)
@@ -891,6 +1116,74 @@ class RunManager:
             run_id = f"run-{self._seq:04d}"
         return self.create(run_id)
 
+    async def rebuild_ledger(self, run_id: str) -> Run:
+        """Replay canonical usage and reconcile journal terminals on demand.
+
+        This is the explicit operator recovery path behind the budget snapshot
+        UI.  It uses the same all-or-fail sequence as startup and pre-spawn
+        reconciliation: replay first, project the budget gate, then canonicalize
+        journal-only terminals through the checked event path.
+        """
+        run = self.runs.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run.ledger is None or run.usage_journal is None or run.store is None:
+            raise RuntimeError("ledger_unavailable")
+        if run.spawn_guard is not None:
+            run.spawn_guard.mark_rebuilding()
+        try:
+            run.ledger.rebuild(
+                run.store.read_events(run_id),
+                journal=run.usage_journal,
+            )
+            run.budget_gate.rebuild(
+                run.ledger.records.values(),
+                run.ledger.budget_actions,
+            )
+            pending = run.ledger.pending_recovery_records()
+            for record in pending:
+                await run.bus.emit_checked(Event(
+                    event_type=EventType.USAGE_RECORDED,
+                    run_id=run.run_id,
+                    payload=record.__dict__.copy(),
+                ))
+            run.ledger.mark_reconciled(record.usage_id for record in pending)
+            if run.spawn_guard is not None:
+                run.spawn_guard.mark_ready()
+            return run
+        except Exception as exc:
+            run.ledger.mark_failed(str(exc))
+            if run.spawn_guard is not None:
+                run.spawn_guard.mark_failed(str(exc))
+            raise
+
+    async def _reconcile_ledger(self, run: Run) -> None:
+        """Canonicalize journal-only terminals before allowing a spawn."""
+        if run.ledger is None:
+            return
+        pending = run.ledger.pending_recovery_records()
+        if not pending:
+            if run.spawn_guard is not None and run.spawn_guard.ledger_state == "rebuilding":
+                run.spawn_guard.mark_ready()
+            return
+        if run.spawn_guard is not None:
+            run.spawn_guard.mark_rebuilding()
+        try:
+            for record in pending:
+                await run.bus.emit_checked(Event(
+                    event_type=EventType.USAGE_RECORDED,
+                    run_id=run.run_id,
+                    payload=record.__dict__.copy(),
+                ))
+            run.ledger.mark_reconciled(record.usage_id for record in pending)
+            if run.spawn_guard is not None:
+                run.spawn_guard.mark_ready()
+        except Exception as exc:
+            run.ledger.mark_failed(str(exc))
+            if run.spawn_guard is not None:
+                run.spawn_guard.mark_failed(str(exc))
+            raise
+
     async def start(self, run_id: str, driver: Driver) -> Run:
         """Dispatch a run through the P4 scheduler: below the concurrency cap it
         launches immediately (today's behavior); at the cap it enters the FIFO
@@ -902,6 +1195,9 @@ class RunManager:
         run = self.create(run_id)
         if run.task is not None and not run.task.done():
             return run  # already live — never stack a second driver on one run
+        await self._reconcile_ledger(run)
+        if run.spawn_guard is not None:
+            await run.spawn_guard.ensure_ready(run_id)
         run.started = True  # the operator dispatched it; rail shows queued/running
         position = self.scheduler.submit(run_id, driver)
         if position is None:
@@ -1003,6 +1299,7 @@ class RunManager:
                 self.scheduler.release(run_id)
                 await self._fill_slots()
                 await run.bus.close()
+                self._unregister_gateway_bridge(run_id)
 
         run.task = asyncio.create_task(_go())
 
@@ -1264,6 +1561,9 @@ class RunManager:
         # that makes the next click look successful but never dispatch.
         if self.scheduler.is_active(run_id) or self.scheduler.is_queued(run_id):
             return False
+        await self._reconcile_ledger(run)
+        if run.spawn_guard is not None:
+            await run.spawn_guard.ensure_ready(run_id)
 
         # Reconstruct the challenge from the durable winner/event history, then
         # layer the saved dispatch body underneath it. This preserves custom
@@ -1300,15 +1600,14 @@ class RunManager:
             ch = {"name": run.name or run_id, "category": run.category or "web",
                   "expected_flags": run.expected_flags,
                   "multi_flag": run.multi_flag}
-        merged = {**saved, "challenge": {**saved_ch, **ch}, **(body or {})}
-        if body and isinstance(body.get("challenge"), dict):
-            merged["challenge"] = {**saved_ch, **ch, **body["challenge"]}
+        merged = merge_resolve_dispatch(saved, body, historical_challenge=ch)
 
         # Continue directly in the coordinator on the existing evidence graph.
         # Do not inject the former race_scout/cold_start knobs here: current
         # build_driver deliberately rejects those legacy fields. Reusing the same
         # workspace already gives the coordinator its existing graph context.
 
+        self.configure_budget(run_id, merged)
         # Build synchronously before changing lifecycle state. Configuration errors
         # should be returned by /resolve, not recorded as a misleading reopen.
         from apps.web.drivers import build_driver
@@ -1347,6 +1646,21 @@ class RunManager:
                          "limit": self.scheduler.max_concurrent_runs}))
         return True
 
+    def _unregister_gateway_bridge(self, run_id: str) -> None:
+        """Detach a finished run from the process-wide gateway bridge.
+
+        Usage remains recoverable from the run-scoped journal; this only prevents
+        late gateway callbacks from targeting a closed EventBus. Standby/resolve
+        paths call ``_fresh_bus`` and register the run again before spawning.
+        """
+        try:
+            from dswarm.solver.modelgateway import ModelGateway
+            unregister = getattr(ModelGateway.instance(), "unregister_usage_bridge", None)
+            if callable(unregister):
+                unregister(run_id)
+        except Exception:
+            LOG.debug("failed to unregister gateway bridge for %s", run_id, exc_info=True)
+
     def _fresh_bus(self, run: Run) -> None:
         """Replace a run's CLOSED bus with a live one (same sinks) so a standby
         worker's events reach a freshly-opened SSE stream. After the main run
@@ -1359,12 +1673,13 @@ class RunManager:
         if not getattr(run.bus, "_closed", False):
             return  # still open (live run) — keep it
         new_bus = EventBus()
-        new_bus.add_sink(run.store.sink)
+        new_bus.add_critical_sink(run.store.sink, run.store.append_checked)
         new_bus.add_sink(self._meta_sink_for(run))
         # carry the seq forward so SSE Last-Event-ID continuity holds across runs
         self._bump_bus_seq(new_bus, max(getattr(run.bus, "_seq", 0), durable_seq))
         run.bus = new_bus
         run.cost.bus = new_bus  # cost updates emit onto the live bus too
+        self._configure_gateway_bridge(run)
 
     def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> None:
         """Spin up a standby worker to serve `cmd`, unless one is already running
@@ -1380,6 +1695,9 @@ class RunManager:
 
         async def _go() -> None:
             try:
+                await self._reconcile_ledger(run)
+                if run.spawn_guard is not None:
+                    await run.spawn_guard.ensure_ready(run_id)
                 LOG.info("standby worker starting for %s action=%s",
                          run_id, cmd.get("action"))
                 await driver(run)
@@ -1418,6 +1736,14 @@ class RunManager:
             self._seq += 1
             run.updated_seq = self._seq
             run.updated_at = ev.ts
+            try:
+                alerts = self._apply_accounting_event(run, ev)
+                self._schedule_budget_alerts(run, alerts)
+            except Exception as exc:
+                if run.ledger is not None:
+                    run.ledger.mark_failed(str(exc))
+                if run.spawn_guard is not None:
+                    run.spawn_guard.mark_failed(str(exc))
             if ev.event_type is EventType.RUN_REOPENED:
                 run.finished = False
                 run.solved = False

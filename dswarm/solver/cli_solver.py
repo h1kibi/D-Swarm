@@ -33,6 +33,7 @@ from typing import Any, Optional
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.provider_errors import classify_provider_error
+from dswarm.core.usage_journal import UsageWriter
 from dswarm.core.events import (
     Event, EventType, blackboard_delta_payload, hitl_request_payload,
     insight_payload, shared_graph_delta_payload, solve_graph_delta_payload,
@@ -550,6 +551,8 @@ class CliSolver:
         found_flags: Optional[list] = None,
         container: "Optional[object]" = None,
         worker_env: Optional[dict[str, str]] = None,
+        usage_writer: Optional[UsageWriter] = None,
+        fallback_usage_writer: Optional[UsageWriter] = None,
         task_kind: str = "",
         host_scan: bool = False,
     ) -> None:
@@ -562,6 +565,8 @@ class CliSolver:
         # tool container (consistent toolchain). None → host subprocess.
         self.container = container
         self._extra_worker_env = dict(worker_env or {})
+        self.usage_writer = usage_writer
+        self.fallback_usage_writer = fallback_usage_writer
         self.task_kind = task_kind
         self.host_scan = bool(host_scan)
         self.run_id = run_id or challenge.id
@@ -3773,22 +3778,45 @@ class CliSolver:
             flags=list(self.graph.flags))
 
     async def _stream_cost(self, res: CliResult) -> None:
-        if self.cost is None:
-            return
         usd = res.cost_usd
-        in_tok = int(res.input_tokens or 0)
-        out_tok = int(res.output_tokens or 0)
-        # Record when we have EITHER a dollar cost OR token usage. claude reports a
-        # real dollar cost; codex's was re-derived from tokens in the driver; cursor
-        # is subscription-backed (usd is None → $0) but still reports tokens, so it
-        # contributes to the deck's token-usage column at zero cost.
-        if usd is None and not (in_tok or out_tok):
+        has_usage = usd is not None or res.input_tokens is not None or res.output_tokens is not None
+        in_tok = int(res.input_tokens) if res.input_tokens is not None else None
+        out_tok = int(res.output_tokens) if res.output_tokens is not None else None
+
+        # Host/non-gateway CLI workers expose only an invocation aggregate.  It is
+        # deliberately separate from provider_call accounting: the CLI may have
+        # made several upstream requests internally, so this record is estimated
+        # when any usage is reported and unknown otherwise.
+        writer = self.fallback_usage_writer
+        if writer is not None and res.invocation_id:
+            outcome = "timeout" if res.timed_out else ("cancelled" if res.cancelled else "succeeded")
+            try:
+                call = await writer.start(provider_call_id=res.invocation_id)
+                await writer.finish(
+                    call,
+                    call_outcome=outcome,
+                    usage_status="estimated" if has_usage else "unknown",
+                    usage=(
+                        {
+                            "prompt_tokens": in_tok,
+                            "completion_tokens": out_tok,
+                            "usd": usd,
+                        }
+                        if has_usage else {}
+                    ),
+                )
+            except Exception:
+                # The worker's legacy cost path remains best-effort in Phase 4;
+                # ledger_state/rebuild enforcement belongs to Phase 5.
+                pass
+
+        if self.cost is None or not has_usage:
             return
         try:
             await self.cost.add_external_usd(
                 float(usd or 0.0), run_id=self.run_id,
                 solver_id=self.solver_id, challenge_id=self.challenge.id,
-                input_tokens=in_tok, output_tokens=out_tok)
+                input_tokens=int(in_tok or 0), output_tokens=int(out_tok or 0))
         except Exception:
             pass
 
@@ -3997,7 +4025,8 @@ class CliSolver:
             asyncio.create_task(summarize_node(
                 text, node_kind=node_kind, fact_seq=fact_seq, intent_id=intent_id,
                 shared_graph=self.shared_graph, bus=self.bus,
-                run_id=self.run_id, challenge_id=self.challenge.id))
+                run_id=self.run_id, challenge_id=self.challenge.id,
+                solver_id="summarizer", usage_writer=self.usage_writer))
         except RuntimeError:
             # no running loop (shouldn't happen on the async path) — skip silently
             pass

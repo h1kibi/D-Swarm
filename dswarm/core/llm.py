@@ -1,4 +1,4 @@
-"""DeepSeek (OpenAI-compatible) LLM client with reasoning-model handling.
+﻿"""DeepSeek (OpenAI-compatible) LLM client with reasoning-model handling.
 
 Empirically verified against the temporary endpoint:
 - Models are REASONING models: responses split `reasoning_content` from
@@ -26,6 +26,7 @@ import httpx
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.events import Event, EventType
+from dswarm.core.usage_journal import UsageCall, UsageContext, UsageWriter
 
 DEFAULT_BASE_URL = os.environ.get("DSWARM_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
@@ -134,11 +135,15 @@ class LLMClient:
         auth_mode: str = "bearer",
         auth_header: Optional[str] = None,
         auth_prefix: Optional[str] = None,
+        usage_writer: UsageWriter | None = None,
+        usage_context: UsageContext | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("DSWARM_DEEPSEEK_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.bus = bus
         self.cost = cost
+        self.usage_writer = usage_writer
+        self.usage_context = usage_context
         self.auth_mode = (auth_mode or "bearer").strip().lower()
         if self.auth_mode not in {"bearer", "x-api-key", "custom"}:
             self.auth_mode = "bearer"
@@ -203,6 +208,61 @@ class LLMClient:
                 solver_id=solver_id,
             )
 
+    def _usage_context_for(
+        self,
+        *,
+        run_id: str | None,
+        challenge_id: str | None,
+        solver_id: str | None,
+    ) -> UsageContext | None:
+        base = self.usage_context
+        effective_run_id = run_id or (base.run_id if base else None)
+        if not effective_run_id:
+            return None
+        return UsageContext(
+            run_id=effective_run_id,
+            challenge_id=challenge_id if challenge_id is not None else (base.challenge_id if base else None),
+            worker_instance_id=base.worker_instance_id if base else None,
+            solver_id=solver_id if solver_id is not None else (base.solver_id if base else None),
+            profile_id=base.profile_id if base else None,
+            configured_account_id=base.configured_account_id if base else None,
+            billing_account_id=base.billing_account_id if base else None,
+            producer=base.producer if base else "internal",
+        )
+
+    @staticmethod
+    def _usage_outcome(exc: BaseException) -> str:
+        if isinstance(exc, asyncio.CancelledError):
+            return "cancelled"
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)):
+            return "timeout"
+        if isinstance(exc, httpx.HTTPStatusError):
+            return "provider_error"
+        return "transport_error"
+
+    async def _finish_usage(
+        self,
+        call: UsageCall,
+        *,
+        outcome: str,
+        response: LLMResponse | None = None,
+    ) -> None:
+        if self.usage_writer is None:
+            return
+        usage: dict[str, Any] = {}
+        if response is not None and (response.input_tokens or response.output_tokens):
+            usage = {
+                "prompt_tokens": response.input_tokens,
+                "completion_tokens": response.output_tokens,
+            }
+        status = "measured" if usage else "unknown"
+        await self.usage_writer.finish(
+            call,
+            call_outcome=outcome,
+            usage_status=status,
+            usage=usage,
+        )
+
     async def chat(
         self,
         *,
@@ -232,10 +292,23 @@ class LLMClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
+        usage_call: UsageCall | None = None
+        if self.usage_writer is not None:
+            usage_call = await self.usage_writer.start(
+                context=self._usage_context_for(
+                    run_id=run_id, challenge_id=challenge_id, solver_id=solver_id
+                )
+            )
         coro = (
-            self._chat_stream(body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id)
+            self._chat_stream(
+                body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id,
+                record_cost=usage_call is None,
+            )
             if stream
-            else self._chat_once(body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id)
+            else self._chat_once(
+                body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id,
+                record_cost=usage_call is None,
+            )
         )
         # hard wall-clock guard: a stalled/half-open SSE stream must not wedge the
         # caller forever. On timeout we surface it as a normal error the solver
@@ -243,13 +316,24 @@ class LLMClient:
         try:
             resp = await asyncio.wait_for(coro, timeout=self.overall_timeout)
         except asyncio.TimeoutError:
-            return LLMResponse(
+            resp = LLMResponse(
                 content="", reasoning="", tool_calls=[],
                 finish_reason="timeout", model=body["model"],
             )
+            if usage_call is not None:
+                await self._finish_usage(usage_call, outcome="timeout", response=resp)
+            return resp
+        except BaseException as exc:
+            if usage_call is not None:
+                await self._finish_usage(
+                    usage_call, outcome=self._usage_outcome(exc), response=None
+                )
+            raise
+        if usage_call is not None:
+            await self._finish_usage(usage_call, outcome="succeeded", response=resp)
         return resp
 
-    async def _chat_once(self, body, *, run_id, challenge_id, solver_id) -> LLMResponse:
+    async def _chat_once(self, body, *, run_id, challenge_id, solver_id, record_cost: bool = True) -> LLMResponse:
         body = {**body, "stream": False}
         if body.get("stream") is True:  # safety
             body["stream"] = False
@@ -261,8 +345,8 @@ class LLMClient:
         choice = data["choices"][0]
         msg = choice["message"]
         usage = data.get("usage", {})
-        await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)
-
+        if record_cost:
+            await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)
         tool_calls = []
         for tc in msg.get("tool_calls") or []:
             fn = tc["function"]
@@ -291,7 +375,7 @@ class LLMClient:
             model=body["model"],
         )
 
-    async def _chat_stream(self, body, *, run_id, challenge_id, solver_id) -> LLMResponse:
+    async def _chat_stream(self, body, *, run_id, challenge_id, solver_id, record_cost: bool = True) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         # tool calls reassembled by index
@@ -350,7 +434,8 @@ class LLMClient:
                     if fn.get("arguments"):
                         slot["arguments"] += fn["arguments"]
 
-        await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)
+        if record_cost:
+            await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)
 
         tool_calls = [
             ToolCall(id=v["id"], name=v["name"], arguments=v["arguments"])
@@ -380,19 +465,11 @@ class LLMClient:
         emit: bool = False,
         record_cost: bool = False,
     ) -> "AsyncIterator[str]":
-        """Stream content deltas from a chat completion, yielding one string chunk
-        at a time. Designed for the read-only btw observer: by default it does NOT
-        emit REASONING_DELTA/TEXT_MESSAGE_DELTA to the run bus and does NOT record
-        cost into the run CostController — so a btw Q&A never pollutes the SSE event
-        stream, the deck's DeckState, or the run cost/budget.
+        """Stream content deltas and optionally record one internal provider call.
 
-        `emit=True`/`record_cost=True` re-enable those side effects for non-btw
-        callers. Reasoning deltas are NOT yielded (only `content` is), matching the
-        observer UX which shows only the final answer text streaming in.
-
-        Never raises mid-stream on parse errors: a malformed SSE line is skipped.
-        Transport/HTTP errors propagate so the caller can render an error frame.
-        The caller is responsible for aclose() (typically via `async with`).
+        With an injected ``UsageWriter`` and ``record_cost=True`` the journal
+        started row is fsynced before the request, and a terminal row is written
+        for success, provider/transport failure, timeout, or cancellation.
         """
         body: dict[str, Any] = {
             "model": model,
@@ -403,44 +480,68 @@ class LLMClient:
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         usage: dict[str, int] = {}
-        async with self._client.stream(
-            "POST", f"{self.base_url}/chat/completions",
-            headers=self._headers(), json=body,
-        ) as r:
-            if r.status_code >= 400:
-                await r.aread()
-                _raise_for_status(r)
-            async for line in r.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[len("data:"):].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                rc = delta.get("reasoning_content")
-                if rc and emit:
-                    await self._emit(
-                        EventType.REASONING_DELTA,
-                        run_id=run_id, challenge_id=challenge_id,
-                        solver_id=solver_id, text=rc,
-                    )
-                cc = delta.get("content")
-                if cc:
-                    if emit:
+        usage_call: UsageCall | None = None
+        if self.usage_writer is not None and record_cost:
+            usage_call = await self.usage_writer.start(
+                context=self._usage_context_for(
+                    run_id=run_id, challenge_id=challenge_id, solver_id=solver_id
+                )
+            )
+        try:
+            async with self._client.stream(
+                "POST", f"{self.base_url}/chat/completions",
+                headers=self._headers(), json=body,
+            ) as r:
+                if r.status_code >= 400:
+                    await r.aread()
+                    _raise_for_status(r)
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    rc = delta.get("reasoning_content")
+                    if rc and emit:
                         await self._emit(
-                            EventType.TEXT_MESSAGE_DELTA,
+                            EventType.REASONING_DELTA,
                             run_id=run_id, challenge_id=challenge_id,
-                            solver_id=solver_id, text=cc,
+                            solver_id=solver_id, text=rc,
                         )
-                    yield cc
-        if record_cost:
-            await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)
+                    cc = delta.get("content")
+                    if cc:
+                        if emit:
+                            await self._emit(
+                                EventType.TEXT_MESSAGE_DELTA,
+                                run_id=run_id, challenge_id=challenge_id,
+                                solver_id=solver_id, text=cc,
+                            )
+                        yield cc
+        except BaseException as exc:
+            if usage_call is not None:
+                await self._finish_usage(
+                    usage_call, outcome=self._usage_outcome(exc), response=None
+                )
+            raise
+        else:
+            if usage_call is not None:
+                await self.usage_writer.finish(
+                    usage_call,
+                    call_outcome="succeeded",
+                    usage_status="measured" if usage else "unknown",
+                    usage=usage,
+                )
+            elif record_cost:
+                await self._record_cost(
+                    body["model"], usage, run_id, challenge_id, solver_id
+                )

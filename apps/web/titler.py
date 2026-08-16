@@ -1,4 +1,4 @@
-"""Auto-title a solve conversation from the operator's opening prompt.
+﻿"""Auto-title a solve conversation from the operator's opening prompt.
 
 ChatGPT/Claude-style: the rail row starts as a "new conversation" placeholder,
 then a short title quietly replaces it. We ask deepseek-v4-flash (cheap, fast)
@@ -19,6 +19,7 @@ from typing import Optional
 from dswarm.core.events import Event, EventType
 from dswarm.core.event_bus import EventBus
 from dswarm.core.llm import LLMClient
+from dswarm.core.usage_journal import UsageContext, UsageWriter
 
 TITLE_MODEL = "deepseek-v4-flash"
 
@@ -72,6 +73,8 @@ async def generate_title(
     run_id: Optional[str] = None,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    usage_writer: Optional[UsageWriter] = None,
+    usage_context: Optional[UsageContext] = None,
 ) -> str:
     """Return a short title for `prompt`; emit RUN_TITLED on `bus` if given.
 
@@ -86,9 +89,19 @@ async def generate_title(
     title = fallback_title(prompt)
     owns_llm = llm is None
     try:
-        client = llm or (
-            LLMClient(base_url=base_url) if (base_url or "").strip() else LLMClient()
-        )
+        if llm is not None:
+            client = llm
+        elif (base_url or "").strip():
+            client = LLMClient(
+                base_url=base_url,
+                usage_writer=usage_writer,
+                usage_context=usage_context,
+            )
+        else:
+            client = LLMClient(
+                usage_writer=usage_writer,
+                usage_context=usage_context,
+            )
         try:
             resp = await client.chat(
                 model=model or TITLE_MODEL,

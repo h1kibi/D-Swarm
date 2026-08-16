@@ -1,4 +1,4 @@
-"""LLM client unit tests with mocked transport (no key, deterministic).
+﻿"""LLM client unit tests with mocked transport (no key, deterministic).
 
 Covers the reasoning-model handling and streaming tool-call reassembly that the
 meta-executor depends on. A separate live smoke test (test_llm_live.py) hits the
@@ -10,10 +10,12 @@ import json
 
 import httpx
 import pytest
+from pathlib import Path
 
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.events import EventType
+from dswarm.core.usage_journal import UsageJournal
 from dswarm.core.llm import LLMClient
 
 
@@ -24,6 +26,9 @@ def _sse(chunks: list[dict]) -> bytes:
     body += "data: [DONE]\n\n"
     return body.encode()
 
+
+def _journal_rows(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 def _client_with(handler, **kw) -> LLMClient:
     transport = httpx.MockTransport(handler)
@@ -237,3 +242,207 @@ async def test_max_tokens_sent_when_set() -> None:
                      messages=[{"role": "user", "content": "x"}],
                      max_tokens=512, stream=False)
     assert captured["body"].get("max_tokens") == 512
+
+@pytest.mark.asyncio
+async def test_llm_usage_writer_records_durable_success_and_canonical_event(tmp_path: Path) -> None:
+    from dswarm.core.usage_journal import UsageContext, UsageWriter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+            },
+        )
+
+    class CheckedBus:
+        def __init__(self) -> None:
+            self.events = []
+
+        async def emit_checked(self, event):
+            self.events.append(event)
+            return event
+
+    bus = CheckedBus()
+    journal = UsageJournal(tmp_path / "run-1-usage-journal.jsonl")
+    writer = UsageWriter(journal, bus=bus)
+    context = UsageContext(
+        run_id="run-1", challenge_id="challenge-1", worker_instance_id="worker-1",
+        solver_id="solver-1", profile_id="pi-web",
+        configured_account_id="acct-1", billing_account_id=None,
+    )
+    async with _client_with(handler, usage_writer=writer, usage_context=context) as client:
+        response = await client.chat(
+            model="deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+        )
+
+    assert response.content == "ok"
+    assert [event.event_type.value for event in bus.events] == ["usage.recorded"]
+    payload = bus.events[0].payload
+    assert payload["producer"] == "internal"
+    assert payload["usage_status"] == "measured"
+    assert payload["input_tokens"] == 11
+    assert payload["output_tokens"] == 7
+    rows = _journal_rows(tmp_path / "run-1-usage-journal.jsonl")
+    assert [row["phase"] for row in rows[1:]] == ["started", "finished"]
+    assert rows[-1]["provider_call_id"] == payload["provider_call_id"]
+
+
+@pytest.mark.asyncio
+async def test_llm_usage_writer_records_provider_error_before_reraising(tmp_path: Path) -> None:
+    from dswarm.core.usage_journal import UsageContext, UsageWriter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, json={"error": {"message": "balance depleted"}})
+
+    class CheckedBus:
+        def __init__(self) -> None:
+            self.events = []
+
+        async def emit_checked(self, event):
+            self.events.append(event)
+            return event
+
+    bus = CheckedBus()
+    journal = UsageJournal(tmp_path / "run-1-usage-journal.jsonl")
+    writer = UsageWriter(
+        journal,
+        bus=bus,
+        context=UsageContext(
+            run_id="run-1", challenge_id="challenge-1", worker_instance_id="worker-1",
+            solver_id="solver-1", profile_id="pi-web",
+            configured_account_id="acct-1", billing_account_id=None,
+        ),
+    )
+    async with _client_with(handler, usage_writer=writer) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.chat(
+                model="deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}],
+                stream=False,
+            )
+
+    assert len(bus.events) == 1
+    payload = bus.events[0].payload
+    assert payload["call_outcome"] == "provider_error"
+    assert payload["usage_status"] == "unknown"
+    assert payload["input_tokens"] is None
+    rows = _journal_rows(tmp_path / "run-1-usage-journal.jsonl")
+    assert [row["phase"] for row in rows[1:]] == ["started", "finished"]
+
+
+@pytest.mark.asyncio
+async def test_llm_usage_writer_records_timeout_terminal(tmp_path: Path) -> None:
+    from dswarm.core.usage_journal import UsageContext, UsageWriter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("upstream stalled", request=request)
+
+    class CheckedBus:
+        def __init__(self) -> None:
+            self.events = []
+
+        async def emit_checked(self, event):
+            self.events.append(event)
+            return event
+
+    bus = CheckedBus()
+    writer = UsageWriter(
+        UsageJournal(tmp_path / "run-timeout-usage-journal.jsonl"),
+        bus=bus,
+        context=UsageContext(run_id="run-timeout", solver_id="titler"),
+    )
+    async with _client_with(handler, usage_writer=writer) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.chat(
+                model="deepseek-v4-flash",
+                messages=[{"role": "user", "content": "title this"}],
+                stream=False,
+            )
+
+    assert len(bus.events) == 1
+    payload = bus.events[0].payload
+    assert payload["call_outcome"] == "timeout"
+    assert payload["usage_status"] == "unknown"
+    rows = _journal_rows(tmp_path / "run-timeout-usage-journal.jsonl")
+    assert [row["phase"] for row in rows[1:]] == ["started", "finished"]
+
+@pytest.mark.asyncio
+async def test_iter_chat_deltas_usage_writer_finishes_terminal_record(tmp_path: Path) -> None:
+    from dswarm.core.usage_journal import UsageContext, UsageWriter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse([
+                {"choices": [{"delta": {"content": "hello"}}]},
+                {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+            ]),
+        )
+
+    class CheckedBus:
+        def __init__(self) -> None:
+            self.events = []
+
+        async def emit_checked(self, event):
+            self.events.append(event)
+            return event
+
+    bus = CheckedBus()
+    writer = UsageWriter(
+        UsageJournal(tmp_path / "run-1-usage-journal.jsonl"),
+        bus=bus,
+        context=UsageContext(run_id="run-1", solver_id="btw-1"),
+    )
+    chunks = []
+    async with _client_with(handler, usage_writer=writer) as client:
+        async for chunk in client.iter_chat_deltas(
+            model="deepseek-v4-flash", messages=[{"role": "user", "content": "hi"}],
+            record_cost=True,
+        ):
+            chunks.append(chunk)
+    assert chunks == ["hello"]
+    assert len(bus.events) == 1
+    assert bus.events[0].payload["usage_status"] == "measured"
+
+@pytest.mark.asyncio
+async def test_streaming_usage_writer_does_not_double_record_legacy_cost(tmp_path: Path) -> None:
+    from dswarm.core.usage_journal import UsageContext, UsageWriter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse([
+                {"choices": [{"delta": {"content": "hello"}}]},
+                {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+            ]),
+        )
+
+    class CheckedBus:
+        async def emit_checked(self, event):
+            return event
+
+    class CountingCost:
+        def __init__(self):
+            self.calls = []
+
+        async def record(self, **kwargs):
+            self.calls.append(kwargs)
+
+    cost = CountingCost()
+    writer = UsageWriter(
+        UsageJournal(tmp_path / "run-1-usage-journal.jsonl"),
+        bus=CheckedBus(),
+        context=UsageContext(run_id="run-1", solver_id="reason"),
+    )
+    async with _client_with(handler, usage_writer=writer, cost=cost) as client:
+        response = await client.chat(
+            model="deepseek-v4-flash", messages=[{"role": "user", "content": "hi"}],
+            stream=True, run_id="run-1", challenge_id="ch-1", solver_id="reason",
+        )
+
+    assert response.content == "hello"
+    assert cost.calls == []

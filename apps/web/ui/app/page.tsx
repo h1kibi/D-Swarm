@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRun, useRunList, useFolders, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
+import { useRun, useRunList, useFolders, useBudgetSnapshot, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
 import { I18nProvider } from "@/lib/i18n";
@@ -134,6 +134,7 @@ function Deck() {
     if (window.location.pathname !== url) window.history.replaceState({}, "", url);
   }, [runId]);
   const { deck, connected, start, sendHitl, resolve } = useRun(runId);
+  const budget = useBudgetSnapshot(runId);
 
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [railWidth, setRailWidth] = useState(RAIL_WIDTH_DEFAULT);
@@ -737,6 +738,18 @@ function Deck() {
             minWidth={INSPECTOR_WIDTH_MIN}
             maxWidth={inspectorWidthMax(winW)}
             defaultWidth={INSPECTOR_WIDTH_DEFAULT}
+            budgetSnapshot={budget.snapshot}
+            budgetLoading={budget.loading}
+            budgetRebuilding={budget.rebuilding}
+            budgetError={budget.error}
+            onRebuildBudget={async () => {
+              try {
+                await budget.rebuild();
+                pushToast({ msg: t("budget.rebuildSuccess"), variant: "success" });
+              } catch (err) {
+                pushToast({ msg: `${t("budget.rebuildFailed")}: ${err instanceof Error ? err.message : String(err)}`, variant: "error" });
+              }
+            }}
           />
         )}
       </div>
