@@ -556,6 +556,13 @@ class ModelGateway:
             with httpx.stream(
                 "POST", upstream_url, json=req, headers=headers,
                 timeout=httpx.Timeout(300.0, connect=20.0),
+                # The gateway is the controlled upstream funnel: route DIRECTLY to
+                # the provider, never through the operator's ambient HTTP(S)_PROXY.
+                # Routing through a local proxy turns connection-refused into a
+                # proxy 502 with an empty body, which both corrupts the terminal
+                # usage semantics and made the transport-error path untestable
+                # (test_gateway_transport_error_gets_terminal_unknown).
+                trust_env=False,
             ) as resp:
                 log.info("gateway upstream status=%s ttfb=%.2fs (run %s)",
                          resp.status_code, time.time() - t0, run_id)
