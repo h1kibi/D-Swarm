@@ -11,6 +11,7 @@ from dswarm.solver.credential_accounts import (
     CredentialAccountStore,
     account_store_root,
     ensure_pi_account_from_env,
+    project_account_root,
     runtime_env_for_engine,
 )
 from apps.web.run_manager import RunManager
@@ -1025,4 +1026,10 @@ def test_detect_system_login_never_raises_on_probe_failure(monkeypatch):
     assert ca.detect_system_login("pi", env=None) in ("present", "absent")
 
 
-
+def test_broad_account_projection_is_explicitly_legacy(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    with pytest.warns(
+        DeprecationWarning, match="legacy broad credential projection"
+    ):
+        project_account_root(source, tmp_path / "dest")

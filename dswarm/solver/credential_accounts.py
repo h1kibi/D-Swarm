@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -553,6 +554,11 @@ def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:
     The HOST store is never modified and never made world-writable; this projection
     is the only thing the container sees. Returns dest_root.
     """
+    warnings.warn(
+        "legacy broad credential projection; use CredentialProjector",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     src = Path(src_root)
     dest = Path(dest_root)
     if dest.exists():
