@@ -89,6 +89,34 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  tui-control:
+    build:
+      context: .
+      dockerfile: docker/tui/Dockerfile
+    image: dswarm-tui:latest
+    stdin_open: true
+    tty: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DSWARM_HOST_DATA_ROOT:?set DSWARM_HOST_DATA_ROOT to an absolute host path}:${DSWARM_HOST_DATA_ROOT}
+    environment:
+      DSWARM_IN_CONTAINER: "1"
+      DSWARM_RUNTIME_MODE: "docker"
+      DSWARM_CONTROL_BIND: "0.0.0.0"
+      DSWARM_CONTROL_HOST: "tui-control"
+      DSWARM_WORKER_NETWORK: "${DSWARM_WORKER_NETWORK:-dswarm_net}"
+      DSWARM_HOST_DATA_ROOT: "${DSWARM_HOST_DATA_ROOT}"
+      DSWARM_CONTAINER_DATA_ROOT: "${DSWARM_HOST_DATA_ROOT}"
+      DSWARM_SESSIONS_ROOT: "${DSWARM_HOST_DATA_ROOT}/sessions"
+      DSWARM_MODEL_GATEWAY_BIND: "0.0.0.0"
+      DSWARM_GATEWAY_URL: "http://tui-control:9101/v1"
+      DSWARM_WORKER_IMAGE: "${DSWARM_WORKER_IMAGE:-ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1}"
+      DSWARM_WORKER_IMAGE_VERSION: "${DSWARM_WORKER_IMAGE_VERSION:-}"
+      DSWARM_DEEPSEEK_API_KEY: "${DSWARM_DEEPSEEK_API_KEY:-}"
+      DSWARM_DEEPSEEK_BASE_URL: "${DSWARM_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}"
+      DSWARM_LLM_TRUST_ENV: "${DSWARM_LLM_TRUST_ENV:-0}"
+    networks: [dswarm_net]
+
   ui:
     build:
       context: ./apps/web/ui

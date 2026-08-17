@@ -31,6 +31,25 @@ def _write_shell_shims(fake_bin: Path) -> None:
         shim.chmod(0o755)
 
 
+def _write_fake_uv(fake_bin: Path) -> None:
+    _write_shell_shims(fake_bin)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        """#!/usr/bin/env bash
+set -eu
+{
+  printf 'UV'
+  for arg in "$@"; do printf '\\t%s' "$arg"; done
+  printf '\\n'
+} >> "$DSWARM_COMMAND_LOG"
+exit "${DSWARM_FAKE_UV_EXIT:-0}"
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    uv.chmod(0o755)
+
+
 def _write_fake_docker(fake_bin: Path) -> None:
     _write_shell_shims(fake_bin)
     docker = fake_bin / "docker"
@@ -55,6 +74,9 @@ if [ \"${1:-}\" = compose ] && [ \"${2:-}\" = up ]; then
     \"${DSWARM_UI_PORT:-}\" \\
     \"${DSWARM_RUNTIME_MODE:-}\" >> \"$DSWARM_COMMAND_LOG\"
   exit \"${DSWARM_FAKE_UP_EXIT:-0}\"
+fi
+if [ \"${1:-}\" = compose ] && [ \"${2:-}\" = run ]; then
+  exit \"${DSWARM_FAKE_RUN_EXIT:-0}\"
 fi
 exit 0
 """,
@@ -112,6 +134,58 @@ def _run_web(
     calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
     return result, calls
 
+
+
+def _shell_quote_preserving_dollar(value: str) -> str:
+    """Quote argv while avoiding the Windows/WSL ``bash -lc`` dollar quirk."""
+    return shlex.quote(value).replace("$", '\'"$"\'')
+
+
+def _run_tui(
+    tmp_path: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+    provide_docker: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    fake_bin = tmp_path / "bin"
+    _write_fake_uv(fake_bin)
+    if provide_docker:
+        _write_fake_docker(fake_bin)
+    log = tmp_path / "commands.log"
+    shell_env = {
+        "PATH": _posix_path(fake_bin),
+        "HOME": "/tmp/dswarm-run-sh-home",
+        "DSWARM_COMMAND_LOG": _posix_path(log),
+        "DSWARM_HOST_DATA_ROOT": "/tmp/dswarm-test-data",
+    }
+    shell_env.update(env or {})
+    assignments = [
+        f"{key}={shlex.quote(value)}"
+        for key, value in shell_env.items()
+    ]
+    command = " ".join(
+        [
+            f"cd {shlex.quote(_posix_path(_REPO_ROOT))}",
+            "&&",
+            *assignments,
+            "./run.sh",
+            "tui",
+            *(_shell_quote_preserving_dollar(arg) for arg in args),
+        ]
+    )
+    result = subprocess.run(
+        ["bash", "-lc", command],
+        cwd=_REPO_ROOT,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return result, calls
 
 def test_web_defaults_to_compose(tmp_path: Path) -> None:
     result, calls = _run_web(tmp_path)
@@ -218,9 +292,70 @@ def test_compose_publishes_only_operator_ports_on_loopback() -> None:
 def test_compose_socket_and_data_mount_are_control_plane_only() -> None:
     compose = (_REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
-    assert compose.count("/var/run/docker.sock:/var/run/docker.sock") == 1
+    assert compose.count("/var/run/docker.sock:/var/run/docker.sock") == 2
     assert (
         "${DSWARM_HOST_DATA_ROOT:?set DSWARM_HOST_DATA_ROOT to an absolute host path}:"
         "${DSWARM_HOST_DATA_ROOT}"
     ) in compose
     assert 'DSWARM_RUNTIME_MODE: "docker"' in compose
+
+
+def test_mock_tui_stays_host_only(tmp_path: Path) -> None:
+    result, calls = _run_tui(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert calls == ["UV\trun\tpython\t-m\tapps.tui"]
+    assert all(not line.startswith("CALL") for line in calls)
+
+
+def test_real_tui_uses_interactive_control_container_and_preserves_argv(tmp_path: Path) -> None:
+    dangerous = 'value with spaces "quotes" $(touch /tmp/must-not-run)'
+    result, calls = _run_tui(
+        tmp_path,
+        "--swarm",
+        "--desc",
+        dangerous,
+        "--target",
+        "http://target/a b",
+    )
+
+    assert result.returncode == 0, result.stderr
+    run_call = next(line for line in calls if "CALL\tcompose\trun" in line)
+    assert run_call.split("\t") == [
+        "CALL", "compose", "run", "--rm", "tui-control", "--swarm",
+        "--desc", dangerous, "--target", "http://target/a b",
+    ]
+    assert "\t-T\t" not in f"\t{run_call}\t"
+    assert not Path("/tmp/must-not-run").exists()
+
+
+def test_real_tui_compose_exit_code_is_propagated(tmp_path: Path) -> None:
+    result, calls = _run_tui(
+        tmp_path, "--swarm", env={"DSWARM_FAKE_RUN_EXIT": "42"}
+    )
+
+    assert result.returncode == 42
+    assert "CALL\tcompose\trun\t--rm\ttui-control\t--swarm" in calls
+
+
+def test_real_tui_rejects_missing_docker_without_host_fallback(tmp_path: Path) -> None:
+    result, calls = _run_tui(tmp_path, "--swarm", provide_docker=False)
+
+    assert result.returncode != 0
+    assert "docker_unavailable" in result.stderr
+    assert calls == []
+
+
+def test_tui_compose_service_is_interactive_portless_and_control_plane_only() -> None:
+    compose = (_REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "  tui-control:" in compose
+    tui = compose.split("  tui-control:", 1)[1].split("\n  ui:", 1)[0]
+    assert "stdin_open: true" in tui
+    assert "tty: true" in tui
+    assert "ports:" not in tui
+    assert "/var/run/docker.sock:/var/run/docker.sock" in tui
+    assert 'DSWARM_CONTROL_HOST: "tui-control"' in tui
+    assert 'DSWARM_MODEL_GATEWAY_BIND: "0.0.0.0"' in tui
+    assert 'DSWARM_GATEWAY_URL: "http://tui-control:9101/v1"' in tui
+    assert compose.count("/var/run/docker.sock:/var/run/docker.sock") == 2

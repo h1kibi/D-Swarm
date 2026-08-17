@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import json
 import math
 import ntpath
+import os
 from pathlib import Path, PurePosixPath
 import re
 import time
@@ -28,7 +29,16 @@ CONTAINER_WORKSPACE = "/home/kali/workspace"
 _MANAGED_LABEL = "com.dswarm.managed"
 _LABEL_PREFIX = "com.dswarm."
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SAFE_CONTROL_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _SAFE_STATUS = frozenset({"starting", "running", "finished", "timeout", "oom", "cancelled", "steered", "failed"})
+
+def _control_host_from_environment() -> str:
+    """Return the validated control-plane host used by worker supervisors."""
+    raw = os.environ.get("DSWARM_CONTROL_HOST")
+    host = "host.docker.internal" if raw is None else raw.strip()
+    if not host or not _SAFE_CONTROL_HOST_RE.fullmatch(host):
+        raise ContainerRuntimeError("invalid_control_host")
+    return host
 
 
 class ContainerRuntimeError(RuntimeError):
@@ -398,6 +408,7 @@ class ContainerRuntimeExecutor:
         if not isinstance(startup_timeout, (int, float)) or isinstance(startup_timeout, bool) or startup_timeout <= 0:
             raise ContainerRuntimeError("invalid_startup_timeout")
 
+        control_host = _control_host_from_environment()
         pool_instance_id = str(uuid.uuid4())
         identity = ContainerGenerationIdentity(
             run_id=run_id,
@@ -461,7 +472,7 @@ class ContainerRuntimeExecutor:
                 user="0:0",
                 command=(
                     "--connect",
-                    f"host.docker.internal:{port}",
+                    f"{control_host}:{port}",
                     "--workspace",
                     CONTAINER_WORKSPACE,
                 ),

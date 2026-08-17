@@ -207,6 +207,44 @@ async def test_create_uses_exact_snapshot_identity_labels_and_mount_allowlist(tm
     ]
 
 
+
+@pytest.mark.asyncio
+async def test_create_uses_validated_control_host_from_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DSWARM_CONTROL_HOST", "tui-control")
+    docker = FakeDocker()
+
+    await ready_executor(tmp_path, docker=docker)
+
+    assert docker.create_calls[0].command[:2] == (
+        "--connect",
+        "tui-control:9100",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host",
+    ["", "bad host", "bad\nhost", "host/path", "host:9100"],
+)
+async def test_create_rejects_invalid_control_host_without_starting_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host: str,
+) -> None:
+    monkeypatch.setenv("DSWARM_CONTROL_HOST", host)
+    docker = FakeDocker()
+    receiver = FakeReceiver()
+
+    with pytest.raises(ContainerRuntimeError, match="invalid_control_host"):
+        await ready_executor(tmp_path, docker=docker, receiver=receiver)
+
+    assert receiver.issued == []
+    assert docker.create_calls == []
+
+
 @pytest.mark.asyncio
 async def test_create_freezes_named_network_resources_and_numeric_uid_gid(tmp_path: Path):
     docker = FakeDocker()

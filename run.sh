@@ -57,9 +57,25 @@ require_uv() {
 }
 
 run_tui() {
-  require_uv
-  echo "==> Launching TUI  (Ctrl+C to quit, Esc to interrupt a run)"
-  exec uv run python -m apps.tui "$@"
+  local real_swarm=0
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = "--swarm" ]; then
+      real_swarm=1
+      break
+    fi
+  done
+
+  if [ "$real_swarm" -eq 0 ]; then
+    require_uv
+    echo "==> Launching TUI  (Ctrl+C to quit, Esc to interrupt a run)"
+    exec uv run python -m apps.tui "$@"
+  fi
+
+  require_docker_compose
+  export DSWARM_RUNTIME_MODE=docker
+  echo "==> Launching containerized TUI control plane  (Ctrl+C to quit)"
+  exec docker compose run --rm tui-control "$@"
 }
 
 
@@ -72,7 +88,7 @@ require_local_worker_gate() {
 
 require_docker_compose() {
   if ! command -v docker >/dev/null 2>&1; then
-    echo "ERROR: docker_unavailable: Docker CLI is required for './run.sh web'" >&2
+    echo "ERROR: docker_unavailable: Docker CLI is required for containerized control-plane runs" >&2
     exit 1
   fi
   if ! docker compose version >/dev/null 2>&1; then

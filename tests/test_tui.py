@@ -9,6 +9,7 @@ import asyncio
 
 import pytest
 
+from apps.tui import __main__ as tui_main
 from apps.tui.app import DSwarmTUI, format_event
 from examples.mock_solver import run_mock_solve
 from dswarm.core.cost import CostController
@@ -78,3 +79,118 @@ async def test_tui_escape_sends_interrupt() -> None:
         await pilot.press("escape")
         await pilot.pause()
     assert ("global", "interrupt", "") in got
+
+
+@pytest.mark.asyncio
+async def test_owned_swarm_closes_pool_after_sandbox_shutdown() -> None:
+    calls: list[str] = []
+
+    class Manager:
+        async def close(self) -> None:
+            calls.append("close")
+
+    class Sandbox:
+        async def shutdown_all(self) -> None:
+            calls.append("shutdown")
+
+    class OwnedSwarm:
+        pool_manager = Manager()
+
+        async def run(self) -> None:
+            calls.append("run")
+
+    await tui_main._run_owned_swarm(OwnedSwarm(), Sandbox())
+
+    assert calls == ["run", "shutdown", "close"]
+
+
+@pytest.mark.asyncio
+async def test_owned_swarm_preserves_run_failure_and_still_closes_pool() -> None:
+    calls: list[str] = []
+
+    class Manager:
+        async def close(self) -> None:
+            calls.append("close")
+
+    class Sandbox:
+        async def shutdown_all(self) -> None:
+            calls.append("shutdown")
+
+    class OwnedSwarm:
+        pool_manager = Manager()
+
+        async def run(self) -> None:
+            calls.append("run")
+            raise RuntimeError("run_failed")
+
+    with pytest.raises(RuntimeError, match="run_failed"):
+        await tui_main._run_owned_swarm(OwnedSwarm(), Sandbox())
+
+    assert calls == ["run", "shutdown", "close"]
+
+
+@pytest.mark.asyncio
+async def test_owned_swarm_closes_pool_when_sandbox_shutdown_fails() -> None:
+    calls: list[str] = []
+
+    class Manager:
+        async def close(self) -> None:
+            calls.append("close")
+
+    class Sandbox:
+        async def shutdown_all(self) -> None:
+            calls.append("shutdown")
+            raise RuntimeError("shutdown_failed")
+
+    class OwnedSwarm:
+        pool_manager = Manager()
+
+        async def run(self) -> None:
+            calls.append("run")
+
+    with pytest.raises(RuntimeError, match="shutdown_failed"):
+        await tui_main._run_owned_swarm(OwnedSwarm(), Sandbox())
+
+    assert calls == ["run", "shutdown", "close"]
+
+
+@pytest.mark.asyncio
+async def test_owned_swarm_propagates_cancellation_after_cleanup() -> None:
+    calls: list[str] = []
+
+    class Manager:
+        async def close(self) -> None:
+            calls.append("close")
+
+    class Sandbox:
+        async def shutdown_all(self) -> None:
+            calls.append("shutdown")
+
+    class OwnedSwarm:
+        pool_manager = Manager()
+
+        async def run(self) -> None:
+            calls.append("run")
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await tui_main._run_owned_swarm(OwnedSwarm(), Sandbox())
+
+    assert calls == ["run", "shutdown", "close"]
+
+
+@pytest.mark.asyncio
+async def test_owned_swarm_allows_legacy_swarm_without_pool_manager() -> None:
+    calls: list[str] = []
+
+    class Sandbox:
+        async def shutdown_all(self) -> None:
+            calls.append("shutdown")
+
+    class OwnedSwarm:
+        async def run(self) -> None:
+            calls.append("run")
+
+    await tui_main._run_owned_swarm(OwnedSwarm(), Sandbox())
+
+    assert calls == ["run", "shutdown"]
