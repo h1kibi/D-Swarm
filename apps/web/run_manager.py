@@ -22,7 +22,7 @@ import tarfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from apps.web.provider_errors import ProviderErrorAggregator, classify_provider_error
 from apps.web.run_meta import FolderStore, RunMetaStore
@@ -35,6 +35,9 @@ from dswarm.core.usage_journal import UsageContext, UsageJournal, UsageRecord, U
 from dswarm.core.usage_ledger import SpawnGuard, UsageLedger
 from dswarm.swarm.budget import ProfileBudgetGate
 from dswarm.solver.credential_accounts import ensure_pi_account_from_env
+from dswarm.solver.container_pool import ContainerPoolManager
+from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError, RuntimeSnapshot
+from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuilder, RuntimeSnapshotStore
 
 LOG = logging.getLogger(__name__)
 
@@ -86,6 +89,9 @@ class Run:
     ledger: UsageLedger | None = None
     spawn_guard: SpawnGuard | None = None
     budget_gate: ProfileBudgetGate = field(default_factory=ProfileBudgetGate)
+    runtime_policy: RuntimePolicy | None = None
+    runtime_snapshot: RuntimeSnapshot | None = None
+    pool_manager: ContainerPoolManager | None = None
     hitl: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
     # operator worker commands (spawn/kill a specific engine) the coordinator drains
     worker_cmds: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
@@ -239,7 +245,14 @@ def _apply_blackboard_meta(run: "Run", ev: Event) -> None:
 
 
 class RunManager:
-    def __init__(self, *, sessions_root: "str | Path | None" = None) -> None:
+    def __init__(
+        self,
+        *,
+        sessions_root: "str | Path | None" = None,
+        runtime_snapshot_store: RuntimeSnapshotStore | None = None,
+        runtime_snapshot_builder: RuntimeSnapshotBuilder | None = None,
+        runtime_pool_manager_factory: Callable[..., ContainerPoolManager] | None = None,
+    ) -> None:
         # P2-v3: in the compose layout the sessions/ tree must live UNDER the
         # mirrored data root (DSWARM_HOST_DATA_ROOT bind-mounted into the web
         # container), so worker sibling containers — launched by the host daemon —
@@ -250,6 +263,11 @@ class RunManager:
             sessions_root = os.environ.get("DSWARM_SESSIONS_ROOT") or "sessions"
         self.sessions_root = Path(sessions_root)
         self.sessions_root.mkdir(parents=True, exist_ok=True)
+        self.runtime_snapshot_store = (
+            runtime_snapshot_store or RuntimeSnapshotStore(self.sessions_root)
+        )
+        self.runtime_snapshot_builder = runtime_snapshot_builder
+        self.runtime_pool_manager_factory = runtime_pool_manager_factory
         self.runs: dict[str, Run] = {}
         self.provider_errors = ProviderErrorAggregator()
         self._seq = 0
@@ -800,9 +818,70 @@ class RunManager:
             task = asyncio.create_task(self._emit_budget_alert(run, alert))
             task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
+    def ensure_runtime_context(
+        self,
+        run_id: str,
+        *,
+        policy: RuntimePolicy,
+        worker_profiles: Sequence[Mapping[str, Any]],
+        runtime_profiles: Sequence[Mapping[str, Any]],
+        run_max_workers: int,
+        snapshot_builder: RuntimeSnapshotBuilder | None = None,
+        pool_manager_factory: Callable[..., ContainerPoolManager] | None = None,
+    ) -> tuple[RuntimePolicy, RuntimeSnapshot | None, ContainerPoolManager | None]:
+        """Build or load exactly one immutable runtime context for ``run_id``."""
+        if not isinstance(policy, RuntimePolicy):
+            raise RuntimePolicyError("invalid_runtime_policy")
+        run = self.create(run_id)
+        if run.runtime_policy is not None:
+            if run.runtime_snapshot is not None and run.pool_manager is None:
+                factory = pool_manager_factory or self.runtime_pool_manager_factory
+                if factory is not None:
+                    run.pool_manager = factory(run_id=run_id, snapshot=run.runtime_snapshot)
+            return run.runtime_policy, run.runtime_snapshot, run.pool_manager
+
+        if policy.mode == "local_dev":
+            if not policy.local_workers_allowed:
+                raise RuntimePolicyError("local_worker_policy_denied")
+            run.runtime_policy = policy
+            return policy, None, None
+
+        builder = snapshot_builder or self.runtime_snapshot_builder
+        if builder is None:
+            raise RuntimePolicyError("runtime_snapshot_builder_required")
+        snapshot = builder.build(
+            run_id=run_id,
+            policy=policy,
+            worker_profiles=worker_profiles,
+            runtime_profiles=runtime_profiles,
+            run_max_workers=run_max_workers,
+        )
+        if snapshot.run_id != run_id:
+            raise RuntimePolicyError("runtime_snapshot_run_mismatch")
+        if snapshot.runtime_policy != policy:
+            raise RuntimePolicyError("runtime_policy_snapshot_mismatch")
+        self.runtime_snapshot_store.create(snapshot)
+        run.runtime_policy = snapshot.runtime_policy
+        run.runtime_snapshot = snapshot
+        factory = pool_manager_factory or self.runtime_pool_manager_factory
+        if factory is not None:
+            run.pool_manager = factory(run_id=run_id, snapshot=snapshot)
+        return run.runtime_policy, run.runtime_snapshot, run.pool_manager
+
     def create(self, run_id: str) -> Run:
         if run_id in self.runs:
             return self.runs[run_id]
+        runtime_snapshot = None
+        runtime_policy = None
+        pool_manager = None
+        snapshot_path = self.runtime_snapshot_store.path_for(run_id)
+        if snapshot_path.is_file():
+            runtime_snapshot = self.runtime_snapshot_store.load(run_id)
+            runtime_policy = runtime_snapshot.runtime_policy
+            if self.runtime_pool_manager_factory is not None:
+                pool_manager = self.runtime_pool_manager_factory(
+                    run_id=run_id, snapshot=runtime_snapshot
+                )
         bus = EventBus()
         store = SessionStore(root=self.sessions_root)
         self._sync_bus_seq(bus, store=store, run_id=run_id)
@@ -828,6 +907,9 @@ class RunManager:
             run_id=run_id, bus=bus, cost=CostController(bus=bus), store=store,
             usage_journal=journal, ledger=ledger, spawn_guard=guard,
             budget_gate=ProfileBudgetGate(),
+            runtime_policy=runtime_policy,
+            runtime_snapshot=runtime_snapshot,
+            pool_manager=pool_manager,
             created_seq=self._seq,
             blackboard_token=secrets.token_urlsafe(32),
         )

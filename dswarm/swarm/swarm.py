@@ -23,6 +23,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ from dswarm.core.usage_ledger import SpawnGuard
 from dswarm.models.solve_graph import Challenge
 from dswarm.sandbox.manager import SandboxManager
 from dswarm.solver.result import ArtifactStore
+from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError, RuntimeSnapshot
 from dswarm.solver.types import SolverConfig, SolveOutcome
 from dswarm.solver.credential_accounts import runtime_env_for_engine
 from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root, resolve_llm_provider
@@ -77,6 +79,9 @@ from dswarm.swarm.runtime import SwarmWorkerRuntime
 from dswarm.swarm.runtime_degradation import RuntimeDegradationMixin
 from dswarm.swarm.review_flow import ReviewFlowMixin
 from dswarm.swarm.worker_runtime_mixin import WorkerRuntimeMixin
+
+_WORKER_BACKEND_UNSET = object()
+_RUNTIME_POLICY_UNSET = object()
 
 # P0 defect-4: max operator standing hints kept (LRU). The cumulative text is
 # injected into EVERY new worker's prompt, so an unbounded list bloated it to the
@@ -448,7 +453,10 @@ class Swarm(
         # "container" → workers run inside the run's isolated Docker execution
         #   node, which mounts ONLY the run workspace and account-scoped credential
         #   material. The image is tool-only; credentials are injected at runtime.
-        worker_backend: str = "local",
+        worker_backend: str | object = _WORKER_BACKEND_UNSET,
+        runtime_policy: RuntimePolicy | None | object = _RUNTIME_POLICY_UNSET,
+        runtime_snapshot: RuntimeSnapshot | None = None,
+        pool_manager: Any | None = None,
         runtime_profiles: "Optional[list[dict]]" = None,
         worker_profiles: "Optional[list[dict]]" = None,
         credential_accounts_root: "Optional[Path]" = None,
@@ -478,6 +486,53 @@ class Swarm(
         self.artifacts = artifacts
         self.config = config
         self.run_id = run_id or challenge.id
+        backend_was_supplied = worker_backend is not _WORKER_BACKEND_UNSET
+        policy_was_supplied = runtime_policy is not _RUNTIME_POLICY_UNSET
+        selected_backend = "local" if not backend_was_supplied else str(worker_backend)
+        selected_policy = None if not policy_was_supplied else runtime_policy
+        if selected_policy is not None and not isinstance(selected_policy, RuntimePolicy):
+            raise RuntimePolicyError("invalid_runtime_policy")
+        if selected_policy is None:
+            # Transitional compatibility is intentionally limited to callers that
+            # have not entered the M9 runtime-policy API yet.  Explicitly supplying
+            # ``runtime_policy=None`` cannot authorize host-local workers.
+            if policy_was_supplied and selected_backend == "local":
+                raise RuntimePolicyError("local_worker_policy_denied")
+            if runtime_snapshot is not None or pool_manager is not None:
+                raise RuntimePolicyError("runtime_policy_required")
+        elif selected_policy.mode == "docker":
+            if backend_was_supplied and selected_backend == "local":
+                raise RuntimePolicyError("local_worker_policy_denied")
+            if runtime_snapshot is None:
+                raise RuntimePolicyError("runtime_snapshot_required")
+            if runtime_snapshot.run_id != self.run_id:
+                raise RuntimePolicyError("runtime_snapshot_run_mismatch")
+            if runtime_snapshot.runtime_policy != selected_policy:
+                raise RuntimePolicyError("runtime_policy_snapshot_mismatch")
+            if pool_manager is None:
+                raise RuntimePolicyError("runtime_manager_required")
+            if getattr(pool_manager, "run_id", None) != self.run_id:
+                raise RuntimePolicyError("runtime_manager_run_mismatch")
+            if getattr(pool_manager, "snapshot", None) is not runtime_snapshot:
+                raise RuntimePolicyError("runtime_manager_snapshot_mismatch")
+            selected_backend = "container"
+        else:
+            if not selected_policy.local_workers_allowed:
+                raise RuntimePolicyError("local_worker_policy_denied")
+            if runtime_snapshot is not None or pool_manager is not None:
+                raise RuntimePolicyError("local_runtime_context_must_be_empty")
+            if backend_was_supplied and selected_backend != "local":
+                raise RuntimePolicyError("local_worker_policy_denied")
+            selected_backend = "local"
+
+        self.runtime_policy = selected_policy
+        self.runtime_snapshot = runtime_snapshot
+        self.pool_manager = pool_manager
+        self._runtime_profile_to_pool = MappingProxyType(
+            {pool.profile_id: pool.pool_id for pool in runtime_snapshot.pools}
+            if runtime_snapshot is not None else {}
+        )
+        self.worker_backend = selected_backend
         # executor: vestigial knob (CLI is the only path now — shelled claude/codex
         # agentic workers). Kept for call-site compatibility; always builds
         # CliSolvers. The moat is the provenance gate + shared_graph + reason.
@@ -588,7 +643,7 @@ class Swarm(
         self.workspace_root = self.worker_root.parent if self.worker_root is not None else None
         if self.workspace_root is not None:
             ensure_workspace(self.workspace_root, runtime={
-                "backend": worker_backend,
+                "backend": self.worker_backend,
                 "run_id": self.run_id,
             })
         self.credential_accounts_root = (
@@ -598,7 +653,6 @@ class Swarm(
         # worker execution backend: "local" (host subprocess) or "container" (workers
         # run in the run's Kali tool container for a consistent toolchain). The
         # ContainerHandle is created lazily on first worker spawn (worker_root first).
-        self.worker_backend = worker_backend
         self._container_handle = None  # set lazily by _container() when backend=container
         self._container_runtime_id = ""  # runtime profile id the container was built with (#11)
         self._container_unavailable = False
@@ -734,6 +788,13 @@ class Swarm(
         # "first flag wins" behaviour.
         self._found_flags: list[str] = []
 
+
+    def pool_id_for_profile(self, profile_id: str) -> str:
+        """Return the frozen run-scoped pool identity for one Worker profile."""
+        try:
+            return self._runtime_profile_to_pool[str(profile_id)]
+        except KeyError as exc:
+            raise RuntimePolicyError("runtime_profile_not_in_snapshot") from exc
 
     def _expected_flags(self) -> int:
         return max(1, getattr(self.challenge, "expected_flags", 1) or 1)

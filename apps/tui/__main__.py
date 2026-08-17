@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+from typing import Any, Callable, Mapping
 
 from dswarm.core.cost import CostController
 from dswarm.core.dotenv_boot import load_env
@@ -52,8 +53,14 @@ async def _mock_driver(bus: EventBus, cost: CostController, run_id: str) -> None
     await run_mock_solve(bus, cost, run_id=run_id)
 
 
-async def _swarm_driver(bus: EventBus, cost: CostController, run_id: str,
-                        args: argparse.Namespace) -> None:
+async def _swarm_driver(
+    bus: EventBus,
+    cost: CostController,
+    run_id: str,
+    args: argparse.Namespace,
+    *,
+    runtime_context_factory: Callable[[str, argparse.Namespace], Mapping[str, Any]] | None = None,
+) -> None:
     import os
     import tempfile
 
@@ -76,12 +83,18 @@ async def _swarm_driver(bus: EventBus, cost: CostController, run_id: str,
     sandbox = SandboxManager(bus=bus, root=root / "sbx")
     arts = ArtifactStore(root=root / "arts")
     knowledge = TemplateStore(root=os.environ.get("DSWARM_KNOWLEDGE_DIR", "knowledge"))
+    runtime_context = (
+        dict(runtime_context_factory(run_id, args))
+        if runtime_context_factory is not None
+        else {}
+    )
     async with LLMClient(cost=cost, bus=bus) as llm:
         swarm = Swarm(
             challenge, default_lineup(args.n_solvers), llm=llm, sandbox=sandbox,
             bus=bus, cost=cost, artifacts=arts, config=SolverConfig(),
             run_id=run_id, knowledge=knowledge,
             executor="cli",
+            **runtime_context,
         )
         try:
             await swarm.run()
@@ -89,17 +102,35 @@ async def _swarm_driver(bus: EventBus, cost: CostController, run_id: str,
             await sandbox.shutdown_all()
 
 
+def _driver_for_args(
+    bus: EventBus,
+    cost: CostController,
+    run_id: str,
+    args: argparse.Namespace,
+    *,
+    runtime_context_factory: Callable[[str, argparse.Namespace], Mapping[str, Any]] | None = None,
+):
+    """Select a driver without touching runtime/Docker state for mock mode."""
+    if args.swarm:
+        lineup = f"swarm×{args.n_solvers} ({args.category})"
+        driver = _swarm_driver(
+            bus,
+            cost,
+            run_id,
+            args,
+            runtime_context_factory=runtime_context_factory,
+        )
+    else:
+        lineup = "mock (UI demo — pass --swarm to solve for real)"
+        driver = _mock_driver(bus, cost, run_id)
+    return lineup, driver
+
+
 async def _amain(args: argparse.Namespace) -> None:
     run_id = "tui-run"
     bus = EventBus()
     cost = CostController(bus=bus)
-
-    if args.swarm:
-        lineup = f"swarm×{args.n_solvers} ({args.category})"
-        driver = _swarm_driver(bus, cost, run_id, args)
-    else:
-        lineup = "mock (UI demo — pass --swarm to solve for real)"
-        driver = _mock_driver(bus, cost, run_id)
+    lineup, driver = _driver_for_args(bus, cost, run_id, args)
 
     async def _run_driver() -> None:
         try:

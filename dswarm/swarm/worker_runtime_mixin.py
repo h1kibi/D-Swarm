@@ -617,6 +617,16 @@ class WorkerRuntimeMixin:
         if self.worker_profiles and profile is None:
             raise WorkerSpawnRejected(
                 f"no available worker profile for {engine} role={role}")
+        runtime_policy = getattr(self, "runtime_policy", None)
+        if runtime_policy is not None and runtime_policy.mode == "docker":
+            profile_id = str(
+                (profile or {}).get("name")
+                or (profile or {}).get("id")
+                or engine
+            )
+            # Task 13 only proves that every strict Docker spawn belongs to the
+            # frozen snapshot.  Task 14 owns actual lease acquisition.
+            self.pool_id_for_profile(profile_id)
         budget_gate = getattr(self, "budget_gate", None)
         if budget_gate is not None and profile is not None:
             profile_id = str(profile.get("name") or profile.get("id") or engine or role)
