@@ -42,6 +42,9 @@ _MISSING_TRACE_FAILURE_CODES = {
     "sidecar_append_failed", "sidecar_init_failed", "writer_busy",
     "trace_already_exists", "case_factory_failed", "planner_factory_failed",
     "missing_trace", "trace_read_failed",
+    "sidecar_unavailable", "advisor_writer_busy",
+    "existing_trace_incomplete", "existing_trace_corrupt",
+    "existing_trace_partial", "existing_trace_identity_mismatch",
 }
 
 

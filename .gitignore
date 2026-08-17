@@ -36,9 +36,10 @@ docker/worker-slim/blackboard.SKILL.md
 
 # Runtime output (artifacts the kernel writes, session event logs, eval runs,
 # distilled knowledge templates)
+/local_benchmarks/
 artifacts/
 sessions/
-eval_runs/
+/eval_runs/
 knowledge/
 
 # Local dev/runtime cruft at the repo root: backend process logs, the pi CLI
