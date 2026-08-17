@@ -18,15 +18,15 @@ import (
 // drives commands on that connection. This mirrors the reverse-connect topology
 // without docker — the supervisor logic (fork/stream/signal) is what's exercised.
 type fakeHost struct {
-	ln       net.Listener
-	token    string
-	mu       sync.Mutex
-	conn     net.Conn
-	enc      *json.Encoder
-	r        *bufio.Reader
-	hello    Hello
-	reqSeq   int64
-	frames   chan Frame // every frame the supervisor sends, fanned out to tests
+	ln     net.Listener
+	token  string
+	mu     sync.Mutex
+	conn   net.Conn
+	enc    *json.Encoder
+	r      *bufio.Reader
+	hello  Hello
+	reqSeq int64
+	frames chan Frame // every frame the supervisor sends, fanned out to tests
 }
 
 func newFakeHost(t *testing.T, token string) *fakeHost {
@@ -36,7 +36,12 @@ func newFakeHost(t *testing.T, token string) *fakeHost {
 		t.Fatal(err)
 	}
 	h := &fakeHost{ln: ln, token: token, frames: make(chan Frame, 1024)}
-	t.Cleanup(func() { ln.Close(); if h.conn != nil { h.conn.Close() } })
+	t.Cleanup(func() {
+		ln.Close()
+		if h.conn != nil {
+			h.conn.Close()
+		}
+	})
 	return h
 }
 
@@ -120,6 +125,105 @@ func errIf(c bool, s string) string {
 	return ""
 }
 
+func validSupervisorEnv(token string) map[string]string {
+	return map[string]string{
+		"DSWARM_RUN_ID":           "run-a",
+		"DSWARM_POOL_ID":          "pool-v1::abc",
+		"DSWARM_POOL_INSTANCE_ID": "11111111-1111-4111-8111-111111111111",
+		"DSWARM_POOL_GENERATION":  "3",
+		"DSWARM_CONTROL_TOKEN":    token,
+	}
+}
+
+func TestHelloV2CarriesPoolInstanceIdentity(t *testing.T) {
+	got := Hello{
+		ProtocolVersion: 2,
+		RunID:           "run-a",
+		PoolID:          "pool-v1::abc",
+		PoolInstanceID:  "11111111-1111-4111-8111-111111111111",
+		Generation:      3,
+		Token:           "opaque",
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["protocol_version"] != float64(2) || wire["generation"] != float64(3) {
+		t.Fatalf("bad hello: %s", raw)
+	}
+	if wire["pool_id"] != "pool-v1::abc" || wire["pool_instance_id"] != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("missing pool identity: %s", raw)
+	}
+	if _, legacy := wire["hello"]; legacy {
+		t.Fatalf("legacy hello marker leaked into v2: %s", raw)
+	}
+}
+
+func TestSupervisorIdentityFromEnvAcceptsCanonicalV2Identity(t *testing.T) {
+	got, err := supervisorIdentityFromEnv(validSupervisorEnv("opaque"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProtocolVersion != 2 || got.RunID != "run-a" || got.PoolID != "pool-v1::abc" ||
+		got.PoolInstanceID != "11111111-1111-4111-8111-111111111111" || got.Generation != 3 || got.Token != "opaque" {
+		t.Fatalf("unexpected identity: %+v", got)
+	}
+}
+
+func TestSupervisorIdentityFromEnvReadsTokenFile(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "control-token")
+	if err := os.WriteFile(tokenPath, []byte("opaque-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := validSupervisorEnv("")
+	delete(env, "DSWARM_CONTROL_TOKEN")
+	env["DSWARM_CONTROL_TOKEN_FILE"] = tokenPath
+	got, err := supervisorIdentityFromEnv(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Token != "opaque-file" {
+		t.Fatalf("unexpected token from file: %q", got.Token)
+	}
+}
+
+func TestSupervisorIdentityFromEnvRejectsMalformedOrMissingV2Identity(t *testing.T) {
+	tests := []struct {
+		name   string
+		field  string
+		value  string
+		remove bool
+	}{
+		{name: "missing run", field: "DSWARM_RUN_ID", remove: true},
+		{name: "missing pool", field: "DSWARM_POOL_ID", remove: true},
+		{name: "malformed uuid", field: "DSWARM_POOL_INSTANCE_ID", value: "not-a-uuid"},
+		{name: "uppercase uuid", field: "DSWARM_POOL_INSTANCE_ID", value: "11111111-1111-4111-8111-11111111111A"},
+		{name: "non-v4 uuid", field: "DSWARM_POOL_INSTANCE_ID", value: "11111111-1111-1111-8111-111111111111"},
+		{name: "zero generation", field: "DSWARM_POOL_GENERATION", value: "0"},
+		{name: "negative generation", field: "DSWARM_POOL_GENERATION", value: "-1"},
+		{name: "noncanonical generation", field: "DSWARM_POOL_GENERATION", value: "03"},
+		{name: "nonnumeric generation", field: "DSWARM_POOL_GENERATION", value: "three"},
+		{name: "missing token", field: "DSWARM_CONTROL_TOKEN", remove: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := validSupervisorEnv("opaque")
+			if tc.remove {
+				delete(env, tc.field)
+			} else {
+				env[tc.field] = tc.value
+			}
+			if _, err := supervisorIdentityFromEnv(env); err == nil {
+				t.Fatal("expected identity validation error")
+			}
+		})
+	}
+}
+
 // startSupervisorDialing runs a supervisor that dials the fake host in a background
 // goroutine (the dial blocks until the host accepts). Safe to call as `go
 // startSupervisorDialing(...)`: it uses t.Errorf (goroutine-safe) not t.Fatal.
@@ -131,7 +235,16 @@ func startSupervisorDialing(t *testing.T, host *fakeHost, runID, token string) {
 		t.Errorf("mkdir workspace: %v", err)
 		return
 	}
-	s := &supervisor{runID: runID, token: token, workspace: ws, workers: map[string]*worker{}}
+	s := &supervisor{
+		protocolVersion: 2,
+		runID:           runID,
+		poolID:          "pool-v1::test",
+		poolInstanceID:  "11111111-1111-4111-8111-111111111111",
+		generation:      1,
+		token:           token,
+		workspace:       ws,
+		workers:         map[string]*worker{},
+	}
 	conn := s.dialHost(host.addr(), 5*time.Second)
 	if conn == nil {
 		t.Errorf("supervisor could not dial fake host")
@@ -153,7 +266,8 @@ func TestHelloHandshakeAndStartWorker(t *testing.T) {
 	// supervisor dials in a goroutine; host accepts.
 	go startSupervisorDialing(t, host, "run-A", "tok123")
 	hello := host.accept(t)
-	if hello.RunID != "run-A" || hello.Token != "tok123" {
+	if hello.ProtocolVersion != 2 || hello.RunID != "run-A" || hello.PoolID != "pool-v1::test" ||
+		hello.PoolInstanceID != "11111111-1111-4111-8111-111111111111" || hello.Generation != 1 || hello.Token != "tok123" {
 		t.Fatalf("bad hello: %+v", hello)
 	}
 
@@ -375,7 +489,16 @@ func TestTokenRejected(t *testing.T) {
 	go func() {
 		ws := filepath.Join(t.TempDir(), "ws")
 		_ = os.MkdirAll(ws, 0o755)
-		s := &supervisor{runID: "run-X", token: "wrong", workspace: ws, workers: map[string]*worker{}}
+		s := &supervisor{
+			protocolVersion: 2,
+			runID:           "run-X",
+			poolID:          "pool-v1::test",
+			poolInstanceID:  "11111111-1111-4111-8111-111111111111",
+			generation:      1,
+			token:           "wrong",
+			workspace:       ws,
+			workers:         map[string]*worker{},
+		}
 		conn := s.dialHost(host.addr(), 3*time.Second)
 		if conn != nil {
 			t.Errorf("dial should have failed on bad token")

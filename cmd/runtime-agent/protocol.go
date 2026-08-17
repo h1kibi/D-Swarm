@@ -1,32 +1,24 @@
 package main
 
-// Runtime Control Plane wire protocol — newline-delimited JSON over a single REVERSE
-// connection (§8-9 of docs/DESIGN_worker_image_clean_rebuild.md). Dependency-free
-// (encoding/json only) so the supervisor stays a single static binary.
+// Runtime Control Plane wire protocol: newline-delimited JSON over one reverse
+// connection per pool instance. It remains standard-library-only so the
+// supervisor can ship as a single static binary.
 //
-// The host-side Python client (dswarm/solver/control_client.py) speaks the exact
-// same frames; any change here must be mirrored there.
+// The host-side Python receiver in dswarm/solver/control_receiver.py validates
+// the same frames; protocol changes must remain synchronized across both sides.
 //
 // Topology (reverse-connect, forward-control):
-//   - The supervisor does NOT listen on any port. At startup it DIALS the host's
-//     control receiver (host.docker.internal:<port>) and sends a Hello frame with
-//     {run_id, token}. The host validates the token and replies HelloAck.
-//   - That one connection then carries ALL control for the run. The HOST is still
-//     the command side: it sends Request frames (each tagged with a ReqID), the
-//     supervisor executes and replies with Response/StreamEvent frames tagged with
-//     the same ReqID / a WorkerID.
-//   - Because there is exactly ONE connection per run (the container dials once),
-//     multiple workers' streams are MULTIPLEXED on it via WorkerID on each frame.
+//   - The supervisor opens no listening port. It dials the host receiver and sends
+//     {protocol_version, run_id, pool_id, pool_instance_id, generation, token}.
+//   - The host validates the frozen pool-generation identity and token, then sends
+//     HelloAck.
+//   - The established connection multiplexes every worker in that pool instance
+//     through WorkerID-tagged request, response, and stream frames.
 //
-// Why reverse: a listening supervisor (UDS or TCP) is either unreachable across the
-// Docker Desktop VM (UDS) or an open network service the worker itself could drive
-// (TCP). Dialing OUT to the host means the supervisor opens no port (the worker has
-// no entry point to it), works across the VM (container→host is supported), and N
-// runs all reach the host's single receiver port (no per-run published ports).
-//
-// Auth: the Hello frame's token is validated by the host against the per-run token
-// it generated. NOT a boundary against the worker (trusted, runs as kali+sudo) —
-// it just keeps a stray/duplicate connection from driving the wrong run.
+// Reverse-connect keeps the worker from driving a supervisor network service and
+// lets all pool containers share one host receiver port. The token prevents a
+// stray or stale container from attaching to the wrong pool generation; it is not
+// a security boundary against the trusted in-container worker.
 
 // Op codes (host → supervisor).
 const (
@@ -38,11 +30,15 @@ const (
 )
 
 // Hello is the FIRST frame the supervisor sends after dialing the host receiver.
+// RCP v2 routes links by immutable pool-generation identity, not merely by run_id.
 type Hello struct {
-	Hello   int    `json:"hello"`            // protocol marker, always 1
-	RunID   string `json:"run_id"`
-	Token   string `json:"token"`
-	Version string `json:"version,omitempty"`
+	ProtocolVersion int    `json:"protocol_version"`
+	RunID           string `json:"run_id"`
+	PoolID          string `json:"pool_id"`
+	PoolInstanceID  string `json:"pool_instance_id"`
+	Generation      int    `json:"generation"`
+	Token           string `json:"token"`
+	Version         string `json:"version,omitempty"`
 }
 
 // HelloAck is the host's reply to Hello.
@@ -109,11 +105,11 @@ type Frame struct {
 	Signalled int  `json:"signalled,omitempty"`
 
 	// t == "resp" (Signal / Status / TeardownRun / Health)
-	OK       bool   `json:"ok,omitempty"`
-	State    string `json:"state,omitempty"` // Status: running | exited | timed_out | oom | unknown
-	RcPtr    *int   `json:"rc_ptr,omitempty"`
-	Paused   bool   `json:"paused,omitempty"`
-	Version  string `json:"version,omitempty"` // Health
-	Workers  int    `json:"workers,omitempty"` // Health: running worker count
-	Uptime   int64  `json:"uptime_sec,omitempty"`
+	OK      bool   `json:"ok,omitempty"`
+	State   string `json:"state,omitempty"` // Status: running | exited | timed_out | oom | unknown
+	RcPtr   *int   `json:"rc_ptr,omitempty"`
+	Paused  bool   `json:"paused,omitempty"`
+	Version string `json:"version,omitempty"` // Health
+	Workers int    `json:"workers,omitempty"` // Health: running worker count
+	Uptime  int64  `json:"uptime_sec,omitempty"`
 }

@@ -2,7 +2,7 @@
 //
 // It is the container's PID1 (ENTRYPOINT). It does NOT listen on any port. At startup
 // it DIALS the host's control receiver (host.docker.internal:<port>), sends a Hello
-// with {run_id, token}, and then serves the host's commands on that one connection:
+// with the immutable RCP-v2 pool identity and token, and then serves the host commands on that one connection:
 // StartWorker / Signal / Status / TeardownRun / Health. It is a DUMB EXECUTOR — it
 // forks workers, forwards their raw output, routes signals, reports status. It does
 // NOT touch flag judgment, fact provenance, graph writes, or key lookups; those stay
@@ -35,9 +35,13 @@ const agentVersion = "dswarm-runtime-agent/2"
 var startedAt = time.Now()
 
 type supervisor struct {
-	runID     string
-	token     string
-	workspace string
+	protocolVersion int
+	runID           string
+	poolID          string
+	poolInstanceID  string
+	generation      int
+	token           string
+	workspace       string
 
 	// the single reverse connection to the host + a write mutex (all worker streams
 	// multiplex onto it, so writes must be serialized).
@@ -50,14 +54,17 @@ type supervisor struct {
 	// exited workers retained briefly so the orphan sweep can kill grandchildren
 	// that outlive the worker (including setsid-detached descendants).
 	deadWorkers []*worker
-	seq     int
+	seq         int
 }
 
 func main() {
 	connect := flag.String("connect", "", "host control receiver host:port to dial (e.g. host.docker.internal:9100). Required.")
-	runID := flag.String("run-id", "", "this run's id, sent in the Hello frame")
-	tokenPath := flag.String("token", "", "path to the per-run token file (default: /run/dswarm/control/token)")
-	tokenInline := flag.String("token-value", "", "the per-run token directly (overrides --token file)")
+	// Deprecated flags remain accepted while image launchers migrate, but RCP-v2
+	// identity is never synthesized from them. Pool identity and the control token
+	// must come from the DSWARM_* environment contract below.
+	_ = flag.String("run-id", "", "(deprecated; RCP-v2 identity comes from DSWARM_RUN_ID)")
+	_ = flag.String("token", "", "(deprecated; use DSWARM_CONTROL_TOKEN_FILE)")
+	_ = flag.String("token-value", "", "(deprecated; use DSWARM_CONTROL_TOKEN)")
 	workspace := flag.String("workspace", "/home/kali/workspace", "worker workspace (mount target)")
 	// kept for backward-compat with the baked ENTRYPOINT (--sock ... is ignored now).
 	_ = flag.String("sock", "", "(ignored — reverse-connect model uses --connect)")
@@ -67,23 +74,23 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetPrefix("[runtime-agent] ")
 
+	identity, err := supervisorIdentityFromEnv(processEnvironment())
+	if err != nil {
+		// Validation errors name fields but never include secret values.
+		log.Fatalf("invalid RCP-v2 runtime identity: %v", err)
+	}
+
 	resolveKali()
 
 	s := &supervisor{
-		runID:     *runID,
-		workspace: *workspace,
-		workers:   map[string]*worker{},
-	}
-
-	// Token: inline value wins, else read the file.
-	if *tokenInline != "" {
-		s.token = strings.TrimSpace(*tokenInline)
-	} else {
-		tp := *tokenPath
-		if tp == "" {
-			tp = "/run/dswarm/control/token"
-		}
-		s.token = s.readToken(tp)
+		protocolVersion: identity.ProtocolVersion,
+		runID:           identity.RunID,
+		poolID:          identity.PoolID,
+		poolInstanceID:  identity.PoolInstanceID,
+		generation:      identity.Generation,
+		token:           identity.Token,
+		workspace:       *workspace,
+		workers:         map[string]*worker{},
 	}
 
 	// The host bind-mounts the workspace dir created by the (root) web process, so
@@ -154,7 +161,15 @@ func (s *supervisor) dialHost(addr string, deadline time.Duration) net.Conn {
 		}
 		// send Hello, await HelloAck.
 		enc := json.NewEncoder(conn)
-		if err := enc.Encode(Hello{Hello: 1, RunID: s.runID, Token: s.token, Version: agentVersion}); err != nil {
+		if err := enc.Encode(Hello{
+			ProtocolVersion: s.protocolVersion,
+			RunID:           s.runID,
+			PoolID:          s.poolID,
+			PoolInstanceID:  s.poolInstanceID,
+			Generation:      s.generation,
+			Token:           s.token,
+			Version:         agentVersion,
+		}); err != nil {
 			conn.Close()
 			time.Sleep(500 * time.Millisecond)
 			continue
@@ -312,15 +327,6 @@ func (s *supervisor) opHealth(req *Request) {
 		T: "resp", ReqID: req.ReqID, OK: true, Version: agentVersion,
 		Workers: n, Uptime: int64(time.Since(startedAt).Seconds()),
 	})
-}
-
-func (s *supervisor) readToken(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Printf("no token file at %s (%v) — auth disabled", path, err)
-		return ""
-	}
-	return strings.TrimSpace(string(data))
 }
 
 // chownWorkspaceRoot makes the bind-mounted workspace directory owned by the kali
