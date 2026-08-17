@@ -220,11 +220,11 @@ class _SupervisorLink:
     def status(self, worker_id: str, *, timeout: float = 10.0) -> dict:
         return self._request("Status", worker_id=worker_id, timeout=timeout)
 
-    def teardown(self, *, timeout: float = 15.0) -> None:
+    def teardown(self, *, timeout: float = 15.0) -> Optional[dict]:
         try:
-            self._request("TeardownRun", timeout=timeout)
+            return self._request("TeardownRun", timeout=timeout)
         except ControlError:
-            pass
+            return None
 
     def start_worker(self, spec: dict, *, timeout: float) -> "tuple[str, _FrameQueue]":
         """Send StartWorker, register a stream queue for the assigned worker_id, and

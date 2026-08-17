@@ -121,6 +121,7 @@ def run_cli_streaming_rcp(
     cancel_event: "Optional[threading.Event]" = None,
     on_proc: "Optional[Callable[[object], None]]" = None,
     steer_event: "Optional[threading.Event]" = None,
+    link: "Optional[_SupervisorLink]" = None,
 ) -> CliResult:
     """Streaming worker run via the rcp supervisor. Mirrors
     container_exec.run_cli_streaming_container (cancel/steer/pause); control routes
@@ -129,7 +130,8 @@ def run_cli_streaming_rcp(
     `argv` MUST already be container-side (argv[0] = in-container bin) and
     `container_cwd` already mapped — container_exec does that before calling us.
     """
-    link = _resolve_link(run_id)
+    if link is None:
+        link = _resolve_link(run_id)
     spec = {
         "argv": argv,
         "cwd": container_cwd,
@@ -260,11 +262,12 @@ def run_cli_streaming_rcp(
 
 
 def run_cli_rcp(driver, argv: list[str], *, run_id: str, container_cwd: str,
-                timeout: int, env: Optional[dict] = None) -> CliResult:
+                timeout: int, env: Optional[dict] = None,
+                link: "Optional[_SupervisorLink]" = None) -> CliResult:
     """Non-streaming worker run — collects the full stream then parses once."""
     return run_cli_streaming_rcp(
         driver, argv, run_id=run_id, container_cwd=container_cwd,
-        timeout=timeout, env=env, on_step=lambda _s: None)
+        timeout=timeout, env=env, on_step=lambda _s: None, link=link)
 
 
 # ── lifecycle helpers used by container_exec ──────────────────────────────────

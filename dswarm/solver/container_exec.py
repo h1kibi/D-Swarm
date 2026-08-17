@@ -52,6 +52,8 @@ from dswarm.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 from dswarm.solver.docker import docker_run
 from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, direction_image
 
+LEGACY_CONTAINER_EXEC_COMPATIBILITY_FACADE = True
+
 # Tool-only worker image. Real credentials are injected from Credential Accounts
 # at runtime; do not bake pi provider/login state into this image. Override with
 # DSWARM_WORKER_IMAGE to pin a different registry or version.

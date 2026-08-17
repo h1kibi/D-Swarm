@@ -283,6 +283,21 @@ def test_teardown_run_forgets_receiver_link(receiver):
     assert receiver.get_link("run-teardown") is None
     assert receiver.has_link("run-teardown") is False
 
+def test_supervisor_link_teardown_returns_acknowledged_response():
+    link = object.__new__(cr._SupervisorLink)
+    response = {"t": "resp", "req_id": 7, "ok": True}
+    calls = []
+
+    def request(op, *, timeout, **fields):
+        calls.append((op, timeout, fields))
+        return response
+
+    link._request = request
+
+    assert link.teardown(timeout=8.0) is response
+    assert calls == [("TeardownRun", 8.0, {})]
+
+
 def test_filter_env_only_allowed_keys():
     out = cc._filter_env({
         "DSWARM_X": "1", "ANTHROPIC_KEY": "k", "DEEPSEEK_API_KEY_FILE": "/f",
@@ -511,3 +526,53 @@ def test_receiver_shutdown_wakes_pool_waiter(receiver):
     assert len(observed) == 1
     assert isinstance(observed[0], cr.ControlError)
     assert str(observed[0]) == "control_receiver_stopped"
+
+class _ExplicitLinkQueue:
+    def __init__(self):
+        self._frames = [
+            {"t": "out", "line": "pool scoped"},
+            {"t": "exit", "rc": 0, "oom": False, "timed_out": False},
+        ]
+
+    def get(self, timeout):
+        del timeout
+        return self._frames.pop(0) if self._frames else None
+
+
+class _ExplicitPoolLink:
+    alive = True
+
+    def __init__(self):
+        self.started = []
+        self.dropped = []
+
+    def start_worker(self, spec, *, timeout):
+        self.started.append((spec, timeout))
+        return "pool-worker-1", _ExplicitLinkQueue()
+
+    def drop_stream(self, worker_id):
+        self.dropped.append(worker_id)
+
+    def signal(self, worker_id, name, timeout=10.0):
+        return {"ok": True, "worker_id": worker_id, "signal": name}
+
+
+def test_run_cli_rcp_uses_explicit_pool_link_without_run_global_lookup(monkeypatch):
+    link = _ExplicitPoolLink()
+
+    def forbidden_lookup(_run_id, *, deadline_s=None):
+        raise AssertionError(f"run-global lookup used: {deadline_s}")
+
+    monkeypatch.setattr(cc, "_resolve_link", forbidden_lookup)
+    result = cc.run_cli_rcp(
+        _Driver(),
+        ["pi", "prompt"],
+        run_id="shared-run",
+        container_cwd="/home/kali/workspace/w1",
+        timeout=5,
+        link=link,
+    )
+
+    assert result.text == "pool scoped"
+    assert link.started[0][0]["argv"] == ["pi", "prompt"]
+    assert link.dropped == ["pool-worker-1"]
