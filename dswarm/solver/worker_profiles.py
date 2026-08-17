@@ -347,3 +347,45 @@ def resolve_seat_ref(
                    if isinstance(s, dict) and str(s.get("engine")) == ref and s.get("id")]
         return matches[0] if len(matches) == 1 else None
     return None
+
+
+def normalize_runtime_profile(
+    item: Mapping[str, Any], *, reject_invalid: bool = False
+) -> dict[str, Any] | None:
+    """Normalize one runtime profile without reading ambient secrets or paths."""
+
+    if not isinstance(item, Mapping):
+        if reject_invalid:
+            raise ValueError("runtime profile must be an object")
+        return None
+    runtime_id = str(item.get("id") or "").strip()
+    backend = str(item.get("backend") or "").strip().lower()
+    if not runtime_id or backend not in {"container", "local"}:
+        if reject_invalid:
+            raise ValueError("runtime profile requires id and valid backend")
+        return None
+
+    raw_features = item.get("runtime_features", ("rcp-v2", "tool-disabled-probe"))
+    if isinstance(raw_features, str):
+        raw_features = [raw_features]
+    if not isinstance(raw_features, (list, tuple, set, frozenset)):
+        if reject_invalid:
+            raise ValueError("runtime_features must be a sequence")
+        raw_features = ("rcp-v2", "tool-disabled-probe")
+
+    normalized = {
+        "id": runtime_id,
+        "backend": backend,
+        "label": str(item.get("label") or runtime_id).strip(),
+        "network": str(
+            item.get("network") or ("bridge" if backend == "container" else "")
+        ).strip(),
+        "cpus": str(item.get("cpus") or "1").strip(),
+        "memory": str(item.get("memory") or "1g").strip(),
+        "pids_limit": item.get("pids_limit") or 256,
+        "tmpfs_bytes": item.get("tmpfs_bytes") or 67108864,
+        "runtime_features": tuple(sorted({str(value).strip() for value in raw_features if str(value).strip()})),
+        "protocol_version": item.get("protocol_version") or 2,
+        "pool_max_concurrent_workers": item.get("pool_max_concurrent_workers"),
+    }
+    return normalized

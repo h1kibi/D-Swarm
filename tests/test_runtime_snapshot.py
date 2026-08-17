@@ -1,11 +1,16 @@
 ﻿from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from dswarm.solver.runtime_policy import build_runtime_policy
 from dswarm.solver.runtime_snapshot import (
     DockerImageInspector,
     ResolvedWorkerImage,
+    RuntimeSnapshotBuilder,
     RuntimeSnapshotBuildError,
+    RuntimeSnapshotStore,
     validate_shared_worker_identity,
 )
 
@@ -114,3 +119,160 @@ def test_empty_worker_image_set_is_rejected():
     with pytest.raises(RuntimeSnapshotBuildError) as exc:
         validate_shared_worker_identity([])
     assert exc.value.code == "worker_identity_mismatch"
+
+
+
+WEB_PROFILE = {
+    "id": "pi-web",
+    "name": "pi-web",
+    "engine": "pi",
+    "runtime": "docker-web",
+    "image": "worker:a",
+    "credential_account": "pi-web-main",
+    "provider_ref": "deepseek",
+    "model": "deepseek-chat",
+}
+PWN_PROFILE = {
+    "id": "pi-pwn",
+    "name": "pi-pwn",
+    "engine": "pi",
+    "runtime": "docker-pwn",
+    "image": "worker:b",
+    "credential_account": "pi-pwn-main",
+    "provider_ref": "deepseek",
+    "model": "deepseek-chat",
+}
+WEB_RUNTIME = {
+    "id": "docker-web",
+    "backend": "container",
+    "network": "bridge",
+    "cpus": "2.0",
+    "memory": "2G",
+    "pids_limit": 256,
+    "tmpfs_bytes": 67108864,
+}
+PWN_RUNTIME = {
+    "id": "docker-pwn",
+    "backend": "container",
+    "network": "none",
+    "cpus": "4",
+    "memory": "4g",
+    "pids_limit": 512,
+    "tmpfs_bytes": 134217728,
+}
+
+
+def snapshot_builder(*, image_ids=None):
+    docker = FakeDocker()
+    docker.images.update(image_ids or {"worker:a": "sha256:a", "worker:b": "sha256:b"})
+    return RuntimeSnapshotBuilder(DockerImageInspector(docker, allow_pull=False))
+
+
+def build_snapshot(run_id="run-1", **changes):
+    values = {
+        "run_id": run_id,
+        "policy": build_runtime_policy(env={}),
+        "worker_profiles": [WEB_PROFILE, PWN_PROFILE],
+        "runtime_profiles": [WEB_RUNTIME, PWN_RUNTIME],
+        "run_max_workers": 6,
+    }
+    values.update(changes)
+    return snapshot_builder().build(**values)
+
+
+def test_snapshot_freezes_image_id_pool_limit_and_binding_identity(tmp_path):
+    snapshot = build_snapshot()
+    assert len(snapshot.pools) == 2
+    assert {pool.pool_max_concurrent_workers for pool in snapshot.pools} == {6}
+    assert all(pool.resolved_image_id.startswith("sha256:") for pool in snapshot.pools)
+    assert {pool.credential_binding_id for pool in snapshot.pools} == {
+        "pi-web-main",
+        "pi-pwn-main",
+    }
+    serialized = RuntimeSnapshotStore(tmp_path).create(snapshot).read_text("utf-8")
+    for forbidden in ("API_KEY", "secret", str(Path.home()), ".pi"):
+        assert forbidden not in serialized
+
+
+def test_snapshot_is_create_once_and_tag_drift_does_not_rewrite_existing_run(tmp_path):
+    store = RuntimeSnapshotStore(tmp_path)
+    original = snapshot_builder(image_ids={"worker:a": "sha256:old"}).build(
+        run_id="run-1",
+        policy=build_runtime_policy(env={}),
+        worker_profiles=[WEB_PROFILE],
+        runtime_profiles=[WEB_RUNTIME],
+        run_max_workers=3,
+    )
+    store.create(original)
+    changed = snapshot_builder(image_ids={"worker:a": "sha256:new"}).build(
+        run_id="run-1",
+        policy=build_runtime_policy(env={}),
+        worker_profiles=[WEB_PROFILE],
+        runtime_profiles=[WEB_RUNTIME],
+        run_max_workers=3,
+    )
+    with pytest.raises(RuntimeSnapshotBuildError, match="snapshot_already_exists"):
+        store.create(changed)
+    assert store.load("run-1").pools[0].resolved_image_id == "sha256:old"
+
+
+def test_snapshot_rejects_pool_count_over_policy_cap():
+    policy = build_runtime_policy(env={}, max_pools_per_run=1)
+    with pytest.raises(RuntimeSnapshotBuildError) as exc:
+        build_snapshot(policy=policy)
+    assert exc.value.code == "max_pools_per_run_exceeded"
+
+
+def test_snapshot_rejects_duplicate_profile_mapping():
+    with pytest.raises(RuntimeSnapshotBuildError) as exc:
+        build_snapshot(worker_profiles=[WEB_PROFILE, dict(WEB_PROFILE)])
+    assert exc.value.code == "duplicate_profile_mapping"
+
+
+def test_snapshot_pool_order_is_stable_by_profile_then_pool_id():
+    snapshot = build_snapshot(worker_profiles=[PWN_PROFILE, WEB_PROFILE])
+    assert [pool.profile_id for pool in snapshot.pools] == ["pi-pwn", "pi-web"]
+
+
+def test_snapshot_store_fsyncs_and_uses_private_runtime_path(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("dswarm.solver.runtime_snapshot.os.fsync", lambda fd: calls.append(fd))
+    path = RuntimeSnapshotStore(tmp_path).create(build_snapshot())
+    assert path == tmp_path / "run-1" / ".runtime" / "pool-snapshot.v1.json"
+    assert len(calls) >= 1
+    assert all(".runtime" not in field for pool in build_snapshot().pools for field in pool.__dataclass_fields__)
+
+
+def test_snapshot_store_rejects_path_traversal(tmp_path):
+    store = RuntimeSnapshotStore(tmp_path)
+    with pytest.raises(RuntimeSnapshotBuildError, match="invalid_run_id"):
+        store.path_for("../other-run")
+
+
+def test_snapshot_has_no_credential_version_or_secret_fields():
+    snapshot = build_snapshot()
+    assert "credential_version" not in snapshot.pools[0].__dataclass_fields__
+    assert "secret" not in snapshot.pools[0].__dataclass_fields__
+
+
+def test_host_and_named_networks_are_normalized():
+    host = dict(WEB_RUNTIME, network="host")
+    named = dict(PWN_RUNTIME, network="competition_net")
+    snapshot = build_snapshot(runtime_profiles=[host, named])
+    by_profile = {pool.profile_id: pool.network for pool in snapshot.pools}
+    assert (by_profile["pi-web"].kind, by_profile["pi-web"].name) == ("host", "")
+    assert (by_profile["pi-pwn"].kind, by_profile["pi-pwn"].name) == (
+        "named",
+        "competition_net",
+    )
+
+
+def test_snapshot_store_replace_failure_leaves_no_partial_final_file(tmp_path, monkeypatch):
+    store = RuntimeSnapshotStore(tmp_path)
+    monkeypatch.setattr(
+        "dswarm.solver.runtime_snapshot.os.replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    with pytest.raises(RuntimeSnapshotBuildError, match="snapshot_write_failed"):
+        store.create(build_snapshot())
+    assert not store.path_for("run-1").exists()

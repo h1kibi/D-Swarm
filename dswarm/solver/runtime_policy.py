@@ -97,7 +97,7 @@ class RuntimeNetworkSpec:
         if not isinstance(self.kind, str):
             raise RuntimePolicyError("invalid_network")
         normalized_kind = self.kind.strip().lower()
-        if normalized_kind not in {"none", "bridge", "named"}:
+        if normalized_kind not in {"none", "bridge", "host", "named"}:
             raise RuntimePolicyError("invalid_network")
         normalized_name = self.name.strip() if isinstance(self.name, str) else ""
         if normalized_kind == "named":
@@ -211,6 +211,40 @@ class RuntimeSnapshot:
     shared_uid: int
     shared_gid: int
     pools: tuple[PoolSpec, ...]
+
+    def __post_init__(self) -> None:
+        if self.version != 1 or self.version != self.runtime_policy.snapshot_version:
+            raise RuntimePolicyError("invalid_snapshot_version")
+        if not isinstance(self.run_id, str) or not self.run_id:
+            raise RuntimePolicyError("invalid_run_id")
+        if (
+            isinstance(self.created_at, bool)
+            or not isinstance(self.created_at, (int, float))
+            or not math.isfinite(float(self.created_at))
+            or self.created_at < 0
+        ):
+            raise RuntimePolicyError("invalid_snapshot_created_at")
+        if not _is_positive_int(self.shared_uid):
+            raise RuntimePolicyError("invalid_uid")
+        if not _is_positive_int(self.shared_gid):
+            raise RuntimePolicyError("invalid_gid")
+        if not isinstance(self.pools, tuple) or not self.pools:
+            raise RuntimePolicyError("invalid_snapshot_pools")
+        if len(self.pools) > self.runtime_policy.max_pools_per_run:
+            raise RuntimePolicyError("max_pools_per_run_exceeded")
+        profile_ids = [pool.profile_id for pool in self.pools]
+        pool_ids = [pool.pool_id for pool in self.pools]
+        if len(profile_ids) != len(set(profile_ids)):
+            raise RuntimePolicyError("duplicate_profile_mapping")
+        if len(pool_ids) != len(set(pool_ids)) or any(not pool_id for pool_id in pool_ids):
+            raise RuntimePolicyError("duplicate_pool_id")
+        if any(
+            (pool.uid, pool.gid) != (self.shared_uid, self.shared_gid)
+            for pool in self.pools
+        ):
+            raise RuntimePolicyError("worker_identity_mismatch")
+        if tuple(sorted(self.pools, key=lambda pool: (pool.profile_id, pool.pool_id))) != self.pools:
+            raise RuntimePolicyError("unstable_pool_order")
 
 
 def canonical_pool_payload(spec: PoolSpec) -> bytes:
