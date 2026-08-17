@@ -22,7 +22,6 @@ router = APIRouter(prefix="/api/runs", tags=["btw"])
 async def btw(run_id: str, request: Request) -> Any:
     from apps.web.drivers import (
         _planner_llm_credentials,
-        _runtime_for_profile,
         _standby_profile_for,
     )
     from apps.web.worker_config import backend_for_profile, resolve_worker_backend
@@ -294,33 +293,60 @@ async def btw(run_id: str, request: Request) -> Any:
             )
             if profile else worker_backend
         )
-        runtime = _runtime_for_profile(profile, runtime_profiles)
         container = None
+        runtime_lease = None
         account_root = account_store_root(mgr.sessions_root)
         worker_root = root / "workers" / "_btw"
         worker_root.mkdir(parents=True, exist_ok=True)
         workdir = worker_root / f"{transport}-{int(time.time() * 1000)}"
         workdir.mkdir(parents=True, exist_ok=True)
-        gateway_token = None
-        gateway = None
+        worker_instance_id = uuid.uuid4().hex
+        runtime_policy = getattr(run, "runtime_policy", None)
+        strict_docker = runtime_policy is not None and runtime_policy.mode == "docker"
         try:
-            if backend == "container":
-                from dswarm.solver.container_exec import (
-                    _chown_tree_to_worker,
-                    ensure_container,
+            if strict_docker:
+                from dswarm.swarm.runtime import (
+                    RuntimeSpawnRequest,
+                    runtime_lease_factory_for_request,
                 )
 
-                container = await asyncio.to_thread(
-                    ensure_container,
-                    run_id,
-                    str(root),
-                    network=str(runtime.get("network") or "bridge"),
-                    memory=str(runtime.get("memory") or "") or None,
-                    cpus=str(runtime.get("cpus") or "") or None,
-                    pids_limit=int(runtime.get("pids_limit") or 0) or None,
-                    account_root=str(account_root),
+                runtime_profile_id = str(
+                    (profile or {}).get("name")
+                    or (profile or {}).get("id")
+                    or selected
                 )
-                await asyncio.to_thread(_chown_tree_to_worker, str(workdir))
+                lease_factory = runtime_lease_factory_for_request(
+                    snapshot=getattr(run, "runtime_snapshot", None),
+                    pool_manager=getattr(run, "pool_manager", None),
+                    request=RuntimeSpawnRequest(
+                        profile_id=runtime_profile_id,
+                        worker_instance_id=worker_instance_id,
+                        operation_kind="btw",
+                        mode="btw",
+                    ),
+                )
+                runtime_lease = await lease_factory(worker_instance_id, "btw")
+                container = runtime_lease.executor
+                worker_env = dict(runtime_lease.worker_env)
+            elif backend == "container":
+                # Container execution is manager-owned. Old/no-policy runs cannot
+                # create a second run-global container from this side route.
+                from dswarm.solver.container_pool import RuntimeFailure
+
+                raise RuntimeFailure(
+                    category="configuration", code="runtime_pool_unavailable"
+                )
+            else:
+                # Explicit local-dev runs retain the host path; Docker policy can
+                # never reach it because the strict branch above is authoritative.
+                worker_env = runtime_env_for_engine(
+                    transport,
+                    account_root=account_root,
+                    account_id=(
+                        profile.get("credential_account") if profile else None
+                    ),
+                    container=False,
+                ).env
 
             def _worker_path(p: Path) -> str:
                 if container is not None:
@@ -347,71 +373,20 @@ async def btw(run_id: str, request: Request) -> Any:
                 context_hint=context_hint,
                 transcript=transcript,
             )
-            worker_env = runtime_env_for_engine(
-                transport,
-                account_root=account_root,
-                account_id=(profile.get("credential_account") if profile else None),
-                container=container is not None,
-            ).env
             worker_env["DSWARM_BTW_WORKER"] = "1"
+            # BTW remains a read-only observer even though its credential and
+            # gateway token are projected by the same pool manager as workers.
             worker_env["DSWARM_BLACKBOARD_DB"] = ""
             if profile:
-                worker_env["DSWARM_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
-                worker_env["DSWARM_CREDENTIAL_ACCOUNT_ID"] = str(
-                    profile.get("credential_account") or ""
+                worker_env.setdefault(
+                    "DSWARM_WORKER_PROFILE_ID", str(profile.get("id") or "")
+                )
+                worker_env.setdefault(
+                    "DSWARM_CREDENTIAL_ACCOUNT_ID",
+                    str(profile.get("credential_account") or ""),
                 )
                 if profile.get("model"):
-                    worker_env["DSWARM_WORKER_MODEL"] = str(profile["model"])
-            if container is not None:
-                home_host = root / "homes" / f"btw-{transport}"
-                home_host.mkdir(parents=True, exist_ok=True)
-                # BTW uses an isolated HOME just like normal container workers.
-                # Expose only the image-baked Pi provider config; do not link the
-                # blackboard skill because BTW is strictly read-only.
-                from dswarm.swarm.swarm import _ensure_pi_config_links
-                _ensure_pi_config_links(home_host)
-                from dswarm.solver.container_exec import _chown_tree_to_worker
-                await asyncio.to_thread(_chown_tree_to_worker, str(home_host))
-                mapper = getattr(container, "to_container_path", None)
-                worker_env["HOME"] = (
-                    mapper(str(home_host)) if callable(mapper) else str(home_host)
-                )
-
-            if container is not None:
-                # Every BTW side worker receives an independent token and revokes
-                # only that token in finally; ordinary run workers are unaffected.
-                from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
-
-                gateway = ModelGateway.instance()
-                gateway.account_root = str(account_root)
-                gateway.sessions_root = str(mgr.sessions_root)
-                gateway.configure_usage_bridge(
-                    bus=run.bus, loop=asyncio.get_running_loop(), run_id=run_id,
-                )
-                worker_instance_id = uuid.uuid4().hex
-                gateway_token = gateway.issue_worker(WorkerClaims(
-                    run_id=run_id,
-                    challenge_id=run_id,
-                    worker_instance_id=worker_instance_id,
-                    solver_id=f"btw-{transport}",
-                    profile_id=str((profile or {}).get("id") or selected),
-                    configured_account_id=(
-                        str((profile or {}).get("credential_account")).strip() or None
-                        if (profile or {}).get("credential_account") is not None else None
-                    ),
-                    token_scope="btw",
-                ))
-                worker_env["DEEPSEEK_API_KEY"] = gateway_token
-                worker_env.pop("DEEPSEEK_API_KEY_FILE", None)
-                worker_env["DSWARM_TASK_TOKEN"] = gateway_token
-                worker_env["DSWARM_GATEWAY_URL"] = os.environ.get(
-                    "DSWARM_GATEWAY_URL",
-                    f"http://host.docker.internal:"
-                    f"{os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
-                )
-                worker_env["DSWARM_PI_PROVIDER"] = "ctf-gateway"
-                if not worker_env.get("DSWARM_WORKER_MODEL"):
-                    worker_env["DSWARM_WORKER_MODEL"] = "deepseek-v4-flash"
+                    worker_env.setdefault("DSWARM_WORKER_MODEL", str(profile["model"]))
 
             async for chunk in stream_btw_worker_deltas(
                 driver=driver_for(profile or transport),
@@ -437,11 +412,8 @@ async def btw(run_id: str, request: Request) -> Any:
                 detail = raw_error or type(e).__name__
             yield {"data": json.dumps({"error": detail[:300]}, ensure_ascii=False)}
         finally:
-            if gateway is not None and gateway_token:
-                try:
-                    gateway.revoke_token(gateway_token)
-                except Exception:
-                    pass
+            if runtime_lease is not None:
+                await runtime_lease.release()
             this_task = asyncio.current_task()
             if this_task is not None:
                 limiter.release(run_id, this_task)

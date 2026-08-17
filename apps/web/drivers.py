@@ -46,6 +46,15 @@ Driver = Callable[[Run], Awaitable[None]]
 LOG = logging.getLogger(__name__)
 
 
+def runtime_context_kwargs(run: Run) -> dict[str, Any]:
+    """Return the exact frozen per-run runtime objects for every driver path."""
+    return {
+        "runtime_policy": getattr(run, "runtime_policy", None),
+        "runtime_snapshot": getattr(run, "runtime_snapshot", None),
+        "pool_manager": getattr(run, "pool_manager", None),
+    }
+
+
 def normalize_operator_direction(value: Any) -> tuple[str, str]:
     """Normalize a CTF operator direction before it enters the kernel."""
     canonical, resolution = _canonicalize_operator_direction(value)
@@ -167,7 +176,12 @@ def _reject_legacy_swarm_fields(body: dict[str, Any]) -> None:
         )
 
 
-def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
+def build_driver(
+    body: dict[str, Any],
+    mgr: RunManager | None = None,
+    *,
+    runtime_operation_kind: str = "",
+) -> Driver:
     _reject_legacy_swarm_fields(body or {})
     # Real solving is the DEFAULT now 鈥?the deck launches the CLI executor swarm.
     # "mock" is opt-in (UI dev / e2e only).
@@ -176,7 +190,11 @@ def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
         return _mock_driver(body)
     if kind == "idle":
         return _idle_driver(body)
-    return _swarm_driver(_infer_challenge(body), mgr=mgr)
+    return _swarm_driver(
+        _infer_challenge(body),
+        mgr=mgr,
+        runtime_operation_kind=runtime_operation_kind,
+    )
 
 
 # ---- conversational dispatch ------------------------------------------------
@@ -312,7 +330,12 @@ def _mock_driver(body: dict[str, Any]) -> Driver:
     return drive
 
 
-def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
+def _swarm_driver(
+    body: dict[str, Any],
+    mgr: RunManager | None = None,
+    *,
+    runtime_operation_kind: str = "",
+) -> Driver:
     """The REAL solver: a shelled-CLI swarm (pi) against the challenge. No DeepSeek
     key 鈥?CliSolver runs the pi CLI and still gates every flag through the real
     provenance check.
@@ -666,6 +689,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             fallback_usage_writer=fallback_usage_writer,
             spawn_guard=getattr(run, "spawn_guard", None),
             budget_gate=getattr(run, "budget_gate", None),
+            initial_runtime_operation_kind=runtime_operation_kind,
+            **runtime_context_kwargs(run),
         )
         try:
             out = await swarm.run()
@@ -792,6 +817,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
     async def drive(run: Run) -> None:
         import asyncio
         import json
+        import uuid
         from pathlib import Path
 
         from dswarm.models.solve_graph import Challenge
@@ -884,8 +910,36 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         )
         runtime = _runtime_for_profile(profile, runtime_profiles)
         container = None
+        worker_env = None
+        runtime_lease_factory = None
+        runtime_policy = getattr(run, "runtime_policy", None)
+        strict_docker = runtime_policy is not None and runtime_policy.mode == "docker"
+        runtime_profile_id = str(
+            (profile or {}).get("name")
+            or (profile or {}).get("id")
+            or transport
+        )
+        worker_instance_id = uuid.uuid4().hex
         account_root = account_store_root(mgr.sessions_root) if mgr is not None else None
-        if backend == "container":
+        if strict_docker:
+            from dswarm.swarm.runtime import (
+                RuntimeSpawnRequest,
+                runtime_lease_factory_for_request,
+            )
+
+            runtime_lease_factory = runtime_lease_factory_for_request(
+                snapshot=getattr(run, "runtime_snapshot", None),
+                pool_manager=getattr(run, "pool_manager", None),
+                request=RuntimeSpawnRequest(
+                    profile_id=runtime_profile_id,
+                    worker_instance_id=worker_instance_id,
+                    operation_kind="standby",
+                    mode="respond",
+                ),
+            )
+        elif backend == "container":
+            # Forward-only compatibility for legacy runs without a frozen M9
+            # snapshot. New Docker-first runs exclusively use the manager lease.
             from dswarm.solver.container_exec import (
                 ensure_container,
                 worker_image_for_profile,
@@ -972,23 +1026,26 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         if not workdir or not Path(workdir).exists():
             workdir = str(worker_root / f"standby-{transport}")
         Path(workdir).mkdir(parents=True, exist_ok=True)
-        if container is not None:
-            from dswarm.solver.container_exec import _chown_tree_to_worker
-            _chown_tree_to_worker(workdir)
+        if not strict_docker:
+            if container is not None:
+                from dswarm.solver.container_exec import _chown_tree_to_worker
+                _chown_tree_to_worker(workdir)
+            home_label = _standby_home_label(
+                root, transport, str(winner.get("session") or ""))
+            worker_env = _standby_worker_env(
+                root=root,
+                label=home_label,
+                engine=transport,
+                profile=profile,
+                account_root=account_root,
+                container=container,
+            )
         solver_label = f"cli-{transport}-standby"
-        home_label = _standby_home_label(
-            root, transport, str(winner.get("session") or ""))
-        worker_env = _standby_worker_env(
-            root=root,
-            label=home_label,
-            engine=transport,
-            profile=profile,
-            account_root=account_root,
-            container=container,
-        )
 
         fallback_usage_writer = (
-            mgr.fallback_usage_writer(run, solver_id=solver_label, profile_id=transport)
+            mgr.fallback_usage_writer(
+                run, solver_id=solver_label, profile_id=runtime_profile_id
+            )
             if mgr is not None else None
         )
         worker = CliSolver(
@@ -1006,8 +1063,11 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             container=container,
             worker_env=worker_env,
             fallback_usage_writer=fallback_usage_writer,
-            spawn_guard=getattr(run, "spawn_guard", None),
+            runtime_lease_factory=runtime_lease_factory,
+            runtime_policy=runtime_policy,
+            runtime_operation_kind="standby",
         )
+        worker.worker_instance_id = worker_instance_id
         try:
             out = await worker.run()
             # writeup: persist the body to sessions/{id}/writeup.md (and it already

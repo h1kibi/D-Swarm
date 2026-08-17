@@ -394,7 +394,12 @@ def test_resolve_relaunches_full_swarm_not_standby(tmp_path, monkeypatch):
     # path was taken, not _ensure_standby's single-worker build_standby_driver).
     async def _noop_driver(run):
         return None
-    monkeypatch.setattr(drivers, "build_driver", lambda body, mgr=None: (built.__setitem__("driver", built["driver"] + 1) or _noop_driver))
+    def _build_driver(body, mgr=None, runtime_operation_kind=""):
+        assert runtime_operation_kind == "resolve"
+        built["driver"] += 1
+        return _noop_driver
+
+    monkeypatch.setattr(drivers, "build_driver", _build_driver)
     monkeypatch.setattr(rm.RunManager, "_ensure_standby",
                         lambda self, rid, cmd: built.__setitem__("standby", built["standby"] + 1))
 
@@ -484,54 +489,75 @@ def test_mark_false_standby_uses_operator_selected_flag(tmp_path, monkeypatch):
     assert run.flag == "flag{a}"
 
 
-def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypatch):
-    """A finished-run follow-up in compose must cold-start a worker container.
+def test_finished_hitl_in_web_container_uses_frozen_runtime_pool(tmp_path, monkeypatch):
+    """A finished-run follow-up reuses the run's frozen pool manager lease.
 
-    This covers writeup/ask/mark_false's shared standby path: the web container
-    must not shell a host-native CLI with the wrong toolchain/credentials.
+    Standby must not construct or tear down a second run-global container.  The
+    worker owns exactly one lease and releases it on completion.
     """
+    from types import SimpleNamespace
+
     from apps.web import run_manager as rm
     import apps.web.drivers as drivers
     import dswarm.solver.cli_solver as cli_solver
     import dswarm.solver.container_exec as container_exec
+    from dswarm.solver.container_pool import WorkerRuntimeLease
+    from dswarm.solver.runtime_policy import build_runtime_policy
 
     monkeypatch.setattr(drivers, "is_web_container", lambda: True)
-    captured = {}
+    captured: dict[str, object] = {"released": 0}
 
     class FakeHandle:
-        container = "dswarm-run-run-x"
+        container = "dswarm-runtime-pool"
 
-        def to_container_path(self, host_path):
-            return "/home/kali/workspace/" + Path(host_path).name
+    class RecordingManager:
+        def __init__(self, snapshot):
+            self.run_id = "run-x"
+            self.snapshot = snapshot
+            self.acquire_calls: list[dict[str, str]] = []
 
-        def to_container_cwd(self, host_cwd):
-            return self.to_container_path(host_cwd)
+        async def acquire(self, **kwargs: str):
+            self.acquire_calls.append(dict(kwargs))
 
-    def fake_ensure_container(run_id, host_workspace, **kwargs):
-        captured["ensure"] = {
-            "run_id": run_id,
-            "host_workspace": host_workspace,
-            **kwargs,
-        }
-        return FakeHandle()
+            async def release_once() -> None:
+                captured["released"] = int(captured["released"]) + 1
 
-    def fake_teardown(run_id, *, remove=True):
-        captured["teardown"] = {"run_id": run_id, "remove": remove}
+            return WorkerRuntimeLease(
+                pool_id="pool-frozen",
+                pool_instance_id="instance-1",
+                generation=1,
+                worker_instance_id=kwargs["worker_instance_id"],
+                executor=FakeHandle(),
+                credential_projection=object(),
+                worker_env={"LEASE_ONLY": "yes"},
+                _release_once=release_once,
+            )
 
-    def fake_chown(path):
-        captured.setdefault("chown", []).append(Path(path).name)
+    def legacy_container_forbidden(*args, **kwargs):
+        raise AssertionError("standby must acquire the frozen run pool")
 
     class FakeCliSolver:
         def __init__(self, *args, **kwargs):
             captured["solver_kwargs"] = kwargs
+            self.runtime_lease_factory = kwargs["runtime_lease_factory"]
+            self.runtime_operation_kind = kwargs["runtime_operation_kind"]
+            self.worker_instance_id = "unset"
 
         async def run(self):
-            return SolveOutcome(False, None, 1, None, "writeup",
-                                engine="pi", reply="# Writeup")
+            lease = await self.runtime_lease_factory(
+                self.worker_instance_id,
+                self.runtime_operation_kind,
+            )
+            captured["lease"] = lease
+            try:
+                return SolveOutcome(False, None, 1, None, "writeup",
+                                    engine="pi", reply="# Writeup")
+            finally:
+                await lease.release()
 
-    monkeypatch.setattr(container_exec, "ensure_container", fake_ensure_container)
-    monkeypatch.setattr(container_exec, "teardown_container", fake_teardown)
-    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", fake_chown)
+    monkeypatch.setattr(container_exec, "ensure_container", legacy_container_forbidden)
+    monkeypatch.setattr(container_exec, "teardown_container", legacy_container_forbidden)
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", legacy_container_forbidden)
     monkeypatch.setattr(cli_solver, "CliSolver", FakeCliSolver)
 
     async def _run():
@@ -555,6 +581,16 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
             ],
         }
         run = mgr.create("run-x")
+        policy = build_runtime_policy(env={})
+        snapshot = SimpleNamespace(
+            run_id="run-x",
+            runtime_policy=policy,
+            pools=(SimpleNamespace(profile_id="seat-pi", pool_id="pool-frozen"),),
+        )
+        manager = RecordingManager(snapshot)
+        run.runtime_policy = policy
+        run.runtime_snapshot = snapshot
+        run.pool_manager = manager
         run.started = True
         run.finished = True
         run.solved = True
@@ -579,20 +615,25 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
         ok = await mgr.post_hitl("run-x", "global", "writeup", text="")
         assert run.standby_task is not None
         await run.standby_task
-        return ok
+        return ok, manager
 
-    ok = asyncio.run(_run())
+    ok, manager = asyncio.run(_run())
     assert ok is True
-    assert captured["ensure"]["run_id"] == "run-x"
-    assert captured["ensure"]["network"] == "bridge"
-    assert captured["solver_kwargs"]["container"].container == "dswarm-run-run-x"
-    assert captured["solver_kwargs"]["engine"] == "pi"
-    assert captured["solver_kwargs"]["resume_session"] == "thread-1"
-    assert captured["solver_kwargs"]["worker_env"]["DSWARM_WORKER_MODEL"] == "deepseek-v4-pro"
-    assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-pi")
-    assert captured["chown"] == ["standby-pi", "cli-pi"]
-    assert captured["teardown"] == {"run_id": "run-x", "remove": True}
-
+    solver_kwargs = captured["solver_kwargs"]
+    assert solver_kwargs["container"] is None
+    assert solver_kwargs["worker_env"] in (None, {})
+    assert solver_kwargs["runtime_operation_kind"] == "standby"
+    assert solver_kwargs["runtime_policy"].mode == "docker"
+    assert "spawn_guard" not in solver_kwargs
+    assert manager.acquire_calls == [{
+        "pool_id": "pool-frozen",
+        "worker_instance_id": manager.acquire_calls[0]["worker_instance_id"],
+        "operation_kind": "standby",
+    }]
+    assert manager.acquire_calls[0]["worker_instance_id"] != "unset"
+    assert captured["lease"].executor.container == "dswarm-runtime-pool"
+    assert captured["lease"].worker_env == {"LEASE_ONLY": "yes"}
+    assert captured["released"] == 1
 
 def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, monkeypatch):
     """Old runs may have no winner.json; standby must still recover the original
@@ -690,8 +731,10 @@ def test_resolve_reuses_challenge_from_winner_json(tmp_path, monkeypatch):
     async def _noop(run):
         return None
 
-    def _capture(body, mgr=None):
+    def _capture(body, mgr=None, runtime_operation_kind=""):
         seen.update(body or {})
+        seen["_runtime_operation_kind"] = runtime_operation_kind
+        seen["_manager"] = mgr
         return _noop
     monkeypatch.setattr(drivers, "build_driver", _capture)
 
@@ -712,6 +755,7 @@ def test_resolve_reuses_challenge_from_winner_json(tmp_path, monkeypatch):
     seen = asyncio.run(_run())
     assert seen.get("challenge", {}).get("target") == "https://target.example/"
     assert seen["challenge"]["name"] == "expensey-eats"
+    assert seen["_runtime_operation_kind"] == "resolve"
 
 
 def test_resolve_reuses_challenge_from_session_jsonl_without_winner(tmp_path, monkeypatch):
@@ -727,7 +771,8 @@ def test_resolve_reuses_challenge_from_session_jsonl_without_winner(tmp_path, mo
     async def _noop(run):
         return None
 
-    def _capture(body, mgr=None):
+    def _capture(body, mgr=None, runtime_operation_kind=""):
+        assert runtime_operation_kind == "resolve"
         seen.update(body or {})
         return _noop
     monkeypatch.setattr(drivers, "build_driver", _capture)

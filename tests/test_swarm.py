@@ -953,9 +953,15 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
         async def run(self):
             await asyncio.sleep(3600)
 
+    review_factory_calls: list[dict[str, object]] = []
+
     monkeypatch.setattr(sw, "_select_review_engine", lambda healthy: "pi")
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: FakeReviewWorker())
+
+    def make_review_worker(engine: str, **kwargs: object):
+        review_factory_calls.append({"engine": engine, **kwargs})
+        return FakeReviewWorker()
+
+    monkeypatch.setattr(sw, "_make_cli_worker", make_review_worker)
 
     async def emit_bb(kind, **fields):
         emitted.append((kind, fields))
@@ -977,6 +983,7 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
             if task.get_name().startswith("review-")
         ) == 1
         assert any(k == "review_started" for k, _ in emitted)
+        assert review_factory_calls[0]["runtime_operation_kind"] == "review"
         assert sw._worker_lane_gate.snapshot() == {
             "ordinary_active": 0, "review_active": 1,
         }
@@ -1390,8 +1397,13 @@ class _FakeWorker:
 async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatch):
     sw = _coordinator_swarm(challenge, tmp_path, engines=["pi", "codex"])
     sw.worker_cmds = asyncio.Queue()
-    monkeypatch.setattr(sw, "_make_cli_worker",
-                        lambda engine, **kw: _FakeWorker(engine))
+    worker_factory_calls: list[dict[str, object]] = []
+
+    def make_operator_worker(engine: str, **kwargs: object):
+        worker_factory_calls.append({"engine": engine, **kwargs})
+        return _FakeWorker(engine)
+
+    monkeypatch.setattr(sw, "_make_cli_worker", make_operator_worker)
 
     tasks: dict = {}
     task_solvers: dict = {}
@@ -1408,6 +1420,7 @@ async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatc
     assert len(tasks) == 1
     w = next(iter(task_solvers.values()))
     assert w.solver_id == "cli-pi-op"
+    assert worker_factory_calls[0]["runtime_operation_kind"] == "bootstrap"
     assert any(k == "worker_spawned" for k, _ in emitted)
     assert sw._worker_lane_gate.snapshot() == {
         "ordinary_active": 1, "review_active": 0,

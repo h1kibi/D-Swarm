@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
@@ -81,6 +82,7 @@ class ReasonSwarm:
         lane_gate: Optional[WorkerLaneGate] = None,
         energy_trace_enabled: bool = False,
         energy_trace_sink: Any = None,
+        initial_runtime_operation_kind: str = "",
     ) -> None:
         self.challenge = challenge
         self.board = board or MemoryBoard(challenge.id, pheromone=pheromone)
@@ -109,6 +111,7 @@ class ReasonSwarm:
         # is a construction error ("no sink, no capture").
         self.energy_trace_enabled = bool(energy_trace_enabled)
         self.energy_trace_sink = energy_trace_sink
+        self.initial_runtime_operation_kind = str(initial_runtime_operation_kind or "")
         if self.energy_trace_enabled and self.energy_trace_sink is None:
             raise ValueError(
                 "energy_trace_enabled=True requires an energy_trace_sink "
@@ -128,6 +131,7 @@ class ReasonSwarm:
         # used to discard that continuation handle.
         self._winner_outcome: Any = None
         self._recovery_attempts: dict[str, int] = {}
+        self._recovery_pending: set[str] = set()
         self._max_recovery_attempts = int(
             os.environ.get("DSWARM_WORKER_PROVIDER_RECOVERY_ATTEMPTS", "2") or 2)
         self._paused_profiles: set[str] = set()
@@ -724,6 +728,7 @@ class ReasonSwarm:
             priority=1.0,
             dedupe_key="recon:recon:initial",
             task_kind=self.challenge.category,
+            runtime_operation_kind=self.initial_runtime_operation_kind,
         )
         findings_before_recon = len(
             self.board.query_findings(FindingPredicate(limit=10000))
@@ -851,6 +856,7 @@ class ReasonSwarm:
                         self._recovery_attempts[decision.dedupe_key] = attempts
                         if attempts <= self._max_recovery_attempts:
                             self._executed.discard(decision.dedupe_key)
+                            self._recovery_pending.add(decision.dedupe_key)
                             await self._emit(
                                 "worker_recovery_scheduled",
                                 stage="dispatch",
@@ -923,7 +929,9 @@ class ReasonSwarm:
 
                 capped = decisions[: self.max_intents_per_reason]
                 fresh = [
-                    d for d in capped
+                    replace(d, runtime_operation_kind="recovery")
+                    if d.dedupe_key in self._recovery_pending else d
+                    for d in capped
                     if d.dedupe_key not in self._executed
                     and d.profile not in self._paused_profiles
                 ]
@@ -1040,6 +1048,7 @@ class ReasonSwarm:
                     except Exception:
                         pass  # telemetry must never break the solve
                 for decision in fresh:
+                    self._recovery_pending.discard(decision.dedupe_key)
                     self._executed.add(decision.dedupe_key)
                     self._register_decision(decision)
                     await self._emit(

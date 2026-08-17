@@ -315,7 +315,11 @@ class ReviewFlowMixin:
             return False
         try:
             w = self._make_cli_worker(
-                engine, mode="review", intent_goal=directive)
+                engine,
+                mode="review",
+                intent_goal=directive,
+                runtime_operation_kind="review",
+            )
         except WorkerSpawnRejected as exc:
             self._worker_lane_gate.release(lane)
             await emit_bb("worker_spawn_rejected", reason=str(exc),

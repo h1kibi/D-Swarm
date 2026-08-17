@@ -1693,7 +1693,11 @@ class RunManager:
         # Build synchronously before changing lifecycle state. Configuration errors
         # should be returned by /resolve, not recorded as a misleading reopen.
         from apps.web.drivers import build_driver
-        driver = build_driver(merged, mgr=self)
+        driver = build_driver(
+            merged,
+            mgr=self,
+            runtime_operation_kind="resolve",
+        )
         self.remember_dispatch(run_id, merged)
 
         # Reopen the bus and reset every lifecycle bit that can make the rail show a

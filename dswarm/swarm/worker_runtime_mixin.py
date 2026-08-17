@@ -582,7 +582,8 @@ class WorkerRuntimeMixin:
     def _make_cli_worker(self, engine: str, *, mode: str, intent_goal: str = "",
                          intent_id: str = "", timeout_override: "Optional[int]" = None,
                          profile_role: "Optional[str]" = None,
-                         task_kind: str = "", host_scan: bool = False):
+                         task_kind: str = "", host_scan: bool = False,
+                         runtime_operation_kind: str = ""):
         guard = getattr(self, "spawn_guard", None)
         if guard is not None:
             guard.check_now(operation="spawn")
@@ -620,23 +621,17 @@ class WorkerRuntimeMixin:
         runtime_policy = getattr(self, "runtime_policy", None)
         runtime_lease_factory = None
         strict_docker = runtime_policy is not None and runtime_policy.mode == "docker"
-        if strict_docker:
-            profile_id = str(
-                (profile or {}).get("name")
-                or (profile or {}).get("id")
-                or engine
-            )
-            pool_id = self.pool_id_for_profile(profile_id)
-            pool_manager = self.pool_manager
-
-            async def runtime_lease_factory(
-                worker_instance_id: str, operation_kind: str
-            ):
-                return await pool_manager.acquire(
-                    pool_id=pool_id,
-                    worker_instance_id=worker_instance_id,
-                    operation_kind=operation_kind,
-                )
+        runtime_profile_id = str(
+            (profile or {}).get("name")
+            or (profile or {}).get("id")
+            or engine
+        )
+        from dswarm.swarm.runtime import runtime_operation_for_spawn
+        audited_operation_kind = runtime_operation_for_spawn(
+            mode=mode,
+            profile_role=str(profile_role or role),
+            requested=runtime_operation_kind,
+        )
         budget_gate = getattr(self, "budget_gate", None)
         if budget_gate is not None and profile is not None:
             profile_id = str(profile.get("name") or profile.get("id") or engine or role)
@@ -654,6 +649,29 @@ class WorkerRuntimeMixin:
             if not verdict.allowed:
                 raise WorkerSpawnRejected(
                     f"budget blocked profile={profile_id}: {verdict.reason or 'budget_cap'}")
+
+        # Resolve the strict Docker lease boundary before charging the spawn
+        # budget. A profile absent from the frozen snapshot is a policy rejection,
+        # not a real worker spawn.
+        worker_instance_id = uuid.uuid4().hex
+        if strict_docker:
+            from dswarm.swarm.runtime import (
+                RuntimeSpawnRequest,
+                runtime_lease_factory_for_request,
+            )
+
+            runtime_request = RuntimeSpawnRequest(
+                profile_id=runtime_profile_id,
+                worker_instance_id=worker_instance_id,
+                operation_kind=audited_operation_kind,
+                mode=mode,
+                intent_id=intent_id,
+            )
+            runtime_lease_factory = runtime_lease_factory_for_request(
+                snapshot=self.runtime_snapshot,
+                pool_manager=self.pool_manager,
+                request=runtime_request,
+            )
 
         # Budget is charged ONLY after we know we'll actually build a worker.
         self._reserve_worker_spawn()
@@ -710,7 +728,6 @@ class WorkerRuntimeMixin:
             self._container_for_engine(engine, profile)
             if runtime_policy is None else None
         )
-        worker_instance_id = uuid.uuid4().hex
         gateway_token = None
         explicit_endpoint = bool(
             (profile or {}).get("base_url")
@@ -772,6 +789,7 @@ class WorkerRuntimeMixin:
                 ),
                 runtime_lease_factory=runtime_lease_factory,
                 runtime_policy=runtime_policy,
+                runtime_operation_kind=audited_operation_kind,
                 task_kind=task_kind,
                 host_scan=host_scan,
             )
@@ -873,7 +891,11 @@ class WorkerRuntimeMixin:
                                   engine=str(engine), phase="operator")
                     continue
                 try:
-                    w = self._make_cli_worker(engine, mode="bootstrap")
+                    w = self._make_cli_worker(
+                        engine,
+                        mode="bootstrap",
+                        runtime_operation_kind="bootstrap",
+                    )
                 except WorkerSpawnRejected as exc:
                     self._worker_lane_gate.release(lane)
                     await emit_bb("worker_spawn_rejected", reason=str(exc),

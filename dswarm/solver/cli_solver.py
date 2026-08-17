@@ -560,6 +560,7 @@ class CliSolver:
         fallback_usage_writer: Optional[UsageWriter] = None,
         runtime_lease_factory: Optional[RuntimeLeaseFactory] = None,
         runtime_policy: Optional[RuntimePolicy] = None,
+        runtime_operation_kind: str = "",
         task_kind: str = "",
         host_scan: bool = False,
     ) -> None:
@@ -581,6 +582,7 @@ class CliSolver:
         self.fallback_usage_writer = fallback_usage_writer
         self.runtime_lease_factory = runtime_lease_factory
         self.runtime_policy = runtime_policy
+        self.runtime_operation_kind = runtime_operation_kind or task_kind or mode
         self.task_kind = task_kind
         self.host_scan = bool(host_scan)
         self.run_id = run_id or challenge.id
@@ -3078,7 +3080,7 @@ class CliSolver:
                     getattr(self, "worker_instance_id", "") or self.solver_id
                 )
                 runtime_lease = await self.runtime_lease_factory(
-                    worker_instance_id, self.task_kind or self.mode
+                    worker_instance_id, self.runtime_operation_kind
                 )
                 # The lease is the sole owner of Docker executor and credential
                 # projection state.  Never merge legacy host/account env into it.

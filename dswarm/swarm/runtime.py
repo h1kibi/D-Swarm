@@ -3,9 +3,92 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from dswarm.swarm.agents import AgentProfile, DispatchDecision
+from dswarm.solver.runtime_policy import RuntimePolicyError
+
+
+RuntimeOperationKind = Literal[
+    "bootstrap",
+    "ordinary",
+    "review",
+    "recon",
+    "recovery",
+    "standby",
+    "resolve",
+    "btw",
+]
+_RUNTIME_OPERATION_KINDS = frozenset(
+    {"bootstrap", "ordinary", "review", "recon", "recovery", "standby", "resolve", "btw"}
+)
+
+
+@dataclass(frozen=True)
+class RuntimeSpawnRequest:
+    """Frozen audit identity for one real worker runtime acquisition."""
+
+    profile_id: str
+    worker_instance_id: str
+    operation_kind: RuntimeOperationKind
+    mode: str
+    intent_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.operation_kind not in _RUNTIME_OPERATION_KINDS:
+            raise ValueError("invalid_runtime_operation_kind")
+
+
+def runtime_operation_for_spawn(
+    *, mode: str, profile_role: str = "", requested: str = ""
+) -> RuntimeOperationKind:
+    """Resolve the audited runtime operation independently of business task kind."""
+
+    if requested:
+        if requested not in _RUNTIME_OPERATION_KINDS:
+            raise ValueError("invalid_runtime_operation_kind")
+        return requested  # type: ignore[return-value]
+    if profile_role == "recon" or mode == "recon":
+        return "recon"
+    if mode == "review":
+        return "review"
+    if mode == "explore":
+        return "ordinary"
+    return "bootstrap"
+
+
+def runtime_lease_factory_for_request(
+    *,
+    snapshot: Any,
+    pool_manager: Any,
+    request: RuntimeSpawnRequest,
+):
+    """Bind one worker request to its frozen profile-to-pool mapping."""
+
+    pool_id = next(
+        (
+            str(pool.pool_id)
+            for pool in snapshot.pools
+            if str(pool.profile_id) == request.profile_id
+        ),
+        "",
+    )
+    if not pool_id:
+        raise RuntimePolicyError("runtime_profile_not_in_snapshot")
+
+    async def acquire(worker_instance_id: str, operation_kind: str):
+        if worker_instance_id != request.worker_instance_id:
+            raise ValueError("runtime_worker_identity_mismatch")
+        if operation_kind != request.operation_kind:
+            raise ValueError("runtime_operation_kind_mismatch")
+        return await pool_manager.acquire(
+            pool_id=pool_id,
+            worker_instance_id=request.worker_instance_id,
+            operation_kind=request.operation_kind,
+        )
+
+    return acquire
 
 
 @runtime_checkable
@@ -68,6 +151,11 @@ class SwarmWorkerRuntime:
             "timeout_override": profile.timeout,
             "task_kind": decision.task_kind or swarm.challenge.category,
             "host_scan": decision.host_scan,
+            "runtime_operation_kind": runtime_operation_for_spawn(
+                mode=mode,
+                profile_role=role,
+                requested=decision.runtime_operation_kind,
+            ),
         }
         loop = asyncio.get_running_loop()
         create_future = loop.run_in_executor(

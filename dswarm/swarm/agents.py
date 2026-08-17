@@ -45,6 +45,8 @@ class DispatchDecision:
     surface_target: str = ""
     task_kind: str = ""
     host_scan: bool = False
+    # Audited container-pool operation; separate from business task_kind.
+    runtime_operation_kind: str = ""
     # M4 diagnostics appended for positional fixture compatibility.
     raw_direction: str = ""
     canonical_direction: str = ""

@@ -377,12 +377,26 @@ async def test_btw_readonly_httpx_read_timeout_is_normalized(tmp_path, monkeypat
     assert frames[-1] == {"done": True}
 
 
-async def test_btw_container_uses_independent_gateway_token_and_revokes_it(
-    tmp_path, monkeypatch
-) -> None:
+async def _exercise_btw_frozen_pool_route(
+    tmp_path,
+    monkeypatch,
+    *,
+    stream_outcome: str,
+) -> tuple[dict[str, object], object, dict[str, int], httpx.Response]:
+    from types import SimpleNamespace
+
+    import dswarm.solver.container_exec as container_exec
+    import dswarm.solver.credential_accounts as credential_accounts
+    import dswarm.solver.modelgateway as modelgateway
+    from dswarm.solver.container_pool import WorkerRuntimeLease
+    from dswarm.solver.runtime_policy import build_runtime_policy
+
     monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
     monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
     mgr = RunManager(sessions_root=tmp_path)
+    profiles = mgr.worker_config.get()["worker_profiles"]
+    next(p for p in profiles if p["name"] == "pi-worker")["enabled"] = True
+    mgr.worker_config.set(worker_profiles=profiles, engines=["pi-worker"])
     run = mgr.create("btw-container-run")
     run.name = "btw container demo"
     run.category = "web"
@@ -391,46 +405,65 @@ async def test_btw_container_uses_independent_gateway_token_and_revokes_it(
         def to_container_path(self, path: str) -> str:
             return "/workspace/" + Path(path).name
 
-    class FakeGateway:
-        account_root = None
-        sessions_root = None
-
-        def __init__(self) -> None:
-            self.claims = None
-            self.revoked: list[str] = []
-
-        def configure_usage_bridge(self, **kwargs) -> None:
-            self.bridge_config = kwargs
-
-        def issue_worker(self, claims) -> str:
-            self.claims = claims
-            return "btw-task-token"
-
-        def revoke_token(self, token: str) -> None:
-            self.revoked.append(token)
-
-    fake_gateway = FakeGateway()
+    released = {"count": 0}
     seen: dict[str, object] = {}
+
+    class RecordingManager:
+        def __init__(self) -> None:
+            self.acquire_calls: list[dict[str, str]] = []
+
+        async def acquire(self, **kwargs: str) -> WorkerRuntimeLease:
+            self.acquire_calls.append(dict(kwargs))
+
+            async def release_once() -> None:
+                released["count"] += 1
+
+            return WorkerRuntimeLease(
+                pool_id="pool-frozen",
+                pool_instance_id="instance-1",
+                generation=1,
+                worker_instance_id=kwargs["worker_instance_id"],
+                executor=FakeContainer(),
+                credential_projection=object(),
+                worker_env={
+                    "LEASE_ONLY": "yes",
+                    "DSWARM_TASK_TOKEN": "lease-task-token",
+                    "DEEPSEEK_API_KEY": "lease-task-token",
+                    "DSWARM_GATEWAY_URL": "http://gateway.invalid/v1",
+                    "DSWARM_PI_PROVIDER": "ctf-gateway",
+                    "DSWARM_WORKER_MODEL": "deepseek-v4-flash",
+                },
+                _release_once=release_once,
+            )
+
+    manager = RecordingManager()
+    policy = build_runtime_policy(env={})
+    run.runtime_policy = policy
+    run.runtime_snapshot = SimpleNamespace(
+        run_id=run.run_id,
+        runtime_policy=policy,
+        pools=(SimpleNamespace(profile_id="pi-worker", pool_id="pool-frozen"),),
+    )
+    run.pool_manager = manager
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("BTW must use the frozen run pool lease")
 
     monkeypatch.setattr(
         "apps.web.worker_config.backend_for_profile",
         lambda *args, **kwargs: "container",
     )
-    monkeypatch.setattr(
-        "dswarm.solver.container_exec.ensure_container",
-        lambda *args, **kwargs: FakeContainer(),
-    )
-    monkeypatch.setattr(
-        "dswarm.solver.container_exec._chown_tree_to_worker",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "dswarm.solver.modelgateway.ModelGateway.instance",
-        staticmethod(lambda: fake_gateway),
-    )
+    monkeypatch.setattr(container_exec, "ensure_container", forbidden)
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", forbidden)
+    monkeypatch.setattr(credential_accounts, "runtime_env_for_engine", forbidden)
+    monkeypatch.setattr(modelgateway.ModelGateway, "instance", staticmethod(forbidden))
 
     async def fake_stream_btw_worker_deltas(**kwargs):
         seen.update(kwargs)
+        if stream_outcome == "error":
+            raise RuntimeError("worker exploded")
+        if stream_outcome == "cancel":
+            raise asyncio.CancelledError()
         yield "ok"
 
     monkeypatch.setattr(
@@ -449,18 +482,45 @@ async def test_btw_container_uses_independent_gateway_token_and_revokes_it(
             "/api/runs/btw-container-run/btw",
             json={"question": "为什么这么久", "worker_backend": "container"},
         )
+    return seen, manager, released, resp
+
+
+async def test_btw_container_uses_frozen_runtime_pool_lease(
+    tmp_path, monkeypatch
+) -> None:
+    seen, manager, released, resp = await _exercise_btw_frozen_pool_route(
+        tmp_path, monkeypatch, stream_outcome="success",
+    )
 
     assert resp.status_code == 200
-    env = seen["env"]
-    assert env["DSWARM_TASK_TOKEN"] == "btw-task-token"  # type: ignore[index]
-    assert env["DEEPSEEK_API_KEY"] == "btw-task-token"  # type: ignore[index]
-    assert env["DSWARM_PI_PROVIDER"] == "ctf-gateway"  # type: ignore[index]
-    assert env["DSWARM_GATEWAY_URL"].endswith("/v1")  # type: ignore[index]
-    assert env["DSWARM_WORKER_MODEL"] == "deepseek-v4-flash"  # type: ignore[index]
+    assert manager.acquire_calls == [{
+        "pool_id": "pool-frozen",
+        "worker_instance_id": manager.acquire_calls[0]["worker_instance_id"],
+        "operation_kind": "btw",
+    }]
+    assert manager.acquire_calls[0]["worker_instance_id"]
     assert seen["container"] is not None
-    assert fake_gateway.claims.run_id == "btw-container-run"
-    assert fake_gateway.claims.token_scope == "btw"
-    assert fake_gateway.revoked == ["btw-task-token"]
+    env = seen["env"]
+    assert env["LEASE_ONLY"] == "yes"  # type: ignore[index]
+    assert env["DSWARM_TASK_TOKEN"] == "lease-task-token"  # type: ignore[index]
+    assert env["DEEPSEEK_API_KEY"] == "lease-task-token"  # type: ignore[index]
+    assert env["DSWARM_BTW_WORKER"] == "1"  # type: ignore[index]
+    assert env["DSWARM_BLACKBOARD_DB"] == ""  # type: ignore[index]
+    assert released["count"] == 1
+
+
+@pytest.mark.parametrize("stream_outcome", ["error", "cancel"])
+async def test_btw_runtime_pool_lease_releases_on_non_success_paths(
+    tmp_path, monkeypatch, stream_outcome: str
+) -> None:
+    _seen, manager, released, resp = await _exercise_btw_frozen_pool_route(
+        tmp_path, monkeypatch, stream_outcome=stream_outcome,
+    )
+
+    assert resp.status_code == 200
+    assert len(manager.acquire_calls) == 1
+    assert manager.acquire_calls[0]["operation_kind"] == "btw"
+    assert released["count"] == 1
 
 async def test_hitl_post_is_accepted_and_echoed(server) -> None:
     async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
@@ -1010,7 +1070,11 @@ async def test_resolve_driver_failure_emits_terminal_runtime_failure(tmp_path, m
     async def boom(_run):
         raise RuntimeError("worker bootstrap exploded")
 
-    monkeypatch.setattr("apps.web.drivers.build_driver", lambda _body, mgr=None: boom)
+    def build_failure(_body, mgr=None, runtime_operation_kind=""):
+        assert runtime_operation_kind == "resolve"
+        return boom
+
+    monkeypatch.setattr("apps.web.drivers.build_driver", build_failure)
     assert await mgr.resolve(run.run_id, {})
     await asyncio.wait_for(run.task, timeout=5)
 
@@ -1047,7 +1111,8 @@ async def test_resolve_infers_pre_sidecar_roster_from_worker_history(tmp_path, m
             event_type=EventType.RUN_FINISHED, run_id=_run.run_id,
             payload={"solved": False, "reason": "mock"}))
 
-    def build(body, mgr=None):
+    def build(body, mgr=None, runtime_operation_kind=""):
+        assert runtime_operation_kind == "resolve"
         captured.update(body)
         return driver
 
@@ -1082,7 +1147,8 @@ async def test_resolve_strips_legacy_fields_from_saved_sidecar(tmp_path, monkeyp
         await _run.bus.emit(Event(
             event_type=EventType.RUN_FINISHED, run_id=_run.run_id,
             payload={"solved": False, "reason": "mock"}))
-    def build(body, mgr=None):
+    def build(body, mgr=None, runtime_operation_kind=""):
+        assert runtime_operation_kind == "resolve"
         captured.update(body)
         return driver
     monkeypatch.setattr("apps.web.drivers.build_driver", build)

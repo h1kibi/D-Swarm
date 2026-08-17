@@ -472,6 +472,7 @@ class Swarm(
         spawn_guard: Optional[SpawnGuard] = None,
         budget_gate: Optional[Any] = None,
         metrics_sink: Optional[Any] = None,
+        initial_runtime_operation_kind: str = "",
     ) -> None:
         self.challenge = challenge
         self.lineup = lineup
@@ -480,6 +481,7 @@ class Swarm(
         self.fallback_usage_writer = fallback_usage_writer
         self.spawn_guard = spawn_guard
         self.budget_gate = budget_gate
+        self.initial_runtime_operation_kind = str(initial_runtime_operation_kind or "")
         self.sandbox = sandbox
         self.bus = bus
         self.cost = cost
@@ -1595,6 +1597,7 @@ class Swarm(
             pause_event=pause_gate,
             planner_diagnostic=self.reason_planner_diagnostic,
             lane_gate=self._worker_lane_gate,
+            initial_runtime_operation_kind=self.initial_runtime_operation_kind,
         )
         try:
             out = await swarm.run()

@@ -61,6 +61,27 @@ async def test_reason_swarm_starts_with_single_recon():
     assert calls[0].profile == "pi-web"  # challenge category web → web direction
 
 
+async def test_reason_swarm_marks_initial_recon_as_resolve_when_requested():
+    board = MemoryBoard("c-reason")
+    calls: list[DispatchDecision] = []
+
+    async def worker(decision: DispatchDecision, profile) -> SimpleNamespace:
+        calls.append(decision)
+        return _outcome("flag{resolved}")
+
+    swarm = ReasonSwarm(
+        _challenge(),
+        board=board,
+        worker_factory=worker,
+        initial_runtime_operation_kind="resolve",
+    )
+    await swarm.run()
+
+    assert len(calls) == 1
+    assert calls[0].mode == "recon"
+    assert calls[0].runtime_operation_kind == "resolve"
+
+
 async def test_planner_unavailable_retries_and_does_not_collapse(monkeypatch):
     """run-3155: a transient planner outage used to collapse the WHOLE run — one
     failed reason cycle → fallback → next failed cycle → break → finished. The
@@ -1159,6 +1180,8 @@ async def test_reason_swarm_retries_retryable_provider_runtime_failure():
 
     i1_calls = [c for c in calls if c.intent_id == "I1"]
     assert len(i1_calls) == 2, "retryable provider runtime failure should free intent for redispatch"
+    assert i1_calls[0].runtime_operation_kind == ""
+    assert i1_calls[1].runtime_operation_kind == "recovery"
     assert result["solved"] is True
     assert result["flags"] == ["flag{recovered_after_retry}"]
     deltas = [e.payload for e in bus.events if e.event_type is EventType.BLACKBOARD_DELTA]

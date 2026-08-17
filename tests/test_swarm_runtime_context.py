@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -393,18 +393,25 @@ async def test_strict_docker_worker_injects_frozen_pool_lease_factory(
         worker_profiles=[_runtime_worker_profile()],
     )
 
-    worker = swarm._make_cli_worker("pi-main", mode="bootstrap", task_kind="ordinary")
+    worker = swarm._make_cli_worker(
+        "pi-main",
+        mode="bootstrap",
+        task_kind="web",
+        runtime_operation_kind="ordinary",
+    )
 
     assert len(seen) == 1
     assert worker.runtime_policy is policy
     assert worker.container is None
     assert worker.worker_env in (None, {})
     assert callable(worker.runtime_lease_factory)
-    lease = await worker.runtime_lease_factory("worker-instance", "ordinary")
+    assert seen[0]["task_kind"] == "web"
+    assert seen[0]["runtime_operation_kind"] == "ordinary"
+    lease = await worker.runtime_lease_factory(worker.worker_instance_id, "ordinary")
     assert lease is manager.lease
     assert manager.acquire_calls == [{
         "pool_id": snapshot.pools[0].pool_id,
-        "worker_instance_id": "worker-instance",
+        "worker_instance_id": worker.worker_instance_id,
         "operation_kind": "ordinary",
     }]
 
