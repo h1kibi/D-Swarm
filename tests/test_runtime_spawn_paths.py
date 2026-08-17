@@ -93,6 +93,82 @@ async def test_runtime_lease_factory_uses_frozen_request_and_snapshot_pool() -> 
     }]
 
 
+class _OverlayLease:
+    def __init__(self, worker_env: dict[str, str]) -> None:
+        self.worker_env = worker_env
+        self.pool_instance_id = "pool-instance"
+        self.generation = 1
+        self.release_calls = 0
+
+    async def release(self) -> None:
+        self.release_calls += 1
+
+
+class _OverlayManager:
+    def __init__(self, lease: _OverlayLease) -> None:
+        self.lease = lease
+
+    async def acquire(self, **_kwargs: str) -> _OverlayLease:
+        return self.lease
+
+
+@pytest.mark.asyncio
+async def test_runtime_lease_binding_freezes_and_merges_worker_env_overlay() -> None:
+    from types import SimpleNamespace
+
+    snapshot = SimpleNamespace(
+        pools=(SimpleNamespace(profile_id="pi-main", pool_id="pool-frozen"),)
+    )
+    lease = _OverlayLease({"LEASE_ONLY": "yes"})
+    request = runtime_module.RuntimeSpawnRequest(
+        profile_id="pi-main",
+        worker_instance_id="worker-1",
+        operation_kind="ordinary",
+        mode="explore",
+    )
+    factory = runtime_module.runtime_lease_factory_for_request(
+        snapshot=snapshot, pool_manager=_OverlayManager(lease), request=request
+    )
+    overlay = {"DSWARM_TASK_TOKEN": "token-original"}
+    factory.bind_worker_env(overlay)
+    overlay["DSWARM_TASK_TOKEN"] = "token-mutated"
+
+    acquired = await factory("worker-1", "ordinary")
+
+    assert dict(acquired.worker_env) == {
+        "LEASE_ONLY": "yes",
+        "DSWARM_TASK_TOKEN": "token-original",
+    }
+    with pytest.raises(TypeError):
+        acquired.worker_env["DSWARM_TASK_TOKEN"] = "replacement"
+
+
+@pytest.mark.asyncio
+async def test_runtime_lease_binding_releases_conflicting_projection() -> None:
+    from types import SimpleNamespace
+
+    snapshot = SimpleNamespace(
+        pools=(SimpleNamespace(profile_id="pi-main", pool_id="pool-frozen"),)
+    )
+    lease = _OverlayLease({"DSWARM_TASK_TOKEN": "projection-token"})
+    request = runtime_module.RuntimeSpawnRequest(
+        profile_id="pi-main",
+        worker_instance_id="worker-1",
+        operation_kind="ordinary",
+        mode="explore",
+    )
+    factory = runtime_module.runtime_lease_factory_for_request(
+        snapshot=snapshot, pool_manager=_OverlayManager(lease), request=request
+    )
+    factory.bind_worker_env({"DSWARM_TASK_TOKEN": "worker-token"})
+
+    with pytest.raises(RuntimePolicyError, match="runtime_worker_env_conflict"):
+        await factory("worker-1", "ordinary")
+
+    assert lease.release_calls == 1
+    assert factory.last_pool_instance_id == ""
+
+
 @pytest.mark.asyncio
 async def test_runtime_lease_factory_rejects_identity_or_operation_drift() -> None:
     from types import SimpleNamespace

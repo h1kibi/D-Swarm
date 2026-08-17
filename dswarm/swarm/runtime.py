@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Iterable, Literal, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
 
 from dswarm.solver.container_pool import RuntimeFailure, RuntimePoolView
 from dswarm.solver.direction_rules import DEFAULT_DIRECTION_REGISTRY
@@ -55,6 +56,20 @@ class RuntimeLeaseBinding:
     pool_id: str
     last_pool_instance_id: str = ""
     last_generation: int = 0
+    worker_env_overlay: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({}), repr=False
+    )
+
+    def bind_worker_env(self, env: Mapping[str, str]) -> None:
+        """Freeze non-secret per-worker control credentials before acquisition."""
+        if self.last_pool_instance_id:
+            raise RuntimePolicyError("runtime_worker_env_already_acquired")
+        normalized: dict[str, str] = {}
+        for key, value in dict(env).items():
+            if not isinstance(key, str) or not key or not isinstance(value, str):
+                raise RuntimePolicyError("invalid_runtime_worker_env")
+            normalized[key] = value
+        self.worker_env_overlay = MappingProxyType(normalized)
 
     async def __call__(self, worker_instance_id: str, operation_kind: str):
         if worker_instance_id != self.request.worker_instance_id:
@@ -66,6 +81,17 @@ class RuntimeLeaseBinding:
             worker_instance_id=self.request.worker_instance_id,
             operation_kind=self.request.operation_kind,
         )
+        if self.worker_env_overlay:
+            base_env = dict(getattr(lease, "worker_env", {}) or {})
+            conflicts = {
+                key for key, value in self.worker_env_overlay.items()
+                if key in base_env and base_env[key] != value
+            }
+            if conflicts:
+                await lease.release()
+                raise RuntimePolicyError("runtime_worker_env_conflict")
+            base_env.update(self.worker_env_overlay)
+            lease.worker_env = MappingProxyType(base_env)
         self.last_pool_instance_id = str(getattr(lease, "pool_instance_id", "") or "")
         self.last_generation = int(getattr(lease, "generation", 0) or 0)
         return lease

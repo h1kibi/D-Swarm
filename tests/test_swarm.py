@@ -272,44 +272,6 @@ def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None
     assert sw.engines == ["pi-zero", "pi-ten"], sw.engines
 
 
-def test_container_unavailable_falls_back_local_on_host(challenge, tmp_path: Path) -> None:
-    # P2-v3 BLOCKER-d: on a BARE HOST (not in the web container), an unavailable
-    # container backend keeps the historical silent fallback to a local worker.
-    sandbox = SandboxManager(root=tmp_path / "sbx")
-    arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
-               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               worker_backend="container")
-    sw._container_unavailable = True
-    import dswarm.swarm.swarm as swmod
-    # force host semantics regardless of where the test actually runs
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(swmod, "is_web_container", lambda: False)
-    try:
-        assert sw._backend_for_engine("pi") == "local"  # degrades, no raise
-    finally:
-        monkey.undo()
-
-
-def test_container_unavailable_hard_fails_in_web_container(challenge, tmp_path: Path) -> None:
-    # P2-v3 BLOCKER-d: INSIDE the web container, an unavailable container backend
-    # must HARD-FAIL — never silently launch a host-native CLI in the web container.
-    sandbox = SandboxManager(root=tmp_path / "sbx")
-    arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
-               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
-               worker_backend="container")
-    sw._container_unavailable = True
-    import dswarm.swarm.swarm as swmod
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(swmod, "is_web_container", lambda: True)
-    try:
-        with pytest.raises(RuntimeError, match="refusing to fall back"):
-            sw._backend_for_engine("pi")
-    finally:
-        monkey.undo()
-
-
 def test_engines_priority_sort_only_when_profiles(challenge, tmp_path: Path) -> None:
     # GUARD: the priority sort is scoped to worker_profiles. A bare engine-name
     # roster (no profiles) must keep its given order untouched — this is what
@@ -2711,73 +2673,6 @@ def test_pi_subscription_uses_profile_capacity_not_account_mutex(challenge, tmp_
     assert sw._profile_for_engine("pi", role="bootstrap", advance=False) is not None
 
 
-def test_active_run_container_is_inherited_without_losing_worker_connection(
-        challenge, tmp_path, monkeypatch):
-    """A Worker joining an active Run reuses its launch container snapshot while
-    retaining its own endpoint, credential, and model selection."""
-    import dswarm.solver.container_exec as ce
-    from dswarm.solver.credential_accounts import (
-        CredentialAccountStore,
-        account_store_root,
-    )
-
-    class _FakeHandle:
-        container = "dswarm-run-x"
-
-    created = []
-
-    def _ensure_container(*args, **kwargs):
-        created.append((args, kwargs))
-        return _FakeHandle()
-
-    monkeypatch.setattr(ce, "ensure_container", _ensure_container, raising=False)
-    account_root = account_store_root(tmp_path)
-    CredentialAccountStore(account_root).upsert_secret(
-        account_id="pi-off-main",
-        engine="api",
-        secret="off-profile-key",
-        base_url="https://off.example/v1",
-        target_engine="pi",
-    )
-    wroot = tmp_path / "wroot"
-    wroot.mkdir(parents=True, exist_ok=True)
-    sw = _coordinator_swarm(
-        challenge, tmp_path, worker_backend="container", worker_root=wroot,
-        credential_accounts_root=str(account_root),
-        worker_profiles=[
-            {"id": "web", "engine": "pi", "roles": ["bootstrap"],
-             "runtime": "docker-web"},
-            {"id": "off", "engine": "pi", "roles": ["bootstrap"],
-             "runtime": "docker-offline", "credential_account": "pi-off-main",
-             "base_url": "https://off.example/v1", "model": "off-model"},
-        ],
-        runtime_profiles=[
-            {"id": "docker-web", "backend": "container", "network": "bridge"},
-            {"id": "docker-offline", "backend": "container", "network": "none"},
-        ],
-    )
-    web_profile = sw._profile_for_engine("web", role="bootstrap")
-    first_handle = sw._container_for_engine("web", web_profile)
-    assert sw._container_runtime_id == "docker-web"
-    degraded_before = list(sw._runtime_degraded)
-
-    off_profile = sw._profile_for_engine("off", role="bootstrap")
-    inherited_handle = sw._container_for_engine("off", off_profile)
-
-    assert inherited_handle is first_handle
-    assert len(created) == 1, "an active Run must never create a second container"
-    assert sw._container_runtime_id == "docker-web"
-    assert sw._runtime_degraded == degraded_before
-
-    env = sw._runtime_env_for(
-        "pi", "cli-off", container=inherited_handle, profile=off_profile
-    )
-    assert env["DSWARM_WORKER_MODEL"] == "off-model"
-    assert env["OPENAI_BASE_URL"] == "https://off.example/v1"
-    assert env["OPENAI_API_KEY_FILE"] == "/run/dswarm/accounts/pi-off-main/API_KEY"
-    assert "OPENAI_API_KEY" not in env
-
-
 def test_pi_config_links_replace_stale_copied_config(tmp_path):
     from dswarm.swarm import swarm as swarm_mod
 
@@ -2851,210 +2746,6 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     assert runtime_provider.is_file()
     assert 'readSecret("OPENAI_API_KEY")' in runtime_provider.read_text(encoding="utf-8")
 
-
-
-def _patch_fake_container_worker(monkeypatch, gateway, *, cli_solver=None):
-    """Install deterministic container/gateway seams for per-worker token tests."""
-    from dswarm.solver.modelgateway import ModelGateway
-    import dswarm.solver.cli_solver as cli_solver_module
-    import dswarm.solver.container_exec as container_exec
-
-    class FakeContainer:
-        def to_container_path(self, path: str) -> str:
-            return "/container/" + str(path).replace("\\", "/").replace(":", "")
-
-    monkeypatch.setattr(ModelGateway, "instance", staticmethod(lambda: gateway))
-    monkeypatch.setattr(
-        Swarm, "_container_for_engine",
-        lambda self, engine, profile=None: FakeContainer(),
-    )
-    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", lambda path: None)
-    if cli_solver is not None:
-        monkeypatch.setattr(cli_solver_module, "CliSolver", cli_solver)
-    return FakeContainer
-
-
-def test_container_workers_receive_independent_claimed_tokens_and_release_only_self(
-    challenge, tmp_path, monkeypatch,
-):
-    from dswarm.solver.modelgateway import ModelGateway
-
-    gateway = ModelGateway(host="127.0.0.1", port=0)
-    seen = []
-
-    class FakeCliSolver:
-        def __init__(self, *args, **kwargs):
-            self.solver_id = kwargs["solver_label"]
-            self.worker_env = kwargs["worker_env"]
-            seen.append(self)
-
-    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
-    sw = _coordinator_swarm(
-        challenge, tmp_path, worker_backend="container",
-        worker_root=tmp_path / "workspace" / "workers",
-    )
-
-    first = sw._make_cli_worker("pi", mode="bootstrap")
-    review = sw._make_cli_worker("pi", mode="review")
-    recon = sw._make_cli_worker("pi", mode="bootstrap", profile_role="recon")
-
-    assert len(seen) == 3
-    tokens = [first.gateway_token, review.gateway_token, recon.gateway_token]
-    assert all(tokens)
-    assert len(set(tokens)) == 3
-    claims = [gateway.claims_for_token(token) for token in tokens]
-    assert [claim.token_scope for claim in claims] == ["worker", "review", "recon"]
-    assert all(claim.run_id == sw.run_id for claim in claims)
-    assert all(claim.challenge_id == challenge.id for claim in claims)
-    assert [claim.solver_id for claim in claims] == [
-        first.solver_id, review.solver_id, recon.solver_id,
-    ]
-    assert len({claim.worker_instance_id for claim in claims}) == 3
-    assert [item.worker_env["DSWARM_TASK_TOKEN"] for item in seen] == tokens
-    assert all(item.worker_env["DEEPSEEK_API_KEY"] == token for item, token in zip(seen, tokens))
-
-    sw._release_worker_account(first)
-    assert first.gateway_token is None
-    assert gateway.claims_for_token(tokens[0]) is None
-    assert gateway.claims_for_token(tokens[1]) is not None
-    assert gateway.claims_for_token(tokens[2]) is not None
-
-
-@pytest.mark.asyncio
-async def test_worker_runtime_finally_revokes_only_completed_worker_token(
-    challenge, tmp_path, monkeypatch,
-):
-    from dswarm.solver.modelgateway import ModelGateway
-    from dswarm.solver.types import SolveOutcome
-    from dswarm.swarm.agents import AgentProfile, DispatchDecision
-    from dswarm.swarm.runtime import SwarmWorkerRuntime
-
-    gateway = ModelGateway(host="127.0.0.1", port=0)
-    created = []
-
-    class FakeCliSolver:
-        def __init__(self, *args, **kwargs):
-            self.solver_id = kwargs["solver_label"]
-            self.worker_env = kwargs["worker_env"]
-            created.append(self)
-
-        async def run(self):
-            return SolveOutcome(False, None, 1, None, "worker complete")
-
-    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
-    sw = _coordinator_swarm(
-        challenge, tmp_path, engines=["pi"], worker_backend="container",
-        worker_root=tmp_path / "workspace" / "workers",
-    )
-    sibling = sw._make_cli_worker("pi", mode="bootstrap")
-    sibling_token = sibling.gateway_token
-
-    runtime = SwarmWorkerRuntime(sw, healthy=["pi"])
-    outcome = await runtime.run(
-        DispatchDecision(
-            intent_id="I-token-finally", profile="pi",
-            goal="finish and release", mode="explore",
-        ),
-        AgentProfile(id="pi", worker_profile="pi", mode="explore"),
-    )
-
-    completed = created[-1]
-    completed_token = completed.worker_env["DSWARM_TASK_TOKEN"]
-    assert outcome.reason == "worker complete"
-    assert completed.gateway_token is None
-    assert gateway.claims_for_token(completed_token) is None
-    assert gateway.claims_for_token(sibling_token) is not None
-
-
-def test_container_worker_constructor_failure_rolls_back_its_token(
-    challenge, tmp_path, monkeypatch,
-):
-    from dswarm.solver.modelgateway import ModelGateway
-
-    gateway = ModelGateway(host="127.0.0.1", port=0)
-
-    class ExplodingCliSolver:
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("fake worker construction failed")
-
-    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=ExplodingCliSolver)
-    sw = _coordinator_swarm(
-        challenge, tmp_path, worker_backend="container",
-        worker_root=tmp_path / "workspace" / "workers",
-    )
-
-    with pytest.raises(RuntimeError, match="fake worker construction failed"):
-        sw._make_cli_worker("pi", mode="bootstrap")
-
-    assert gateway.token_for_run(sw.run_id) is None
-    assert gateway._tokens == {}
-    assert gateway._run_tokens == {}
-
-
-def test_worker_account_claim_failure_rolls_back_gateway_token(
-    challenge, tmp_path, monkeypatch,
-):
-    from dswarm.solver.modelgateway import ModelGateway
-
-    gateway = ModelGateway(host="127.0.0.1", port=0)
-
-    class FakeCliSolver:
-        def __init__(self, *args, **kwargs):
-            self.solver_id = kwargs["solver_label"]
-            self.worker_env = kwargs["worker_env"]
-
-    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
-    sw = _coordinator_swarm(
-        challenge, tmp_path, worker_backend="container",
-        worker_root=tmp_path / "workspace" / "workers",
-    )
-
-    def fail_claim(*args, **kwargs):
-        raise RuntimeError("account claim failed")
-
-    monkeypatch.setattr(sw, "_claim_worker_account", fail_claim)
-
-    with pytest.raises(RuntimeError, match="account claim failed"):
-        sw._make_cli_worker("pi", mode="bootstrap")
-
-    assert gateway.token_for_run(sw.run_id) is None
-    assert gateway._tokens == {}
-    assert gateway._run_tokens == {}
-
-
-def test_explicit_endpoint_container_worker_does_not_issue_gateway_token(
-    challenge, tmp_path, monkeypatch,
-):
-    from dswarm.solver.modelgateway import ModelGateway
-
-    gateway = ModelGateway(host="127.0.0.1", port=0)
-
-    class FakeCliSolver:
-        def __init__(self, *args, **kwargs):
-            self.solver_id = kwargs["solver_label"]
-            self.worker_env = kwargs["worker_env"]
-
-    _patch_fake_container_worker(monkeypatch, gateway, cli_solver=FakeCliSolver)
-    sw = _coordinator_swarm(
-        challenge, tmp_path, worker_backend="container",
-        worker_root=tmp_path / "workspace" / "workers",
-    )
-    profile = {
-        "id": "pi-custom",
-        "engine": "pi",
-        "transport": "pi_cli",
-        "base_url": "https://llm.example/v1",
-        "api_key_ref": "CUSTOM_API_KEY",
-    }
-    monkeypatch.setattr(sw, "_profile_for_engine", lambda engine, role=None: profile)
-
-    worker = sw._make_cli_worker("pi", mode="bootstrap")
-
-    assert worker.gateway_token is None
-    assert "DSWARM_TASK_TOKEN" not in worker.worker_env
-    assert worker.worker_env["DSWARM_PI_PROVIDER"] == "dswarm-worker"
-    assert worker.worker_env["OPENAI_BASE_URL"] == "https://llm.example/v1"
-    assert gateway._tokens == {}
 
 
 @pytest.mark.asyncio
@@ -3479,3 +3170,23 @@ async def test_review_factory_exception_releases_reserved_lane(
     assert sw._worker_lane_gate.snapshot() == {
         "ordinary_active": 0, "review_active": 0,
     }
+
+
+def test_container_backend_without_frozen_policy_fails_closed(
+    challenge, tmp_path: Path,
+) -> None:
+    from dswarm.solver.runtime_policy import RuntimePolicyError
+
+    swarm = Swarm(
+        challenge,
+        [ModelSpec(solver_id="seat", model="mock")],
+        llm=None,
+        sandbox=SandboxManager(root=tmp_path / "sbx"),
+        artifacts=ArtifactStore(root=tmp_path / "arts"),
+        executor="cli",
+        worker_backend="container",
+    )
+
+    assert swarm._backend_for_engine("pi") == "container"
+    with pytest.raises(RuntimePolicyError, match="runtime_policy_required"):
+        swarm._make_cli_worker("pi", mode="bootstrap")

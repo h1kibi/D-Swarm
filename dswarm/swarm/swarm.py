@@ -52,7 +52,6 @@ from dswarm.solver.worker_profiles import (
     profile_names,
 )
 from dswarm.solver.workspace import cleanup_worker_scratch, ensure_workspace
-from dswarm.solver.container_exec import worker_image_for_profile
 from dswarm.swarm.insight_bus import InsightBus
 from dswarm.swarm.lane_gate import WorkerLaneGate
 from dswarm.swarm.stage_policy import StagePolicy
@@ -652,13 +651,8 @@ class Swarm(
             Path(credential_accounts_root).expanduser().resolve()
             if credential_accounts_root is not None else None
         )
-        # worker execution backend: "local" (host subprocess) or "container" (workers
-        # run in the run's Kali tool container for a consistent toolchain). The
-        # ContainerHandle is created lazily on first worker spawn (worker_root first).
-        self._container_handle = None  # set lazily by _container() when backend=container
-        self._container_runtime_id = ""  # runtime profile id the container was built with (#11)
-        self._container_unavailable = False
-        # route A P3: per-run model-gateway task token (issued when the run container
+        # ModelGateway issues independent per-worker task tokens at spawn time;
+        # only the blackboard token remains run-scoped here.
         self._blackboard_token = blackboard_token or os.environ.get("DSWARM_BLACKBOARD_TOKEN", "").strip() or None
         self._runtime_degraded: list[dict[str, Any]] = []
         # engines dropped from the roster by a dispatch-time health-check failure
@@ -1450,34 +1444,17 @@ class Swarm(
                 continue
 
     async def run(self) -> SwarmOutcome:
-        # Single authoritative teardown for the run's worker container, covering EVERY
-        # exit path of every solve mode: the coordinator's race-scout fast-path return,
-        # its main-loop finally, the race-only path, and exceptions. The per-method
-        # cleanups cancel worker tasks but the CONTAINER (and its idle supervisor) must
-        # be removed exactly when the run truly ends — doing it here guarantees a
-        # solved / stopped / budget-exhausted / errored run never leaks a container.
-        # Cheap + idempotent when there's no container (local backend) or it's already
-        # gone. A later resolve()/standby re-creates a fresh container via ensure_container.
-        if self.worker_backend == "container" or self._container_handle is not None:
-            try:
-                from dswarm.solver.container_exec import allow_container_start
-                allow_container_start(self.run_id)
-            except Exception:
-                pass
+        # Per-run profile/runtime pools outlive an individual solve pass. Their
+        # deletion/archive/shutdown lifecycle is owned by the run manager, not by
+        # ordinary completion of Swarm.run().
         await self._reconcile_blackboard_skill()
         try:
             if self.executor == "cli":
                 return await self._run_reason_scheduler()
             raise RuntimeError(f"unsupported executor: {self.executor}")
         finally:
-            if self.worker_backend == "container" or self._container_handle is not None:
-                try:
-                    from dswarm.solver.container_exec import teardown_container
-                    await asyncio.to_thread(teardown_container, self.run_id, remove=True)
-                except Exception:
-                    pass
             # Defense in depth: worker finally paths revoke individual tokens;
-            # run teardown removes any token left by a crash/late construction.
+            # run completion removes any token left by a crash/late construction.
             try:
                 from dswarm.solver.modelgateway import ModelGateway
                 ModelGateway.instance().revoke_run(self.run_id)

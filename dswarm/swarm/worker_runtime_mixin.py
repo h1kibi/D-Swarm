@@ -8,8 +8,8 @@ from typing import Any, Optional
 
 from dswarm.core.runtime_env import is_web_container
 from dswarm.solver.credential_accounts import runtime_env_for_engine
-from dswarm.solver.container_exec import worker_image_for_profile
 from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root, resolve_llm_provider
+from dswarm.solver.runtime_policy import RuntimePolicyError
 from dswarm.solver.worker_profiles import base_engine_for_profile, direction_profile_name, normalize_profile_roster, normalize_worker_profiles
 from dswarm.solver.workspace import ensure_workspace
 from dswarm.swarm.budget import WorkerBudgetExhausted
@@ -484,100 +484,13 @@ class WorkerRuntimeMixin:
         return env
 
     def _backend_for_engine(self, engine: str, profile: "Optional[dict]" = None) -> str:
+        """Resolve configured backend without mutating or degrading runtime policy."""
         profile = profile if profile is not None else self._profile_for_engine(engine)
         if profile:
             runtime = self._runtime_for_engine(engine, profile)
             if runtime:
-                if self._container_unavailable and runtime["backend"] == "container":
-                    self._fail_if_container_required(engine)
-                    return "local"
                 return runtime["backend"]
-        if self._container_unavailable and self.worker_backend == "container":
-            self._fail_if_container_required(engine)
-            return "local"
         return "container" if self.worker_backend == "container" else "local"
-
-    def _fail_if_container_required(self, engine: str) -> None:
-        """P2-v3: when the coordinator runs INSIDE the web container, a container
-        backend that has gone unavailable must NOT silently degrade to local — that
-        would launch a host-native agent CLI inside the web container (no tools,
-        wrong creds, broken isolation), violating the "web container ⇒ worker
-        container" invariant. Hard-fail the run instead so the operator sees the
-        real cause (docker socket unreachable / image missing / network name wrong)
-        rather than a subtly-wrong run. On a bare host this is a no-op and the
-        historical local fallback stands."""
-        from dswarm.swarm import swarm as _swarm_mod
-        if _swarm_mod.is_web_container():
-            raise RuntimeError(
-                f"container worker backend is unavailable for {engine!r} and this "
-                f"coordinator runs inside the web container — refusing to fall back "
-                f"to a host-native (local) worker (it would run with no tools / wrong "
-                f"credentials). Fix the container backend: check the docker socket "
-                f"mount, the worker image is pulled, and DSWARM_CONTROL_BIND/"
-                f"DSWARM_CONTROL_HOST + the compose network are set."
-            )
-
-    def _container_for_engine(self, engine: str, profile: "Optional[dict]" = None) -> "Optional[object]":
-        """The run's container ContainerHandle when worker_backend=="container",
-        else None (local host backend). Created lazily — worker_root must exist so
-        it can be bind-mounted as the shared workspace (only the run workspace +
-        control socket + account projection are mounted). Container mode surfaces
-        setup failures instead of silently falling back to host execution. The
-        first Worker's runtime becomes the active Run's immutable container snapshot;"""
-        if self._backend_for_engine(engine, profile) != "container":
-            return None
-        requested_runtime = (self._runtime_for_engine(engine, profile) or {})
-        requested_rt_id = requested_runtime.get("id") or (profile or {}).get("runtime") or ""
-        if self._container_handle is not None:
-            # One container is an immutable launch snapshot for the whole active Run.
-            # A Worker joining later intentionally inherits that container even when
-            # its current settings request another runtime. Endpoint, credential, and
-            # model selection remain per Worker in _runtime_env_for().
-            return self._container_handle
-        if self.worker_root is None:
-            self._container_unavailable = True
-            self._record_runtime_degraded(
-                engine=engine, profile=profile,
-                reason="container worker_backend requires worker_root",
-                requested_backend="container")
-            self._fail_if_container_required(engine)  # P2-v3: no local fallback in-container
-            return None
-        try:
-            from dswarm.solver.container_exec import ensure_container
-            # Mount the whole run workspace, not only workspace/workers: the shared
-            # graph lives in workspace/graph and the blackboard skill needs it.
-            # Route A: the image is picked per agent profile; category is fallback.
-            self._container_handle = ensure_container(
-                self.run_id,
-                str(self.workspace_root or self.worker_root),
-                image=worker_image_for_profile(profile, category=self.challenge.category),
-                network=str((self._runtime_for_engine(engine, profile) or {}).get("network") or "bridge"),
-                memory=str((self._runtime_for_engine(engine, profile) or {}).get("memory") or "") or None,
-                cpus=str((self._runtime_for_engine(engine, profile) or {}).get("cpus") or "") or None,
-                pids_limit=int((self._runtime_for_engine(engine, profile) or {}).get("pids_limit") or 0) or None,
-                account_root=(str(self.credential_accounts_root)
-                              if self.credential_accounts_root is not None else None),
-            )
-            # Remember the runtime captured by this active Run. Later Workers
-            # intentionally inherit this container instead of mutating or replacing it.
-            self._container_runtime_id = requested_rt_id
-            # Start/configure the process gateway here; each worker receives its
-            # own token later in _make_cli_worker once its immutable identity exists.
-            from dswarm.solver.modelgateway import ModelGateway
-            gw = ModelGateway.instance()
-            gw.account_root = (str(self.credential_accounts_root)
-                               if self.credential_accounts_root is not None else None)
-            if self.workspace_root is not None:
-                gw.sessions_root = str(self.workspace_root.parent)
-        except Exception as exc:  # noqa: BLE001
-            self._container_unavailable = True
-            self._record_runtime_degraded(
-                engine=engine, profile=profile,
-                reason=f"container worker backend failed for {self.run_id}: {exc}",
-                requested_backend="container")
-            self._fail_if_container_required(engine)  # P2-v3: no local fallback in-container
-            return None
-        return self._container_handle
 
     def _make_cli_worker(self, engine: str, *, mode: str, intent_goal: str = "",
                          intent_id: str = "", timeout_override: "Optional[int]" = None,
@@ -722,19 +635,18 @@ class WorkerRuntimeMixin:
         workdir = self._alloc_workdir(engine)
         # A frozen runtime policy is authoritative. Strict Docker workers acquire
         # asynchronously from their run-scoped pool; approved local-dev workers
-        # remain on the host. Transitional callers without a policy keep the
-        # legacy eager-container path until M9 migration is complete.
-        container = (
-            self._container_for_engine(engine, profile)
-            if runtime_policy is None else None
-        )
+        # remain on the host. Container execution without a frozen policy is the
+        # retired run-global ownership path and must fail closed, never fall back.
+        if runtime_policy is None and self._backend_for_engine(engine, profile) == "container":
+            raise RuntimePolicyError("runtime_policy_required")
+        container = None
         gateway_token = None
         explicit_endpoint = bool(
             (profile or {}).get("base_url")
             or (profile or {}).get("api_key_ref")
             or (profile or {}).get("provider_ref")
         )
-        if container is not None and not explicit_endpoint:
+        if (strict_docker or container is not None) and not explicit_endpoint:
             from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
             gateway_token = ModelGateway.instance().issue_worker(WorkerClaims(
                 run_id=self.run_id,
@@ -753,6 +665,20 @@ class WorkerRuntimeMixin:
             ))
         from dswarm.solver.cli_driver import driver_for
         try:
+            if runtime_lease_factory is not None and gateway_token:
+                runtime_lease_factory.bind_worker_env({
+                    "DEEPSEEK_API_KEY": gateway_token,
+                    "DSWARM_TASK_TOKEN": gateway_token,
+                    "DSWARM_GATEWAY_URL": os.environ.get(
+                        "DSWARM_GATEWAY_URL",
+                        "http://host.docker.internal:"
+                        f"{os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
+                    ),
+                    "DSWARM_PI_PROVIDER": "ctf-gateway",
+                    "DSWARM_WORKER_MODEL": str(
+                        (profile or {}).get("model") or "deepseek-v4-flash"
+                    ),
+                })
             worker = CliSolver(
                 None, self.challenge, bus=self.bus, cost=self.cost,
                 artifacts=self.artifacts, config=self.config, run_id=self.run_id,

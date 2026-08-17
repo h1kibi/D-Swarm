@@ -31,6 +31,7 @@ from dswarm.core.runtime_env import is_web_container
 from dswarm.solver.direction_rules import (
     normalize_operator_direction as _canonicalize_operator_direction,
 )
+from dswarm.solver.runtime_policy import RuntimePolicyError
 from dswarm.solver.worker_profiles import (
     base_engine_for_profile,
     normalize_profile_roster,
@@ -938,23 +939,10 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 ),
             )
         elif backend == "container":
-            # Forward-only compatibility for legacy runs without a frozen M9
-            # snapshot. New Docker-first runs exclusively use the manager lease.
-            from dswarm.solver.container_exec import (
-                ensure_container,
-                worker_image_for_profile,
-            )
-            container = await asyncio.to_thread(
-                ensure_container,
-                run.run_id,
-                str(root),
-                image=worker_image_for_profile(profile, category=challenge.category),
-                network=str(runtime.get("network") or "bridge"),
-                memory=str(runtime.get("memory") or "") or None,
-                cpus=str(runtime.get("cpus") or "") or None,
-                pids_limit=int(runtime.get("pids_limit") or 0) or None,
-                account_root=(str(account_root) if account_root is not None else None),
-            )
+            # Historical runs without a frozen M9 runtime context may still carry
+            # a container backend in persisted settings. Production standby must
+            # fail closed instead of recreating the retired run-global container.
+            raise RuntimePolicyError("legacy_container_disabled")
 
         # Re-open the persisted shared graph (verified facts / dead-ends / flag).
         # Metrics remain a sibling sidecar and may degrade independently.
@@ -1097,12 +1085,6 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             if shared_graph is not None:
                 try:
                     shared_graph.close()
-                except Exception:
-                    pass
-            if container is not None:
-                try:
-                    from dswarm.solver.container_exec import teardown_container
-                    await asyncio.to_thread(teardown_container, run.run_id, remove=True)
                 except Exception:
                     pass
 

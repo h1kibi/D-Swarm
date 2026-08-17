@@ -50,6 +50,7 @@ from typing import Callable, Optional, Any
 from dswarm.solver.cli_driver import CliDriver, CliResult, StreamStep
 from dswarm.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 from dswarm.solver.docker import docker_run
+from dswarm.solver.runtime_policy import RuntimePolicy
 from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, direction_image
 
 LEGACY_CONTAINER_EXEC_COMPATIBILITY_FACADE = True
@@ -677,6 +678,34 @@ def ensure_container(run_id: str, host_workspace: str, *,
         if mode == "rcp":
             _await_supervisor(handle)
         return handle
+
+
+# The old one-container-per-run constructor remains only as an explicitly gated
+# compatibility seam for low-level tests and unsafe local development. Production
+# Swarm/Web/BTW code must use ContainerPoolManager instead.
+_ensure_container_legacy = ensure_container
+
+
+def legacy_container_allowed(policy: RuntimePolicy) -> bool:
+    """Return whether the deprecated facade is explicitly authorized."""
+    return (
+        isinstance(policy, RuntimePolicy)
+        and policy.mode == "local_dev"
+        and policy.local_workers_allowed
+    )
+
+
+def ensure_container_legacy_for_tests(
+    run_id: str,
+    host_workspace: str,
+    *,
+    policy: RuntimePolicy,
+    **kwargs: Any,
+) -> ContainerHandle:
+    """Invoke the deprecated constructor only under approved local-dev policy."""
+    if not legacy_container_allowed(policy):
+        raise RuntimeError("legacy_container_disabled")
+    return _ensure_container_legacy(run_id, host_workspace, **kwargs)
 
 
 def _await_supervisor(handle: ContainerHandle) -> None:
