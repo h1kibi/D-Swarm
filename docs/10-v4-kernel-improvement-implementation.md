@@ -1375,37 +1375,91 @@ M7-2（replay/paired bootstrap/N/A 纪律报告 + 测试 40-44/52/117-118）→ 
 
 ---
 
-## M8 Advisor 解锁实验（09 §10.3.8；第六批维持 No-Go，本模块只做证据收集）
+## M8 Advisor 解锁实验（09 §10.3.8；仅离线证据收集）
 
-**现状（已核实）**：`shared_graph.subscribe_events` 存在但仅轮询；ReasonSwarm 的 `gather`
-屏障意味着"flag 落地 → 下一轮 Reason"至少等本轮最慢 worker。评审要求先给消费协议 +
-延迟 trace，再谈实施。
+**状态（2026-08-17）**：Implemented (offline evidence collection only); production Advisor remains No-Go.
 
-**设计（不生产化）**
+**实施结论与边界**
 
-1. `dswarm/swarm/suggestions.py`——suggestion 侧表（**非 intents**）：
-   ```sql
-   CREATE TABLE suggestions (
-     suggestion_id TEXT PRIMARY KEY,
-     source_event_seq INTEGER NOT NULL UNIQUE,   -- 幂等：同一源事件唯一
-     kind TEXT NOT NULL,                          -- flag_scout|...
-     payload TEXT NOT NULL,
-     status TEXT NOT NULL DEFAULT 'open',         -- open|consumed|rejected
-     reason TEXT, created_seq INTEGER)
-   ```
-2. `scripts/advisor_latency_exp.py`：同一 fixture 跑两条路径——
-   - baseline：现网行为，记录 `time(flag_found → next focused dispatch)`；
-   - suggestion：flag 事件时写 open suggestion（不唤醒、不派发），Reason 下一轮摘要增
-     `## Open suggestions` block，Reason 决定 convert（→propose_intent）或 reject（记
-     reason）；测量延迟差，并计算"若存在唤醒机制"的理论最小延迟。
-   输出完整 trace + 接受/拒绝原因，作为第六批解锁与否的证据。
-3. 生命周期：convert 前检查 pause/stop/budget；`pause/stop` 后绝不产生新 spawn；
-   durable cursor 用 `source_event_seq`，进程重启后从 checkpoint 续。
+M8 已按离线实验契约实现，但没有解锁生产 Advisor，也没有实现 OODA 快路径。实现仅比较同一冻结
+fixture 下 baseline 与 Advisor 两次“下一轮规划输出”，用于评估 Advisor block 是否改善意图质量；它不能
+证明真实派发更快、flag latency 降低、solve rate 提升、worker 启动减少或竞速结果改善。
 
-**测试**：同 source_event_seq 重放不重复；rejected 不生成 intent；pause/stop 零 spawn；
-cursor 恢复幂等。
+生产摘要可能已经包含 `_captured_flags_block()`；baseline 始终把 fixture 中的 opaque
+`graph_summary` 原样交给 planner。Advisor arm 只在该不透明前缀之后追加固定格式的建议 block，
+不会解析、提取或复制原始 flag，也不会读取 hidden reference 内容。生产 schema、SharedGraph、
+EventBus、Reason prompt、scheduler/dispatch、Web/TUI、pause/stop/budget、wakeup、cost ledger 与
+provenance gate 均未改动；生产代码也不反向导入任何 M8 模块。
 
-**验收映射**：09 §10.5 Advisor 全部 5 条（以实验产物形式）。
+**已实现模块**
+
+1. `dswarm/swarm/advisor_experiment.py`
+   - 定义冻结的 `AdvisorFixture`、hidden `AdvisorReferenceObjective`、确定性
+     `flag_scout_trigger()` 与建议 block 构造器；同一 source identity 可稳定重建 fixture。
+   - `summary_digest` 只绑定精确 opaque summary；source identity 经过单行、ASCII、长度与
+     canonical route 校验。
+   - planner 输出通过显式 allowlist 转成 `SafeReasonTrace`：只持久化结构化枚举、数值、事实引用、
+     路由和不可逆 goal fingerprint；不直接 `asdict/model_dump/to_payload`，不保存
+     `Intent.goal/rationale/result_detail`、`ReasonResult.audit_notes`、prompt、request、raw flag、
+     hidden reference ID 或异常消息。
+
+2. `dswarm/swarm/advisor_sidecar.py`
+   - 每个 case 写入 `<case_root>/metrics/advisor-experiment.jsonl`，使用
+     `advisor-experiment.writer.lock` 执行单 writer、write-once fixture-root 绑定；第二 writer
+     固定拒绝。
+   - 事件只接受固定 kind/payload allowlist，并绑定 `fixture_id + summary_digest +
+     benchmark_run_id`。物理顺序 DFA 覆盖 `case_started`、suggestion lifecycle、两 arm 的
+     setup/terminal、`case_interrupted` 与最终 `case_completed`。
+   - exact duplicate 幂等；语义冲突、重复 terminal、无 start 的 terminal、consumed/rejected
+     并存、完成后追加或 identity/digest 不一致均为 `corrupt`；缺 terminal、orphan start、
+     interruption 或尾部 partial line 为 `incomplete`。`suggestion_consumed` 仅表示 runner 已把
+     Advisor 请求交给 planner callable，不宣称上游 provider 已收到请求。
+
+3. `dswarm/swarm/advisor_runner.py`
+   - baseline/advisor 各由 `PlannerFactory(arm)` 创建独立 callable，不允许跨 arm 复用同一对象；
+     arm 顺序由 fixture identity 确定，降低固定顺序偏差。
+   - 每个 arm 由 runner 拥有唯一 asyncio task；timeout/cancel 后先 cancel 并有界等待清理，清理
+     未完成即抛 `AdvisorIsolationFailure`，不再启动另一 arm/后续 case。
+   - `CancelledError`、`KeyboardInterrupt`、`SystemExit` 保持传播；可写时追加结构化 interruption，
+     不伪造 planner terminal。普通 planner 错误只写固定 outcome/error code，不持久化异常文本。
+   - M8 v1 没有进程级 sandbox；operator suite 与 planner adapter 是受信本地代码，不得创建未交给
+     runner 的后台任务或在 arm 结束后继续写 trace/usage。
+
+4. `dswarm/swarm/advisor_report.py`
+   - 是唯一允许语义读取 `reference_objectives` 的模块；hidden reference 只在内存中计算 coverage、
+     intent overlap/citation 与 `CaseAssessment`，assessment 不回写 sidecar。
+   - usage 保留 `measured | estimated | unknown`；只有同一字段两侧均 measured 时才给 token/USD
+     delta，缺失值绝不当作 0。case 先在 `benchmark_run_id` 内求均值，再按 run bootstrap。
+   - 报告 kind 固定为 `m8_offline_next_cycle_planning_estimate`；真实 flag latency、solve rate、
+     worker starts saved、tokens saved、race outcome、生产 pause/stop/budget 正确性与 OODA wakeup
+     latency 均固定为 `"N/A"`。
+
+5. `dswarm/swarm/advisor_benchmark.py` 与 `scripts/advisor_benchmark.py`
+   - 顺序执行 operator-local suite；在创建目录、sink 或 planner 前完整校验 fixture、source key、
+     case root、summary digest、timeout 与 bootstrap 参数。
+   - artifact 只允许落在仓库内 `eval_runs/m8-advisor/` 或 `sessions/` 的严格后代；已有 clean trace
+     只读复用，incomplete/corrupt/partial/identity mismatch 不追加、不重跑。
+   - CLI 通过 `module:factory` 加载本地 suite；Python 层 stdout/stderr 被丢弃并转换为固定错误码，
+     不回显 prompt、flag、credential 或异常。原生 `os.write` 与 child-process 输出不在 v1 隔离
+     能力内，受信 adapter 必须保持静默。
+   - stdout 只输出一行确定性 JSON；`--output` 仅允许仓库内 `eval_runs/` 或 `sessions/`，采用同目录
+     temp → flush → fsync → replace 的原子写入，失败清理自己的 temp 并保留旧文件。
+
+**验收与测试**
+
+- 六组 M8 测试覆盖 trigger/fixture、安全序列化、sidecar DFA、单 writer、fixture-root 绑定、两种 arm
+  顺序、owned-task timeout cleanup、取消/中断、reporter-only reference、逐字段 usage 分母、run-level
+  bootstrap、suite-fatal isolation、路径限制、固定 CLI 错误码与原子输出。
+- AST 边界测试禁止 M8 导入 SharedGraph、production scheduler、EventBus、UI 或 gate，也禁止
+  production Reason/scheduler/graph/gate 反向导入 M8；trace/runner 禁止通用 planner-output 序列化。
+- `/local_benchmarks/` 与 `/eval_runs/` 已由根 `.gitignore` 屏蔽，fixture、opaque summary、hidden
+  reference、trace/report 和 credential 均不得提交。
+
+**继续维持 No-Go 的生产前置条件**
+
+如需在线化，必须另立 RFC 并解决：durable watcher ownership、事件驱动 wakeup、`gather` 的取消/等待
+策略、正式 Intent conversion gate、pause/stop/budget/cooldown/cursor、provider/process 级隔离，以及
+真实端到端 dispatch/flag latency 实验。M8 的离线结果不能绕过这些前置条件。
 
 ---
 

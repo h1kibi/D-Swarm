@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import asdict, fields
 import json
 import math
@@ -307,3 +308,110 @@ def test_module_does_not_import_production_scheduler_or_graph():
     source = Path("dswarm/swarm/advisor_experiment.py").read_text("utf-8")
     for forbidden in ("reason_scheduler", "shared_graph", "event_bus", "solver.gate"):
         assert forbidden not in source
+
+
+_M8_OFFLINE_FILES = (
+    Path("dswarm/swarm/advisor_experiment.py"),
+    Path("dswarm/swarm/advisor_sidecar.py"),
+    Path("dswarm/swarm/advisor_runner.py"),
+    Path("dswarm/swarm/advisor_report.py"),
+    Path("dswarm/swarm/advisor_benchmark.py"),
+    Path("scripts/advisor_benchmark.py"),
+)
+_PRODUCTION_FILES = (
+    Path("dswarm/swarm/reason_scheduler.py"),
+    Path("dswarm/swarm/shared_graph.py"),
+    Path("dswarm/solver/reason.py"),
+    Path("dswarm/solver/gate.py"),
+)
+_FORBIDDEN_OFFLINE_IMPORT_PREFIXES = (
+    "apps",
+    "dswarm.core.event_bus",
+    "dswarm.solver.gate",
+    "dswarm.swarm.reason_scheduler",
+    "dswarm.swarm.shared_graph",
+)
+_M8_MODULE_NAMES = {
+    "advisor_experiment",
+    "advisor_sidecar",
+    "advisor_runner",
+    "advisor_report",
+    "advisor_benchmark",
+}
+
+
+def _python_tree(path: Path) -> ast.AST:
+    return ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+
+
+def _import_names(path: Path) -> tuple[str, ...]:
+    names: list[str] = []
+    for node in ast.walk(_python_tree(path)):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            names.append(module)
+            names.extend(
+                f"{module}.{alias.name}" if module else alias.name
+                for alias in node.names
+            )
+    return tuple(names)
+
+
+def test_all_m8_modules_are_statically_isolated_from_production_substrate():
+    for path in _M8_OFFLINE_FILES:
+        imports = _import_names(path)
+        for imported in imports:
+            assert not any(
+                imported == prefix or imported.startswith(prefix + ".")
+                for prefix in _FORBIDDEN_OFFLINE_IMPORT_PREFIXES
+            ), (path, imported)
+
+
+def test_production_paths_do_not_import_m8_experiment_modules():
+    for path in _PRODUCTION_FILES:
+        imports = _import_names(path)
+        for imported in imports:
+            assert not any(
+                imported == name or imported.endswith("." + name)
+                for name in _M8_MODULE_NAMES
+            ), (path, imported)
+
+
+def test_trace_and_runner_modules_do_not_use_generic_planner_serialization():
+    targets = (
+        Path("dswarm/swarm/advisor_experiment.py"),
+        Path("dswarm/swarm/advisor_sidecar.py"),
+        Path("dswarm/swarm/advisor_runner.py"),
+    )
+    forbidden_calls = {"asdict", "model_dump", "vars", "to_payload"}
+    for path in targets:
+        for node in ast.walk(_python_tree(path)):
+            if isinstance(node, ast.Call):
+                function = node.func
+                name = (
+                    function.id if isinstance(function, ast.Name)
+                    else function.attr if isinstance(function, ast.Attribute)
+                    else ""
+                )
+                assert name not in forbidden_calls, (path, name)
+            if isinstance(node, ast.Attribute):
+                assert node.attr != "__dict__", path
+
+
+def test_hidden_references_are_only_semantically_read_by_reporter():
+    targets = (
+        Path("dswarm/swarm/advisor_runner.py"),
+        Path("dswarm/swarm/advisor_sidecar.py"),
+        Path("dswarm/swarm/advisor_benchmark.py"),
+        Path("scripts/advisor_benchmark.py"),
+    )
+    for path in targets:
+        reads = [
+            node for node in ast.walk(_python_tree(path))
+            if isinstance(node, ast.Attribute)
+            and node.attr == "reference_objectives"
+            and isinstance(node.ctx, ast.Load)
+        ]
+        assert reads == [], path
