@@ -64,27 +64,13 @@ DEFAULT_TTL_S = 12 * 3600
 # ticket or reading identity both require an already-valid token.
 PUBLIC_API_PATHS = frozenset({"/api/auth/login", "/api/health"})
 
-_LOOPBACK_HOSTS = frozenset({
-    "127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1", "",
-})
-
-
-def is_loopback_host(host: Optional[str]) -> bool:
-    """True if `host` is a loopback / unset bind address.
-
-    A wildcard bind (0.0.0.0 / ::) is explicitly NOT loopback: it exposes the
-    server on every interface, which is exactly the case the fail-fast guards.
-    """
-    h = (host or "").strip().lower()
-    # strip optional IPv6 brackets and a trailing :port a user might pass in
-    # DSWARM_WEB_BIND (e.g. "[::1]:8000" or "127.0.0.1:8000"). A bare IPv6 like
-    # "::1" has multiple colons and no brackets — don't mistake its last colon
-    # for a port separator.
-    if h.startswith("[") and "]" in h:
-        h = h[1:h.index("]")]
-    elif h.count(":") == 1:
-        h = h.split(":", 1)[0]
-    return h in _LOOPBACK_HOSTS
+# Keep this public import for callers/tests that historically imported it here;
+# the policy implementation lives in the shared runtime module.
+from dswarm.core.runtime_env import (  # noqa: E402
+    WebLaunchConfigError,
+    is_loopback_host,
+    validate_web_launch,
+)
 
 
 def _derive_secret(password: str) -> bytes:
@@ -142,13 +128,20 @@ class AuthConfig:
         reachable from the network. That is almost never intended; make it a
         loud startup error instead of a silent exposure.
         """
-        if not self.password and not is_loopback_host(self.bind_host):
-            raise RuntimeError(
-                f"Refusing to start: bound to non-loopback host "
-                f"{self.bind_host!r} with no {PASSWORD_ENV} set — the /api "
-                f"surface (including credential accounts) would be exposed "
-                f"unauthenticated. Set {PASSWORD_ENV}, or bind to 127.0.0.1."
+        try:
+            validate_web_launch(
+                public_host=self.bind_host,
+                password=self.password,
+                internal_bind=os.environ.get("DSWARM_WEB_INTERNAL_BIND"),
+                trusted_control_plane=(
+                    os.environ.get("DSWARM_TRUSTED_CONTROL_PLANE", "")
+                    .strip().lower() in {"1", "true", "yes", "on"}
+                ),
             )
+        except WebLaunchConfigError as exc:
+            # Preserve the historical RuntimeError API while keeping the
+            # structured, secret-free policy code visible to callers/logs.
+            raise RuntimeError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

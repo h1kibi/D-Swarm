@@ -69,9 +69,13 @@ services:
       # container data root == host root (identity mirror), so _mount_source is a no-op
       DSWARM_CONTAINER_DATA_ROOT: "${DSWARM_HOST_DATA_ROOT}"
       DSWARM_SESSIONS_ROOT: "${DSWARM_HOST_DATA_ROOT}/sessions"
-      # Uvicorn listens on 0.0.0.0 inside the container; auth follows the
-      # host-side published address so loopback-only use can stay passwordless.
+      # Uvicorn listens on 0.0.0.0 inside the container. Auth follows the
+      # host-side published address, while the trusted internal wildcard is
+      # explicitly distinguished from public exposure.
       DSWARM_WEB_BIND: "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}"
+      DSWARM_WEB_PUBLIC_HOST: "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}"
+      DSWARM_WEB_INTERNAL_BIND: "0.0.0.0"
+      DSWARM_TRUSTED_CONTROL_PLANE: "1"
       DSWARM_WEB_PASSWORD: "${DSWARM_WEB_PASSWORD:-}"
       DSWARM_WORKER_IMAGE: "${DSWARM_WORKER_IMAGE:-ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1}"
       DSWARM_WORKER_IMAGE_VERSION: "${DSWARM_WORKER_IMAGE_VERSION:-}"

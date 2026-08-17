@@ -86,6 +86,30 @@ require_local_worker_gate() {
   fi
 }
 
+require_web_launch_policy() {
+  local host="${1:-}"
+  local normalized="$host"
+  # Match the shared Python validator: bracketed IPv6 and host:port spellings
+  # are normalized before the public exposure decision. Do not print host or
+  # password values in policy diagnostics.
+  if [[ "$normalized" == \[*\]* ]]; then
+    normalized="${normalized#\[}"
+    normalized="${normalized%%\]*}"
+  elif [[ "$normalized" != *:*:* && "$normalized" == *:* ]]; then
+    normalized="${normalized%%:*}"
+  fi
+  normalized="${normalized,,}"
+  case "$normalized" in
+    ""|localhost|127.*|::1|0:0:0:0:0:0:0:1)
+      return 0
+      ;;
+  esac
+  if [ -z "${DSWARM_WEB_PASSWORD:-}" ]; then
+    echo "ERROR: web_password_required_for_non_loopback" >&2
+    exit 1
+  fi
+}
+
 require_docker_compose() {
   if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: docker_unavailable: Docker CLI is required for containerized control-plane runs" >&2
@@ -120,6 +144,8 @@ run_web_local() {
       *) passthru+=("$1"); shift ;;
     esac
   done
+
+  require_web_launch_policy "$host"
 
   local ui_dir="apps/web/ui"
   local want_ui=1
@@ -279,6 +305,10 @@ run_web() {
         ;;
     esac
   done
+
+  # Fail before the local uvicorn path or any Docker probe/Compose call. This
+  # mirrors dswarm.core.runtime_env.validate_web_launch without exposing secrets.
+  require_web_launch_policy "$host"
 
   if [ "$local_dev" -eq 1 ]; then
     # The CLI flag alone is intentionally insufficient: production must never
