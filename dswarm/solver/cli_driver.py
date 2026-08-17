@@ -206,6 +206,37 @@ class CliResult:
     runtime_status: dict = field(default_factory=dict)
 
 
+class ProbeContractError(RuntimeError):
+    """The driver cannot prove that its runtime Probe is tool-disabled."""
+
+
+@dataclass(frozen=True)
+class CliProbeSpec:
+    """Safe, single-turn invocation description for a runtime readiness Probe."""
+
+    argv: tuple[str, ...]
+    prompt: str
+    model: str
+    session_dir: str
+    disabled_tools: tuple[str, ...]
+    non_agentic: bool
+    requires_closed_stdin: bool
+    max_output_bytes: int = 64 * 1024
+
+
+@dataclass(frozen=True)
+class CliProbeResult:
+    """Sanitized result of parsing a tool-disabled Probe transcript."""
+
+    ok: bool
+    classification: str
+    code: str
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    diagnostics: str = ""
+    completed_event_type: Optional[str] = None
+
+
 @dataclass
 class StreamStep:
     """One live step parsed from a streaming CLI line — so the deck can show the
@@ -322,6 +353,16 @@ class CliDriver(abc.ABC):
     @abc.abstractmethod
     def parse(self, stdout: str, stderr: str) -> CliResult:
         """Normalize the engine's stdout into a CliResult."""
+
+    def probe_spec(self, *, model: str, session_dir: str) -> CliProbeSpec:
+        """Return a provably tool-disabled, one-turn runtime Probe."""
+        raise ProbeContractError("tool_disabled_unprovable")
+
+    def parse_probe_result(
+        self, stdout: str, stderr: str, returncode: int
+    ) -> CliProbeResult:
+        """Parse a Probe transcript without exposing raw model/provider text."""
+        raise ProbeContractError("probe_parser_unavailable")
 
     # ── self-check (FE-healthcheck-page) ─────────────────────────────────────
     # The deep probe sends ONE tiny prompt and waits for the engine to answer —
@@ -654,6 +695,177 @@ class PiDriver(CliDriver):
                              raw_stderr=stderr[-2000:])
         return CliResult(text=stdout[-8000:], session=session, raw_stderr=stderr[-2000:])
 
+    _PROBE_BUILTIN_TOOLS = ("read", "bash", "edit", "write", "grep", "find", "ls")
+    _PROBE_MAX_OUTPUT_BYTES = 64 * 1024
+
+    @staticmethod
+    def _validate_probe_value(value: str, field_name: str, *, max_len: int = 256) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError(f"{field_name} must not be empty")
+        if len(value) > max_len or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(f"{field_name} is invalid")
+        return value
+
+    def _probe_disabled_tools(self) -> tuple[str, ...]:
+        tools = list(self._PROBE_BUILTIN_TOOLS) + list(self._WEB_TOOLS)
+        if self.KB_TOOL_PREFIX:
+            tools.append(self.KB_TOOL_PREFIX)
+        configured = os.environ.get("DSWARM_MCP_TOOL_PREFIXES", "")
+        tools.extend(part.strip() for part in configured.split(",") if part.strip())
+        return tuple(dict.fromkeys(tools))
+
+    def probe_spec(self, *, model: str, session_dir: str) -> CliProbeSpec:
+        model = self._validate_probe_value(model, "model")
+        session_dir = self._validate_probe_value(session_dir, "session_dir", max_len=1024)
+        # The path is interpreted inside the Linux worker container, even when
+        # the coordinator itself runs on Windows.
+        if not session_dir.startswith("/"):
+            raise ValueError("session_dir must be absolute")
+        disabled_tools = self._probe_disabled_tools()
+        # `pi` is intentionally a logical in-container command.  Do not use
+        # self.bin: resolving it would inspect or execute the host installation.
+        argv = (
+            "pi",
+            "--mode",
+            "json",
+            "--model",
+            model,
+            "--session-dir",
+            session_dir,
+            "--exclude-tools",
+            ",".join(disabled_tools),
+            self.HELLO_PROMPT,
+        )
+        return CliProbeSpec(
+            argv=argv,
+            prompt=self.HELLO_PROMPT,
+            model=model,
+            session_dir=session_dir,
+            disabled_tools=disabled_tools,
+            non_agentic=True,
+            requires_closed_stdin=True,
+            max_output_bytes=self._PROBE_MAX_OUTPUT_BYTES,
+        )
+
+    @staticmethod
+    def _probe_event_text(event: Any) -> str:
+        messages = event.get("messages") if isinstance(event, dict) else None
+        candidates = messages if isinstance(messages, list) else [
+            event.get("message") if isinstance(event, dict) else None
+        ]
+        parts: list[str] = []
+        for message in candidates:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            text = PiDriver._message_text(message)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _probe_usage(event: Any) -> tuple[Optional[int], Optional[int], bool]:
+        usage = None
+        if isinstance(event, dict) and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+        elif isinstance(event, dict) and isinstance(event.get("message"), dict):
+            message = event["message"]
+            if isinstance(message.get("usage"), dict):
+                usage = message["usage"]
+        if usage is None:
+            return None, None, True
+
+        def token_value(*keys: str) -> tuple[Optional[int], bool]:
+            present = next((usage[key] for key in keys if key in usage), None)
+            if present is None:
+                return None, True
+            if isinstance(present, bool) or not isinstance(present, int) or present < 0:
+                return None, False
+            return present, True
+
+        inp, inp_ok = token_value("input_tokens", "input")
+        out, out_ok = token_value("output_tokens", "output")
+        return inp, out, inp_ok and out_ok
+
+    @staticmethod
+    def _probe_failure_classification(text: str) -> tuple[str, str]:
+        lower = text.lower()
+        if any(token in lower for token in ("api key", "authentication", "unauthorized", "forbidden", "401", "403")):
+            return "auth", "auth_failed"
+        if any(token in lower for token in ("model", "configuration", "config", "unsupported", "invalid option")):
+            return "model_config", "model_or_config_failed"
+        if any(token in lower for token in ("timeout", "timed out", "deadline")):
+            return "timeout", "timeout"
+        if any(token in lower for token in ("connection", "connect", "transport", "reset", "network", "eof")):
+            return "transport", "transport_error"
+        return "non_zero_exit", "nonzero_exit"
+
+    def parse_probe_result(
+        self, stdout: str, stderr: str, returncode: int
+    ) -> CliProbeResult:
+        parseable = False
+        invalid_usage = False
+        input_tokens: Optional[int] = None
+        output_tokens: Optional[int] = None
+        reply_parts: list[str] = []
+        terminal_type: Optional[str] = None
+        failure_text = ""
+        for raw in (stdout or "").splitlines():
+            line = raw.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            parseable = True
+            event_type = str(event.get("type") or "")
+            if event_type in {"turn.failed", "agent_failed", "error"}:
+                error = event.get("error")
+                if isinstance(error, dict):
+                    failure_text += " " + str(error.get("message") or "")
+                else:
+                    failure_text += " " + str(error or event.get("message") or "")
+            inp, out, usage_ok = self._probe_usage(event)
+            if not usage_ok:
+                invalid_usage = True
+            else:
+                if inp is not None:
+                    input_tokens = inp
+                if out is not None:
+                    output_tokens = out
+            if event_type in {"message_end", "turn_end", "agent_end", "agent_settled"}:
+                terminal_type = terminal_type or event_type
+                text = self._probe_event_text(event)
+                if text:
+                    reply_parts.append(text)
+
+        if invalid_usage:
+            return CliProbeResult(False, "protocol", "invalid_usage", diagnostics="invalid usage")
+
+        failure_source = failure_text + " " + (stderr or "")
+        if returncode != 0 or failure_text:
+            classification, code = self._probe_failure_classification(failure_source)
+            return CliProbeResult(
+                False, classification, code, input_tokens, output_tokens,
+                diagnostics=code, completed_event_type=terminal_type,
+            )
+
+        if terminal_type is None:
+            code = "incomplete_turn" if parseable else "empty_output"
+            return CliProbeResult(False, "protocol", code, diagnostics=code)
+        if not "".join(reply_parts).strip():
+            return CliProbeResult(
+                False, "empty_reply", "empty_reply", input_tokens, output_tokens,
+                diagnostics="empty reply", completed_event_type=terminal_type,
+            )
+        return CliProbeResult(
+            True, "success", "completed", input_tokens, output_tokens,
+            completed_event_type=terminal_type,
+        )
+
     def _hello_argv(self) -> list[str]:
         # a real one-turn json-mode probe — symmetric with the other engines.
         return [self.bin, "--mode", "json", "--session-dir", ".pi-sessions",
@@ -748,6 +960,14 @@ class ProfileDriver(CliDriver):
     def parse(self, stdout: str, stderr: str) -> CliResult:
         return self.base.parse(stdout, stderr)
 
+    def probe_spec(self, *, model: str, session_dir: str) -> CliProbeSpec:
+        return self.base.probe_spec(model=self._model() or model, session_dir=session_dir)
+
+    def parse_probe_result(
+        self, stdout: str, stderr: str, returncode: int
+    ) -> CliProbeResult:
+        return self.base.parse_probe_result(stdout, stderr, returncode)
+
     def parse_stream_line(self, line: str) -> Optional["StreamStep"]:
         return self.base.parse_stream_line(line)
 
@@ -796,6 +1016,15 @@ class EndpointDriver(CliDriver):
 
     def parse(self, stdout: str, stderr: str) -> CliResult:
         return self.base.parse(stdout, stderr)
+
+    def probe_spec(self, *, model: str, session_dir: str) -> CliProbeSpec:
+        selected_model = str(self.profile.get("model") or model).strip()
+        return self.base.probe_spec(model=selected_model, session_dir=session_dir)
+
+    def parse_probe_result(
+        self, stdout: str, stderr: str, returncode: int
+    ) -> CliProbeResult:
+        return self.base.parse_probe_result(stdout, stderr, returncode)
 
     def parse_stream_line(self, line: str) -> Optional["StreamStep"]:
         return self.base.parse_stream_line(line)
