@@ -96,6 +96,7 @@ class UsageCall:
     profile_id: str | None
     configured_account_id: str | None
     billing_account_id: str | None
+    operation_kind: str = "provider_call"
 
     def __post_init__(self) -> None:
         if not self.provider_call_id:
@@ -126,6 +127,7 @@ class InvocationCall:
     configured_account_id: str | None
     billing_account_id: str | None
     producer: str = "fallback"
+    operation_kind: str = "provider_call"
 
     def __post_init__(self) -> None:
         if not self.invocation_id:
@@ -164,6 +166,7 @@ class UsageRecord:
     input_tokens: int | None
     output_tokens: int | None
     usd: float | None
+    operation_kind: str = "provider_call"
 
     def __post_init__(self) -> None:
         if self.producer not in {"internal", "gateway", "fallback"}:
@@ -234,6 +237,7 @@ class UsageRecord:
             profile_id=call.profile_id,
             configured_account_id=call.configured_account_id,
             billing_account_id=call.billing_account_id,
+            operation_kind=call.operation_kind,
             call_outcome=call_outcome,
             usage_status=usage_status,
             input_tokens=input_tokens,
@@ -265,6 +269,7 @@ class UsageRecord:
             profile_id=invocation.profile_id,
             configured_account_id=invocation.configured_account_id,
             billing_account_id=invocation.billing_account_id,
+            operation_kind=invocation.operation_kind,
             call_outcome=call_outcome,
             usage_status=usage_status,
             input_tokens=input_tokens,
@@ -446,6 +451,7 @@ class UsageJournal:
                     profile_id=row.get("profile_id"),
                     configured_account_id=row.get("configured_account_id"),
                     billing_account_id=row.get("billing_account_id"),
+                    operation_kind=row.get("operation_kind") or "provider_call",
                 )
             else:
                 call = UsageCall(
@@ -458,6 +464,7 @@ class UsageJournal:
                     profile_id=row.get("profile_id"),
                     configured_account_id=row.get("configured_account_id"),
                     billing_account_id=row.get("billing_account_id"),
+                    operation_kind=row.get("operation_kind") or "provider_call",
                 )
         except (KeyError, TypeError, ValueError) as exc:
             raise UsageJournalCorrupt("invalid started usage record") from exc
@@ -471,6 +478,10 @@ class UsageJournal:
             name: row.get(name)
             for name in UsageRecord.__dataclass_fields__
         }
+        # Journals written before M9 did not carry operation_kind.  Preserve
+        # deterministic replay by applying the backwards-compatible default.
+        if fields.get("operation_kind") is None:
+            fields["operation_kind"] = "provider_call"
         try:
             return UsageRecord(**fields)
         except (TypeError, ValueError) as exc:
@@ -489,6 +500,7 @@ class UsageContext:
     configured_account_id: str | None = None
     billing_account_id: str | None = None
     producer: str = "internal"
+    operation_kind: str = "provider_call"
 
     def __post_init__(self) -> None:
         if not self.run_id:
@@ -536,6 +548,7 @@ class UsageWriter:
                 profile_id=ctx.profile_id,
                 configured_account_id=ctx.configured_account_id,
                 billing_account_id=ctx.billing_account_id,
+                operation_kind=ctx.operation_kind,
             )
         else:
             call = UsageCall(
@@ -548,6 +561,7 @@ class UsageWriter:
                 profile_id=ctx.profile_id,
                 configured_account_id=ctx.configured_account_id,
                 billing_account_id=ctx.billing_account_id,
+                operation_kind=ctx.operation_kind,
             )
         self.journal.append_started(call)
         return call
