@@ -659,6 +659,28 @@ def test_state_machine_accepts_each_legal_transition(current, target):
     assert entry.state == target
 
 
+def test_transition_callback_failure_isolated_from_pool_state():
+    pool = make_pool()
+
+    def broken_callback(_view, _error):
+        raise RuntimeError("diagnostics unavailable")
+
+    manager = ContainerPoolManager(
+        run_id="run-a",
+        snapshot=make_snapshot(pool),
+        executor_factory=UnusedFactory(),
+        probe=UnusedProbe(),
+        credential_projector=UnusedProjector(),
+        transition_callback=broken_callback,
+    )
+
+    entry = manager._entries[pool.pool_id]
+    manager._apply_transition(entry, "starting")
+
+    assert entry.state == "starting"
+    assert manager.transition_count == 1
+
+
 def test_state_machine_rejects_illegal_transition_and_allows_idempotent_noop():
     entry = SimpleNamespace(state="ready")
     ContainerPoolManager._transition(entry, "ready")

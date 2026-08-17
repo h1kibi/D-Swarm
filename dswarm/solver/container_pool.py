@@ -183,6 +183,7 @@ class ContainerPoolManager:
         probe: RuntimeProbeProtocol,
         credential_projector: Any,
         credential_modes: Mapping[str, CredentialMode] | None = None,
+        transition_callback: Callable[[RuntimePoolView, str | None], None] | None = None,
     ) -> None:
         if run_id != snapshot.run_id:
             raise RuntimeFailure(category="configuration", code="snapshot_run_mismatch")
@@ -193,6 +194,8 @@ class ContainerPoolManager:
         self.executor_factory = executor_factory
         self.probe = probe
         self.credential_projector = credential_projector
+        self.transition_callback = transition_callback
+        self._transition_count = 0
         self._pools = {pool.pool_id: pool for pool in snapshot.pools}
         self._entries = {
             pool.pool_id: _ContainerPoolEntry(
@@ -348,7 +351,7 @@ class ContainerPoolManager:
                 return entry.executor
             if entry.startup_task is None:
                 entry.generation += 1
-                self._transition(entry, "starting")
+                self._apply_transition(entry, "starting")
                 entry.startup_task = asyncio.create_task(
                     self._start_generation(entry, entry.generation)
                 )
@@ -373,7 +376,7 @@ class ContainerPoolManager:
             async with entry.lock:
                 if self._closed or entry.generation != generation or entry.state != "starting":
                     raise self._entry_unavailable_failure(entry)
-                self._transition(entry, "probing")
+                self._apply_transition(entry, "probing")
             projection = await self._project(
                 entry=entry,
                 worker_instance_id=f"probe-{generation}",
@@ -395,7 +398,7 @@ class ContainerPoolManager:
                 entry.executor = executor
                 entry.probe_cache_identity = result.cache_identity
                 entry.failure = None
-                self._transition(entry, "ready")
+                self._apply_transition(entry, "ready")
             return executor
         except asyncio.CancelledError:
             if executor is not None:
@@ -421,7 +424,7 @@ class ContainerPoolManager:
                         entry.executor = residual_executor
                     entry.failure = failure
                     if entry.state not in {"stopping", "stopped"}:
-                        self._transition(entry, "degraded")
+                        self._apply_transition(entry, "degraded")
                     entry.unavailable.set()
             raise failure
         finally:
@@ -499,9 +502,9 @@ class ContainerPoolManager:
             elif failure.category == "infrastructure":
                 if entry.state != "ready":
                     return False
-                self._transition(entry, "recovering")
                 entry.failure = failure
                 entry.recovery_episode += 1
+                self._apply_transition(entry, "recovering")
                 entry.unavailable.set()
                 entry.recovery_source_instance = pool_instance_id
                 entry.recovery_task = asyncio.create_task(
@@ -512,7 +515,7 @@ class ContainerPoolManager:
                 if entry.state != "ready":
                     return False
                 entry.failure = failure
-                self._transition(entry, "degraded")
+                self._apply_transition(entry, "degraded")
                 entry.unavailable.set()
                 return True
 
@@ -540,7 +543,7 @@ class ContainerPoolManager:
             async with entry.lock:
                 if entry.state not in {"stopping", "stopped"}:
                     entry.failure = failure
-                    self._transition(entry, "degraded")
+                    self._apply_transition(entry, "degraded")
                     entry.unavailable.set()
             raise failure
 
@@ -550,7 +553,7 @@ class ContainerPoolManager:
             entry.executor = None
             entry.startup_task = None
             entry.generation += 1
-            self._transition(entry, "starting")
+            self._apply_transition(entry, "starting")
             generation = entry.generation
 
         executor = await self._start_generation(entry, generation)
@@ -574,7 +577,7 @@ class ContainerPoolManager:
         for entry in self._entries.values():
             async with entry.lock:
                 if entry.state != "stopped":
-                    self._transition(entry, "stopping")
+                    self._apply_transition(entry, "stopping")
                 entry.unavailable.set()
                 for task in (entry.startup_task, entry.recovery_task):
                     if task is not None and not task.done():
@@ -609,7 +612,7 @@ class ContainerPoolManager:
                 entry.active_leases.clear()
                 entry.active_workers = 0
                 if entry.state != "stopped":
-                    self._transition(entry, "stopped")
+                    self._apply_transition(entry, "stopped")
         return PoolCloseReport(
             closed=True,
             pool_count=len(self._entries),
@@ -636,6 +639,27 @@ class ContainerPoolManager:
             )
         )
 
+    @property
+    def transition_count(self) -> int:
+        return self._transition_count
+
+    def _view_for_entry(self, entry: _ContainerPoolEntry) -> RuntimePoolView:
+        return RuntimePoolView(
+            pool_id=entry.pool_spec.pool_id,
+            state=entry.state,
+            generation=entry.generation,
+            pool_instance_id=(
+                str(entry.executor.pool_instance_id)
+                if entry.executor is not None
+                else ""
+            ),
+            active_workers=entry.active_workers,
+            waiting_workers=entry.waiting_workers,
+            capacity=entry.pool_spec.pool_max_concurrent_workers,
+            failure=entry.failure,
+            recovery_episode=entry.recovery_episode,
+        )
+
     @staticmethod
     def _transition(entry: _ContainerPoolEntry, target: str) -> None:
         if target not in _POOL_STATES:
@@ -645,6 +669,21 @@ class ContainerPoolManager:
         if target not in _ALLOWED_TRANSITIONS[entry.state]:
             raise RuntimeFailure(category="configuration", code="invalid_pool_transition")
         entry.state = target
+
+    def _apply_transition(self, entry: _ContainerPoolEntry, target: str) -> None:
+        previous = entry.state
+        self._transition(entry, target)
+        if previous == entry.state:
+            return
+        self._transition_count += 1
+        callback = self.transition_callback
+        if callback is not None:
+            try:
+                callback(self._view_for_entry(entry), None)
+            except Exception:
+                # Diagnostics are a private best-effort sidecar.  They must never
+                # alter pool state, capacity, or scheduler behavior.
+                pass
 
     def _entry_unavailable_failure(self, entry: _ContainerPoolEntry) -> RuntimeFailure:
         if self._closed or entry.state in {"stopping", "stopped"}:

@@ -17,6 +17,7 @@ from dswarm.solver.container_runtime import ContainerRuntimeExecutor
 from dswarm.solver.control_receiver import ControlReceiver
 from dswarm.solver.credential_accounts import account_store_root
 from dswarm.solver.runtime_credentials import CredentialProjector
+from dswarm.solver.runtime_diagnostics import RuntimeDiagnosticsStore
 from dswarm.solver.runtime_policy import RuntimeSnapshot, build_runtime_policy
 from dswarm.solver.runtime_probe import RuntimeProbe
 from dswarm.solver.runtime_snapshot import (
@@ -92,6 +93,12 @@ def build_docker_runtime_context(
         pool.pool_id: _credential_mode(profile_by_id.get(pool.profile_id, {}))
         for pool in snapshot.pools
     }
+    diagnostics_store = RuntimeDiagnosticsStore(
+        run_root=root / run_id, run_id=run_id
+    )
+
+    def record_transition(view: Any, error: str | None) -> None:
+        diagnostics_store.record_transition(view, error=error)
 
     async def executor_factory(*, run_id: str, pool_spec: Any, generation: int) -> Any:
         active_receiver = receiver or ControlReceiver.instance()
@@ -111,6 +118,7 @@ def build_docker_runtime_context(
         probe=probe,
         credential_projector=projector,
         credential_modes=credential_modes,
+        transition_callback=record_transition,
     )
     if getattr(manager, "run_id", None) != run_id:
         raise RuntimeSnapshotBuildError(

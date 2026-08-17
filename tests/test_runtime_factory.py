@@ -7,6 +7,7 @@ import pytest
 
 from dswarm.core.event_bus import EventBus
 from dswarm.solver.runtime_factory import build_docker_runtime_context
+from dswarm.solver.container_pool import RuntimePoolView
 from dswarm.solver.runtime_policy import (
     PoolSpec,
     RuntimeNetworkSpec,
@@ -192,6 +193,60 @@ def test_runtime_context_passes_direct_and_gateway_credential_modes(tmp_path: Pa
     assert captured["credential_projector"] is not None
     assert captured["probe"] is not None
     assert callable(captured["executor_factory"])
+
+
+def test_runtime_context_wires_transition_callback_to_private_diagnostics(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def manager_factory(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return type("Manager", (), {
+            "run_id": kwargs["run_id"],
+            "snapshot": kwargs["snapshot"],
+        })()
+
+    build_docker_runtime_context(
+        run_id="tui-run",
+        sessions_root=tmp_path / "sessions",
+        bus=EventBus(),
+        budget_gate=ProfileBudgetGate(),
+        worker_profiles=_profiles(),
+        runtime_profiles=_runtimes(),
+        run_max_workers=2,
+        snapshot_builder=RecordingBuilder(),
+        pool_manager_factory=manager_factory,
+    )
+
+    callback = captured["transition_callback"]
+    callback(
+        RuntimePoolView(
+            pool_id="pool-a",
+            state="ready",
+            generation=1,
+            pool_instance_id="instance-a",
+            active_workers=0,
+            waiting_workers=0,
+            capacity=1,
+            failure=None,
+            recovery_episode=0,
+        ),
+        None,
+    )
+
+    lifecycle = (
+        tmp_path
+        / "sessions"
+        / "tui-run"
+        / ".runtime"
+        / "pools"
+        / "pool-a"
+        / "diagnostics"
+        / "lifecycle.jsonl"
+    )
+    assert lifecycle.is_file()
+    assert '"state":"ready"' in lifecycle.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(

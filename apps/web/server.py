@@ -49,6 +49,7 @@ from apps.web.routes.folders import router as folders_router
 from apps.web.routes.llm_settings import router as llm_settings_router
 from apps.web.routes.profile_health import router as profile_health_router
 from apps.web.routes.runtime_environment import router as runtime_environment_router
+from apps.web.routes.runtime_pools import router as runtime_pools_router
 from apps.web.routes.runs import router as runs_router
 from apps.web.routes.scheduler import router as scheduler_router
 from apps.web.routes.settings_identity import router as settings_identity_router
@@ -122,6 +123,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.include_router(llm_settings_router)
     app.include_router(profile_health_router)
     app.include_router(runtime_environment_router)
+    app.include_router(runtime_pools_router)
     app.include_router(runs_router)
     app.include_router(scheduler_router)
     app.include_router(settings_identity_router)
