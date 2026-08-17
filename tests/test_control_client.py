@@ -135,10 +135,7 @@ def receiver():
     # make the module-level helpers resolve THIS receiver
     cr.ControlReceiver._instance = rcv
     yield rcv
-    try:
-        rcv._srv.close()
-    except OSError:
-        pass
+    rcv.stop()
     cr.ControlReceiver._instance = None
 
 
@@ -297,3 +294,220 @@ def test_filter_env_only_allowed_keys():
                    "OPENAI_API_KEY": "v",
                    "PI_CODING_AGENT_DIR": "/home/kali/workspace/homes/cli-pi/.pi/agent"}
     assert cc._filter_env({"HOME": "/home/kali/workspace/h"}) == {"HOME": "/home/kali/workspace/h"}
+
+# ---------------------------------------------------------------------------
+# M9a-2: pool-instance-scoped RCP v2 identity
+
+_UUID_A = "11111111-1111-4111-8111-111111111111"
+_UUID_B = "22222222-2222-4222-8222-222222222222"
+
+
+def _runtime_identity(
+    *,
+    run_id: str = "run-pool",
+    pool_id: str = "pool-v1::alpha",
+    pool_instance_id: str = _UUID_A,
+    generation: int = 1,
+) -> cr.ExpectedRuntimeIdentity:
+    return cr.ExpectedRuntimeIdentity(
+        run_id=run_id,
+        pool_id=pool_id,
+        pool_instance_id=pool_instance_id,
+        generation=generation,
+        expected_image_id="sha256:abc",
+        protocol_version=2,
+    )
+
+
+def _pool_hello(identity: cr.ExpectedRuntimeIdentity, token: str, **overrides) -> dict:
+    hello = {
+        "protocol_version": identity.protocol_version,
+        "run_id": identity.run_id,
+        "pool_id": identity.pool_id,
+        "pool_instance_id": identity.pool_instance_id,
+        "generation": identity.generation,
+        "token": token,
+        "version": "fake/2",
+    }
+    hello.update(overrides)
+    return hello
+
+
+def _raw_pool_hello(receiver, hello: dict) -> tuple[socket.socket, dict]:
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    conn.settimeout(2.0)
+    conn.connect(("127.0.0.1", receiver._test_port))
+    conn.sendall((json.dumps(hello) + "\n").encode())
+    buf = b""
+    while b"\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    line, _, _ = buf.partition(b"\n")
+    ack = json.loads(line.decode()) if line else {}
+    return conn, ack
+
+
+def _connect_pool(receiver, identity: cr.ExpectedRuntimeIdentity, token: str):
+    conn, ack = _raw_pool_hello(receiver, _pool_hello(identity, token))
+    assert ack == {"ok": True}
+    return conn, receiver.wait_pool(identity.pool_instance_id, timeout=2.0)
+
+
+def test_same_run_can_hold_two_independent_pool_links(receiver):
+    identity_a = _runtime_identity(pool_id="pool-v1::alpha", pool_instance_id=_UUID_A)
+    identity_b = _runtime_identity(pool_id="pool-v1::beta", pool_instance_id=_UUID_B)
+    token_a = receiver.issue_pool(identity_a)
+    token_b = receiver.issue_pool(identity_b)
+
+    conn_a, link_a = _connect_pool(receiver, identity_a, token_a)
+    conn_b, link_b = _connect_pool(receiver, identity_b, token_b)
+    try:
+        assert link_a is receiver.link_for(_UUID_A)
+        assert link_b is receiver.link_for(_UUID_B)
+        assert link_a is not link_b
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("run_id", "run-other"),
+        ("pool_id", "pool-v1::other"),
+        ("pool_instance_id", _UUID_B),
+        ("generation", 2),
+        ("protocol_version", 1),
+    ],
+)
+def test_pool_hello_rejects_every_identity_mismatch(receiver, field, bad_value):
+    identity = _runtime_identity()
+    token = receiver.issue_pool(identity)
+    conn, ack = _raw_pool_hello(
+        receiver,
+        _pool_hello(identity, token, **{field: bad_value}),
+    )
+    conn.close()
+
+    assert ack == {"ok": False, "error": "runtime_identity_mismatch"}
+    assert receiver.link_for(identity.pool_instance_id) is None
+
+
+def test_pool_hello_rejects_wrong_token_without_leaking_identity(receiver):
+    identity = _runtime_identity()
+    receiver.issue_pool(identity)
+    conn, ack = _raw_pool_hello(receiver, _pool_hello(identity, "secret-wrong-token"))
+    conn.close()
+
+    assert ack == {"ok": False, "error": "runtime_identity_mismatch"}
+    encoded = json.dumps(ack)
+    assert identity.run_id not in encoded
+    assert identity.pool_id not in encoded
+    assert identity.pool_instance_id not in encoded
+    assert "secret-wrong-token" not in encoded
+
+
+def test_pool_hello_rejects_malformed_uuid_and_explicit_v1(receiver):
+    identity = _runtime_identity()
+    token = receiver.issue_pool(identity)
+
+    bad_uuid, uuid_ack = _raw_pool_hello(
+        receiver,
+        _pool_hello(identity, token, pool_instance_id="not-a-uuid"),
+    )
+    bad_uuid.close()
+    v1, v1_ack = _raw_pool_hello(
+        receiver,
+        {"hello": 1, "run_id": identity.run_id, "token": token, "version": "fake/1"},
+    )
+    v1.close()
+
+    assert uuid_ack == {"ok": False, "error": "runtime_identity_mismatch"}
+    assert v1_ack == {"ok": False, "error": "runtime_identity_mismatch"}
+    assert receiver.link_for(identity.pool_instance_id) is None
+
+
+def test_duplicate_live_pool_link_is_rejected_without_replacing_original(receiver):
+    identity = _runtime_identity()
+    token = receiver.issue_pool(identity)
+    first_conn, first_link = _connect_pool(receiver, identity, token)
+    second_conn, second_ack = _raw_pool_hello(receiver, _pool_hello(identity, token))
+    second_conn.close()
+    try:
+        assert second_ack == {"ok": False, "error": "runtime_identity_mismatch"}
+        assert receiver.link_for(identity.pool_instance_id) is first_link
+        assert first_link.alive is True
+    finally:
+        first_conn.close()
+
+
+def test_revoke_pool_instance_only_closes_target_link(receiver):
+    identity_a = _runtime_identity(pool_id="pool-v1::alpha", pool_instance_id=_UUID_A)
+    identity_b = _runtime_identity(pool_id="pool-v1::beta", pool_instance_id=_UUID_B)
+    conn_a, link_a = _connect_pool(receiver, identity_a, receiver.issue_pool(identity_a))
+    conn_b, link_b = _connect_pool(receiver, identity_b, receiver.issue_pool(identity_b))
+    try:
+        receiver.revoke_pool_instance(_UUID_A)
+        assert receiver.link_for(_UUID_A) is None
+        assert link_a.alive is False
+        assert receiver.link_for(_UUID_B) is link_b
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+
+def test_revoke_pool_and_run_have_scoped_effects(receiver):
+    run_a_pool_a = _runtime_identity(
+        run_id="run-a", pool_id="pool-v1::alpha", pool_instance_id=_UUID_A
+    )
+    run_a_pool_b = _runtime_identity(
+        run_id="run-a", pool_id="pool-v1::beta", pool_instance_id=_UUID_B
+    )
+    run_b_pool_a = _runtime_identity(
+        run_id="run-b",
+        pool_id="pool-v1::alpha",
+        pool_instance_id="33333333-3333-4333-8333-333333333333",
+    )
+    opened = []
+    try:
+        for expected in (run_a_pool_a, run_a_pool_b, run_b_pool_a):
+            opened.append(_connect_pool(receiver, expected, receiver.issue_pool(expected))[0])
+
+        receiver.revoke_pool("pool-v1::beta")
+        assert receiver.link_for(_UUID_B) is None
+        assert receiver.link_for(_UUID_A) is not None
+        assert receiver.link_for(run_b_pool_a.pool_instance_id) is not None
+
+        receiver.revoke_run("run-a")
+        assert receiver.link_for(_UUID_A) is None
+        assert receiver.link_for(run_b_pool_a.pool_instance_id) is not None
+    finally:
+        for conn in opened:
+            conn.close()
+
+
+def test_receiver_shutdown_wakes_pool_waiter(receiver):
+    identity = _runtime_identity()
+    receiver.issue_pool(identity)
+    observed = []
+    finished = threading.Event()
+
+    def wait_for_pool():
+        try:
+            receiver.wait_pool(identity.pool_instance_id, timeout=30.0)
+        except Exception as exc:  # asserted below from the waiting thread
+            observed.append(exc)
+        finally:
+            finished.set()
+
+    waiter = threading.Thread(target=wait_for_pool, daemon=True)
+    waiter.start()
+    time.sleep(0.05)
+    receiver.stop()
+
+    assert finished.wait(2.0) is True
+    assert len(observed) == 1
+    assert isinstance(observed[0], cr.ControlError)
+    assert str(observed[0]) == "control_receiver_stopped"
