@@ -151,6 +151,7 @@ async def ready_executor(
     generation: int = 1,
     run_rcp=None,
     run_streaming_rcp=None,
+    worker_token_revoker=None,
 ) -> ContainerRuntimeExecutor:
     return await ContainerRuntimeExecutor.create(
         run_id=run_id,
@@ -161,6 +162,7 @@ async def ready_executor(
         receiver=receiver or FakeReceiver(),
         run_rcp=run_rcp,
         run_streaming_rcp=run_streaming_rcp,
+        worker_token_revoker=worker_token_revoker,
         startup_timeout=3,
     )
 
@@ -566,3 +568,118 @@ async def test_generation_identity_is_frozen_and_safe(tmp_path: Path):
     )
     with pytest.raises(Exception):
         executor.identity.generation = 2
+
+@pytest.mark.asyncio
+async def test_terminate_require_proof_requires_exact_post_remove_absence(tmp_path: Path):
+    class AbsentAfterRemoveDocker(FakeDocker):
+        def __init__(self):
+            super().__init__()
+            self.removed = False
+
+        def inspect(self, container_id: str) -> ContainerInspection:
+            if self.removed:
+                raise LookupError("no such container")
+            return super().inspect(container_id)
+
+        def remove(self, container_id: str, *, force: bool) -> bool:
+            result = super().remove(container_id, force=force)
+            self.removed = result
+            return result
+
+    docker = AbsentAfterRemoveDocker()
+    receiver = FakeReceiver()
+    executor = await ready_executor(tmp_path, docker=docker, receiver=receiver)
+
+    report = await executor.terminate(require_proof=True)
+
+    assert report.proof_complete is True
+    assert report.container_removed is True
+    assert docker.inspect_calls == ["container-123", "container-123"]
+    assert receiver.revoked == [executor.pool_instance_id]
+
+
+@pytest.mark.asyncio
+async def test_terminate_require_proof_does_not_remove_identity_mismatch(tmp_path: Path):
+    docker = FakeDocker()
+    receiver = FakeReceiver()
+    executor = await ready_executor(tmp_path, docker=docker, receiver=receiver)
+    docker.inspection_mutator = lambda inspection: replace(
+        inspection,
+        labels={**inspection.labels, "com.dswarm.pool_id": "other-pool"},
+    )
+
+    with pytest.raises(ContainerRuntimeError, match="cleanup_unproven"):
+        await executor.terminate(require_proof=True)
+
+    assert docker.remove_calls == []
+    assert receiver.revoked == [executor.pool_instance_id]
+
+
+def test_docker_adapter_inspects_stopped_container_without_exec_identity_probe(monkeypatch):
+    from dswarm.solver import container_runtime as runtime_module
+
+    payload = [{
+        "Id": "container-123",
+        "Image": "sha256:immutable",
+        "Mounts": [{
+            "Type": "bind",
+            "Source": "/sessions/run-a/workspace",
+            "Destination": "/home/kali/workspace",
+            "RW": True,
+        }],
+        "HostConfig": {"NetworkMode": "bridge"},
+        "State": {"Running": False},
+        "Config": {"Labels": {"com.dswarm.managed": "true"}},
+    }]
+    calls = []
+
+    def fake_docker_run(*args, **kwargs):
+        calls.append(args)
+        assert args[:2] == ("inspect", "container-123")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(runtime_module, "docker_run", fake_docker_run)
+    inspection = runtime_module.DockerCliRuntimeAdapter().inspect("container-123")
+
+    assert inspection.running is False
+    assert inspection.uid == 0
+    assert inspection.gid == 0
+    assert calls == [("inspect", "container-123")]
+
+
+@pytest.mark.asyncio
+async def test_terminate_revokes_registered_worker_tokens_with_independent_hook(tmp_path: Path):
+    class WorkerRevoker:
+        def __init__(self):
+            self.revoked = []
+
+        def revoke_token(self, token: str) -> None:
+            self.revoked.append(token)
+
+    class AbsentAfterRemoveDocker(FakeDocker):
+        def __init__(self):
+            super().__init__()
+            self.removed = False
+
+        def inspect(self, container_id: str) -> ContainerInspection:
+            if self.removed:
+                raise LookupError("no such container")
+            return super().inspect(container_id)
+
+        def remove(self, container_id: str, *, force: bool) -> bool:
+            self.removed = super().remove(container_id, force=force)
+            return self.removed
+
+    revoker = WorkerRevoker()
+    executor = await ready_executor(
+        tmp_path,
+        docker=AbsentAfterRemoveDocker(),
+        worker_token_revoker=revoker,
+    )
+    executor.register_worker_token("task-token-a")
+    executor.register_worker_token("task-token-b")
+
+    report = await executor.terminate(require_proof=True)
+
+    assert report.proof_complete is True
+    assert revoker.revoked == ["task-token-a", "task-token-b"]

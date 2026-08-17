@@ -177,6 +177,8 @@ class DockerRuntimeAdapter(Protocol):
 
     def inspect(self, container_id: str) -> ContainerInspection: ...
 
+    def list(self, *, container_id: str) -> tuple[str, ...]: ...
+
     def remove(self, container_id: str, *, force: bool) -> bool: ...
 
 
@@ -248,8 +250,14 @@ class DockerCliRuntimeAdapter:
             image_id = str(item.get("Image", ""))
         except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ContainerRuntimeError("container_inspect_failed") from exc
-        uid = self._container_identity(container_id, "-u")
-        gid = self._container_identity(container_id, "-g")
+        # A stopped stale generation must remain inspectable for proof-first
+        # cleanup.  Live startup still probes the in-image kali identity.
+        if running:
+            uid = self._container_identity(container_id, "-u")
+            gid = self._container_identity(container_id, "-g")
+        else:
+            uid = 0
+            gid = 0
         return ContainerInspection(
             container_id=container_id,
             image_id=image_id,
@@ -273,6 +281,26 @@ class DockerCliRuntimeAdapter:
         if value <= 0:
             raise ContainerRuntimeError("container_identity_probe_failed")
         return value
+
+    def list(self, *, container_id: str) -> tuple[str, ...]:
+        result = docker_run(
+            "container",
+            "ls",
+            "-a",
+            "--no-trunc",
+            "--filter",
+            f"id={container_id}",
+            "--format",
+            "{{.ID}}",
+            timeout=20.0,
+        )
+        if result.returncode != 0:
+            raise ContainerRuntimeError("container_list_failed")
+        return tuple(
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip() == container_id
+        )
 
     def remove(self, container_id: str, *, force: bool) -> bool:
         args = ["rm"]
@@ -301,6 +329,7 @@ class ContainerRuntimeExecutor:
         mounts: tuple[ContainerMount, ...],
         run_rcp_impl: Callable[..., CliResult],
         run_streaming_rcp_impl: Callable[..., CliResult],
+        worker_token_revoker: Any | None = None,
     ) -> None:
         self.identity = identity
         self.pool_spec = pool_spec
@@ -312,6 +341,8 @@ class ContainerRuntimeExecutor:
         self.mounts = mounts
         self._run_rcp = run_rcp_impl
         self._run_streaming_rcp = run_streaming_rcp_impl
+        self._worker_token_revoker = worker_token_revoker
+        self._worker_token_ids: set[str] = set()
         self._terminated = False
 
     @property
@@ -330,6 +361,19 @@ class ContainerRuntimeExecutor:
     def generation(self) -> int:
         return self.identity.generation
 
+    def register_worker_token(self, token: str) -> None:
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 4096
+            or any(ord(char) < 32 or ord(char) == 127 for char in token)
+        ):
+            raise ContainerRuntimeError("invalid_worker_token")
+        self._worker_token_ids.add(token)
+
+    def unregister_worker_token(self, token: str) -> None:
+        self._worker_token_ids.discard(token)
+
     @classmethod
     async def create(
         cls,
@@ -342,6 +386,7 @@ class ContainerRuntimeExecutor:
         receiver: Any,
         run_rcp: Callable[..., CliResult] | None = None,
         run_streaming_rcp: Callable[..., CliResult] | None = None,
+        worker_token_revoker: Any | None = None,
         startup_timeout: float = 40.0,
     ) -> "ContainerRuntimeExecutor":
         if not isinstance(pool_spec, PoolSpec):
@@ -442,6 +487,7 @@ class ContainerRuntimeExecutor:
                 mounts=mounts,
                 run_rcp_impl=run_rcp or run_cli_rcp,
                 run_streaming_rcp_impl=run_streaming_rcp or run_cli_streaming_rcp,
+                worker_token_revoker=worker_token_revoker,
             )
         except ContainerRuntimeError as exc:
             await _cleanup_startup(adapter, receiver, container_id, pool_instance_id)
@@ -621,17 +667,14 @@ class ContainerRuntimeExecutor:
 
     async def terminate(self, *, require_proof: bool = False) -> RuntimeTerminationReport:
         if self._terminated:
-            report = RuntimeTerminationReport(
+            return RuntimeTerminationReport(
                 pool_instance_id=self.pool_instance_id,
                 link_drained=True,
                 token_revoked=True,
                 container_removed=True,
                 proof_complete=True,
             )
-            return report
         link_drained = False
-        token_revoked = False
-        container_removed = False
         try:
             response = await asyncio.to_thread(self.control_link.teardown, timeout=20.0)
             link_drained = bool(
@@ -641,24 +684,42 @@ class ContainerRuntimeExecutor:
             )
         except Exception:
             link_drained = False
-        try:
-            await asyncio.to_thread(self.receiver.revoke_pool_instance, self.pool_instance_id)
-            token_revoked = True
-        except Exception:
-            token_revoked = False
-        try:
-            container_removed = bool(
-                await asyncio.to_thread(self.docker.remove, self.container_id, force=True)
-            )
-        except Exception:
-            container_removed = False
-        proof_complete = link_drained and token_revoked and container_removed
+
+        # Lazy import avoids a cycle with the shared inspection dataclasses.
+        from dswarm.solver.runtime_cleanup import (
+            RuntimeCleanupExpectation,
+            cleanup_pool_generation,
+        )
+
+        expected = RuntimeCleanupExpectation(
+            container_id=self.container_id,
+            run_id=self.run_id,
+            pool_id=self.pool_id,
+            pool_instance_id=self.pool_instance_id,
+            generation=self.generation,
+            image_id=self.identity.resolved_image_id,
+            network=_network_name(self.pool_spec),
+            mounts=self.mounts,
+            private_state_mounts=self.mounts,
+            worker_token_ids=tuple(sorted(self._worker_token_ids)),
+        )
+        cleanup = await asyncio.to_thread(
+            cleanup_pool_generation,
+            docker=self.docker,
+            expected=expected,
+            receiver=self.receiver,
+            worker_token_revoker=self._worker_token_revoker,
+            link_drained=link_drained,
+        )
+        proof_complete = cleanup.proven
         self._terminated = proof_complete
+        if proof_complete:
+            self._worker_token_ids.clear()
         report = RuntimeTerminationReport(
             pool_instance_id=self.pool_instance_id,
             link_drained=link_drained,
-            token_revoked=token_revoked,
-            container_removed=container_removed,
+            token_revoked=cleanup.pool_token_revoked,
+            container_removed=cleanup.removed,
             proof_complete=proof_complete,
         )
         if require_proof and not proof_complete:
