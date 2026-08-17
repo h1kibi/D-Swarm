@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
@@ -57,7 +57,9 @@ from dswarm.solver.cli_stream import (
     classify_need_kind,
 )
 from dswarm.solver.gate import flag_ok as _gate_flag_ok, is_placeholder_flag
+from dswarm.solver.container_pool import WorkerRuntimeLease
 from dswarm.solver.result import ArtifactStore
+from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError
 from dswarm.solver.result_codes import (
     RESULT_CANCELLED,
     RESULT_DEAD_END,
@@ -78,6 +80,9 @@ from dswarm.solver.workspace import (
     relative_symlink,
     workspace_root_for_worker,
 )
+
+
+RuntimeLeaseFactory = Callable[[str, str], Awaitable[WorkerRuntimeLease]]
 
 
 _WORKER_HEARTBEAT_SECONDS = 15.0
@@ -553,6 +558,8 @@ class CliSolver:
         worker_env: Optional[dict[str, str]] = None,
         usage_writer: Optional[UsageWriter] = None,
         fallback_usage_writer: Optional[UsageWriter] = None,
+        runtime_lease_factory: Optional[RuntimeLeaseFactory] = None,
+        runtime_policy: Optional[RuntimePolicy] = None,
         task_kind: str = "",
         host_scan: bool = False,
     ) -> None:
@@ -561,12 +568,19 @@ class CliSolver:
         self.bus = bus
         self.cost = cost
         self.config = config or SolverConfig()
+        if runtime_policy is not None:
+            if runtime_policy.mode == "docker" and runtime_lease_factory is None:
+                raise RuntimePolicyError("runtime_lease_factory_required")
+            if runtime_policy.mode == "local_dev" and runtime_lease_factory is not None:
+                raise RuntimePolicyError("local_runtime_lease_forbidden")
         # container backend: a ContainerHandle → run this worker in the run's Kali
         # tool container (consistent toolchain). None → host subprocess.
         self.container = container
         self._extra_worker_env = dict(worker_env or {})
         self.usage_writer = usage_writer
         self.fallback_usage_writer = fallback_usage_writer
+        self.runtime_lease_factory = runtime_lease_factory
+        self.runtime_policy = runtime_policy
         self.task_kind = task_kind
         self.host_scan = bool(host_scan)
         self.run_id = run_id or challenge.id
@@ -3029,6 +3043,21 @@ class CliSolver:
                     pass
         return proposed
 
+    def _revoke_gateway_token(self) -> None:
+        """Revoke the worker-scoped gateway token before its runtime disappears."""
+        token = getattr(self, "gateway_token", None)
+        if not token:
+            return
+        try:
+            from dswarm.solver.modelgateway import ModelGateway
+
+            ModelGateway.instance().revoke_token(token)
+        except Exception:
+            # Runtime release must still proceed, but retain the exact token so the
+            # run-level idempotent cleanup can retry after the gateway recovers.
+            return
+        self.gateway_token = None
+
     async def run(self) -> SolveOutcome:
         # Subscribe to the InsightBus so HITL pause/resume + a sibling's FLAG reach
         # this live worker (drained by the monitor thread in _run_streaming).
@@ -3042,7 +3071,20 @@ class CliSolver:
             except Exception:
                 self._insight_inbox = None
         outcome: "Optional[SolveOutcome]" = None
+        runtime_lease: Optional[WorkerRuntimeLease] = None
         try:
+            if self.runtime_lease_factory is not None:
+                worker_instance_id = str(
+                    getattr(self, "worker_instance_id", "") or self.solver_id
+                )
+                runtime_lease = await self.runtime_lease_factory(
+                    worker_instance_id, self.task_kind or self.mode
+                )
+                # The lease is the sole owner of Docker executor and credential
+                # projection state.  Never merge legacy host/account env into it.
+                self.container = runtime_lease.executor
+                self._extra_worker_env = dict(runtime_lease.worker_env)
+
             await self._emit_worker_status(
                 online=True, reason="standby" if self.mode == "respond" else "started")
             # I: granular lifecycle — the worker spawned, in its role/phase.
@@ -3097,6 +3139,9 @@ class CliSolver:
                     self.insight.unsubscribe(self.solver_id)
                 except Exception:
                     pass
+            self._revoke_gateway_token()
+            if runtime_lease is not None:
+                await runtime_lease.release()
 
     async def _run_bootstrap(self) -> SolveOutcome:
         await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())

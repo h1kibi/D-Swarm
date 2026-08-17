@@ -310,3 +310,134 @@ def test_mock_tui_selection_does_not_construct_runtime_context() -> None:
     finally:
         driver.close()
 
+
+
+class _AcquiringManager:
+    def __init__(self, snapshot: RuntimeSnapshot, *, failure: BaseException | None = None) -> None:
+        from dswarm.solver.container_pool import WorkerRuntimeLease
+
+        self.run_id = snapshot.run_id
+        self.snapshot = snapshot
+        self.failure = failure
+        self.acquire_calls: list[dict[str, str]] = []
+        self.executor = object()
+        self.lease = WorkerRuntimeLease(
+            pool_id=snapshot.pools[0].pool_id,
+            pool_instance_id="pool-instance",
+            generation=1,
+            worker_instance_id="placeholder",
+            executor=self.executor,
+            credential_projection=object(),
+            worker_env={"LEASE_ONLY": "yes"},
+            _release_once=self._release,
+        )
+
+    async def _release(self) -> None:
+        return None
+
+    async def acquire(self, **kwargs: str):
+        self.acquire_calls.append(dict(kwargs))
+        if self.failure is not None:
+            raise self.failure
+        self.lease.worker_instance_id = kwargs["worker_instance_id"]
+        return self.lease
+
+
+def _runtime_worker_profile() -> dict[str, Any]:
+    return {
+        "id": "pi-main",
+        "name": "pi-main",
+        "engine": "pi",
+        "transport": "pi_cli",
+        "roles": ["bootstrap", "review", "recon", "explore"],
+        "runtime": "docker-main",
+        "enabled": True,
+        "max_running": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_strict_docker_worker_injects_frozen_pool_lease_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dswarm.solver import cli_solver as cli_solver_module
+
+    policy = build_runtime_policy(env={})
+    snapshot = _snapshot("runtime-run", policy)
+    manager = _AcquiringManager(snapshot)
+    seen: list[dict[str, Any]] = []
+
+    class FakeCliSolver:
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            self.solver_id = kwargs["solver_label"]
+            self.runtime_lease_factory = kwargs.get("runtime_lease_factory")
+            self.runtime_policy = kwargs.get("runtime_policy")
+            self.container = kwargs.get("container")
+            self.worker_env = kwargs.get("worker_env")
+
+    monkeypatch.setattr(cli_solver_module, "CliSolver", FakeCliSolver)
+    monkeypatch.setattr(
+        Swarm,
+        "_container_for_engine",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("strict Docker must not use the legacy container path")
+        ),
+    )
+    swarm = _make_swarm(
+        tmp_path,
+        runtime_policy=policy,
+        runtime_snapshot=snapshot,
+        pool_manager=manager,
+        engines=["pi-main"],
+        worker_profiles=[_runtime_worker_profile()],
+    )
+
+    worker = swarm._make_cli_worker("pi-main", mode="bootstrap", task_kind="ordinary")
+
+    assert len(seen) == 1
+    assert worker.runtime_policy is policy
+    assert worker.container is None
+    assert worker.worker_env in (None, {})
+    assert callable(worker.runtime_lease_factory)
+    lease = await worker.runtime_lease_factory("worker-instance", "ordinary")
+    assert lease is manager.lease
+    assert manager.acquire_calls == [{
+        "pool_id": snapshot.pools[0].pool_id,
+        "worker_instance_id": "worker-instance",
+        "operation_kind": "ordinary",
+    }]
+
+
+def test_local_dev_worker_uses_host_without_runtime_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dswarm.solver import cli_solver as cli_solver_module
+
+    policy = build_runtime_policy(
+        mode="local_dev",
+        local_dev_cli_flag=True,
+        env={"DSWARM_ALLOW_LOCAL_WORKERS": "1"},
+    )
+    seen: list[dict[str, Any]] = []
+
+    class FakeCliSolver:
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            self.solver_id = kwargs["solver_label"]
+
+    monkeypatch.setattr(cli_solver_module, "CliSolver", FakeCliSolver)
+    swarm = _make_swarm(
+        tmp_path,
+        worker_backend="local",
+        runtime_policy=policy,
+        engines=["pi-main"],
+        worker_profiles=[_runtime_worker_profile()],
+    )
+
+    worker = swarm._make_cli_worker("pi-main", mode="bootstrap")
+
+    assert worker.gateway_token is None
+    assert seen[0].get("runtime_lease_factory") is None
+    assert seen[0].get("runtime_policy") is policy
+    assert seen[0].get("container") is None

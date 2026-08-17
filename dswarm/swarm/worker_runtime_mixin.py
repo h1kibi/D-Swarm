@@ -618,15 +618,25 @@ class WorkerRuntimeMixin:
             raise WorkerSpawnRejected(
                 f"no available worker profile for {engine} role={role}")
         runtime_policy = getattr(self, "runtime_policy", None)
-        if runtime_policy is not None and runtime_policy.mode == "docker":
+        runtime_lease_factory = None
+        strict_docker = runtime_policy is not None and runtime_policy.mode == "docker"
+        if strict_docker:
             profile_id = str(
                 (profile or {}).get("name")
                 or (profile or {}).get("id")
                 or engine
             )
-            # Task 13 only proves that every strict Docker spawn belongs to the
-            # frozen snapshot.  Task 14 owns actual lease acquisition.
-            self.pool_id_for_profile(profile_id)
+            pool_id = self.pool_id_for_profile(profile_id)
+            pool_manager = self.pool_manager
+
+            async def runtime_lease_factory(
+                worker_instance_id: str, operation_kind: str
+            ):
+                return await pool_manager.acquire(
+                    pool_id=pool_id,
+                    worker_instance_id=worker_instance_id,
+                    operation_kind=operation_kind,
+                )
         budget_gate = getattr(self, "budget_gate", None)
         if budget_gate is not None and profile is not None:
             profile_id = str(profile.get("name") or profile.get("id") or engine or role)
@@ -692,7 +702,14 @@ class WorkerRuntimeMixin:
             kw["hitl_cmd"] = {"action": "redirect", "url": self._target_redirect}
 
         workdir = self._alloc_workdir(engine)
-        container = self._container_for_engine(engine, profile)
+        # A frozen runtime policy is authoritative. Strict Docker workers acquire
+        # asynchronously from their run-scoped pool; approved local-dev workers
+        # remain on the host. Transitional callers without a policy keep the
+        # legacy eager-container path until M9 migration is complete.
+        container = (
+            self._container_for_engine(engine, profile)
+            if runtime_policy is None else None
+        )
         worker_instance_id = uuid.uuid4().hex
         gateway_token = None
         explicit_endpoint = bool(
@@ -747,10 +764,14 @@ class WorkerRuntimeMixin:
                 lifecycle_scope="worker",
                 # container backend (None → local host subprocess, default).
                 container=container,
-                worker_env=self._runtime_env_for(
-                    transport, label, container=container, profile=profile,
-                    task_token=gateway_token,
+                worker_env=(
+                    None if strict_docker else self._runtime_env_for(
+                        transport, label, container=container, profile=profile,
+                        task_token=gateway_token,
+                    )
                 ),
+                runtime_lease_factory=runtime_lease_factory,
+                runtime_policy=runtime_policy,
                 task_kind=task_kind,
                 host_scan=host_scan,
             )
