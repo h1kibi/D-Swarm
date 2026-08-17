@@ -800,6 +800,13 @@ class WorkerRuntimeMixin:
             raise
         worker.worker_instance_id = worker_instance_id
         worker.gateway_token = gateway_token
+        if runtime_lease_factory is not None:
+            # The callable binding records the concrete generation identity when
+            # CliSolver acquires its lease. SwarmWorkerRuntime consumes only this
+            # frozen identity when classifying a failure; it never re-reads settings.
+            worker.runtime_pool_id = runtime_lease_factory.pool_id
+            worker.runtime_pool_instance_id = ""
+            worker.runtime_lease_binding = runtime_lease_factory
         try:
             self._claim_worker_account(worker.solver_id, transport, profile, role=role)
         except BaseException:

@@ -1,4 +1,4 @@
-﻿"""M4 direction diagnostics: deterministic registry, fallback, and persistence."""
+"""M4 direction diagnostics: deterministic registry, fallback, and persistence."""
 
 from __future__ import annotations
 
@@ -299,3 +299,31 @@ def test_scheduler_canonicalizes_programmatic_alias_intents():
             decision.direction_resolution, decision.profile) == (
                 "rev", "rev", "recognized_alias", "pi-rev"
             )
+
+
+def test_genuine_route_fallback_still_records_existing_m4_override():
+    swarm = ReasonSwarm(_challenge(direction="web"))
+    result = ReasonResult(
+        goal_met=False,
+        intents=[Intent(
+            intent_id="route-change",
+            goal="reverse engineer the binary",
+            direction="",
+            raw_direction="reversing",
+            direction_resolution="invalid",
+        )],
+        audit_notes=[],
+    )
+
+    decision = swarm._decisions_from_reason(result)[0]
+
+    assert decision.direction == "web"
+    assert decision.direction_source == "operator"
+    assert len(swarm._direction_overrides) == 1
+    override = swarm._direction_overrides[0]
+    assert override["intent_id"] == "route-change"
+    assert override["raw_direction"] == "reversing"
+    assert override["canonical_direction"] == "web"
+    assert override["direction_resolution"] == "invalid"
+    assert override["direction_source"] == "operator"
+    assert override["reason"] == "model_direction_invalid"

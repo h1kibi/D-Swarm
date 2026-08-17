@@ -1609,7 +1609,9 @@ class Swarm(
                 if solved else None
             )
             reason = (
-                "operator_stop"
+                "runtime_unavailable"
+                if runtime.runtime_unavailable
+                else "operator_stop"
                 if stop_event.is_set()
                 else "solved via reason swarm" if solved else "reason swarm stopped"
             )
@@ -1640,7 +1642,9 @@ class Swarm(
                 await self._finalize_coordinator_run(
                     winner=None, flag=None, goal_complete=False, per_solver={},
                     terminal_reason=(
-                        "operator_stop" if stop_event.is_set() else "runtime_failure"
+                        "runtime_unavailable"
+                        if runtime.runtime_unavailable
+                        else "operator_stop" if stop_event.is_set() else "runtime_failure"
                     ),
                 )
             except Exception:
