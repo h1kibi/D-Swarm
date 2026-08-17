@@ -53,7 +53,7 @@ services:
     image: dswarm-web:latest
     networks: [dswarm_net]
     ports:
-      - "8000:8000"           # operator/API; remove to keep it compose-internal
+      - "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}:${DSWARM_WEB_PORT:-8000}:8000"
     volumes:
       # talk to the HOST docker daemon (launch worker sibling containers)
       - /var/run/docker.sock:/var/run/docker.sock
@@ -61,6 +61,7 @@ services:
       - ${DSWARM_HOST_DATA_ROOT:?set DSWARM_HOST_DATA_ROOT to an absolute host path}:${DSWARM_HOST_DATA_ROOT}
     environment:
       DSWARM_IN_CONTAINER: "1"
+      DSWARM_RUNTIME_MODE: "docker"
       DSWARM_CONTROL_BIND: "0.0.0.0"
       DSWARM_CONTROL_HOST: "web-api"
       DSWARM_WORKER_NETWORK: "${DSWARM_WORKER_NETWORK:-dswarm_net}"
@@ -68,8 +69,10 @@ services:
       # container data root == host root (identity mirror), so _mount_source is a no-op
       DSWARM_CONTAINER_DATA_ROOT: "${DSWARM_HOST_DATA_ROOT}"
       DSWARM_SESSIONS_ROOT: "${DSWARM_HOST_DATA_ROOT}/sessions"
-      DSWARM_WEB_BIND: "0.0.0.0"
-      DSWARM_WEB_PASSWORD: "${DSWARM_WEB_PASSWORD:?set DSWARM_WEB_PASSWORD — non-loopback bind requires it}"
+      # Uvicorn listens on 0.0.0.0 inside the container; auth follows the
+      # host-side published address so loopback-only use can stay passwordless.
+      DSWARM_WEB_BIND: "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}"
+      DSWARM_WEB_PASSWORD: "${DSWARM_WEB_PASSWORD:-}"
       DSWARM_WORKER_IMAGE: "${DSWARM_WORKER_IMAGE:-ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1}"
       DSWARM_WORKER_IMAGE_VERSION: "${DSWARM_WORKER_IMAGE_VERSION:-}"
       # The coordinator brain (planner) + auto-titler use LLMClient, which reads
@@ -98,7 +101,7 @@ services:
     networks: [dswarm_net]
     ports:
       # host port overridable (a dev server may already own 3001); container stays 3001
-      - "${DSWARM_UI_PORT:-3001}:3001"
+      - "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}:${DSWARM_UI_PORT:-3001}:3001"
     environment:
       DSWARM_BACKEND: "http://web-api:8000"   # kept for parity; baked at build (see args)
     depends_on: [web-api]

@@ -62,7 +62,30 @@ run_tui() {
   exec uv run python -m apps.tui "$@"
 }
 
-run_web() {
+
+require_local_worker_gate() {
+  if [ "${DSWARM_ALLOW_LOCAL_WORKERS:-}" != "1" ]; then
+    echo "ERROR: local_worker_policy_denied: --local-dev requires DSWARM_ALLOW_LOCAL_WORKERS=1" >&2
+    exit 1
+  fi
+}
+
+require_docker_compose() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker_unavailable: Docker CLI is required for './run.sh web'" >&2
+    exit 1
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "ERROR: docker_compose_unavailable: Docker Compose plugin is required" >&2
+    exit 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: docker_daemon_unavailable: Docker daemon is unavailable" >&2
+    exit 1
+  fi
+}
+
+run_web_local() {
   require_uv
   local backend_only=0 port=8000 host=127.0.0.1 ui_port="${DSWARM_UI_PORT:-3001}"
   local rebuild_ui="${DSWARM_UI_REBUILD:-auto}"
@@ -171,6 +194,102 @@ run_web() {
   fi
   uv run uvicorn apps.web.server:create_app --factory \
       --host "$host" --port "$port" "${passthru[@]+"${passthru[@]}"}"
+}
+
+
+run_web() {
+  local local_dev=0 backend_only=0
+  local port="${DSWARM_WEB_PORT:-8000}"
+  local ui_port="${DSWARM_UI_PORT:-3001}"
+  local host="${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}"
+  local local_args=() unsupported=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --local-dev)
+        local_dev=1
+        shift
+        ;;
+      --backend-only)
+        backend_only=1
+        local_args+=("$1")
+        shift
+        ;;
+      --port)
+        port="${2:?--port needs a value}"
+        local_args+=("$1" "$2")
+        shift 2
+        ;;
+      --port=*)
+        port="${1#*=}"
+        local_args+=("$1")
+        shift
+        ;;
+      --ui-port)
+        ui_port="${2:?--ui-port needs a value}"
+        local_args+=("$1" "$2")
+        shift 2
+        ;;
+      --ui-port=*)
+        ui_port="${1#*=}"
+        local_args+=("$1")
+        shift
+        ;;
+      --host)
+        host="${2:?--host needs a value}"
+        local_args+=("$1" "$2")
+        shift 2
+        ;;
+      --host=*)
+        host="${1#*=}"
+        local_args+=("$1")
+        shift
+        ;;
+      --rebuild-ui)
+        # Compose already uses --build; retain the old flag as an idempotent
+        # compatibility alias for operators and scripts.
+        local_args+=("$1")
+        shift
+        ;;
+      --no-rebuild-ui)
+        local_args+=("$1")
+        unsupported+=("$1")
+        shift
+        ;;
+      *)
+        local_args+=("$1")
+        unsupported+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [ "$local_dev" -eq 1 ]; then
+    # The CLI flag alone is intentionally insufficient: production must never
+    # silently fall back to host workers when Docker is missing or unhealthy.
+    require_local_worker_gate
+    run_web_local "${local_args[@]}"
+    return
+  fi
+
+  if [ "${#unsupported[@]}" -gt 0 ]; then
+    echo "ERROR: unsupported_compose_web_option: ${unsupported[*]} (use --local-dev for host-only uvicorn options)" >&2
+    exit 1
+  fi
+
+  require_docker_compose
+  export DSWARM_WEB_PUBLISH_HOST="$host"
+  export DSWARM_WEB_PORT="$port"
+  export DSWARM_UI_PORT="$ui_port"
+  export DSWARM_RUNTIME_MODE=docker
+
+  local services=(web-api)
+  if [ "$backend_only" -eq 0 ]; then
+    services+=(ui)
+  fi
+
+  echo "==> Starting Docker Compose Web control plane on ${host} (API ${port}, UI ${ui_port})"
+  exec docker compose up --build "${services[@]}"
 }
 
 main() {

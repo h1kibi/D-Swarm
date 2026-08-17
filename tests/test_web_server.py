@@ -1408,3 +1408,13 @@ async def test_run_manager_checked_sink_survives_fresh_bus_without_double_append
     replayed = [event async for event in run.store.replay(run.run_id)]
     assert [event.payload["text"] for event in replayed] == ["before", "after"]
     assert [event.seq for event in replayed] == [1, 2]
+
+
+def test_compose_web_auth_bind_tracks_published_host() -> None:
+    """The container binds internally on 0.0.0.0 but auth follows host exposure."""
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+
+    assert (
+        'DSWARM_WEB_BIND: "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}"'
+    ) in compose
+    assert 'DSWARM_WEB_PASSWORD: "${DSWARM_WEB_PASSWORD:-}"' in compose
