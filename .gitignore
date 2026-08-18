@@ -98,3 +98,5 @@ docs/_local/
 docs/internal-design/
 docs/wechat/
 docs/assets/wechat-promo/
+
+.worktrees/
