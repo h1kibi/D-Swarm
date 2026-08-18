@@ -1,0 +1,5 @@
+FROM python:3.12-slim
+COPY fake_pi.py /usr/local/bin/fake-pi
+COPY fake_provider.py /usr/local/bin/fake-provider
+RUN chmod 0555 /usr/local/bin/fake-pi /usr/local/bin/fake-provider
+CMD ["sleep", "600"]

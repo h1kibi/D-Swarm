@@ -13,6 +13,7 @@ human commands.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -38,6 +39,7 @@ from dswarm.solver.credential_accounts import ensure_pi_account_from_env
 from dswarm.solver.container_pool import ContainerPoolManager
 from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError, RuntimeSnapshot
 from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuilder, RuntimeSnapshotStore
+from dswarm.solver.runtime_cleanup import RuntimeCleanupInspector, RuntimeCleanupResult
 
 LOG = logging.getLogger(__name__)
 
@@ -252,6 +254,7 @@ class RunManager:
         runtime_snapshot_store: RuntimeSnapshotStore | None = None,
         runtime_snapshot_builder: RuntimeSnapshotBuilder | None = None,
         runtime_pool_manager_factory: Callable[..., ContainerPoolManager] | None = None,
+        runtime_cleanup_inspector: RuntimeCleanupInspector | Any | None = None,
     ) -> None:
         # P2-v3: in the compose layout the sessions/ tree must live UNDER the
         # mirrored data root (DSWARM_HOST_DATA_ROOT bind-mounted into the web
@@ -268,6 +271,7 @@ class RunManager:
         )
         self.runtime_snapshot_builder = runtime_snapshot_builder
         self.runtime_pool_manager_factory = runtime_pool_manager_factory
+        self.runtime_cleanup_inspector = runtime_cleanup_inspector
         self.runs: dict[str, Run] = {}
         self.provider_errors = ProviderErrorAggregator()
         self._seq = 0
@@ -325,7 +329,7 @@ class RunManager:
                 if m0:
                     max_seq = max(max_seq, int(m0.group(1)))
                 continue
-            run = self.create(rid)
+            run = self.create(rid, _defer_runtime_manager=True)
             # `summary()` falls back name→run_id; treat that as "no real title" so
             # the rail renders its placeholder instead of leaking the bare id.
             run.name = "" if s.get("name") in (None, "", rid) else s["name"]
@@ -471,6 +475,11 @@ class RunManager:
             t.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        if run.pool_manager is not None:
+            try:
+                await run.pool_manager.close()
+            except Exception:
+                LOG.warning("runtime pool close failed while deleting run %s", run_id, exc_info=True)
         await run.bus.close()
         self._drop_board_schema(run_id)
         self._delete_artifacts(run_id)
@@ -868,7 +877,34 @@ class RunManager:
             run.pool_manager = factory(run_id=run_id, snapshot=snapshot)
         return run.runtime_policy, run.runtime_snapshot, run.pool_manager
 
-    def create(self, run_id: str) -> Run:
+    async def _cleanup_before_reopen(self, run: Run) -> RuntimeCleanupResult | None:
+        """Prove every stale private runtime is gone before a reopened dispatch."""
+        inspector = self.runtime_cleanup_inspector
+        if inspector is None:
+            return None
+        method = getattr(inspector, "cleanup_run_before_reopen", None)
+        if not callable(method):
+            raise RuntimeError("stale_runtime_cleanup_unproven")
+        safe = run.run_id.replace("/", "_").replace("..", "_")
+        run_root = self.sessions_root / safe
+        result = method(run.run_id, run_root)
+        if inspect.isawaitable(result):
+            result = await result
+        if not getattr(result, "proven", False):
+            raise RuntimeError("stale_runtime_cleanup_unproven")
+        return result
+
+    def _ensure_runtime_pool_manager(self, run: Run) -> ContainerPoolManager | None:
+        """Lazily construct the per-run pool after any reopen barrier."""
+        if run.pool_manager is not None or run.runtime_snapshot is None:
+            return run.pool_manager
+        factory = self.runtime_pool_manager_factory
+        if factory is None:
+            return None
+        run.pool_manager = factory(run_id=run.run_id, snapshot=run.runtime_snapshot)
+        return run.pool_manager
+
+    def create(self, run_id: str, *, _defer_runtime_manager: bool = False) -> Run:
         if run_id in self.runs:
             return self.runs[run_id]
         runtime_snapshot = None
@@ -878,7 +914,7 @@ class RunManager:
         if snapshot_path.is_file():
             runtime_snapshot = self.runtime_snapshot_store.load(run_id)
             runtime_policy = runtime_snapshot.runtime_policy
-            if self.runtime_pool_manager_factory is not None:
+            if self.runtime_pool_manager_factory is not None and not _defer_runtime_manager:
                 pool_manager = self.runtime_pool_manager_factory(
                     run_id=run_id, snapshot=runtime_snapshot
                 )
@@ -1278,6 +1314,9 @@ class RunManager:
         if run.task is not None and not run.task.done():
             return run  # already live — never stack a second driver on one run
         await self._reconcile_ledger(run)
+        if run.runtime_snapshot is not None and run.finished:
+            await self._cleanup_before_reopen(run)
+        self._ensure_runtime_pool_manager(run)
         if run.spawn_guard is not None:
             await run.spawn_guard.ensure_ready(run_id)
         run.started = True  # the operator dispatched it; rail shows queued/running
@@ -1644,6 +1683,9 @@ class RunManager:
         if self.scheduler.is_active(run_id) or self.scheduler.is_queued(run_id):
             return False
         await self._reconcile_ledger(run)
+        if run.runtime_snapshot is not None:
+            await self._cleanup_before_reopen(run)
+        self._ensure_runtime_pool_manager(run)
         if run.spawn_guard is not None:
             await run.spawn_guard.ensure_ready(run_id)
 
@@ -1888,3 +1930,12 @@ class RunManager:
                     pending.append(t)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        managers: dict[int, Any] = {}
+        for run in list(self.runs.values()):
+            if run.pool_manager is not None:
+                managers[id(run.pool_manager)] = run.pool_manager
+        for manager in managers.values():
+            try:
+                await manager.close()
+            except Exception:
+                LOG.warning("runtime pool close failed during manager shutdown", exc_info=True)

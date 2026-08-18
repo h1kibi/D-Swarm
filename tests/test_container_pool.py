@@ -1174,7 +1174,36 @@ async def test_close_reports_safe_failure_and_still_cleans_other_pool():
     ]
     assert bad_executor.terminate_calls == 1
     assert good_executor.terminate_calls == 1
-    assert {view.state for view in manager.snapshot_view()} == {"stopped"}
+    states = {view.pool_id: view.state for view in manager.snapshot_view()}
+    assert states[bad_pool.pool_id] == "stopping"
+    assert states[good_pool.pool_id] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_close_failure_retains_residual_executor_and_stopping_state():
+    pool = make_pool(profile_id="pi-residual", capacity=1)
+    factory = MultiExecutorFactory(cleanup_proven=False)
+    manager = ContainerPoolManager(
+        run_id="run-a",
+        snapshot=make_snapshot(pool),
+        executor_factory=factory,
+        probe=SelectiveProbe(),
+        credential_projector=FakeProjector(),
+    )
+
+    lease = await manager.acquire(
+        pool_id=pool.pool_id,
+        worker_instance_id="residual-worker",
+        operation_kind="worker",
+    )
+    executor = factory.executors[0]
+
+    report = await manager.close()
+
+    assert report.failures
+    assert manager.snapshot_view()[0].state == "stopping"
+    assert manager._entries[pool.pool_id].executor is executor
+    assert lease.released is True
 
 
 @pytest.mark.asyncio

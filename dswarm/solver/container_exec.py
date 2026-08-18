@@ -485,7 +485,7 @@ def runtime_execs_for_run(run_id: str) -> list[dict[str, Any]]:
 _ENSURE_LOCK = threading.Lock()
 
 
-def ensure_container(run_id: str, host_workspace: str, *,
+def _ensure_container_legacy_impl(run_id: str, host_workspace: str, *,
                      image: str = WORKER_IMAGE, network: str = "bridge",
                      memory: Optional[str] = None,
                      cpus: Optional[str] = None,
@@ -683,7 +683,29 @@ def ensure_container(run_id: str, host_workspace: str, *,
 # The old one-container-per-run constructor remains only as an explicitly gated
 # compatibility seam for low-level tests and unsafe local development. Production
 # Swarm/Web/BTW code must use ContainerPoolManager instead.
-_ensure_container_legacy = ensure_container
+def _ensure_container_legacy(*args: Any, **kwargs: Any) -> ContainerHandle:
+    """Compatibility seam whose implementation remains monkeypatchable in tests."""
+    return _ensure_container_legacy_impl(*args, **kwargs)
+
+
+def ensure_container(
+    run_id: str,
+    host_workspace: str,
+    *,
+    policy: RuntimePolicy,
+    **kwargs: Any,
+) -> ContainerHandle:
+    """Deprecated one-container compatibility facade.
+
+    The named facade is intentionally policy-gated so merely selecting the old
+    backend cannot bypass Docker-first runtime policy. New production code must
+    use ``ContainerPoolManager``; tests and explicitly authorized local-dev
+    experiments should prefer ``ensure_container_legacy_for_tests``.
+    """
+    return ensure_container_legacy_for_tests(
+        run_id, host_workspace, policy=policy, **kwargs
+    )
+
 
 
 def legacy_container_allowed(policy: RuntimePolicy) -> bool:

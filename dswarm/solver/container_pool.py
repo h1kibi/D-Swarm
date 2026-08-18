@@ -601,16 +601,36 @@ class ContainerPoolManager:
             async with entry.lock:
                 if entry.executor is not None:
                     executors[id(entry.executor)] = entry.executor
-        for executor in executors.values():
+        termination_failures: dict[int, RuntimeFailure] = {}
+        for executor_id, executor in executors.items():
             try:
                 await executor.terminate(require_proof=True)
             except Exception as exc:
-                failures.append(self._failure_from_exception(exc))
+                failure = self._failure_from_exception(exc)
+                termination_failures[executor_id] = failure
+                failures.append(failure)
         for entry in self._entries.values():
             async with entry.lock:
-                entry.executor = None
+                residual_failure = (
+                    termination_failures.get(id(entry.executor))
+                    if entry.executor is not None
+                    else None
+                )
                 entry.active_leases.clear()
                 entry.active_workers = 0
+                if residual_failure is not None:
+                    # A failed proof is not equivalent to termination.  Retain the
+                    # executor identity and stopping state so the reopen barrier can
+                    # discover and clean the residual generation later.
+                    entry.failure = residual_failure
+                    callback = self.transition_callback
+                    if callback is not None:
+                        try:
+                            callback(self._view_for_entry(entry), residual_failure.code)
+                        except Exception:
+                            pass
+                    continue
+                entry.executor = None
                 if entry.state != "stopped":
                     self._apply_transition(entry, "stopped")
         return PoolCloseReport(

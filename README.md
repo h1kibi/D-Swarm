@@ -47,3 +47,16 @@ uv run pytest -m "not live"  # 测试套件（无 key 时 live 测试自动跳�
 
 - dswarm/muteki（内核来源）：AGPL-3.0。当前 checkout 默认只配置 `origin`；如需跟踪上游，请显式添加 upstream remote。
 - CTF-BTFly（参考）：源码在 `references/btfly/`，commit `a141bb5`，AGPL-3.0。
+
+## Runtime pools (M9a)
+
+D-Swarm is Docker-first for real workers. The control plane freezes one
+run-scoped runtime snapshot and owns one long-lived container per PoolKey; a
+worker container never receives the Docker socket, host HOME, host `.pi` state,
+full credential stores, or solution/reference files. Credentials are projected
+per operation and diagnostics remain private rather than becoming evidence.
+
+See [docs/runtime-pools.md](docs/runtime-pools.md) for the Docker-first runbook,
+local-development dual gate, reopen cleanup barrier, lifecycle ownership, and
+forward-only rollback procedure. The fake-Pi Docker proof is opt-in with
+`DSWARM_RUN_DOCKER_TESTS=1` and never uses a real provider credential.

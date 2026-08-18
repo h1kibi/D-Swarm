@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Protocol, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Protocol, Sequence
 import uuid
 
 from dswarm.solver.container_runtime import ContainerInspection, ContainerMount
@@ -103,7 +104,69 @@ class RuntimeCleanupResult:
 
 
 class RuntimeCleanupInspector:
-    """Validate every exact identity dimension before allowing removal."""
+    """Validate exact identities and enforce a run-wide cleanup barrier.
+
+    Candidate discovery is deliberately injected.  A caller must provide the
+    coordinator-private expectations reconstructed from its durable runtime
+    sidecar; Docker names alone are never accepted as evidence.
+    """
+
+    def __init__(
+        self,
+        *,
+        docker: CleanupDocker | None = None,
+        receiver: Any | None = None,
+        worker_token_revoker: Any | None = None,
+        candidate_provider: Callable[[str, Path], Iterable[Any]] | None = None,
+    ) -> None:
+        self.docker = docker
+        self.receiver = receiver
+        self.worker_token_revoker = worker_token_revoker
+        self.candidate_provider = candidate_provider
+
+    def cleanup_run_before_reopen(
+        self, run_id: str, run_root: str | Path
+    ) -> RuntimeCleanupResult:
+        """Clean every exact private runtime candidate before a run reopens.
+
+        The barrier is fail-closed but best-effort across pools: one bad
+        generation must not prevent revocation/inspection of the remaining
+        candidates.  Legacy name-only evidence is explicitly insufficient.
+        """
+        failures: list[str] = []
+        results: list[RuntimeCleanupResult] = []
+        provider = self.candidate_provider
+        if provider is None:
+            candidates: Iterable[Any] = ()
+            failures.append("cleanup_expectations_unavailable")
+        else:
+            try:
+                candidates = provider(run_id, Path(run_root))
+            except Exception:
+                candidates = ()
+                failures.append("candidate_discovery_failed")
+
+        for candidate in candidates:
+            if not isinstance(candidate, RuntimeCleanupExpectation):
+                failures.append("legacy_runtime_evidence_insufficient")
+                continue
+            if candidate.run_id != run_id:
+                failures.append("candidate_run_mismatch")
+                continue
+            if self.docker is None:
+                failures.append("docker_cleanup_unavailable")
+                continue
+            result = cleanup_pool_generation(
+                docker=self.docker,
+                expected=candidate,
+                receiver=self.receiver,
+                worker_token_revoker=self.worker_token_revoker,
+            )
+            results.append(result)
+            failures.extend(result.failures)
+
+        return _aggregate_cleanup_results(results, failures)
+
 
     def inspect_candidate(
         self,
@@ -234,6 +297,50 @@ def cleanup_pool_generation(
         pool_token_revoked=pool_token_revoked,
         worker_tokens_revoked=worker_tokens_revoked,
         failures=proof.failures,
+        proof=proof,
+    )
+
+
+def _aggregate_cleanup_results(
+    results: Sequence[RuntimeCleanupResult], failures: Sequence[str]
+) -> RuntimeCleanupResult:
+    """Fold per-generation proofs without weakening any proof dimension."""
+    failure_tuple = tuple(dict.fromkeys((*failures, *(failure for r in results for failure in r.failures))))
+    if results:
+        proof = RuntimeTerminationProof(
+            identity_proven=all(result.proof.identity_proven for result in results),
+            absence_proven=all(result.proof.absence_proven for result in results),
+            link_drained=all(result.proof.link_drained for result in results),
+            pool_token_revoked=all(result.proof.pool_token_revoked for result in results),
+            worker_tokens_revoked=all(result.proof.worker_tokens_revoked for result in results),
+            failures=failure_tuple,
+        )
+        return RuntimeCleanupResult(
+            container_id=results[0].container_id if len(results) == 1 else "",
+            safe_to_remove=all(result.safe_to_remove for result in results),
+            removed=all(result.removed for result in results),
+            absence_proven=all(result.absence_proven for result in results),
+            pool_token_revoked=all(result.pool_token_revoked for result in results),
+            worker_tokens_revoked=all(result.worker_tokens_revoked for result in results),
+            failures=failure_tuple,
+            proof=proof,
+        )
+    proof = RuntimeTerminationProof(
+        identity_proven=not failure_tuple,
+        absence_proven=not failure_tuple,
+        link_drained=not failure_tuple,
+        pool_token_revoked=not failure_tuple,
+        worker_tokens_revoked=not failure_tuple,
+        failures=failure_tuple,
+    )
+    return RuntimeCleanupResult(
+        container_id="",
+        safe_to_remove=not failure_tuple,
+        removed=not failure_tuple,
+        absence_proven=not failure_tuple,
+        pool_token_revoked=not failure_tuple,
+        worker_tokens_revoked=not failure_tuple,
+        failures=failure_tuple,
         proof=proof,
     )
 

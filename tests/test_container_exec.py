@@ -29,10 +29,12 @@ from dswarm.solver.container_exec import (
     _DockerExecBackend,
     _mount_source,
     ensure_container,
+    ensure_container_legacy_for_tests,
     run_cli_container,
     runtime_execs_for_run,
 )
 from dswarm.solver.cli_driver import CliResult
+from dswarm.solver.runtime_policy import build_runtime_policy
 
 
 def _handle(ws="/run/sessions/abc/workspace", container="dswarm-run-nyu_2021q-x",
@@ -40,6 +42,41 @@ def _handle(ws="/run/sessions/abc/workspace", container="dswarm-run-nyu_2021q-x"
     return ContainerHandle(run_id="nyu:2021q-x", host_workspace=ws,
                            container=container, image="snowywar/dswarm-worker:latest",
                            network="host", mode=mode)
+
+
+def _legacy_policy():
+    return build_runtime_policy(
+        mode="local_dev",
+        local_dev_cli_flag=True,
+        env={"DSWARM_ALLOW_LOCAL_WORKERS": "1"},
+    )
+
+
+def test_legacy_facade_requires_explicit_local_dev_policy(monkeypatch):
+    policy = build_runtime_policy(
+        mode="local_dev",
+        local_dev_cli_flag=True,
+        env={"DSWARM_ALLOW_LOCAL_WORKERS": "1"},
+    )
+    captured = {}
+
+    def fake_impl(run_id, host_workspace, **kwargs):
+        captured.update(run_id=run_id, host_workspace=host_workspace, kwargs=kwargs)
+        return "legacy-handle"
+
+    monkeypatch.setattr(cx, "_ensure_container_legacy_impl", fake_impl)
+    assert cx.ensure_container_legacy_for_tests("run-a", "/workspace", policy=policy) == "legacy-handle"
+    assert captured["run_id"] == "run-a"
+
+    with pytest.raises(RuntimeError, match="legacy_container_disabled"):
+        cx.ensure_container_legacy_for_tests(
+            "run-a", "/workspace", policy=build_runtime_policy(env={})
+        )
+
+
+def test_named_ensure_container_facade_requires_policy():
+    with pytest.raises(TypeError):
+        cx.ensure_container("run-a", "/workspace")
 
 
 # ── cwd mapping (host path under the bind-mounted workspace → container path) ──
@@ -274,7 +311,7 @@ def test_ensure_container_aborts_if_teardown_starts_mid_creation(monkeypatch, tm
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
 
     with pytest.raises(RuntimeError, match="teardown"):
-        ce.ensure_container("run-teardown-race", str(tmp_path / "ws"), image="img")
+        ce.ensure_container_legacy_for_tests("run-teardown-race", str(tmp_path / "ws"), policy=_legacy_policy(), image="img")
 
     assert not any(call and call[0] == "run" for call in calls)
 
@@ -303,8 +340,8 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     os.chmod(acct / "API_KEY", 0o600)
     os.chmod(acct / "codex-home" / "auth.json", 0o600)
 
-    handle = ensure_container(
-        "run-x", str(ws), account_root=str(accounts), image="img",
+    handle = ensure_container_legacy_for_tests(
+        "run-x", str(ws), policy=_legacy_policy(), account_root=str(accounts), image="img",
         network="bridge", memory="12g", cpus="4", pids_limit=2048)
 
     run_call = next(a for a in calls if a and a[0] == "run")
@@ -451,7 +488,7 @@ def test_ensure_container_chowns_workspace_to_worker(monkeypatch, tmp_path):
     chowned = []
     monkeypatch.setattr(os, "chown", lambda p, u, g: chowned.append((os.path.abspath(p), u, g)))
 
-    ensure_container("run-cw", str(ws), image="img", network="bridge")
+    ensure_container_legacy_for_tests("run-cw", str(ws), policy=_legacy_policy(), image="img", network="bridge")
 
     db = os.path.abspath(str(ws / "graph" / "shared_graph.db"))
     assert any(p == db and (u, g) == (ce._WORKER_UID, ce._WORKER_GID) for p, u, g in chowned), \
@@ -473,7 +510,7 @@ def test_ensure_container_rcp_upgrades_none_network_to_bridge(monkeypatch, tmp_p
         def expect(self, *a): pass
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
     ws = tmp_path / "run" / "workspace"
-    handle = ensure_container("run-off", str(ws), image="img", network="none")
+    handle = ensure_container_legacy_for_tests("run-off", str(ws), policy=_legacy_policy(), image="img", network="none")
     assert handle.network == "bridge"  # upgraded
     run_call = next(a for a in calls if a and a[0] == "run")
     assert "--network bridge" in " ".join(run_call)
@@ -486,7 +523,7 @@ def test_ensure_container_dockerexec_appends_sleep_infinity(monkeypatch, tmp_pat
     monkeypatch.setattr(ce, "_docker", _fake_docker_factory(calls))
     monkeypatch.setattr(ce, "_USE_DOCKEREXEC", True)
     ws = tmp_path / "run" / "workspace"
-    handle = ensure_container("run-y", str(ws), image="img", network="bridge")
+    handle = ensure_container_legacy_for_tests("run-y", str(ws), policy=_legacy_policy(), image="img", network="bridge")
     run_call = next(a for a in calls if a and a[0] == "run")
     # legacy mode: keepalive is `sleep infinity`, no control mount.
     assert run_call[-2:] == ("sleep", "infinity")

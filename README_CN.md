@@ -482,3 +482,15 @@ go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtim
 6. **Co-RedTeam: Orchestrated Security Discovery and Exploitation with LLM Agents**
   Jiahao Zhu, et al. 2025.
    [arXiv:2602.02164](https://arxiv.org/abs/2602.02164)
+
+## M9a 运行时容器池
+
+真实 worker 默认采用 Docker-first：每个 run 冻结一份 runtime snapshot，
+每个 PoolKey 对应一个长生命周期容器。worker 容器不会拿到 Docker socket、
+宿主 HOME、宿主 `.pi` 状态、完整凭据库，也不会看到 solution/reference 文件；
+凭据按操作投影，运行时诊断只进入私有 sidecar，不进入证据图。
+
+施工与运维规则见 [docs/runtime-pools.md](docs/runtime-pools.md)，其中包含
+local-dev 双开关、reopen 清理屏障、生命周期关闭责任及 forward-only 回滚顺序。
+fake-Pi Docker 集成测试必须显式设置 `DSWARM_RUN_DOCKER_TESTS=1`，不会读取真实
+provider 凭据。
