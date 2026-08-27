@@ -40,15 +40,15 @@ ALLOWLIST = {
     "LICENSE",
     "NOTICE",
     "ROADMAP.md",  # historical iteration log
-    "docs/01-architecture.md",  # historical design doc
-    "docs/02-implementation-plan.md",  # historical design doc
-    "docs/03-worker-contract.md",  # historical design doc
-    "docs/04-coordination-and-state.md",  # historical design doc
-    "docs/05-security-and-eval.md",  # historical design doc
-    "docs/06-route-a-plan.md",  # historical planning context
+    "docs/archive/01-architecture.md",  # historical design doc
+    "docs/archive/02-implementation-plan.md",  # historical design doc
+    "docs/archive/03-worker-contract.md",  # historical design doc
+    "docs/archive/04-coordination-and-state.md",  # historical design doc
+    "docs/archive/05-security-and-eval.md",  # historical design doc
+    "docs/archive/06-route-a-plan.md",  # historical planning context
     "docs/07-d-swarm-ui-audit-and-redesign.md",  # the rename plan's own audit
     "docs/08-oss-research-and-kernel-improvements.md",  # research record citing upstream
-    "docs/brand-inventory-2026-08-06.txt",  # dated pre-rename inventory artifact
+    "docs/archive/brand-inventory-2026-08-06.txt",  # dated pre-rename inventory artifact
     "eval_nyu/_reports/FINAL_eval_report.md",  # historical eval record
     "eval_nyu/_reports/RESULTS.md",  # historical eval record
     "public_eval/RESULTS.md",  # historical eval record

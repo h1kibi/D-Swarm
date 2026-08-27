@@ -1,3 +1,5 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # M3 严格事件行不可变 — 事件协议 RFC v3（sticky 生命周期 + challenge 绑定 + 完整有效模型）
 
 > 状态：**RFC v3 已按批准计划实施（2026-08-14）**。v1 经 [docs/12](12-m3-event-immutability-rfc-review.md)

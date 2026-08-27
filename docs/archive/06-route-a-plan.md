@@ -1,3 +1,5 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # 路线 A 实施计划：muteki 底座 + BTFly 资产
 
 > 本文档是对 01–05 的修订与落地。决策背景见 [评审结论](#决策记录)。

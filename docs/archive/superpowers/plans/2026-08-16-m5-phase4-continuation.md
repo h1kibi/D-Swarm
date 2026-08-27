@@ -1,4 +1,6 @@
-﻿# M5 Phase 4 continuation implementation plan
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
+# M5 Phase 4 continuation implementation plan
 
 ## Scope
 Continue the approved M5 v4.1 Phase 4 producer wiring without entering Phase 5. Preserve provenance gate, anti-laundering, shared-graph fact semantics, existing COST_UPDATE consumers, and all unrelated uncommitted work.

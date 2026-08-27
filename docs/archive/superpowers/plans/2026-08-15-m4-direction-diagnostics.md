@@ -1,4 +1,6 @@
-﻿# M4 direction diagnostics implementation plan
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
+# M4 direction diagnostics implementation plan
 
 Date: 2026-08-15
 

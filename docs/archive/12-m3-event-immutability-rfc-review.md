@@ -1,7 +1,9 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # M3 事件不可变 RFC v1 评审反馈
 
 > 评审对象：[`docs/11-m3-event-immutability-rfc.md`](11-m3-event-immutability-rfc.md)
-> 关联计划：[`docs/10-v4-kernel-improvement-implementation.md`](10-v4-kernel-improvement-implementation.md) M3
+> 关联计划：[`docs/10-v4-kernel-improvement-implementation.md`](../10-v4-kernel-improvement-implementation.md) M3
 > 评审日期：2026-08-14
 > 结论：**Conditional No-Go / RFC v1 必须修订后再评审；暂不实施 M3 生产代码。**
 

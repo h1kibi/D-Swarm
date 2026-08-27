@@ -1,3 +1,5 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # 架构总览
 
 ## 目标

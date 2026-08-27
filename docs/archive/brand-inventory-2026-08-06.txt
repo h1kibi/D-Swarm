@@ -1,3 +1,4 @@
+# 历史档案：已被 docs/00-architecture-spec.md 取代（日期快照，保留作参考）。
 1836 hits in 188 files
     132  tests/test_cli_executor.py
      93  tests/test_swarm.py

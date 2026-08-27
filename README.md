@@ -28,16 +28,17 @@ uv run pytest -q            # 测试套件（无 key 时 live 测试自动跳过
 | `cmd/runtime-agent/` | 容器内 Go supervisor（反向连接） |
 | `docker/` | worker 镜像（BTFly 分类镜像逐步并入） |
 | `skills/` | dswarm-blackboard skill |
-| `docs/` | 设计 / 研究 / RFC / 运维文档（内核实施账本：`docs/10`；运维手册：`docs/runtime-pools.md`） |
+| `docs/` | 权威架构规范 `00-architecture-spec.md` + 运维手册 / 账本 / 决定案卷；历史草案在 `docs/archive/` |
 | `references/btfly/` | BTFly 参考源码（git 历史 a141bb5，AGPL-3.0，只读参考） |
 
 ## 路线与状态
 
 - **路线 A**：fork dswarm 为底座，BTFly 资产以功能形式并入。许可证 AGPL-3.0（已接受）。
+（批准记录：[docs/archive/06-route-a-plan.md](docs/archive/06-route-a-plan.md)。）
 - 进度：路线 A P0–P6 已全部落地（v0.3.0-rc.1）；内核改进里程碑 M0–M9a 已实现并验证，
   现状以实施账本 [docs/10](docs/10-v4-kernel-improvement-implementation.md) 为准。测试数量
   随工作区演进变化，以 `uv run pytest -q` 的实际输出为准。
-- 详见 [docs/06-route-a-plan.md](docs/06-route-a-plan.md)。
+- 详见 [docs/00-architecture-spec.md](docs/00-architecture-spec.md)（权威架构规范）。
 
 ## 开发约定
 

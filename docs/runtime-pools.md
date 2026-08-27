@@ -1,4 +1,4 @@
-﻿# Runtime Pool Operations
+# Runtime Pool Operations
 
 M9a uses a Docker-first, run-scoped runtime model. A run owns one immutable
 runtime snapshot and one long-lived container for every `(run_id, pool_id)`.

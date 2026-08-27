@@ -1,7 +1,9 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # M5 唯一账本 RFC v3 第三轮评审反馈
 
 > 评审对象：[docs/14-m5-unique-ledger-rfc.md](14-m5-unique-ledger-rfc.md)
-> 上位方案：[docs/10-v4-kernel-improvement-implementation.md](10-v4-kernel-improvement-implementation.md) M5
+> 上位方案：[docs/10-v4-kernel-improvement-implementation.md](../10-v4-kernel-improvement-implementation.md) M5
 > 前轮评审：[docs/16-m5-unique-ledger-rfc-v2-review.md](16-m5-unique-ledger-rfc-v2-review.md)
 > 评审日期：2026-08-15
 > 裁决：**Design Review Required / 暂不批准实施**

@@ -1,3 +1,5 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # M3 事件不可变 RFC v2 第三轮复评
 
 > 评审对象：[`docs/11-m3-event-immutability-rfc.md`](11-m3-event-immutability-rfc.md)（RFC v2）

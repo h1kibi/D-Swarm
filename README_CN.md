@@ -371,7 +371,7 @@ D-Swarm 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
 | `docker/worker/`     | worker 镜像(Dockerfile、构建脚本、工具感知地图)                                                 |
 | `scripts/`           | eval / 回测 harness                                                                 |
-| `docs/`              | eval 报告 + 开源就绪审查;设计 / 研究 / RFC 文档平铺在 `docs/`（内核实施账本:`docs/10`） |
+| `docs/`              | eval 报告 + 开源就绪审查;权威架构规范 `docs/00-architecture-spec.md`，历史草案在 `docs/archive/` |
 
 
 ### 单个 runner（题目）的工作目录

@@ -1,3 +1,5 @@
+> 状态：历史档案 —— 已被 [docs/00-architecture-spec.md](../00-architecture-spec.md) 取代；本文保留作为时代记录。
+
 # M5 token accounting 唯一账本 RFC v4.1（自包含实施规范）
 
 > 状态：**RFC v4.1，已获第五轮评审批准（2026-08-15）**。第四轮评审见

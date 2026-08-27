@@ -150,7 +150,7 @@ promotion provenance 和 summary 字段。旧的 `fact_reviews`、`fact_states`�
 验证覆盖：M3 专项、SharedGraph、Board projector、blackboard skill、lifecycle wiring、
 Reason/summary 回归和空凭据全量测试均纳入最终验证；Postgres 当前为 contract-level 测试，
 尚未在本机执行真实 Postgres 集成测试。实现基线和 28 项测试矩阵仍见
-[docs/11-m3-event-immutability-rfc.md](11-m3-event-immutability-rfc.md)。
+[docs/11-m3-event-immutability-rfc.md](archive/11-m3-event-immutability-rfc.md)。
 
 发布注意：当前工作区代码已经是 v2 contract（`user_version=2`）的 phase-2 实现；向
 GitHub 发布时应将数据库备份/显式迁移作为升级说明，不能宣称早于 phase-1 的旧二进制
@@ -294,12 +294,12 @@ initial recon 用操作员方向覆盖 category。模型给合法方向 → 只�
 ## M5 token accounting 重设计（09 §10.3.5 / §10.5 token 1-6）
 
 **状态更新（2026-08-15）**：§12.7 判定本模块 **Redesign before Go**；唯一账本契约
-（[docs/14](14-m5-unique-ledger-rfc.md)）的 v1/v2 评审见
-[docs/15](15-m5-unique-ledger-rfc-review.md) 与
-[docs/16](16-m5-unique-ledger-rfc-v2-review.md)，v3 第三轮评审见
-[docs/17](17-m5-unique-ledger-rfc-v3-review.md)，v4 第四轮评审见
-[docs/18](18-m5-unique-ledger-rfc-v4-review.md)，v4.1 第五轮最终评审见
-[docs/19](19-m5-unique-ledger-rfc-v4-1-review.md)。**RFC v4.1 已批准实施**（docs/14 当前版，
+（[docs/14](archive/14-m5-unique-ledger-rfc.md)）的 v1/v2 评审见
+[docs/15](archive/15-m5-unique-ledger-rfc-review.md) 与
+[docs/16](archive/16-m5-unique-ledger-rfc-v2-review.md)，v3 第三轮评审见
+[docs/17](archive/17-m5-unique-ledger-rfc-v3-review.md)，v4 第四轮评审见
+[docs/18](archive/18-m5-unique-ledger-rfc-v4-review.md)，v4.1 第五轮最终评审见
+[docs/19](archive/19-m5-unique-ledger-rfc-v4-1-review.md)。**RFC v4.1 已批准实施**（docs/14 当前版，
 自包含实施规范）：完整恢复 per-worker token/bridge/互斥/预算/reconciliation，拆分
 `call_outcome`/`usage_status`，统一 `UsageJournal`，定稿 checked durability、postflight fail-stop、
 完整 canonical identity、per-worker exec-env token 接线与 `SpawnGuard`，并以测试矩阵 1–30
