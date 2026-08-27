@@ -22,7 +22,6 @@ import dswarm.solver.container_exec as cx
 from dswarm.solver.container_exec import (
     CONTAINER_WORKSPACE,
     CONTAINER_CONTROL_DIR,
-    LEGACY_CONTAINER_CONTROL_DIR,
     ContainerHandle,
     _containerize_argv,
     _ContainerProc,
@@ -354,7 +353,6 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     # supervisor told to --connect host.docker.internal --run-id, + --add-host.
     control_dir = ws / ".dswarm_control"
     assert f"source={control_dir},target={CONTAINER_CONTROL_DIR}" in joined
-    assert f"source={control_dir},target={LEGACY_CONTAINER_CONTROL_DIR}" in joined
     assert handle.control_dir == str(control_dir)
     assert handle.token and (control_dir / "token").read_text() == handle.token
     assert (control_dir / "token").stat().st_mode & 0o777 == 0o600

@@ -1,4 +1,4 @@
-# AGENTS.md — Project D-Swarm (無敵)
+# AGENTS.md — Project D-Swarm
 
 Autonomous multi-model **CTF-solving agent swarm**. This file is the routing map
 and the invariants — facts live in the code and in `README.md` / `README_CN.md`.

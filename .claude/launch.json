@@ -2,7 +2,7 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "muteki-web",
+      "name": "dswarm-web",
       "runtimeExecutable": "uv",
       "runtimeArgs": [
         "run",
@@ -14,7 +14,7 @@
       "port": 8000
     },
     {
-      "name": "muteki-ui",
+      "name": "dswarm-ui",
       "runtimeExecutable": "npm",
       "runtimeArgs": [
         "--prefix",
@@ -24,12 +24,12 @@
       ],
       "port": 3001,
       "env": {
-        "NEXT_PUBLIC_MUTEKI_API": "http://127.0.0.1:8000"
+        "NEXT_PUBLIC_DSWARM_API": "http://127.0.0.1:8000"
       },
       "autoPort": false
     },
     {
-      "name": "muteki-ui-preview",
+      "name": "dswarm-ui-preview",
       "runtimeExecutable": "npx",
       "runtimeArgs": [
         "next",
@@ -40,7 +40,7 @@
       "cwd": "apps/web/ui",
       "port": 3002,
       "env": {
-        "NEXT_PUBLIC_MUTEKI_API": "http://127.0.0.1:8000"
+        "NEXT_PUBLIC_DSWARM_API": "http://127.0.0.1:8000"
       },
       "autoPort": false
     }

@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-<h1 align="center">無敵 · Project D-Swarm</h1>
+<h1 align="center">Project D-Swarm</h1>
 
 <p align="center">
   <strong>多模型异构 AI Agent 蜂群 · 自主攻防安全自动化</strong>
@@ -37,7 +37,7 @@
 
 ---
 
-这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 目标就是成为如项目名称，**無敵 · Project D-Swarm**
+这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 它就是 **Project D-Swarm**
 
 项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。当前 worker 引擎是 `pi` CLI agent，未来将持续更新迭代支持更多种类的 CLI agent。
 
@@ -87,7 +87,7 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 
 ## 架构
 
-無敵让一群基于 `pi` CLI agent 的 worker 扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **共享证据 + 溯源闸门**。
+D-Swarm 让一群基于 `pi` CLI agent 的 worker 扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **共享证据 + 溯源闸门**。
 
 而 worker 是怎么把数据交到平台、又怎么看到队友进展的？**全靠每个 worker 内置的 `dswarm-blackboard` skill**——这是 worker 与黑板之间唯一的数据通道。
 
@@ -437,6 +437,17 @@ go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtim
 - [ ] 更多agent worker类型支持，如pi、zai、opencode等。
 - [x] TUI模式
 - [ ] 全自动爬ctf平台题目，自动解题，自动提交，自动生成报告功能。
+
+---
+
+## 血统与上游
+
+- **本项目是 [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) 的 fork（魔改分支）**，
+  遵循 GNU AGPL-3.0。归属与分叉声明详见根目录 `NOTICE` 文件。
+- **D-Swarm 是独立项目**：自 fork 起实现已大幅分叉——单引擎路线（`pi`）、event-sourced 共享图、
+  内核不可变加固（M3）、唯一 token 账本（M5）、两阶段 stage_policy 协调、Docker-first 运行时池
+  （M9a）、pentest Verified-PoC 门与 scope 审计（M9）等均为本项目自有演进；除血统外与上游无
+  代码同步关系。
 
 ---
 

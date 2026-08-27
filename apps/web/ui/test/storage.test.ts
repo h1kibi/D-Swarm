@@ -1,7 +1,10 @@
 /**
- * Storage key migration (docs/07 Phase 3): `muteki.*` → `dswarm.*`. Reads must
- * prefer the new key and fall back to the legacy one (no user data loss);
- * writes must only touch the new key; removeKey clears both.
+ * Plain localStorage wrapper tests: reads return the stored value or null,
+ * writes only touch the new `dswarm.*` key, removeKey clears it, and every
+ * path is safe without a window (SSR) or with storage disabled.
+ *
+ * (The muteki.* → dswarm.* migration shim that used to live here was retired;
+ * see lib/storage.ts for the historical note.)
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { readKey, writeKey, removeKey } from "../lib/storage";
@@ -24,39 +27,52 @@ beforeEach(() => {
   (globalThis as Record<string, unknown>).window = { localStorage: store };
 });
 
-describe("storage key migration", () => {
-  it("reads the new key when present", () => {
-    store.setItem("dswarm.lang", "en");
-    store.setItem("muteki.lang", "zh");
+describe("storage wrapper", () => {
+  it("reads a written key back", () => {
+    writeKey("dswarm.lang", "en");
     expect(readKey("dswarm.lang")).toBe("en");
   });
 
-  it("falls back to the legacy key", () => {
-    store.setItem("muteki.lang", "zh");
-    expect(readKey("dswarm.lang")).toBe("zh");
+  it("returns null for unset keys", () => {
+    expect(readKey("dswarm.theme")).toBeNull();
   });
 
-  it("falls back for dynamic blackboard layout keys", () => {
-    store.setItem("muteki.bb.layout.v3.run-1", "{}");
+  it("writes and clears dynamic blackboard layout keys", () => {
+    writeKey("dswarm.bb.layout.v3.run-1", "{}");
     expect(readKey("dswarm.bb.layout.v3.run-1")).toBe("{}");
+    removeKey("dswarm.bb.layout.v3.run-1");
+    expect(readKey("dswarm.bb.layout.v3.run-1")).toBeNull();
   });
 
-  it("writes only the new key", () => {
-    writeKey("dswarm.theme", "dark");
-    expect(store.getItem("dswarm.theme")).toBe("dark");
-    expect(store.getItem("muteki.theme")).toBeNull();
-  });
-
-  it("removeKey clears both new and legacy", () => {
-    store.setItem("dswarm_auth_token", "new");
-    store.setItem("muteki_auth_token", "old");
+  it("removeKey deletes exactly one key", () => {
+    store.setItem("dswarm_auth_token", "tok");
     removeKey("dswarm_auth_token");
     expect(readKey("dswarm_auth_token")).toBeNull();
+    expect(store._map.size).toBe(0);
   });
 
-  it("returns null without a window (SSR)", () => {
+  it("returns null and never throws without a window (SSR)", () => {
     delete (globalThis as Record<string, unknown>).window;
     expect(readKey("dswarm.lang")).toBeNull();
     expect(() => writeKey("dswarm.lang", "en")).not.toThrow();
+    expect(() => removeKey("dswarm.lang")).not.toThrow();
+  });
+
+  it("never throws when storage rejects access", () => {
+    const throwing = {
+      getItem: () => {
+        throw new Error("SecurityError");
+      },
+      setItem: () => {
+        throw new Error("SecurityError");
+      },
+      removeItem: () => {
+        throw new Error("SecurityError");
+      },
+    };
+    (globalThis as Record<string, unknown>).window = { localStorage: throwing };
+    expect(readKey("dswarm.lang")).toBeNull();
+    expect(() => writeKey("dswarm.lang", "en")).not.toThrow();
+    expect(() => removeKey("dswarm.lang")).not.toThrow();
   });
 });

@@ -61,7 +61,6 @@ LEGACY_CONTAINER_EXEC_COMPATIBILITY_FACADE = True
 WORKER_IMAGE = os.environ.get("DSWARM_WORKER_IMAGE", DEFAULT_WORKER_IMAGE)
 CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/dswarm/control"  # bind-mounted; carries the per-run token
-LEGACY_CONTAINER_CONTROL_DIR = "/run/muteki/control"  # pre-rename worker images
 _RUN_PREFIX = "dswarm-run-"
 
 # Route A: the single all-in-one Kali pi worker image (docker/worker-kali/). A
@@ -623,12 +622,6 @@ def _ensure_container_legacy_impl(run_id: str, host_workspace: str, *,
             run_cmd += [
                 "--mount",
                 f"type=bind,source={_mount_source(control_dir)},target={CONTAINER_CONTROL_DIR}",
-                # Back-compat for locally-built 0.1.x pi images whose runtime_agent
-                # still looks for /run/muteki/control/token. Without this mount the
-                # container starts, but the supervisor sends an unauthenticated Hello
-                # and the host waits until it degrades to local execution.
-                "--mount",
-                f"type=bind,source={_mount_source(control_dir)},target={LEGACY_CONTAINER_CONTROL_DIR}",
             ]
             # The supervisor dials OUT to host.docker.internal. On Docker Desktop that
             # DNS resolves to the host automatically; on a Linux host it does NOT, so

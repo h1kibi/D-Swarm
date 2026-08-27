@@ -17,6 +17,9 @@ D-Swarm 是**自主多模型 CTF / 授权渗透测试解题智能体集群**：
   （引擎名册当前仅 `pi`），自带 agentic shell 循环与工具集；D-Swarm 负责规划、派发、证据管理
   与正确性把关。执行器边界：`dswarm/solver/cli_driver.py`（进程/健康）、
   `dswarm/solver/cli_solver.py`（marker 协议、分模式提示词、黑盒约束）。
+- **血统**：本仓库是 [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki)
+  （AGPL-3.0）的魔改 fork；自 fork 起实现已大幅分叉，与上游无代码同步关系——本文描述的
+  全部机制均为 D-Swarm 自有演进。归属声明见根目录 `NOTICE` 与 `README` 上游节。
 - 适用范围：CTF、自有靶场、书面授权的渗透测试。信任模型与安全非目标见
   [SECURITY.md](../SECURITY.md)，运维契约见 [docs/runtime-pools.md](runtime-pools.md)，
   端到端工作方式科普见 [工作原理.md](工作原理.md)。三者作为独立文档由本文链接引用。

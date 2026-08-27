@@ -46,10 +46,14 @@ uv run pytest -q            # 测试套件（无 key 时 live 测试自动跳过
 - 测试：Windows 宿主跑测试用 `PYTHONUTF8=1`；容器执行路径的 POSIX 专属测试在 Windows 上跳过。
 - Worker 引擎名册：`pi`（当前唯一 worker 引擎；方向 profile 统一使用同一 Kali 镜像）。
 
-## 上游
+## 血统与上游
 
-- dswarm/muteki（内核来源）：AGPL-3.0。当前 checkout 默认只配置 `origin`；如需跟踪上游，请显式添加 upstream remote。
-- CTF-BTFly（参考）：源码在 `references/btfly/`，commit `a141bb5`，AGPL-3.0。
+- **本项目是 [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) 的 fork（魔改分支）**，
+  遵循 GNU AGPL-3.0（上游许可证已保留）。归属与分叉声明详见根目录 `NOTICE`。
+- **D-Swarm 是独立项目**：自 fork 起实现已大幅分叉——单引擎路线（`pi`）、event-sourced
+  共享图、M3/M5 内核加固、两阶段 stage_policy 协调、M5 预算账本、M9a Docker-first 运行时池、
+  M9 pentest Verified-PoC 门等均为本项目自有演进；除血统外与上游无代码同步关系。
+- CTF-BTFly（参考）：源码在 `references/btfly/`，commit `a141bb5`，AGPL-3.0，只读参考。
 
 ## Runtime pools (M9a)
 

@@ -1,7 +1,7 @@
 [project]
 name = "project-dswarm"
 version = "0.3.0rc1"
-description = "Project D-Swarm (無敵): autonomous multi-model CTF-solving AI agent swarm"
+description = "Project D-Swarm: autonomous multi-model CTF-solving AI agent swarm"
 requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.7",

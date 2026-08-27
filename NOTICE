@@ -1,0 +1,16 @@
+D-Swarm
+Copyright 2026 the D-Swarm authors (h1kibi)
+
+This repository is a fork of FishCodeTech/muteki ("Muteki"),
+https://github.com/FishCodeTech/muteki, licensed under the
+GNU Affero General Public License v3.0. Substantial portions of the kernel
+derive from that project's contributors, whose copyright is preserved.
+
+Since the fork, this project has diverged substantially from upstream
+(single-engine pi worker route, event immutability hardening, unique token
+ledger, two-stage stage_policy coordination, Docker-first runtime pools,
+pentest Verified-PoC gate, scope audit) and no longer syncs code with it.
+"D-Swarm" is an independent product; historical planning documents that predate
+the fork identity are kept under docs/archive/ for attribution purposes only.
+
+License: GNU Affero General Public License v3.0 (see LICENSE).

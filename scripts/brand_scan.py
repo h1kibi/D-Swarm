@@ -53,14 +53,12 @@ ALLOWLIST = {
     "eval_nyu/_reports/RESULTS.md",  # historical eval record
     "public_eval/RESULTS.md",  # historical eval record
     "scripts/brand_scan.py",  # self-referential legacy token
-    "README.md",  # upstream attribution note
-    # Pre-rename worker images still look for /run/muteki/control/token; this
-    # constant keeps those images mountable (functional compatibility shim).
-    "dswarm/solver/container_exec.py",
-    # Legacy localStorage key migration: browsers still hold `muteki.*` keys
-    # from before the rebrand; the read-fallback map must keep the old names.
-    "apps/web/ui/lib/storage.ts",
-    "apps/web/ui/test/storage.test.ts",
+    "README.md",  # upstream attribution note (fork lineage)
+    "NOTICE",  # AGPL attribution note (fork lineage)
+    "README_CN.md",  # upstream attribution note (fork lineage)
+    "docs/00-architecture-spec.md",  # blueprint §1 lineage note
+    "apps/web/ui/lib/storage.ts",  # retired-shim historical note
+    "apps/web/ui/test/storage.test.ts",  # retired-shim historical note
 }
 
 BINARY_SUFFIXES = {".pyc", ".png", ".ico", ".icns", ".exe", ".dll", ".so"}

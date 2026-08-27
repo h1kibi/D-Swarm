@@ -1,4 +1,4 @@
-# Project Muteki — Iteration Roadmap
+# Project D-Swarm — Iteration Roadmap (historical)
 
 > **Current status override:** this roadmap is retained as historical planning
 > context. It predates the Pi-only executor, multi-flag work, current web deck,
