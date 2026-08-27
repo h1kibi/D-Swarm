@@ -53,15 +53,7 @@ fi
 
 PYTEST_ARGS=(-q)
 
-# The pwn SDK is optional and depends on pwntools / a pwn-capable worker image.
-# Keep the default session bootstrap lean. Older checkouts had a dedicated
-# tests/test_kit_pwn.py module; ignore it only when present so this script does
-# not advertise a non-existent test file.
-if [[ "${DSWARM_RUN_PWN_TESTS:-0}" != "1" && -f tests/test_kit_pwn.py ]]; then
-  PYTEST_ARGS+=(--ignore=tests/test_kit_pwn.py)
-fi
-
-echo "==> [3/3] Fast test suite (unit + scripted-loop; pwn optional; live tests skip without API key)"
+echo "==> [3/3] Fast test suite (unit + scripted-loop; live tests skip without API key)"
 # The web entrypoint auto-loads a repo-root .env (dotenv_boot.load_env). If the
 # operator has filled DSWARM_WEB_PASSWORD there, the web app would start with auth
 # ON and the unauthenticated web-server tests would all 401. Exporting it EMPTY for
@@ -72,9 +64,8 @@ DSWARM_WEB_PASSWORD= uv run pytest "${PYTEST_ARGS[@]}"
 echo
 echo "OK — suite green. See README.md to get started; AGENTS.md for the dev map."
 
-# Optional pwn SDK verification:
-#   DSWARM_RUN_PWN_TESTS=1 ./init.sh
-# Requires pwntools (and dynamic tests may require a pwn-capable worker image).
+# Optional opt-in suites: see .env.example (e.g. DSWARM_RUN_DOCKER_TESTS=1 for
+# the fake-Pi Docker integration tests).
 #
 # To run a real challenge (needs an API key), use the web deck:
 #   ./run.sh web   → create a run, flip the offline toggle for a clean black-box.

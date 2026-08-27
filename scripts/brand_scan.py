@@ -23,6 +23,9 @@ EXCLUDE_DIRS = {
     ".git", ".venv", "node_modules", ".next", "__pycache__", ".pytest_cache",
     "references", "sessions", ".pi-sessions", "build", "dist", "$out",
     "assets", ".claude", ".agents",
+    # Agent session worktrees mirror the whole tree (legacy tokens included);
+    # they are git-ignored dev scaffolding, not distribution content.
+    ".worktrees", ".zcode",
 }
 
 # Legacy brand tokens. Matched case-insensitively as whole words where the
@@ -44,11 +47,16 @@ ALLOWLIST = {
     "docs/05-security-and-eval.md",  # historical design doc
     "docs/06-route-a-plan.md",  # historical planning context
     "docs/07-d-swarm-ui-audit-and-redesign.md",  # the rename plan's own audit
+    "docs/08-oss-research-and-kernel-improvements.md",  # research record citing upstream
     "docs/brand-inventory-2026-08-06.txt",  # dated pre-rename inventory artifact
     "eval_nyu/_reports/FINAL_eval_report.md",  # historical eval record
     "eval_nyu/_reports/RESULTS.md",  # historical eval record
     "public_eval/RESULTS.md",  # historical eval record
     "scripts/brand_scan.py",  # self-referential legacy token
+    "README.md",  # upstream attribution note
+    # Pre-rename worker images still look for /run/muteki/control/token; this
+    # constant keeps those images mountable (functional compatibility shim).
+    "dswarm/solver/container_exec.py",
     # Legacy localStorage key migration: browsers still hold `muteki.*` keys
     # from before the rebrand; the read-fallback map must keep the old names.
     "apps/web/ui/lib/storage.ts",

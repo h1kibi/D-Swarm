@@ -16,9 +16,11 @@ and the invariants — facts live in the code and in `README.md` / `README_CN.md
   append-only). An independent **Reason phase** (`dswarm/solver/reason.py`) reads the
   graph and proposes typed intents for workers to claim.
 - **Race vs coordinator.** Pi worker profiles can attack the same challenge in
-  parallel, first past the gate wins. An opt-in **coordinator**
-  (`Swarm(coordinator=True)`) instead plans intents from the graph and dispatches
-  focused workers.
+  parallel, first past the gate wins. A two-stage coordinator is configured via
+  `Swarm(stage_policy={"coordinator": {...}})` (`dswarm/swarm/stage_policy.py`;
+  read at `swarm.py` when planning review stages) and dispatches focused workers
+  from graph-planned intents. (A top-level `coordinator` request field is legacy
+  and rejected by `apps/web/drivers.py`; do not document or use it.)
 - **Multi-flag.** `Challenge.expected_flags` (default 1). `expected_flags=1` is
   byte-identical to "first flag wins"; only `>1` engages the multi-flag paths. Until
   `Swarm._flags_complete()`, a flag is not a stop signal.
@@ -75,7 +77,8 @@ Primary check: **`./init.sh`** (or `uv run pytest -q`). A change is done only wh
 - [ ] A solve-rate claim is backed by a real black-box trace showing the flag in actual
       worker output — not a model's claim.
 
-> The pwn SDK tests are optional (need pwntools): `DSWARM_RUN_PWN_TESTS=1 ./init.sh`.
+> Optional opt-in suites live behind explicit env gates (see `.env.example`),
+> e.g. `DSWARM_RUN_DOCKER_TESTS=1` for the fake-Pi Docker integration tests.
 
 ## Where things are
 

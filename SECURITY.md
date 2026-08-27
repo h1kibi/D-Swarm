@@ -4,7 +4,7 @@
 
 Please report security vulnerabilities **privately** via GitHub Security Advisories:
 
-> **[Report a vulnerability](https://github.com/FishCodeTech/dswarm/security/advisories/new)**
+> **[Report a vulnerability](https://github.com/h1kibi/D-Swarm/security/advisories/new)**
 > (repo → *Security* tab → *Report a vulnerability*)
 
 Do **not** open a public issue for security problems. We will acknowledge your
