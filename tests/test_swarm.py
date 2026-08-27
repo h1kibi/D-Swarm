@@ -3123,7 +3123,9 @@ def test_lifecycle_integration_directive_review_resource_compact(challenge, tmp_
 
 def test_sync_flags_from_graph_absorbs_graph_only_flags(challenge, tmp_path: Path):
     """Flags recorded ONLY via the shared-graph path (never via outcome.flags) must
-    make _flags_complete() true after reconcile — no split-brain."""
+    make _flags_complete() true — no split-brain. Since the wiring commit,
+    _flags_complete() itself reconciles against the authoritative graph before
+    every verdict, so a lost clean outcome can no longer blind completion."""
     challenge.expected_flags = 2
     challenge.multi_flag = True
     sw = _coordinator_swarm(challenge, tmp_path)
@@ -3133,13 +3135,10 @@ def test_sync_flags_from_graph_absorbs_graph_only_flags(challenge, tmp_path: Pat
     sw.shared_graph.flag_found(actor="cli-x", flag="flag{a}", intent_id=None)
     sw.shared_graph.flag_found(actor="cli-y", flag="flag{b}", intent_id=None)
     assert sw._found_flags == []
-    assert sw._flags_complete() is False  # in-memory set still empty → split-brain
 
-    fresh = sw._sync_flags_from_graph()
-
-    assert set(fresh) == {"flag{a}", "flag{b}"}          # both newly absorbed
+    assert sw._flags_complete() is True                  # wired reconcile absorbs them
     assert set(sw._found_flags) == {"flag{a}", "flag{b}"}
-    assert sw._flags_complete() is True                  # completion now fires
+    assert sw._sync_flags_from_graph() == []             # idempotent once absorbed
 
 
 def test_sync_flags_drops_operator_invalidated_flag(challenge, tmp_path: Path):
@@ -3172,6 +3171,62 @@ def test_sync_flags_noop_without_graph(challenge, tmp_path: Path):
     sw._found_flags = ["flag{kept}"]
     assert sw._sync_flags_from_graph() == []
     assert sw._found_flags == ["flag{kept}"]             # untouched
+
+
+def test_flags_complete_falls_back_to_memory_when_graph_unreadable(
+    challenge, tmp_path: Path,
+):
+    """The run-75379 wiring is strictly additive: when the graph snapshot cannot
+    be read (DB failure), completion degrades to the pre-wiring memory-only
+    verdict instead of raising or wiping held flags."""
+    challenge.expected_flags = 1
+    sw = _coordinator_swarm(challenge, tmp_path)
+    assert sw.shared_graph is not None
+    real_graph = sw.shared_graph
+
+    class _Unreadable:
+        def snapshot(self):
+            raise RuntimeError("db locked")
+
+        def invalidated_flags(self):
+            raise RuntimeError("db locked")
+
+    sw.shared_graph = _Unreadable()
+    try:
+        sw._found_flags = ["flag{mem}"]
+        assert sw._flags_complete() is True              # memory still decides
+        assert sw._found_flags == ["flag{mem}"]          # nothing wiped
+    finally:
+        sw.shared_graph = real_graph
+    # with a readable graph restored, an absent-from-graph flag stays held but the
+    # graph's own valid flags are absorbed on the next verdict.
+    real_graph.flag_found(actor="cli-x", flag="flag{graph}", intent_id=None)
+    assert sw._flags_complete() is True
+    assert set(sw._found_flags) >= {"flag{mem}", "flag{graph}"}
+
+
+def test_flags_complete_absorbs_single_flag_run_from_graph(challenge, tmp_path: Path):
+    """expected_flags=1 race mode: one graph-only accepted flag finishes the run —
+    byte-identical guarantee to first-flag-wins, now backed by the graph."""
+    challenge.expected_flags = 1
+    sw = _coordinator_swarm(challenge, tmp_path)
+    assert sw._flags_complete() is False
+    sw.shared_graph.flag_found(actor="cli-x", flag="flag{single}", intent_id=None)
+    assert sw._flags_complete() is True
+
+
+def test_flags_complete_never_finishes_unknown_count_collect_mode(
+    challenge, tmp_path: Path,
+):
+    """multi_flag=True with expected_flags<=1 never completes by count, even when
+    the graph holds many accepted flags."""
+    challenge.multi_flag = True
+    challenge.expected_flags = 1
+    sw = _coordinator_swarm(challenge, tmp_path)
+    for i in range(5):
+        sw.shared_graph.flag_found(actor=f"cli-{i}", flag=f"flag{{{i}}}",
+                                   intent_id=None)
+    assert sw._flags_complete() is False
 
 async def test_review_factory_exception_releases_reserved_lane(
     challenge, tmp_path: Path, monkeypatch,

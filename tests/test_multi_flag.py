@@ -74,6 +74,11 @@ class _PredHost:
     _flags_complete = Swarm._flags_complete
     _record_flags = Swarm._record_flags
 
+    # The real Swarm._flags_complete reconciles against the shared graph before
+    # every verdict (run-75379 wiring). This double has no graph; the no-op
+    # keeps these tests focused on the pure count predicate.
+    _sync_flags_from_graph = lambda self: []
+
     def __init__(self, challenge: Challenge) -> None:
         self.challenge = challenge
         self._found_flags: list[str] = []

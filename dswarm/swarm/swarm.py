@@ -803,6 +803,12 @@ class Swarm(
         (run-10070): saving a flag (_record_flags) must not finish a collect-mode run
         the way it finishes a single-flag run.
 
+        Every decision point first reconciles against the authoritative shared-graph
+        snapshot (_sync_flags_from_graph, the run-75379 fix): a flag that reached
+        the graph through a path without a clean reaped outcome still counts toward
+        completion. If the graph is unavailable the memory set alone decides —
+        exactly the pre-sync behavior.
+
         - single-flag (multi_flag=False, the default): `len >= expected_flags`, which
           with expected_flags=1 finishes on the first gated flag — byte-identical to
           the old behavior.
@@ -811,6 +817,7 @@ class Swarm(
         - collect mode with UNKNOWN count (multi_flag=True, expected_flags<=1): NEVER
           finish by count. Flags still save + display; the run ends only on operator
           STOP or the coordinator's no-progress pause. A saved flag is not a finish."""
+        self._sync_flags_from_graph()
         if self._multi_flag() and self._expected_flags() <= 1:
             return False
         return len(self._found_flags) >= self._expected_flags()
@@ -828,28 +835,30 @@ class Swarm(
     def _sync_flags_from_graph(self) -> list[str]:
         """Reconcile the in-memory flag set with the AUTHORITATIVE shared-graph
         snapshot, returning the flags that were newly absorbed (for one-time
-        broadcast). This is the fix for the run-75379 split-brain (BUG②).
+        broadcast). This is the fix for the run-75379 split-brain (BUG②/④).
 
-        Every worker writes each accepted flag to the shared graph via _accept_flag
-        → shared_graph.flag_found, and the graph snapshot is what the UI / planner /
-        finalize already trust. But _found_flags (the in-memory list _flags_complete
-        reads) is fed ONLY from reaped `outcome.flags`, so a flag that reached the
-        graph via a path that never delivered a clean outcome — a worker cancelled
-        after it accepted a flag (reaped as CancelledError, line ~3615), an
-        error-reaped worker, or the live-broadcast/DB-bridge path — stays invisible
-        to the completion check. In run-75379 the graph held 4 valid flags (5 found,
-        1 operator-invalidated) while _found_flags was stuck at 2, so _flags_complete()
-        never fired and the run spawned ~55 post-solve waves until operator stop.
+        Every worker writes each accepted flag to the shared graph via
+        cli_solver._accept_flag → shared_graph.flag_found, and the graph snapshot
+        is what the UI / planner / finalize already trust. But _found_flags (the
+        in-memory list this class reads for completion) was fed ONLY from reaped
+        `outcome.flags`, so a flag that reached the graph via a path that never
+        delivered a clean outcome — a worker cancelled after it accepted a flag,
+        an error-reaped worker, or the live-broadcast/DB-bridge path — stayed
+        invisible to the completion check. In run-75379 the graph held 4 valid
+        flags (5 found, 1 operator-invalidated) while _found_flags was stuck at 2,
+        so _flags_complete() never fired and the run spawned ~55 post-solve waves
+        until operator stop.
 
         Reconciling against snapshot().flags makes the graph the single source of
-        truth for completion:
+        truth for completion; _flags_complete() calls this before every verdict
+        so no completion decision site can forget to sync:
           - ADD any flag the graph holds but _found_flags is missing.
           - DROP any flag the operator explicitly INVALIDATED (snapshot already
             excludes it), so a blacklisted false positive (e.g. 090099b7) can never
             count toward expected_flags (BUG③ cross-check).
         Absent-from-snapshot-but-not-invalidated flags are LEFT in place: a silent
-        flag_found DB-write failure (the `except: pass` in _accept_flag) must not
-        let a genuinely-held flag vanish from the count."""
+        flag_found DB-write failure must not let a genuinely-held flag vanish from
+        the count."""
         if self.shared_graph is None:
             return []
         try:
