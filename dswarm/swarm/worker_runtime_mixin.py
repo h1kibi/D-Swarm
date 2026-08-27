@@ -496,7 +496,8 @@ class WorkerRuntimeMixin:
                          intent_id: str = "", timeout_override: "Optional[int]" = None,
                          profile_role: "Optional[str]" = None,
                          task_kind: str = "", host_scan: bool = False,
-                         runtime_operation_kind: str = ""):
+                         runtime_operation_kind: str = "",
+                         reproduction_id: str = "", source_finding_id: str = ""):
         guard = getattr(self, "spawn_guard", None)
         if guard is not None:
             guard.check_now(operation="spawn")
@@ -718,6 +719,8 @@ class WorkerRuntimeMixin:
                 runtime_operation_kind=audited_operation_kind,
                 task_kind=task_kind,
                 host_scan=host_scan,
+                reproduction_id=reproduction_id,
+                source_finding_id=source_finding_id,
             )
         except BaseException:
             if gateway_token:

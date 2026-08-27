@@ -408,6 +408,39 @@ async def test_exec_record_never_exposes_argv_env_token_host_path_or_stderr(tmp_
 
 
 @pytest.mark.asyncio
+async def test_registered_poc_command_uses_fixed_shell_wrapper_and_raw_runtime_provenance(tmp_path: Path):
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(driver, argv, **kwargs):
+        calls.append({"driver": driver, "argv": argv, **kwargs})
+        return CliResult(
+            text="raw stdout POC_OK",
+            raw_stderr="raw stderr",
+            runtime_status={"status": "finished", "rc": 0},
+        )
+
+    executor = await ready_executor(tmp_path, run_rcp=fake_run)
+    cwd = tmp_path / "run-a" / "workspace" / "verifiers" / "poc-1"
+    cwd.mkdir(parents=True)
+
+    result = await executor.run_registered_command(
+        ("sh", "-c", "python3 poc.py"),
+        host_cwd=cwd,
+        timeout=7,
+        worker_instance_id="verifier-1",
+        env={"SAFE": "1"},
+    )
+
+    assert result.text == "raw stdout POC_OK"
+    assert result.raw_stderr == "raw stderr"
+    assert result.runtime_status["operation_kind"] == "poc_verifier"
+    assert calls[0]["driver"].name == "poc-verifier"
+    assert calls[0]["argv"] == ["sh", "-c", "python3 poc.py"]
+    assert calls[0]["container_cwd"] == f"{CONTAINER_WORKSPACE}/verifiers/poc-1"
+    assert calls[0]["link"] is executor.control_link
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("raw_failure_code", "expected_failure_code"),
     [

@@ -659,3 +659,38 @@ async def test_strict_docker_explicit_endpoint_does_not_issue_gateway_token(
     assert "DSWARM_TASK_TOKEN" not in lease.worker_env
     assert "DEEPSEEK_API_KEY" not in lease.worker_env
     assert gateway._tokens == {}
+
+
+def test_worker_factory_preserves_verifier_linkage_without_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dswarm.solver import cli_solver as cli_solver_module
+
+    seen: list[dict[str, Any]] = []
+
+    class FakeCliSolver:
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            self.solver_id = kwargs["solver_label"]
+
+    monkeypatch.setattr(cli_solver_module, "CliSolver", FakeCliSolver)
+    swarm = _make_swarm(
+        tmp_path,
+        engines=["pi-main"],
+        worker_profiles=[_runtime_worker_profile()],
+    )
+
+    worker = swarm._make_cli_worker(
+        "pi-main",
+        mode="review",
+        intent_goal="Run the saved PoC entrypoint",
+        intent_id="intent-verifier",
+        reproduction_id="poc-repro::artifact::digest",
+        source_finding_id="finding-1",
+    )
+
+    assert worker.solver_id
+    assert seen[0]["reproduction_id"] == "poc-repro::artifact::digest"
+    assert seen[0]["source_finding_id"] == "finding-1"
+    assert "command" not in seen[0]
+    assert "entry_command" not in seen[0]

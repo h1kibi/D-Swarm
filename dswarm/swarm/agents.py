@@ -53,6 +53,10 @@ class DispatchDecision:
     direction_resolution: str = ""
     # Final routing authority: model/operator/keyword/category/default.
     direction_source: str = ""
+    # M9 Verified-PoC linkage; appended for positional fixture compatibility.
+    reproduction_id: str = ""
+    source_finding_id: str = ""
+    poc_id: str = ""
 
 
 class AgentRegistry:

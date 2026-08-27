@@ -410,6 +410,9 @@ class ReasonSwarm:
                     "surface_target": decision.surface_target,
                     "task_kind": decision.task_kind,
                     "host_scan": decision.host_scan,
+                    "reproduction_id": decision.reproduction_id,
+                    "source_finding_id": decision.source_finding_id,
+                    "poc_id": decision.poc_id,
                 },
                 from_fact_seqs=decision.from_facts or None,
             )
@@ -627,6 +630,9 @@ class ReasonSwarm:
                 canonical_direction=direction,
                 direction_resolution=resolution,
                 direction_source=direction_source,
+                reproduction_id=it.reproduction_id,
+                source_finding_id=it.source_finding_id,
+                poc_id=getattr(it, "poc_id", ""),
             )
             out.append(decision)
 

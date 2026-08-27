@@ -7,6 +7,7 @@ plan / dispatch loop — all with the CLI subprocess stubbed out (no real engine
 """
 
 import asyncio
+import hashlib
 import time
 from pathlib import Path
 
@@ -116,6 +117,41 @@ def test_flag_unverified_graph_event_bridges_to_blackboard(challenge, tmp_path: 
         "source_actor": "cli-pi-1",
         "artifact_id": "",
     })]
+
+
+def test_poc_reproduction_graph_event_bridge_redacts_indicator_and_command(challenge, tmp_path: Path):
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+        graph_dir=tmp_path / "graph",
+    )
+    ev = {
+        "seq": 9,
+        "kind": "poc_reproduction_registered",
+        "actor": "cli-pi-1",
+        "payload": {
+            "poc_id": "poc-1",
+            "reproduction_id": "poc-repro::1",
+            "artifact_id": "artifact-1",
+            "command": "python3 poc.py --token=do-not-leak",
+            "indicator": "sensitive-observable",
+        },
+    }
+
+    bridged = sw._graph_event_to_bb(ev)
+
+    assert bridged == [("poc_reproduction_registered", {
+        "seq": 9,
+        "poc_id": "poc-1",
+        "reproduction_id": "poc-repro::1",
+        "status": "registered",
+        "indicator_digest": hashlib.sha256(b"sensitive-observable").hexdigest(),
+        "indicator_length": len("sensitive-observable"),
+    })]
+    assert "sensitive-observable" not in repr(bridged)
+    assert "do-not-leak" not in repr(bridged)
 
 
 def test_runtime_infra_fact_graph_event_does_not_bridge_to_blackboard(challenge, tmp_path: Path):

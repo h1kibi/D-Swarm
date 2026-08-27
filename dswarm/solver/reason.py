@@ -64,6 +64,10 @@ class Intent:
     raw_direction: str = ""
     canonical_direction: str = ""
     direction_resolution: str = ""
+    # M9 Verified-PoC linkage. Appended to preserve positional fixture compatibility.
+    reproduction_id: str = ""
+    source_finding_id: str = ""
+    poc_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.canonical_direction:
@@ -86,7 +90,10 @@ class Intent:
                 "mode": self.mode,
                 "surface_target": self.surface_target,
                 "priority": self.priority, "requires_recon": self.requires_recon,
-                "task_kind": self.task_kind, "host_scan": self.host_scan}
+                "task_kind": self.task_kind, "host_scan": self.host_scan,
+                "reproduction_id": self.reproduction_id,
+                "source_finding_id": self.source_finding_id,
+                "poc_id": self.poc_id}
 
 
 # Reason's verdict — a state-machine decision, not just a bool. The solver acts on

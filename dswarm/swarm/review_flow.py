@@ -10,7 +10,7 @@ from dswarm.solver.worker_profiles import normalize_profile_roster
 from dswarm.swarm.budget import WorkerBudgetExhausted
 from dswarm.swarm.errors import WorkerSpawnRejected
 from dswarm.swarm.lane_gate import WorkerLaneDisabled, WorkerLaneStopped
-from dswarm.swarm.shared_graph import canonicalize_lane
+from dswarm.swarm.shared_graph import EV_REVIEW_FINDING, canonicalize_lane
 
 
 class ReviewFlowMixin:
@@ -434,6 +434,98 @@ class ReviewFlowMixin:
         )
         return True
 
+    _POC_VERIFY_GOAL = (
+        "Run the saved PoC entrypoint and confirm the registered reproduction indicator "
+        "from real verifier output."
+    )
+
+    def _review_finding_payload(self, finding_id: str) -> Optional[dict[str, Any]]:
+        """Return one stored review finding without exposing worker commands."""
+        fid = str(finding_id or "").strip()
+        if not fid or self.shared_graph is None:
+            return None
+        try:
+            events = self.shared_graph.events()
+        except Exception:
+            return None
+        for event in reversed(events):
+            if event.get("kind") != EV_REVIEW_FINDING:
+                continue
+            payload = dict(event.get("payload") or {})
+            if str(payload.get("finding_id") or "") == fid:
+                return payload
+        return None
+
+    def eligible_poc_verification(self, finding_id: str) -> Optional[dict[str, Any]]:
+        """Build bounded verifier metadata for an eligible pentest finding.
+
+        This is deliberately a read-only eligibility check.  It never exposes the
+        saved PoC command to a review payload; the later verifier runtime resolves
+        the immutable command from the registered graph projection.
+        """
+        if self.shared_graph is None:
+            return None
+        if str(getattr(self.challenge, "mode", "ctf") or "ctf") != "pentest":
+            return None
+        finding = self._review_finding_payload(finding_id)
+        if not finding or str(finding.get("severity") or "").strip().lower() != "blocker":
+            return None
+        explicit: list[str] = []
+        for raw in ([finding.get("poc_id")] if finding.get("poc_id") else []):
+            clean = str(raw or "").strip()
+            if clean and clean not in explicit:
+                explicit.append(clean)
+        for raw in finding.get("poc_ids") or []:
+            clean = str(raw or "").strip()
+            if clean and clean not in explicit:
+                explicit.append(clean)
+        if len(explicit) != 1:
+            return None
+        reproduction = self.shared_graph.get_poc_reproduction(explicit[0])
+        if not reproduction:
+            return None
+        if str(reproduction.get("status") or "") in {"verified", "failed"}:
+            return None
+        return {
+            "worker_class": "verifier",
+            "goal": self._POC_VERIFY_GOAL,
+            "poc_id": explicit[0],
+            "reproduction_id": str(reproduction.get("reproduction_id") or ""),
+            "source_finding_id": str(finding_id or "").strip(),
+        }
+
+    def _create_poc_verifier_intent(self, finding_id: str) -> Optional[dict[str, Any]]:
+        metadata = self.eligible_poc_verification(finding_id)
+        if metadata is None:
+            return None
+        try:
+            active = self.shared_graph.dispatchable_intents()
+        except Exception:
+            active = []
+        for row in active:
+            if (str(row.get("worker_class") or "") == "verifier"
+                    and str(row.get("reproduction_id") or "") == metadata["reproduction_id"]
+                    and str(row.get("source_finding_id") or "") == metadata["source_finding_id"]):
+                return None
+        iid = "I-poc-verify-" + hashlib.sha1(
+            f"{metadata['reproduction_id']}:{metadata['source_finding_id']}".encode("utf-8")
+        ).hexdigest()[:12]
+        seq = self.shared_graph.propose_intent(
+            actor="coordinator", intent_id=iid, goal=metadata["goal"],
+            payload={
+                "worker_class": "verifier",
+                "reproduction_id": metadata["reproduction_id"],
+                "source_finding_id": metadata["source_finding_id"],
+                "poc_id": metadata["poc_id"],
+                "mode": "review",
+                "task_kind": "pentest",
+                "rationale": "eligible blocker finding requires registered PoC verification",
+            },
+        )
+        if seq == -1:
+            return None
+        return {**metadata, "intent_id": iid, "seq": seq}
+
     async def _drain_review_proposals(self, *, emit_bb, fruitless_workers: int = 0) -> int:
         if self.shared_graph is None:
             return 0
@@ -583,14 +675,35 @@ class ReviewFlowMixin:
                             recommended_actions=[
                                 str(x) for x in payload.get("recommended_actions", []) if x
                             ],
+                            poc_id=str(payload.get("poc_id") or ""),
+                            poc_ids=[str(x) for x in payload.get("poc_ids", []) if x],
                         )
+                        finding_id = ""
+                        try:
+                            finding_event = next(
+                                item for item in self.shared_graph.events()
+                                if int(item.get("seq") or 0) == int(applied_seq or 0)
+                            )
+                            finding_id = str((finding_event.get("payload") or {}).get("finding_id") or "")
+                        except Exception:
+                            finding_id = ""
+                        verifier = self._create_poc_verifier_intent(finding_id) if finding_id else None
                         await emit_bb("review_finding", seq=applied_seq,
                                       finding_kind=str(payload.get("kind") or "no_action"),
                                       severity=str(payload.get("severity") or "info"),
                                       summary=str(payload.get("summary") or ""),
                                       route_hash=str(payload.get("route_hash") or ""),
                                       branch_id=str(payload.get("branch_id") or ""),
+                                      poc_id=str(payload.get("poc_id") or ""),
                                       proposal_seq=seq)
+                        if verifier is not None:
+                            await emit_bb("intent_proposed",
+                                          intent_id=verifier["intent_id"],
+                                          goal=verifier["goal"],
+                                          worker_class="verifier",
+                                          reproduction_id=verifier["reproduction_id"],
+                                          source_finding_id=verifier["source_finding_id"],
+                                          proposal_seq=seq)
                     elif marker == "FLAG_AUDIT":
                         flag = str(payload.get("flag") or "").strip()
                         verdict = str(payload.get("verdict") or "insufficient_context").strip()
@@ -739,6 +852,8 @@ class ReviewFlowMixin:
                                     "depends_on": [
                                         str(x) for x in payload.get("depends_on", []) if x
                                     ],
+                                    "reproduction_id": str(payload.get("reproduction_id") or ""),
+                                    "source_finding_id": str(payload.get("source_finding_id") or ""),
                                 },
                                 from_fact_seqs=[
                                     int(x) for x in payload.get("from", [])

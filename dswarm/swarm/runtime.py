@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
+import uuid
 
 from dswarm.solver.container_pool import RuntimeFailure, RuntimePoolView
 from dswarm.solver.direction_rules import DEFAULT_DIRECTION_REGISTRY
@@ -404,6 +405,94 @@ class SwarmWorkerRuntime:
                 stop_event.set()
         return None
 
+
+    async def _run_poc_verifier(
+        self, decision: DispatchDecision, profile: AgentProfile, engine: str
+    ) -> Any:
+        swarm = self.swarm
+        from dswarm.swarm.poc_verification import VerificationFailure
+        from dswarm.swarm.poc_verification_runtime import (
+            VerificationOutcome,
+            run_poc_verification,
+        )
+        from dswarm.solver.poc_verifier import ContainerPocVerifier
+
+        worker_instance_id = uuid.uuid4().hex
+        base = {
+            "poc_id": decision.poc_id,
+            "reproduction_id": decision.reproduction_id,
+            "source_finding_id": decision.source_finding_id,
+            "intent_id": decision.intent_id,
+            "worker_id": worker_instance_id,
+        }
+        workspace_root = getattr(swarm, "workspace_root", None)
+        runtime_policy = getattr(swarm, "runtime_policy", None)
+        snapshot = getattr(swarm, "runtime_snapshot", None)
+        manager = getattr(swarm, "pool_manager", None)
+        if (
+            workspace_root is None
+            or runtime_policy is None
+            or getattr(runtime_policy, "mode", "") != "docker"
+            or snapshot is None
+            or manager is None
+        ):
+            return VerificationOutcome(
+                status=VerificationFailure.DOCKER_RUNTIME_UNAVAILABLE.value,
+                poc_id=str(base["poc_id"] or ""),
+                reproduction_id=decision.reproduction_id,
+                verification_id="",
+                source_finding_id=decision.source_finding_id,
+                intent_id=decision.intent_id,
+                worker_id=worker_instance_id,
+                verified=False,
+                failure_reason=VerificationFailure.DOCKER_RUNTIME_UNAVAILABLE.value,
+                diagnostics="docker runtime unavailable",
+            )
+
+        operation_kind = runtime_operation_for_spawn(
+            mode=decision.mode or profile.mode or "review",
+            profile_role="review",
+            requested=decision.runtime_operation_kind or "review",
+        )
+        try:
+            request = RuntimeSpawnRequest(
+                profile_id=str(engine or profile.resolve_worker_profile(swarm.challenge.category)),
+                worker_instance_id=worker_instance_id,
+                operation_kind=operation_kind,
+                mode=decision.mode or profile.mode or "review",
+                intent_id=decision.intent_id,
+            )
+            lease_factory = runtime_lease_factory_for_request(
+                snapshot=snapshot, pool_manager=manager, request=request
+            )
+        except Exception:
+            return VerificationOutcome(
+                status=VerificationFailure.DOCKER_RUNTIME_UNAVAILABLE.value,
+                poc_id=str(base["poc_id"] or ""),
+                reproduction_id=decision.reproduction_id,
+                verification_id="",
+                source_finding_id=decision.source_finding_id,
+                intent_id=decision.intent_id,
+                worker_id=worker_instance_id,
+                verified=False,
+                failure_reason=VerificationFailure.DOCKER_RUNTIME_UNAVAILABLE.value,
+                diagnostics="docker runtime unavailable",
+            )
+
+        return await run_poc_verification(
+            base,
+            graph=swarm.shared_graph,
+            verifier=ContainerPocVerifier(),
+            runtime_lease_factory=lease_factory,
+            usage_context=SimpleNamespace(
+                workspace_root=workspace_root,
+                worker_id=worker_instance_id,
+                operation_kind=operation_kind,
+                timeout=profile.timeout,
+                emit_delta=getattr(swarm, "_emit_bb_bus", None),
+            ),
+        )
+
     async def run(self, decision: DispatchDecision, profile: AgentProfile) -> Any:
         swarm = self.swarm
         mode = decision.mode or profile.mode or "explore"
@@ -417,6 +506,8 @@ class SwarmWorkerRuntime:
         )
         engine = profile.resolve_worker_profile(swarm.challenge.category)
         primary = profile.resolve_worker_profile(swarm.challenge.category)
+        if decision.worker_class == "verifier" and getattr(swarm, "shared_graph", None) is not None:
+            return await self._run_poc_verifier(decision, profile, engine)
         if not swarm._healthy_matches(engine, self.healthy):
             try:
                 engine = swarm._pick_engine([], self.healthy, role=role)
@@ -435,6 +526,8 @@ class SwarmWorkerRuntime:
             "timeout_override": profile.timeout,
             "task_kind": decision.task_kind or swarm.challenge.category,
             "host_scan": decision.host_scan,
+            "reproduction_id": decision.reproduction_id,
+            "source_finding_id": decision.source_finding_id,
             "runtime_operation_kind": runtime_operation_for_spawn(
                 mode=mode,
                 profile_role=role,

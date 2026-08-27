@@ -323,8 +323,22 @@ class DockerCliRuntimeAdapter:
             return False
 
 
+class _RegisteredCommandDriver:
+    """Minimal raw-output parser for the adapter-owned fixed shell wrapper."""
+
+    name = "poc-verifier"
+
+    @staticmethod
+    def parse(stdout: str, stderr: str) -> CliResult:
+        return CliResult(text=stdout, raw_stderr=stderr)
+
+
 class ContainerRuntimeExecutor:
     """Own one frozen pool generation and its exact RCP-v2 control link."""
+
+    # Explicit marker consumed by the Verified-PoC adapter; host executors do not
+    # implement this marker and therefore cannot enter the production verifier path.
+    is_docker_runtime = True
 
     def __init__(
         self,
@@ -543,6 +557,31 @@ class ContainerRuntimeExecutor:
             env=env,
             worker_instance_id=worker_instance_id,
             operation_kind=operation_kind,
+        )
+
+    async def run_registered_command(
+        self,
+        argv: list[str] | tuple[str, ...],
+        *,
+        host_cwd: str | Path,
+        timeout: float,
+        worker_instance_id: str,
+        env: Optional[dict] = None,
+    ) -> CliResult:
+        """Execute a pre-resolved argv through this Docker pool generation."""
+        if not isinstance(argv, (list, tuple)) or not argv:
+            raise ContainerRuntimeError("invalid_registered_command")
+        normalized = list(argv)
+        if any(not isinstance(item, str) or not item for item in normalized):
+            raise ContainerRuntimeError("invalid_registered_command")
+        return await self.run(
+            _RegisteredCommandDriver(),
+            normalized,
+            host_cwd=host_cwd,
+            timeout=timeout,
+            env=env,
+            worker_instance_id=worker_instance_id,
+            operation_kind="poc_verifier",
         )
 
     async def run_streaming(

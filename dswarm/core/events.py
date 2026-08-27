@@ -47,6 +47,14 @@ class EventType(str, Enum):
     SHARED_GRAPH_DELTA = "sharedgraph.delta"  # P-A/P-B: verified/candidate evidence on the shared graph
     REASON_INTENT = "reason.intent"  # P-C: planner proposed a typed intent (or goal_met)
     BLACKBOARD_DELTA = "blackboard.delta"  # shared knowledge blackboard lifecycle:
+    # M9 Verified-PoC lifecycle. These are public stream labels only; canonical
+    # graph storage remains append-only under the corresponding snake_case kinds.
+    POC_REPRODUCTION_REGISTERED = "poc.reproduction.registered"
+    POC_REPRODUCTION_REJECTED = "poc.reproduction.rejected"
+    POC_VERIFICATION_STARTED = "poc.verification.started"
+    POC_VERIFIED = "poc.verified"
+    POC_VERIFICATION_FAILED = "poc.verification.failed"
+    REVIEW_FINDING_VERIFIED = "review.finding.verified"
     #   intent proposed/claimed/concluded (who claimed what, done?), fact, dead-end,
     #   flag — the full collaboration layer of the SQLiteSharedGraph, surfaced so the
     #   deck can render the blackboard canvas (claim animations + provenance + timeline)

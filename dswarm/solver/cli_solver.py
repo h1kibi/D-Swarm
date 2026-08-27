@@ -71,6 +71,9 @@ from dswarm.solver.result_codes import (
     RESULT_TIMED_OUT,
 )
 from dswarm.solver.types import SolverConfig, SolveOutcome
+from dswarm.swarm.poc_verification import (
+    normalize_reproduction_indicator, sanitize_public_text,
+)
 from dswarm.solver.workspace import (
     ensure_workspace,
     link_input_into_worker,
@@ -421,6 +424,7 @@ _DEADEND_LINE = re.compile(r"DEADEND=\s*(.+)")
 _NEED_INPUT_LINE = re.compile(r"NEED_INPUT=\s*(.+)")
 _NEED_KIND_LINE = re.compile(r"NEED_KIND\s*=\s*([a-z_]+)", re.IGNORECASE)
 _POC_SAVE_LINE = re.compile(r"POC_SAVE=\s*([^|]+)\|([^|]+)\|([^|]+)\|(.*)")
+_POC_REPRO_LINE = re.compile(r"POC_REPRO=\s*([^|]+)\|(.*)")
 _SECRET_LITERAL_RE = re.compile(
     r"(-----BEGIN [A-Z ]*PRIVATE KEY-----|"
     r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{12,})",
@@ -563,6 +567,8 @@ class CliSolver:
         runtime_operation_kind: str = "",
         task_kind: str = "",
         host_scan: bool = False,
+        reproduction_id: str = "",
+        source_finding_id: str = "",
     ) -> None:
         self.spec = spec
         self.challenge = challenge
@@ -585,6 +591,9 @@ class CliSolver:
         self.runtime_operation_kind = runtime_operation_kind or task_kind or mode
         self.task_kind = task_kind
         self.host_scan = bool(host_scan)
+        # Bounded linkage for verifier runtime resolution; never a free-form command.
+        self.reproduction_id = str(reproduction_id or "").strip()
+        self.source_finding_id = str(source_finding_id or "").strip()
         self.run_id = run_id or challenge.id
         self.graph = SolveGraph(challenge=challenge)
         # solver_id: prefer an explicit label (the coordinator hands each spawned
@@ -733,6 +742,9 @@ class CliSolver:
         # appears in both the tool-call echo and its result, and again at end-of-run).
         self._published_markers: "set[tuple[str, str]]" = set()
         self._published_pocs: "set[str]" = set()
+        self._published_poc_repros: "set[str]" = set()
+        self._pending_poc_repros: "dict[str, str]" = {}
+        self._poc_paths: "dict[str, str]" = {}
         self._claimed_pocs: "set[str]" = set()
         self._inherited_pocs: "list[dict[str, str]]" = []
         self._current_workdir: "Optional[Path]" = None
@@ -1579,6 +1591,11 @@ class CliSolver:
                     self._stream_accepted.append(f)
         for path_text, entry_command, status, note in self._extract_poc_saves(text):
             await self._handle_poc_save(path_text, entry_command, status, note)
+        # Verified-PoC registration is pentest-only. Keep the branch completely
+        # outside the CTF marker path so CTF output and dispatch stay unchanged.
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            for path_text, indicator in self._extract_poc_repros(text):
+                await self._handle_poc_repro(path_text, indicator)
         facts, deadends = self._extract_structured_facts(text)
         witness_hint = self._extract_fact_witness(text)
         for f_text in facts:
@@ -2762,6 +2779,16 @@ class CliSolver:
                 out.append(tuple(part.strip() for part in m.groups()))
         return out
 
+    def _extract_poc_repros(self, text: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for line in (text or "").splitlines():
+            m = _POC_REPRO_LINE.match(line.strip())
+            if m:
+                path_text, indicator = (part.strip() for part in m.groups())
+                if path_text:
+                    out.append((path_text, indicator))
+        return out
+
     def _poc_flag_literals(self, body: str) -> list[str]:
         matches = set(_BRACE_FLAG.findall(body or ""))
         try:
@@ -2851,6 +2878,7 @@ class CliSolver:
         artifact, clean_status, note = result
         poc_id = f"poc-{artifact['sha256'][:12]}"
         intent_id = getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or None
+        graph_saved = False
         if self.shared_graph is not None:
             try:
                 self.shared_graph.save_poc(
@@ -2864,12 +2892,115 @@ class CliSolver:
                     intent_id=intent_id,
                     name=src.name,
                 )
+                graph_saved = True
             except Exception:
                 pass
+        if graph_saved:
+            normalized_path = str(src.resolve())
+            self._poc_paths[normalized_path] = poc_id
+            pending_indicator = self._pending_poc_repros.pop(normalized_path, None)
+            if pending_indicator is not None:
+                await self._register_poc_reproduction(
+                    poc_id=poc_id, indicator=pending_indicator
+                )
         await self._emit_bb(
             "poc_saved", poc_id=poc_id, intent_id=intent_id, name=src.name,
             path=str(artifact["path"]), artifact_id=artifact["sha256"],
             entry_command=entry_command, status=clean_status, note=note)
+
+    def _resolve_poc_marker_path(self, path_text: str) -> Optional[Path]:
+        cwd = (self._current_workdir
+               or (Path(self._workdir).resolve() if self._workdir else None))
+        if cwd is None:
+            return None
+        try:
+            src = ((cwd / path_text).resolve()
+                   if not Path(path_text).is_absolute()
+                   else Path(path_text).resolve())
+            src.relative_to(cwd)
+        except (OSError, ValueError):
+            return None
+        return src
+
+    async def _register_poc_reproduction(self, *, poc_id: str, indicator: str) -> None:
+        if self.shared_graph is None:
+            return
+        register = getattr(self.shared_graph, "register_poc_reproduction", None)
+        if not callable(register):
+            return
+        try:
+            registration = register(
+                actor=self.solver_id, poc_id=poc_id, indicator=indicator
+            )
+        except Exception as exc:
+            await self._emit_bb(
+                "poc_reproduction_rejected",
+                status="rejected",
+                poc_id=poc_id,
+                note=str(exc)[:160],
+            )
+            return
+        await self._emit_bb(
+            "poc_reproduction_registered",
+            status="registered",
+            poc_id=poc_id,
+            reproduction_id=str(registration.get("reproduction_id") or ""),
+            indicator_digest=hashlib.sha256(indicator.encode("utf-8")).hexdigest(),
+            indicator_length=len(indicator),
+        )
+
+    async def _handle_poc_repro(self, path_text: str, indicator: str) -> None:
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            return
+        src = self._resolve_poc_marker_path(path_text)
+        if src is None:
+            await self._emit_bb(
+                "poc_reproduction_rejected",
+                status="rejected",
+                note="POC_REPRO path must stay inside this worker cwd",
+            )
+            return
+        try:
+            normalized_indicator = normalize_reproduction_indicator(indicator)
+        except ValueError as exc:
+            await self._emit_bb(
+                "poc_reproduction_rejected",
+                status="rejected",
+                note=sanitize_public_text(exc, limit=160),
+            )
+            return
+        marker_key = f"{src}:{normalized_indicator}"
+        if marker_key in self._published_poc_repros:
+            return
+        self._published_poc_repros.add(marker_key)
+        normalized_path = str(src)
+        poc_id = self._poc_paths.get(normalized_path)
+        if poc_id:
+            await self._register_poc_reproduction(
+                poc_id=poc_id, indicator=normalized_indicator
+            )
+            return
+        # A worker may announce the observable before its POC_SAVE marker reaches
+        # the stream. Keep only a bounded worker-local pending map; no graph event
+        # is emitted until a matching saved PoC exists.
+        pending_indicator = self._pending_poc_repros.get(normalized_path)
+        if pending_indicator is not None:
+            if pending_indicator == normalized_indicator:
+                return
+            await self._emit_bb(
+                "poc_reproduction_rejected",
+                status="rejected",
+                note="conflicting pending reproduction indicator",
+            )
+            return
+        if len(self._pending_poc_repros) >= 32:
+            oldest = next(iter(self._pending_poc_repros))
+            self._pending_poc_repros.pop(oldest, None)
+        self._pending_poc_repros[normalized_path] = normalized_indicator
+
+    def _discard_pending_poc_repros(self) -> None:
+        """Drop worker-local repro announcements that never matched a saved PoC."""
+        self._pending_poc_repros.clear()
 
     async def _mark_claimed_pocs_spent(self, reason: str) -> None:
         if self.shared_graph is None or not self._claimed_pocs:
@@ -3128,6 +3259,7 @@ class CliSolver:
                     except Exception:
                         pass
                 self._owned_scratch = None
+            self._discard_pending_poc_repros()
             if not self._worker_stop_reason:
                 self._note_worker_stop("cancelled" if self._cancel_event.is_set() else "finished")
             try:

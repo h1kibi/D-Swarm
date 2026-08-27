@@ -53,6 +53,13 @@ from dswarm.swarm.fact_events import (
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 from dswarm.swarm.route_telemetry import RouteMetricRecord
 from dswarm.solver.direction_rules import sanitize_raw_direction
+from dswarm.swarm.poc_verification import (
+    VerificationFailure,
+    normalize_reproduction_indicator,
+    reproduction_id_for,
+    sanitize_public_text,
+    verification_failure_value,
+)
 
 
 # ── event types (C: append-only log) ─────────────────────────────────────────
@@ -69,6 +76,12 @@ EV_FLAG_INVALIDATED = "flag_invalidated"  # multi-flag: a false-positive flag is
 EV_POC_SAVED = "poc_saved"
 EV_POC_CLAIMED = "poc_claimed"
 EV_POC_CONCLUDED = "poc_concluded"
+EV_POC_REPRODUCTION_REGISTERED = "poc_reproduction_registered"
+EV_POC_REPRODUCTION_REJECTED = "poc_reproduction_rejected"
+EV_POC_VERIFICATION_STARTED = "poc_verification_started"
+EV_POC_VERIFIED = "poc_verified"
+EV_POC_VERIFICATION_FAILED = "poc_verification_failed"
+EV_REVIEW_FINDING_VERIFIED = "review_finding_verified"
 EV_REVIEW_FINDING = "review_finding"
 EV_FACT_CHALLENGED = "fact_challenged"
 EV_FACT_REVALIDATED = "fact_revalidated"
@@ -419,6 +432,33 @@ class SharedGraph(Protocol):
     def conclude_poc(self, *, actor: str, poc_id: str,
                      status: str = "spent", note: str = "") -> int: ...
 
+    def register_poc_reproduction(self, *, actor: str, poc_id: str,
+                                  indicator: str) -> dict[str, Any]: ...
+
+    def get_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]: ...
+
+    def poc_verification_status(self, poc_id: str) -> Optional[dict[str, Any]]: ...
+
+    def begin_poc_verification(self, *, actor: str, poc_id: str,
+                               verification_id: str, reproduction_id: str,
+                               worker_id: str = "", finding_id: str = "",
+                               intent_id: str = "", pool_identity: str = "",
+                               lease_s: float = 600.0) -> Optional[dict[str, Any]]: ...
+
+    def append_poc_verification_terminal(
+        self, *, actor: str, poc_id: str, verification_id: str,
+        verified: bool, exit_code: Optional[int] = None,
+        failure_reason: Optional[VerificationFailure | str] = None,
+        observed_location: str = "",
+        provenance_artifact_ids: Optional[list[str]] = None,
+        diagnostics: str = "", elapsed_ms: Optional[int] = None,
+    ) -> int: ...
+
+    def mark_review_finding_verified(
+        self, *, actor: str, finding_id: str, poc_id: str,
+        reproduction_id: str, verification_id: str,
+    ) -> int: ...
+
     def supersede_open_intents(self, *, actor: str, match: str,
                                reason: str = "") -> list[str]: ...
 
@@ -426,7 +466,9 @@ class SharedGraph(Protocol):
                            summary: str, evidence_seqs: Optional[list[int]] = None,
                            intent_ids: Optional[list[str]] = None,
                            route_hash: str = "", branch_id: str = "",
-                           recommended_actions: Optional[list[str]] = None) -> int: ...
+                           recommended_actions: Optional[list[str]] = None,
+                           poc_id: str = "",
+                           poc_ids: Optional[list[str]] = None) -> int: ...
 
     def add_review_proposal(self, *, actor: str, marker: str, payload: dict,
                             tier: str = "tier1") -> int: ...
@@ -662,6 +704,30 @@ CREATE TABLE IF NOT EXISTS pocs (
 -- that finds the activity already claimed (lease not expired) avoids redoing it.
 -- This is the "two workers nmap the same target" fix that intent-level claim can't
 -- reach (whole-challenge workers don't claim per-action). Lease-expiry self-heals.
+CREATE TABLE IF NOT EXISTS poc_reproductions (
+    reproduction_id TEXT PRIMARY KEY,
+    poc_id          TEXT NOT NULL,
+    challenge_id    TEXT NOT NULL,
+    intent_id       TEXT,
+    artifact_id     TEXT NOT NULL,
+    command         TEXT NOT NULL,
+    indicator       TEXT NOT NULL,
+    registration_seq INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'registered',
+    verification_id TEXT,
+    started_seq     INTEGER,
+    terminal_seq    INTEGER,
+    worker_id       TEXT,
+    finding_id      TEXT,
+    pool_identity   TEXT,
+    failure_reason  TEXT,
+    exit_code       INTEGER,
+    observed_location TEXT,
+    provenance_artifact_ids TEXT,
+    diagnostics     TEXT,
+    elapsed_ms      INTEGER
+);
+-- P4: action-level dedup: a worker claims a high-cost ACTIVITY (e.g.
 CREATE TABLE IF NOT EXISTS activity_locks (
     activity_key  TEXT PRIMARY KEY,           -- normalized "verb:target"
     challenge_id  TEXT NOT NULL,
@@ -927,6 +993,7 @@ class SQLiteSharedGraph:
         # pre-v2 databases require an explicit, snapshotted migrate_to_v2() call.
         if is_new_database or user_version(self._conn) == self.SUPPORTED_USER_VERSION:
             install_fact_event_contract(self._conn)
+        self._rebuild_poc_reproduction_projection()
 
     def _table_exists(self, name: str) -> bool:
         with self._lock:
@@ -1519,7 +1586,9 @@ class SQLiteSharedGraph:
                            summary: str, evidence_seqs: Optional[list[int]] = None,
                            intent_ids: Optional[list[str]] = None,
                            route_hash: str = "", branch_id: str = "",
-                           recommended_actions: Optional[list[str]] = None) -> int:
+                           recommended_actions: Optional[list[str]] = None,
+                           poc_id: str = "",
+                           poc_ids: Optional[list[str]] = None) -> int:
         route = self.normalize_route_hash(route_hash) if route_hash else ""
         fid_seed = f"{kind}:{summary}:{route}:{time.time()}"
         payload = {
@@ -1533,6 +1602,15 @@ class SQLiteSharedGraph:
             "branch_id": (branch_id or "").strip(),
             "recommended_actions": [str(x) for x in (recommended_actions or []) if x],
         }
+        explicit_pocs = []
+        for raw in ([poc_id] if poc_id else []) + list(poc_ids or []):
+            clean = str(raw or "").strip()
+            if clean and clean not in explicit_pocs:
+                explicit_pocs.append(clean)
+        if explicit_pocs:
+            payload["poc_ids"] = explicit_pocs
+            if len(explicit_pocs) == 1:
+                payload["poc_id"] = explicit_pocs[0]
         return self._append(EV_REVIEW_FINDING, actor, payload,
                             dedupe_key=f"review::{payload['kind']}::{payload['summary']}::{route}")
 
@@ -3176,6 +3254,350 @@ class SQLiteSharedGraph:
             for r in rows
         ]
 
+    # ── M9 Verified-PoC registration and lifecycle projection ────────────────
+    @staticmethod
+    def _poc_reproduction_row(row: sqlite3.Row | tuple | None) -> Optional[dict[str, Any]]:
+        if row is None:
+            return None
+        values = list(row)
+        return {
+            "reproduction_id": values[0],
+            "poc_id": values[1],
+            "intent_id": values[2] or "",
+            "artifact_id": values[3],
+            "command": values[4],
+            "indicator": values[5],
+            "registration_seq": int(values[6] or 0),
+            "status": values[7],
+            "verification_id": values[8] or "",
+            "started_seq": int(values[9]) if values[9] is not None else None,
+            "terminal_seq": int(values[10]) if values[10] is not None else None,
+            "worker_id": values[11] or "",
+            "finding_id": values[12] or "",
+            "pool_identity": values[13] or "",
+            "failure_reason": values[14] or "",
+            "exit_code": int(values[15]) if values[15] is not None else None,
+            "observed_location": values[16] or "",
+            "provenance_artifact_ids": tuple(json.loads(values[17] or "[]")),
+            "diagnostics": values[18] or "",
+            "elapsed_ms": int(values[19]) if values[19] is not None else None,
+        }
+
+    def _select_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT reproduction_id, poc_id, intent_id, artifact_id, command, "
+                "indicator, registration_seq, status, verification_id, started_seq, "
+                "terminal_seq, worker_id, finding_id, pool_identity, failure_reason, "
+                "exit_code, observed_location, provenance_artifact_ids, diagnostics, "
+                "elapsed_ms FROM poc_reproductions WHERE challenge_id=? AND poc_id=?",
+                (self.challenge.id, str(poc_id)),
+            ).fetchone()
+        return self._poc_reproduction_row(row)
+
+    def _rebuild_poc_reproduction_projection(self) -> None:
+        """Fold M9 PoC lifecycle events into the rebuildable projection table."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM poc_reproductions WHERE challenge_id=?",
+                (self.challenge.id,),
+            )
+            rows = self._conn.execute(
+                "SELECT seq, kind, payload FROM events WHERE challenge_id=? "
+                "AND kind IN (?,?,?,?,?,?) ORDER BY seq",
+                (self.challenge.id, EV_POC_REPRODUCTION_REGISTERED,
+                 EV_POC_REPRODUCTION_REJECTED, EV_POC_VERIFICATION_STARTED,
+                 EV_POC_VERIFIED, EV_POC_VERIFICATION_FAILED,
+                 EV_REVIEW_FINDING_VERIFIED),
+            ).fetchall()
+            for seq, kind, raw_payload in rows:
+                payload = json.loads(raw_payload or "{}")
+                if kind == EV_POC_REPRODUCTION_REGISTERED:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO poc_reproductions "
+                        "(reproduction_id, poc_id, challenge_id, intent_id, artifact_id, "
+                        "command, indicator, registration_seq, status) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (payload["reproduction_id"], payload["poc_id"], self.challenge.id,
+                         payload.get("intent_id") or None, payload["artifact_id"],
+                         payload["command"], payload["indicator"], int(seq), "registered"),
+                    )
+                elif kind == EV_POC_VERIFICATION_STARTED:
+                    self._conn.execute(
+                        "UPDATE poc_reproductions SET status='started', "
+                        "verification_id=?, started_seq=?, worker_id=?, finding_id=?, "
+                        "pool_identity=? WHERE challenge_id=? AND reproduction_id=?",
+                        (payload["verification_id"], int(seq), payload.get("worker_id") or "",
+                         payload.get("finding_id") or "", payload.get("pool_identity") or "",
+                         self.challenge.id, payload["reproduction_id"]),
+                    )
+                elif kind in (EV_POC_VERIFIED, EV_POC_VERIFICATION_FAILED):
+                    status = "verified" if kind == EV_POC_VERIFIED else "failed"
+                    artifact_ids = json.dumps(payload.get("provenance_artifact_ids") or [])
+                    self._conn.execute(
+                        "UPDATE poc_reproductions SET status=?, terminal_seq=?, "
+                        "failure_reason=?, exit_code=?, observed_location=?, "
+                        "provenance_artifact_ids=?, diagnostics=?, elapsed_ms=? "
+                        "WHERE challenge_id=? AND reproduction_id=?",
+                        (status, int(seq), payload.get("reason") or "",
+                         payload.get("exit_code"), payload.get("observed_location") or "",
+                         artifact_ids, payload.get("diagnostics") or "", payload.get("elapsed_ms"),
+                         self.challenge.id, payload["reproduction_id"]),
+                    )
+            self._conn.commit()
+
+    def register_poc_reproduction(self, *, actor: str, poc_id: str,
+                                  indicator: str) -> dict[str, Any]:
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            raise ValueError("Verified-PoC reproduction requires pentest mode")
+        normalized = normalize_reproduction_indicator(indicator)
+        with self._lock:
+            poc = self._conn.execute(
+                "SELECT poc_id, intent_id, artifact_id, entry_command FROM pocs "
+                "WHERE challenge_id=? AND poc_id=?",
+                (self.challenge.id, str(poc_id)),
+            ).fetchone()
+        if poc is None:
+            raise ValueError("unknown PoC")
+        _, intent_id, artifact_id, command = poc
+        reproduction_id = reproduction_id_for(
+            artifact_id=artifact_id or "", command=command or "", indicator=normalized
+        )
+        existing = self._select_poc_reproduction(str(poc_id))
+        if existing is not None:
+            if existing["reproduction_id"] == reproduction_id:
+                return dict(existing)
+            self._append(
+                EV_POC_REPRODUCTION_REJECTED,
+                actor,
+                {
+                    "poc_id": str(poc_id),
+                    "existing_reproduction_id": existing["reproduction_id"],
+                    "candidate_indicator_digest": hashlib.sha256(
+                        normalized.encode("utf-8")
+                    ).hexdigest(),
+                    "reason": "conflicting_registration",
+                },
+                dedupe_key=(f"poc-repro-rejected::{poc_id}::"
+                            f"{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"),
+            )
+            raise ValueError("conflicting reproduction registration")
+        payload = {
+            "poc_id": str(poc_id),
+            "intent_id": intent_id or "",
+            "artifact_id": str(artifact_id or ""),
+            "command": str(command or ""),
+            "indicator": normalized,
+            "reproduction_id": reproduction_id,
+        }
+        seq = self._append(
+            EV_POC_REPRODUCTION_REGISTERED,
+            actor,
+            payload,
+            dedupe_key=f"poc-repro::{poc_id}::{reproduction_id}",
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO poc_reproductions "
+                "(reproduction_id, poc_id, challenge_id, intent_id, artifact_id, command, "
+                "indicator, registration_seq, status) VALUES (?,?,?,?,?,?,?,?,?)",
+                (reproduction_id, str(poc_id), self.challenge.id, intent_id or None,
+                 artifact_id or "", command or "", normalized, seq if seq > 0 else 0,
+                 "registered"),
+            )
+            self._conn.commit()
+        return dict(self._select_poc_reproduction(str(poc_id)) or {})
+
+    def get_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]:
+        """Return a reproduction only when it still binds to its saved PoC row.
+
+        This is the canonical resolution boundary for the Docker verifier: the
+        lifecycle projection supplies the registered command/indicator while the
+        saved-PoC projection supplies the immutable CAS path and user-facing name.
+        """
+        row = self._select_poc_reproduction(str(poc_id))
+        if row is None:
+            return None
+        with self._lock:
+            poc = self._conn.execute(
+                "SELECT artifact_id, path, name, entry_command FROM pocs "
+                "WHERE challenge_id=? AND poc_id=?",
+                (self.challenge.id, str(poc_id)),
+            ).fetchone()
+        if poc is None:
+            return None
+        artifact_id, path, name, entry_command = poc
+        if (
+            str(artifact_id or "") != row["artifact_id"]
+            or str(entry_command or "") != row["command"]
+        ):
+            return None
+        resolved = dict(row)
+        resolved["path"] = str(path or "")
+        resolved["name"] = str(name or "")
+        resolved["entry_command"] = str(entry_command or "")
+        return resolved
+
+    def poc_verification_status(self, poc_id: str) -> Optional[dict[str, Any]]:
+        row = self._select_poc_reproduction(str(poc_id))
+        if row is None:
+            return None
+        return {
+            "poc_id": row["poc_id"],
+            "reproduction_id": row["reproduction_id"],
+            "status": row["status"],
+            "verification_id": row["verification_id"],
+            "started_seq": row["started_seq"],
+            "terminal_seq": row["terminal_seq"],
+            "failure_reason": row["failure_reason"],
+            "exit_code": row["exit_code"],
+            "observed_location": row["observed_location"],
+            "provenance_artifact_ids": tuple(row["provenance_artifact_ids"]),
+            "diagnostics": row["diagnostics"],
+            "elapsed_ms": row["elapsed_ms"],
+        }
+
+    def begin_poc_verification(self, *, actor: str, poc_id: str,
+                               verification_id: str, reproduction_id: str,
+                               worker_id: str = "", finding_id: str = "",
+                               intent_id: str = "", pool_identity: str = "",
+                               lease_s: float = 600.0) -> Optional[dict[str, Any]]:
+        row = self._select_poc_reproduction(str(poc_id))
+        if row is None or row["reproduction_id"] != reproduction_id:
+            return None
+        if row["status"] in {"started", "verified", "failed"}:
+            return None
+        owner = str(worker_id or actor)
+        lock_key = f"poc-verification:{reproduction_id}"
+        if not self.try_claim_activity(worker=owner, key=lock_key, lease_s=lease_s):
+            return None
+        payload = {
+            "poc_id": row["poc_id"],
+            "reproduction_id": reproduction_id,
+            "verification_id": str(verification_id),
+            "finding_id": str(finding_id or ""),
+            "intent_id": str(intent_id or ""),
+            "worker_id": owner,
+            "pool_identity": sanitize_public_text(pool_identity, limit=160),
+        }
+        try:
+            seq = self._append(
+                EV_POC_VERIFICATION_STARTED,
+                actor,
+                payload,
+                dedupe_key=f"poc-verification-start::{reproduction_id}::{verification_id}",
+            )
+        except Exception:
+            self.release_activity(worker=owner, key=lock_key)
+            raise
+        with self._lock:
+            self._conn.execute(
+                "UPDATE poc_reproductions SET status='started', verification_id=?, "
+                "started_seq=?, worker_id=?, finding_id=?, pool_identity=? "
+                "WHERE challenge_id=? AND reproduction_id=?",
+                (str(verification_id), seq if seq > 0 else 0, owner,
+                 payload["finding_id"], payload["pool_identity"], self.challenge.id,
+                 reproduction_id),
+            )
+            self._conn.commit()
+        return dict(self._select_poc_reproduction(str(poc_id)) or {})
+
+    def append_poc_verification_terminal(
+        self, *, actor: str, poc_id: str, verification_id: str,
+        verified: bool, exit_code: Optional[int] = None,
+        failure_reason: Optional[VerificationFailure | str] = None,
+        observed_location: str = "",
+        provenance_artifact_ids: Optional[list[str]] = None,
+        diagnostics: str = "", elapsed_ms: Optional[int] = None,
+    ) -> int:
+        row = self._select_poc_reproduction(str(poc_id))
+        if row is None:
+            raise ValueError("unknown PoC reproduction")
+        if row["verification_id"] != str(verification_id):
+            raise ValueError("verification does not own reproduction")
+        if row["status"] in {"verified", "failed"}:
+            return -1
+        if row["status"] != "started":
+            raise ValueError("verification must be started before terminal append")
+        if not verified:
+            reason = verification_failure_value(
+                failure_reason or VerificationFailure.EXECUTION_ERROR
+            )
+        else:
+            reason = ""
+        artifact_ids = tuple(
+            sanitize_public_text(item, limit=160)
+            for item in (provenance_artifact_ids or [])
+            if str(item or "").strip()
+        )[:16]
+        payload = {
+            "poc_id": row["poc_id"],
+            "reproduction_id": row["reproduction_id"],
+            "verification_id": str(verification_id),
+            "exit_code": int(exit_code) if exit_code is not None else None,
+            "observed_location": sanitize_public_text(observed_location, limit=80),
+            "provenance_artifact_ids": list(artifact_ids),
+            "diagnostics": sanitize_public_text(diagnostics),
+            "elapsed_ms": max(0, int(elapsed_ms)) if elapsed_ms is not None else None,
+        }
+        kind = EV_POC_VERIFIED if verified else EV_POC_VERIFICATION_FAILED
+        if reason:
+            payload["reason"] = reason
+        seq = self._append(
+            kind,
+            actor,
+            payload,
+            dedupe_key=f"poc-verification-terminal::{verification_id}",
+        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE poc_reproductions SET status=?, terminal_seq=?, failure_reason=?, "
+                "exit_code=?, observed_location=?, provenance_artifact_ids=?, diagnostics=?, "
+                "elapsed_ms=? WHERE challenge_id=? AND reproduction_id=?",
+                ("verified" if verified else "failed", seq if seq > 0 else 0,
+                 reason, payload["exit_code"], payload["observed_location"],
+                 json.dumps(list(artifact_ids)), payload["diagnostics"],
+                 payload["elapsed_ms"], self.challenge.id, row["reproduction_id"]),
+            )
+            self._conn.commit()
+        self.release_activity(
+            worker=row["worker_id"] or actor,
+            key=f"poc-verification:{row['reproduction_id']}",
+        )
+        return seq
+
+    def mark_review_finding_verified(
+        self, *, actor: str, finding_id: str, poc_id: str,
+        reproduction_id: str, verification_id: str,
+    ) -> int:
+        row = self._select_poc_reproduction(str(poc_id))
+        if row is None:
+            raise ValueError("unknown PoC reproduction")
+        if row["reproduction_id"] != str(reproduction_id):
+            raise ValueError("review finding verification does not match reproduction")
+        if row["verification_id"] != str(verification_id):
+            raise ValueError("review finding verification does not own reproduction")
+        if row["status"] != "verified":
+            raise ValueError("review finding requires durable verified PoC")
+        payload = {
+            "finding_id": sanitize_public_text(finding_id, limit=160),
+            "poc_id": row["poc_id"],
+            "reproduction_id": row["reproduction_id"],
+            "verification_id": str(verification_id),
+            "status": "verified",
+        }
+        if not payload["finding_id"]:
+            raise ValueError("finding_id is required")
+        return self._append(
+            EV_REVIEW_FINDING_VERIFIED,
+            actor,
+            payload,
+            dedupe_key=(
+                f"review-finding-verified::{payload['finding_id']}::"
+                f"{row['reproduction_id']}::{verification_id}"
+            ),
+        )
+
     def reopen_after_false_positive(self, *, actor: str, flag: str,
                                     reason: str = "") -> dict:
         """A human marked ONE flag as a FALSE POSITIVE. Record it as a dead-end (so
@@ -4123,13 +4545,18 @@ class SQLiteSharedGraph:
             "raw_direction", "direction_resolution", "direction_source",
             "route_hash", "branch_id",
             "priority", "priority_scale", "lane_key", "risk_class", "resource_key",
+            "reproduction_id", "source_finding_id", "poc_id",
         )
         with self._lock:
             rows = self._conn.execute(
-                "SELECT intent_id, goal, worker_class, direction, direction, raw_direction, "
-                "direction_resolution, direction_source, route_hash, branch_id, priority, priority_scale, "
-                "lane_key, risk_class, resource_key FROM intents "
-                "WHERE challenge_id=? AND dispatch_state='active' AND (status='open' "
+                "SELECT i.intent_id, i.goal, i.worker_class, i.direction, i.direction, i.raw_direction, "
+                "i.direction_resolution, i.direction_source, i.route_hash, i.branch_id, i.priority, i.priority_scale, "
+                "i.lane_key, i.risk_class, i.resource_key, "
+                "json_extract(e.payload, '$.reproduction_id'), "
+                "json_extract(e.payload, '$.source_finding_id'), "
+                "json_extract(e.payload, '$.poc_id') "
+                "FROM intents i LEFT JOIN events e ON e.seq=i.created_seq "
+                "WHERE i.challenge_id=? AND dispatch_state='active' AND (status='open' "
                 "   OR (status='claimed' AND lease_until IS NOT NULL "
                 "       AND lease_until < ?)) "
                 "ORDER BY CASE WHEN worker_class IN ('verifier','review') "
@@ -4158,6 +4585,9 @@ class SQLiteSharedGraph:
             item["lane_key"] = str(item.get("lane_key") or "")
             item["risk_class"] = str(item.get("risk_class") or "")
             item["resource_key"] = str(item.get("resource_key") or "")
+            item["reproduction_id"] = str(item.get("reproduction_id") or "")
+            item["source_finding_id"] = str(item.get("source_finding_id") or "")
+            item["poc_id"] = str(item.get("poc_id") or "")
             out.append(item)
         return out
 

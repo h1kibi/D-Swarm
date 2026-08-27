@@ -1465,6 +1465,8 @@ provenance gate 均未改动；生产代码也不反向导入任何 M8 模块。
 
 ## M9 OSS 遗产四项（08 §5.8；独立小项，可与 M4+ 并行）
 
+**Status (2026-08-19): Verified-PoC M9 implemented and verified; other M9 items remain separate.**
+
 | 项 | 实现要点 | 测试 |
 |---|---|---|
 | **Verified-PoC 门**（pentest） | `cli_solver._handle_poc_save` 扩展：POC 记录 `Reproduction{command, indicator}`；review_flow 对高严重度 finding 生成 verifier intent；verifier 重跑后 indicator 必须出现在 `_provenance_corpus` 才把 finding 置 verified（复用 witness gate 模式，不新增可信度语义） | test_pentest_mode.py：无复现证据的 finding 不得 verified；indicator 命中即 verified |

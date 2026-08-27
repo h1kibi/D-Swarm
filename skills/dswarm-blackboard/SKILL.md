@@ -18,6 +18,16 @@ challenge. You do **not** talk to them directly — you coordinate through a sha
 **blackboard** (a fact/intent graph). The `blackboard.py` script in this skill is
 your interface to it.
 
+## Verified-PoC display semantics (M9)
+
+Pentest workers may publish a `POC_REPRO` observable only after a matching
+`POC_SAVE` artifact is registered. The blackboard display is metadata only:
+use the stable `poc_id`/`reproduction_id`, status, digest, and bounded reason.
+Never treat a reproduction marker as a fact, verified evidence, or a flag, and
+never copy raw indicator text, command output, credentials, or local paths into
+public notes. Verification is performed later by the container-only verifier;
+worker claims and blackboard text are not provenance.
+
 ## When to use it (this is the important part)
 
 Run these at the RIGHT moments — not constantly, not never:
