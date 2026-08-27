@@ -3114,3 +3114,54 @@ def test_bootstrap_intent_lease_covers_execute_and_conclude_timeout(tmp_path):
     assert worker == solver.solver_id
     assert lease_until >= before + 900 + 120 + 55
     graph.close()
+
+
+class _ExplodingIntentGraph:
+    """Shared-graph stand-in whose intent writes always fail."""
+
+    db_path = "/tmp/none.db"
+
+    def propose_intent(self, **kw):
+        raise RuntimeError("graph down")
+
+    def conclude_intent(self, **kw):
+        raise RuntimeError("graph down")
+
+
+async def test_intent_db_failure_is_surfaced_once_without_disturbing_solve():
+    ch = Challenge(id="t", name="t", category="pwn", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False, shared_graph=_ExplodingIntentGraph())
+    deltas: list[tuple[str, dict]] = []
+
+    async def fake_emit_bb(kind, **fields):
+        deltas.append((kind, fields))
+
+    solver._emit_bb = fake_emit_bb
+    solver._intent_id = "I-x"
+
+    # A failed propose must not raise — best-effort stays best-effort.
+    solver._record_intent_db("solve the whole challenge")
+    await asyncio.sleep(0)  # let the fire-and-forget task run
+    solver._conclude_intent_db(result="explored")  # second failure: deduped
+    await asyncio.sleep(0)
+
+    kinds = [k for k, _ in deltas]
+    assert kinds.count("intent_db_write_failed") == 1
+    payload = next(fields for k, fields in deltas if k == "intent_db_write_failed")
+    assert payload["intent_id"] == "I-x"
+    assert payload["op"] == "propose"
+    assert "graph down" in payload["reason"]
+    # The bound failure note never leaks unbounded per-op noise across intents.
+    assert len(solver._intent_db_failures_noted) == 1
+
+
+def test_intent_db_failure_degrades_to_silence_without_running_loop():
+    ch = Challenge(id="t", name="t", category="pwn", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False, shared_graph=_ExplodingIntentGraph())
+    solver._intent_id = "I-sync"
+
+    # No running loop here (sync test): the RuntimeDegradationMixin contract is
+    # to degrade to silence rather than raise or spin a new loop.
+    solver._record_intent_db("solve the whole challenge")
+    solver._conclude_intent_db(result="explored")
+    assert solver._intent_db_failures_noted == {"I-sync"}

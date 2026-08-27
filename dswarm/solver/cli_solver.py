@@ -745,6 +745,9 @@ class CliSolver:
         self._published_poc_repros: "set[str]" = set()
         self._pending_poc_repros: "dict[str, str]" = {}
         self._poc_paths: "dict[str, str]" = {}
+        # intent lifecycle for which a shared-graph write failure was already
+        # surfaced to the bus (one bounded delta per intent, never silent spam).
+        self._intent_db_failures_noted: "set[str]" = set()
         self._claimed_pocs: "set[str]" = set()
         self._inherited_pocs: "list[dict[str, str]]" = []
         self._current_workdir: "Optional[Path]" = None
@@ -814,6 +817,30 @@ class CliSolver:
             float(self.timeout) + float(self.conclude_timeout) + 60.0,
         )
 
+    def _note_intent_db_failure(self, op: str, exc: BaseException) -> None:
+        """Surface one swallowed shared-graph intent write as a bounded bb delta.
+
+        Best-effort must not mean invisible: a lost propose/claim/conclude is
+        run-75379-class split-brain fuel (the board then lies to the next
+        bootstrap worker). This never disturbs the solve — it schedules ONE
+        fire-and-forget delta per intent lifecycle; contexts without a running
+        loop degrade to silence, exactly like RuntimeDegradationMixin.
+        """
+        if self._intent_id in self._intent_db_failures_noted:
+            return
+        # Bounded worker-local memory: same cap style as _pending_poc_repros.
+        if len(self._intent_db_failures_noted) >= 32:
+            self._intent_db_failures_noted.clear()
+        self._intent_db_failures_noted.add(self._intent_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reason = sanitize_public_text(str(exc), limit=160)
+        loop.create_task(self._emit_bb(
+            "intent_db_write_failed",
+            intent_id=self._intent_id, op=op, reason=reason))
+
     def _claim_intent_db(self) -> bool:
         """Claim or renew this worker's assigned intent, owner-fenced in SQLite."""
         if self.shared_graph is None:
@@ -828,7 +855,9 @@ class CliSolver:
     def _record_intent_db(self, goal: str) -> None:
         """Register and claim a bootstrap/recon intent in the SQLite graph.
 
-        Best-effort: graph availability must never disturb a solve.
+        Best-effort: graph availability must never disturb a solve — but a
+        failure is surfaced once via _note_intent_db_failure, not swallowed
+        silently.
         """
         if self.shared_graph is None:
             return
@@ -837,8 +866,8 @@ class CliSolver:
                 actor=self.solver_id, intent_id=self._intent_id, goal=goal,
                 payload={"worker_class": "shell_agent", "mode": self.mode})
             self._claim_intent_db()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._note_intent_db_failure("propose", exc)
 
     def _conclude_intent_db(self, *, result: str,
                             to_fact_seq: "Optional[int]" = None,
@@ -854,8 +883,8 @@ class CliSolver:
                 actor=self.solver_id, intent_id=self._intent_id,
                 result=result, to_fact_seq=to_fact_seq,
                 result_detail=result_detail)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._note_intent_db_failure("conclude", exc)
 
     async def _emit_finished(self, *, flag: Optional[str], solved: bool,
                              flags: Optional[list[str]] = None) -> None:
