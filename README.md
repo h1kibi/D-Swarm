@@ -1,69 +1,82 @@
-# ctf-swarm — CTF 自动化解题系统
+# Project D-Swarm
 
-基于 **dswarm**（AGPL-3.0）内核的 CTF / 授权渗透测试多 Agent 自动化解题平台，融合 **CTF-BTFly** 的工程资产：
+An autonomous multi-agent swarm for CTF solving and authorized offensive security.
+You hand it a challenge; it launches a swarm of coding-agent workers that attack it
+in parallel through a **shared, append-only evidence graph**, and every accepted
+result traces back to **real execution output** — nothing else counts.
 
-- **内核（来自 dswarm，只读不重写）**：Swarm 协调器、SharedGraph 事件源共享黑板、Reason 规划、provenance gate、blackboard skill、HITL、容器后端。
-- **BTFly 资产（路线 A 逐步并入）**：Pi RPC worker 引擎、统一 Kali worker 镜像、CTF 知识库（`skills/` 100+ 参考文档）、模型网关（task token 换真实 key）。
-- **控制面**：FastAPI + Next.js 指挥台（dswarm 原版）。
+> ⚠️ Offensive-security automation: use only for authorized CTFs, your own ranges,
+> and written-permission engagements.
 
-> ⚠️ 本工具是攻击性安全自动化工具，只允许用于明确授权的 CTF、自有靶场和书面授权的渗透测试。勿对未授权目标使用。
+## How it works
 
-## 快速开始
+- **Workers are complete CLI agents** (`pi` is the current engine), each running its
+  own agentic loop inside a sandboxed Kali container with bash/python/ghidra/pwntools.
+- **One shared blackboard**: discovered facts, dead ends, PoC artifacts and intents
+  live on an event-sourced SQLite graph (append-only, replayable). Workers coordinate
+  through it; an independent Reason phase reads the graph and proposes typed intents.
+- **A race past a hardcoded provenance gate**: first worker whose flag appears in
+  real stdout/stderr/artifacts scores; placeholder or laundered flags are rejected,
+  zero false positives by design.
+- **Verified-PoC gate for pentest mode**: blocker findings are confirmed only after
+  the registered reproduction command is replayed inside the verifier container and
+  its indicator reappears in fresh output.
+
+## Capability snapshot (kernel milestones M0–M9a)
+
+| Area | What ships |
+| --- | --- |
+| Worker runtime | Docker-first runtime pools (M9a): frozen pool generations, RCP-v2 control link, reverse-dial supervisor; workers never see Docker socket / host HOME / full credential stores |
+| Credentials | Task-token model gateway: worker containers exchange tokens, never upstream API keys |
+| Budgets | Unique usage ledger (M5): run-scoped accounting, profile budget gates, spawn guard |
+| Coordination | Race mode by default; opt-in two-stage coordinator via `stage_policy` (explore → review) |
+| Pentest | Origin/Goal/Hints framing, Verified-PoC reproduction gate, post-hoc scope audit (M9) |
+| Correctness | Strict event immutability guards (M3), direction authority chain with audit trail (M4) |
+
+Implementation ledger: [docs/10](docs/10-v4-kernel-improvement-implementation.md).
+Authoritative architecture spec: [docs/00-architecture-spec.md](docs/00-architecture-spec.md).
+
+## Quick start
 
 ```bash
-uv sync --extra dev          # 安装依赖（Python ≥ 3.13, uv）
-uv run pytest -q            # 测试套件（无 key 时 live 测试自动跳过）
-./run.sh web                 # FastAPI 后端 (:8000) + Next 指挥台 (:3001)
+uv sync --extra dev          # install deps (Python >= 3.13, uv)
+uv run pytest -q             # test suite (live tests skip without keys)
+./run.sh web                 # FastAPI backend (:8000) + Next.js deck (:3001)
 ```
 
-配置通过 `DSWARM_*` 环境变量（见 `.env.example`）；Reason 规划器需要 `DSWARM_DEEPSEEK_API_KEY`。
+Configuration via `DSWARM_*` env vars (see `.env.example`). The Reason planner needs
+`DSWARM_DEEPSEEK_API_KEY`. Prefer a terminal: `./run.sh tui --swarm --key <k>`.
 
-## 目录结构
+## Repository map
 
-| 路径 | 内容 |
+| Path | Contents |
 | --- | --- |
-| `dswarm/` | 内核：swarm / solver / models / sandbox / learning / core |
-| `apps/web/` | FastAPI 后端 + Next.js 指挥台 |
-| `apps/tui/` | Textual TUI（未完工） |
-| `cmd/runtime-agent/` | 容器内 Go supervisor（反向连接） |
-| `docker/` | worker 镜像（BTFly 分类镜像逐步并入） |
-| `skills/` | dswarm-blackboard skill |
-| `docs/` | 权威架构规范 `00-architecture-spec.md` + 运维手册 / 账本 / 决定案卷；历史草案在 `docs/archive/` |
-| `references/btfly/` | BTFly 参考源码（git 历史 a141bb5，AGPL-3.0，只读参考） |
+| `dswarm/` | Kernel: swarm orchestration, solver execution layer, shared evidence graph, provenance gate, event spine |
+| `apps/web/` | FastAPI backend (:8000) + Next.js deck (:3001); apps/tui for terminal use |
+| `cmd/runtime-agent/` | In-container Go supervisor (reverse connection) |
+| `docker/` | Unified Kali worker image |
+| `skills/dswarm-blackboard/` | Worker ↔ blackboard interface skill |
+| `docs/` | Authoritative spec, operations runbooks, milestone ledger; historical drafts under `docs/archive/` |
 
-## 路线与状态
+## Lineage
 
-- **路线 A**：fork dswarm 为底座，BTFly 资产以功能形式并入。许可证 AGPL-3.0（已接受）。
-（批准记录：[docs/archive/06-route-a-plan.md](docs/archive/06-route-a-plan.md)。）
-- 进度：路线 A P0–P6 已全部落地（v0.3.0-rc.1）；内核改进里程碑 M0–M9a 已实现并验证，
-  现状以实施账本 [docs/10](docs/10-v4-kernel-improvement-implementation.md) 为准。测试数量
-  随工作区演进变化，以 `uv run pytest -q` 的实际输出为准。
-- 详见 [docs/00-architecture-spec.md](docs/00-architecture-spec.md)（权威架构规范）。
+D-Swarm began as a fork of [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki)
+(GNU AGPL-3.0, preserved) and is now an independent product:
 
-## 开发约定
+- the repositories share **no common commit history** (the fork rebuilt history);
+- as of 2026-08-27, a mapped HEAD-to-HEAD tree comparison shows only ~68 byte-identical
+  files across both trees while 263 tracked files exist exclusively here — the evidence
+  graph alone grew from 584 to 5153 lines, and the solver engines diverged in both
+  directions;
+- attribution and the divergence statement live in [NOTICE](NOTICE).
 
-- 内核（`dswarm/`）保持边界清晰：BTFly/运营资产应落在扩展点（driver / docker / web 层）。如需同步上游，请先配置对应 remote，再按维护者确认的合并流程操作。
-- 测试：Windows 宿主跑测试用 `PYTHONUTF8=1`；容器执行路径的 POSIX 专属测试在 Windows 上跳过。
-- Worker 引擎名册：`pi`（当前唯一 worker 引擎；方向 profile 统一使用同一 Kali 镜像）。
+Historical planning records mentioning the original codebase are archived under
+`docs/archive/`. See also `references/btfly/` (read-only reference sources, AGPL-3.0).
 
-## 血统与上游
+## Governance & status
 
-- **本项目是 [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) 的 fork（魔改分支）**，
-  遵循 GNU AGPL-3.0（上游许可证已保留）。归属与分叉声明详见根目录 `NOTICE`。
-- **D-Swarm 是独立项目**：自 fork 起实现已大幅分叉——单引擎路线（`pi`）、event-sourced
-  共享图、M3/M5 内核加固、两阶段 stage_policy 协调、M5 预算账本、M9a Docker-first 运行时池、
-  M9 pentest Verified-PoC 门等均为本项目自有演进；除血统外与上游无代码同步关系。
-- CTF-BTFly（参考）：源码在 `references/btfly/`，commit `a141bb5`，AGPL-3.0，只读参考。
-
-## Runtime pools (M9a)
-
-D-Swarm is Docker-first for real workers. The control plane freezes one
-run-scoped runtime snapshot and owns one long-lived container per PoolKey; a
-worker container never receives the Docker socket, host HOME, host `.pi` state,
-full credential stores, or solution/reference files. Credentials are projected
-per operation and diagnostics remain private rather than becoming evidence.
-
-See [docs/runtime-pools.md](docs/runtime-pools.md) for the Docker-first runbook,
-local-development dual gate, reopen cleanup barrier, lifecycle ownership, and
-forward-only rollback procedure. The fake-Pi Docker proof is opt-in with
-`DSWARM_RUN_DOCKER_TESTS=1` and never uses a real provider credential.
+- Roadmap A P0–P6 shipped (v0.3.0-rc.1); kernel milestones M0–M9a implemented and
+  verified. Progress tracks in [docs/10](docs/10-v4-kernel-improvement-implementation.md).
+- Security posture: see [SECURITY.md](SECURITY.md) — run in dedicated disposable
+  environments only; isolation of malicious challenges is an explicit non-goal.
+- Development conventions and repo invariants: [AGENTS.md](AGENTS.md).

@@ -63,6 +63,10 @@ ALLOWLIST = {
 
 BINARY_SUFFIXES = {".pyc", ".png", ".ico", ".icns", ".exe", ".dll", ".so"}
 
+# Git-ignored personal working-state files (AGENTS.md startup workflow); they are
+# local scratch notes, not distribution content.
+LOCAL_STATE_FILES = {"session-handoff.md", "progress.md", "feature_list.json"}
+
 
 def iter_files(root: Path):
     for path in sorted(root.rglob("*")):
@@ -70,6 +74,8 @@ def iter_files(root: Path):
             continue
         rel = path.relative_to(root)
         if any(part in EXCLUDE_DIRS for part in rel.parts):
+            continue
+        if len(rel.parts) == 1 and rel.name in LOCAL_STATE_FILES:
             continue
         if path.suffix.lower() in BINARY_SUFFIXES:
             continue
