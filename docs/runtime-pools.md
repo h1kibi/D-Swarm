@@ -26,6 +26,14 @@ still sibling containers:
 ./run.sh tui --swarm
 ```
 
+Both launch paths freeze exactly one immutable runtime context before dispatch
+(`RunManager.start` -> `ensure_runtime_context`; `POST /api/runs/{id}/start`
+answers 400 with a structured `runtime_policy`/`runtime_snapshot` code when the
+freeze cannot complete — e.g. the worker image is unavailable, or local workers
+lack the dual gate: an explicit local-dev launch request AND
+`DSWARM_ALLOW_LOCAL_WORKERS=1`). The create-once snapshot is authoritative for
+the run's lifetime; re-dispatch/reopen reuses it.
+
 On a native Windows development host, filesystem mode bits are best-effort only:
 `chmod(0o600/0o700)` does not reproduce POSIX owner-only permissions. Do not treat
 that host-side credential/runtime staging as a security boundary; use the Docker/Linux

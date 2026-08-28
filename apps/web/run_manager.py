@@ -27,21 +27,39 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from apps.web.provider_errors import ProviderErrorAggregator, classify_provider_error
 from apps.web.run_meta import FolderStore, RunMetaStore
-from apps.web.worker_config import WorkerConfigStore
+from apps.web.worker_config import WorkerConfigStore, resolve_worker_backend
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.events import Event, EventType, hitl_response_payload
+from dswarm.core.runtime_env import is_web_container
 from dswarm.core.session_store import SessionStore
 from dswarm.core.usage_journal import UsageContext, UsageJournal, UsageRecord, UsageWriter
 from dswarm.core.usage_ledger import SpawnGuard, UsageLedger
 from dswarm.swarm.budget import ProfileBudgetGate
 from dswarm.solver.credential_accounts import ensure_pi_account_from_env
 from dswarm.solver.container_pool import ContainerPoolManager
-from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError, RuntimeSnapshot
+from dswarm.solver.runtime_policy import (
+    RuntimePolicy,
+    RuntimePolicyError,
+    RuntimeSnapshot,
+    build_runtime_policy,
+)
 from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuilder, RuntimeSnapshotStore
 from dswarm.solver.runtime_cleanup import RuntimeCleanupInspector, RuntimeCleanupResult
+from dswarm.solver.worker_profiles import normalize_profile_roster, profile_uses_endpoint
 
 LOG = logging.getLogger(__name__)
+
+
+def _selected_roster(engines: Any, worker_profiles: list[dict]) -> list[dict]:
+    """Mirror drivers._selected_profiles: normalize the roster to profile dicts."""
+    names = normalize_profile_roster(engines or [], worker_profiles)
+    by_name = {
+        str(p.get("name") or p.get("id")): p
+        for p in worker_profiles
+        if isinstance(p, dict)
+    }
+    return [by_name[n] for n in names if n in by_name]
 
 
 def merge_resolve_dispatch(
@@ -269,8 +287,16 @@ class RunManager:
         self.runtime_snapshot_store = (
             runtime_snapshot_store or RuntimeSnapshotStore(self.sessions_root)
         )
-        self.runtime_snapshot_builder = runtime_snapshot_builder
-        self.runtime_pool_manager_factory = runtime_pool_manager_factory
+        # M9a production defaults: snapshot preflight proves worker-image
+        # availability at dispatch time (fail-fast at POST /start, not a silent
+        # dead run), and the pool manager uses the same composition as the TUI
+        # (runtime_factory.build_pool_manager_for_run).
+        self.runtime_snapshot_builder = (
+            runtime_snapshot_builder or RuntimeSnapshotBuilder()
+        )
+        self.runtime_pool_manager_factory = (
+            runtime_pool_manager_factory or self._default_runtime_pool_manager_factory
+        )
         self.runtime_cleanup_inspector = runtime_cleanup_inspector
         self.runs: dict[str, Run] = {}
         self.provider_errors = ProviderErrorAggregator()
@@ -1218,6 +1244,97 @@ class RunManager:
                 run.spawn_guard.mark_failed(str(exc))
             raise
 
+    def _default_runtime_pool_manager_factory(self, *, run_id: str, snapshot: RuntimeSnapshot, **_: Any) -> ContainerPoolManager:
+        """Production pool composition — identical pieces to the TUI path."""
+        from dswarm.solver.runtime_factory import build_pool_manager_for_run
+
+        run = self.runs.get(run_id)
+        return build_pool_manager_for_run(
+            run_id=run_id,
+            snapshot=snapshot,
+            worker_profiles=self._run_worker_profiles(run),
+            sessions_root=self.sessions_root,
+            bus=getattr(run, "bus", None),
+            budget_gate=getattr(run, "budget_gate", None) or ProfileBudgetGate(),
+        )
+
+    def _run_worker_profiles(self, run: Run) -> list[dict[str, Any]]:
+        body = dict(self._load_dispatch(run.run_id) or {})
+        wc = self.worker_config.resolve(
+            str((body.get("challenge") or {}).get("category") or "")
+        )
+        profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
+        return [p for p in profiles if isinstance(p, dict)]
+
+    def _freeze_dispatch_runtime(self, run: Run) -> None:
+        """Freeze exactly one immutable runtime context before first dispatch.
+
+        M9a fail-closed contract: container-backend profiles require a frozen
+        runtime policy, and the web deck historically never wired the freeze —
+        every spawn failed with ``runtime_policy_required`` while the rail kept
+        showing a live run (run-4408). This mirrors drivers._swarm_driver's
+        resolution (request body > worker config > env), including the offline
+        network clamp, then delegates to the create-once
+        :meth:`ensure_runtime_context`. Idempotent across re-dispatch/reopen:
+        the first frozen snapshot is authoritative forever.
+        """
+        if run.runtime_policy is not None:
+            return
+        body = dict(self._load_dispatch(run.run_id) or {})
+        if not body:
+            return
+        wc = self.worker_config.resolve(
+            str((body.get("challenge") or {}).get("category") or "")
+        )
+        engines = body.get("engines") or wc.get("engines") or []
+        worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
+        worker_profiles = [p for p in worker_profiles if isinstance(p, dict)]
+        if not worker_profiles:
+            return
+        worker_backend = resolve_worker_backend(
+            request_backend=body.get("worker_backend"),
+            config_backend=wc.get("worker_backend"),
+            env_backend=os.environ.get("DSWARM_WORKER_BACKEND"),
+            in_web_container=is_web_container(),
+        )
+        runtime_profiles = list(
+            body.get("runtime_profiles") or wc.get("runtime_profiles") or []
+        )
+        selected = _selected_roster(engines, worker_profiles)
+        # Same offline clamp as the dispatch path: the deck's "offline" switch
+        # means deny worker web tools, but a selected OpenAI-compatible endpoint
+        # still needs egress to its LLM gateway, so only then is hard network
+        # isolation relaxed. Default is network=none for container runtimes.
+        offline = bool(body.get("offline", False))
+        offline_endpoint_profiles = (
+            [p for p in selected if profile_uses_endpoint(p)] if offline else []
+        )
+        strict_offline_network = (not offline) or (not offline_endpoint_profiles)
+        if strict_offline_network:
+            runtime_profiles = [
+                {**r, "network": "none"}
+                if isinstance(r, dict) and str(r.get("backend") or "") == "container"
+                else r
+                for r in runtime_profiles
+            ]
+        run_max_workers = int(
+            body.get("max_workers", wc.get("max_workers", 10)) or 0
+        ) or max(1, len(selected))
+        # Local-dev dual gate (docs/runtime-pools.md): BOTH the launcher flag
+        # (the deck's explicit local-dev request) and the operator env
+        # (DSWARM_ALLOW_LOCAL_WORKERS) must authorize host-local workers.
+        policy = build_runtime_policy(
+            mode="docker" if worker_backend == "container" else "local_dev",
+            local_dev_cli_flag=bool(body.get("local_dev", False)),
+        )
+        self.ensure_runtime_context(
+            run.run_id,
+            policy=policy,
+            worker_profiles=worker_profiles,
+            runtime_profiles=runtime_profiles,
+            run_max_workers=run_max_workers,
+        )
+
     async def start(self, run_id: str, driver: Driver) -> Run:
         """Dispatch a run through the P4 scheduler: below the concurrency cap it
         launches immediately (today's behavior); at the cap it enters the FIFO
@@ -1232,6 +1349,11 @@ class RunManager:
         await self._reconcile_ledger(run)
         if run.runtime_snapshot is not None and run.finished:
             await self._cleanup_before_reopen(run)
+        # M9a: freeze the runtime context BEFORE dispatch so a misconfigured
+        # launch fails here (operator-visible) instead of as a silently dead
+        # run whose every spawn raised runtime_policy_required.
+        if getattr(driver, "dispatch_kind", "swarm") == "swarm":
+            self._freeze_dispatch_runtime(run)
         self._ensure_runtime_pool_manager(run)
         if run.spawn_guard is not None:
             await run.spawn_guard.ensure_ready(run_id)

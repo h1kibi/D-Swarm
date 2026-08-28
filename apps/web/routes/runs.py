@@ -15,6 +15,8 @@ from apps.web.auth import AuthConfig, bearer_from_header, verify_token
 from apps.web.http_utils import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, _require_dict_body
 from apps.web.run_manager import Run, RunManager
 from dswarm.core.events import Event, EventType
+from dswarm.solver.runtime_policy import RuntimePolicyError
+from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuildError
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -161,7 +163,17 @@ async def start_run(run_id: str, request: Request) -> Any:
     # configuration.
     request.app.state.manager.remember_dispatch(run_id, body)
     request.app.state.manager.configure_budget(run_id, body)
-    await request.app.state.manager.start(run_id, driver)
+    try:
+        await request.app.state.manager.start(run_id, driver)
+    except RuntimePolicyError as exc:
+        # M9a fail-closed: a misconfigured runtime (container profiles without a
+        # freezable docker context, local workers without the dual gate) must
+        # surface as an operator-visible launch error, not a silently dead run.
+        raise HTTPException(status_code=400, detail=f"runtime_policy: {exc}") from exc
+    except RuntimeSnapshotBuildError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"runtime_snapshot: {exc.code}: {exc}"
+        ) from exc
 
     # ChatGPT-style auto-title: if the operator gave no explicit name, kick off
     # a background summarizer that names the conversation from the prompt and

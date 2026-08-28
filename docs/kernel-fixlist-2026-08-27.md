@@ -287,3 +287,26 @@ A1 scope 接线 → A2 cleanup 落地/降级决策 → B1+B3（小而硬） → 
 
 每完成一个 Issue：更新 `docs/10` 相应状态行（若涉及账本宣告的能力），并在
 本文档该条目后追加一行 `✅ closed in <commit>` —— 本文件同时充当验收台账。
+
+---
+
+## 2026-08-28 追加（外部使用中发现的接线缺口，已闭环）
+
+### F1. web 派工路径从未冻结 M9a 运行时策略（run-4408 静默阵亡）
+
+- **现象**：web 指挥台派发的容器后端 run，所有 spawn 被 `runtime_policy_required`
+  fail-closed 击毙，run 无 worker 空转约 1 分钟后 unsolved 结束；界面骨架屏等不到
+  `RUN_STARTED`。`build_docker_runtime_context` 全仓仅 TUI 调用，
+  `RunManager.ensure_runtime_context` 在 web 启动路径零调用方（`git log -S` 证实
+  自 M9a 落地起从未接线——非 111 文件批次引入）。
+- **修复（✅ closed 2026-08-28）**：`RunManager.start` 在派发前调用新的
+  `_freeze_dispatch_runtime`：按与派工路径完全相同的解析顺序（body > worker_config >
+  env，含 offline 网络钳制）构建 `build_runtime_policy`，容器后端走 docker 冻结
+  （镜像预检失败 => POST /start 直接 400 `image_resolution_failed`），本地后端走
+  双门禁（启动请求显式 `local_dev` + `DSWARM_ALLOW_LOCAL_WORKERS=1`）；
+  `RunManager` 默认装配真实 `RuntimeSnapshotBuilder` 与
+  `runtime_factory.build_pool_manager_for_run` 池组合（从 TUI 路径抽取共用，行为不变，
+  `tests/test_runtime_factory.py` 5/5 绿）；mock/idle driver 跳过冻结。
+- **验收**：`tests/test_web_launch_runtime.py` 5 项端到端（真实 HTTP 路由）：容器冻结
+  +快照落盘+池组合+网络钳制 / 本地双门禁两态 / 镜像缺失 400 且 run 不再静默死亡 /
+  重复派发幂等（同一快照对象）/ mock 跳过。全量 pytest exit=0。

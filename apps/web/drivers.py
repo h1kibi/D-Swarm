@@ -170,17 +170,25 @@ def build_driver(
 ) -> Driver:
     _reject_retired_swarm_fields(body or {})
     # Real solving is the DEFAULT now 鈥?the deck launches the CLI executor swarm.
-    # "mock" is opt-in (UI dev / e2e only).
+    # "mock" is opt-in (UI dev / e2e only). The dispatch_kind tag tells
+    # RunManager.start which drivers need the M9a runtime freeze (only swarm
+    # runs spawn workers; mock/idle never touch the pool).
     kind = (body or {}).get("kind", "swarm")
     if kind == "mock":
-        return _mock_driver(body)
+        driver = _mock_driver(body)
+        driver.dispatch_kind = "mock"
+        return driver
     if kind == "idle":
-        return _idle_driver(body)
-    return _swarm_driver(
+        driver = _idle_driver(body)
+        driver.dispatch_kind = "idle"
+        return driver
+    driver = _swarm_driver(
         _infer_challenge(body),
         mgr=mgr,
         runtime_operation_kind=runtime_operation_kind,
     )
+    driver.dispatch_kind = "swarm"
+    return driver
 
 
 # ---- conversational dispatch ------------------------------------------------
