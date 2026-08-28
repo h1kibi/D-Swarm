@@ -6,6 +6,7 @@ scheduler selects; ``profile["engine"]`` is the concrete CLI transport family.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Mapping
 
 from dswarm.core.normalization import clean_text
@@ -13,7 +14,13 @@ from dswarm.solver.direction_rules import DEFAULT_DIRECTION_REGISTRY
 
 
 VALID_BASE_ENGINES = ("pi",)
-DEFAULT_WORKER_IMAGE = "ctf-swarm-pi:0.2.0"
+# Unified worker image (M9a): one Docker-first Kali runtime for every direction.
+# Tools are installed on demand inside the worker (dswarm-auto-sudo) instead of
+# being prebaked per direction. DSWARM_WORKER_IMAGE pins a different registry,
+# version, or a locally built tag without code changes.
+DEFAULT_WORKER_IMAGE = os.environ.get(
+    "DSWARM_WORKER_IMAGE", "ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1"
+)
 TRANSPORT_TO_ENGINE = {
     "pi": "pi",
     "pi_cli": "pi",
@@ -37,17 +44,12 @@ for _spec in (
         DIRECTION_PROFILE.update({alias: _spec.profile for alias in _spec.aliases})
 
 
-# Route A ships a generic pi base plus one direction-tagged worker image per
-# category. The base tag remains the fallback for the generic pi-worker profile.
-_DIRECTION_IMAGE_TAG = {
-    "web": "ctf-swarm-pi-web:0.2.0",
-    "pwn": "ctf-swarm-pi-pwn:0.2.0",
-    "rev": "ctf-swarm-pi-rev:0.2.0",
-    "crypto": "ctf-swarm-pi-crypto:0.2.0",
-    "misc": "ctf-swarm-pi-misc:0.2.0",
-    "forensics": "ctf-swarm-pi-forensics:0.2.0",
-    "aisec": "ctf-swarm-pi-aisec:0.2.0",
-}
+# Route A historically shipped one direction-tagged image per category
+# (`ctf-swarm-pi-<dir>:0.2.0`). Those pre-M9a images lack the RCP-v2 runtime
+# agent and have been retired; the unified-image doctrine
+# (docs/00-architecture-spec.md §4.4) resolves every direction to the same
+# DEFAULT_WORKER_IMAGE. `direction_image` keeps its signature for existing
+# callers that ask per direction.
 
 
 def direction_profile_name(direction: str) -> str:
@@ -63,9 +65,13 @@ def canonical_direction(value: Any) -> str:
 
 
 def direction_image(direction: str) -> str:
-    """The worker image tag for a direction, resolved after canonicalization."""
+    """The worker image for a direction — the unified image under M9a.
+
+    Kept per-direction in signature for historical callers; the per-direction
+    tag map was retired with the pre-M9a images.
+    """
     canonical = canonical_direction(direction)
-    return _DIRECTION_IMAGE_TAG.get(canonical, "")
+    return DEFAULT_WORKER_IMAGE if canonical else ""
 
 
 def direction_account_id(direction: str) -> str:

@@ -10,6 +10,7 @@ import subprocess
 
 import apps.web.worker_image as wi
 from dswarm.solver.container_exec import worker_image_for_profile
+from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE
 
 
 def _fake(returncode=0, stdout="", stderr=""):
@@ -101,5 +102,5 @@ def test_worker_image_for_profile_falls_back_to_category(monkeypatch):
     monkeypatch.delenv("DSWARM_WORKER_IMAGE", raising=False)
     monkeypatch.delenv("DSWARM_CATEGORY_IMAGE_CRYPTO", raising=False)
     image = worker_image_for_profile(None, category="crypto")
-    # category fallback now resolves to the local direction image
-    assert image == "ctf-swarm-pi-crypto:0.2.0"
+    # M9a unified-image doctrine: category fallback resolves to the shared image
+    assert image == DEFAULT_WORKER_IMAGE

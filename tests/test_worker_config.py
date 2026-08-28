@@ -9,6 +9,7 @@ import os
 import subprocess
 
 import pytest
+from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE
 
 from apps.web.run_manager import RunManager
 from apps.web.drivers import _missing_profile_accounts
@@ -67,7 +68,7 @@ def test_default_profiles_leave_room_for_bootstrap_and_explore():
 def test_default_profiles_have_agent_images():
     assert all(p.get("image") for p in DEFAULT_WORKER_PROFILES)
     by_name = {p["name"]: p["image"] for p in DEFAULT_WORKER_PROFILES}
-    assert by_name["pi-worker"] == "ctf-swarm-pi:0.2.0"
+    assert by_name["pi-worker"] == DEFAULT_WORKER_IMAGE
 
 
 def test_default_profiles_bind_pi_accounts():
@@ -80,14 +81,15 @@ def test_default_profiles_bind_pi_accounts():
 
 
 def test_default_direction_profiles_use_direction_images():
+    # M9a unified-image doctrine: every direction resolves to the same image.
     expected = {
-        "pi-web": "ctf-swarm-pi-web:0.2.0",
-        "pi-pwn": "ctf-swarm-pi-pwn:0.2.0",
-        "pi-rev": "ctf-swarm-pi-rev:0.2.0",
-        "pi-crypto": "ctf-swarm-pi-crypto:0.2.0",
-        "pi-misc": "ctf-swarm-pi-misc:0.2.0",
-        "pi-forensics": "ctf-swarm-pi-forensics:0.2.0",
-        "pi-aisec": "ctf-swarm-pi-aisec:0.2.0",
+        "pi-web": DEFAULT_WORKER_IMAGE,
+        "pi-pwn": DEFAULT_WORKER_IMAGE,
+        "pi-rev": DEFAULT_WORKER_IMAGE,
+        "pi-crypto": DEFAULT_WORKER_IMAGE,
+        "pi-misc": DEFAULT_WORKER_IMAGE,
+        "pi-forensics": DEFAULT_WORKER_IMAGE,
+        "pi-aisec": DEFAULT_WORKER_IMAGE,
     }
     by_name = {p["name"]: p["image"] for p in DEFAULT_WORKER_PROFILES}
     for name, image in expected.items():
@@ -129,7 +131,7 @@ def test_account_endpoint_overrides_deepseek_default(tmp_path, monkeypatch):
 
 
 def test_worker_profile_normalization_keeps_effort():
-    from dswarm.solver.worker_profiles import normalize_worker_profiles
+    from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, normalize_worker_profiles
 
     profiles = normalize_worker_profiles([
         {"id": "pi-web", "name": "pi-web", "engine": "pi", "effort": "high"}
@@ -444,8 +446,8 @@ def test_direction_profile_names_are_real_not_aliases(tmp_path):
     assert {"pi-web", "pi-pwn", "pi-rev", "pi-crypto",
             "pi-misc", "pi-forensics", "pi-aisec"} <= set(by_name)
     # each direction profile carries its own image tag
-    assert by_name["pi-web"]["image"] == "ctf-swarm-pi-web:0.2.0"
-    assert by_name["pi-rev"]["image"] == "ctf-swarm-pi-rev:0.2.0"
+    # M9a unified-image doctrine: projection resolves to the shared image
+    assert by_name['pi-web']['image'] == DEFAULT_WORKER_IMAGE
     # cleaning no longer collapses direction names to pi-worker
     cleaned = wc.get()  # stored engines untouched by defaults
     assert "pi-worker" in {p["name"] for p in cleaned["worker_profiles"]}
