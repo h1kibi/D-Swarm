@@ -21,6 +21,8 @@ Usage:
   blackboard.py write-fact "<text>" [--verified --artifact PATH]  # own worker file is materialized to shared CAS
   blackboard.py mark-deadend "<reason>"
   blackboard.py claim <intent_id>              # atomic; prints WON or LOST
+  blackboard.py register-cleanup <type:target>  # typed action only; never a shell command
+  blackboard.py read-cleanups                    # cleanup status (targets are redacted)
 
 This script is intentionally dependency-free (stdlib sqlite3 only) so it runs in
 any worker container without setup.
@@ -151,6 +153,32 @@ _SECRET_LITERAL_RE = re.compile(
     r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{12,})",
     re.IGNORECASE,
 )
+
+
+_CLEANUP_ACTION_TYPES = {
+    "remove_artifact", "stop_listener", "close_session", "revoke_credential",
+}
+_CLEANUP_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$")
+
+def _parse_cleanup_spec(spec: str) -> tuple[str, str]:
+    """Parse a typed cleanup spec; raw shell commands are intentionally rejected."""
+    text = str(spec or "").strip()
+    if ":" not in text:
+        raise ValueError("cleanup must be <action_type>:<target>")
+    action_type, target = text.split(":", 1)
+    action_type = action_type.strip().lower()
+    target = target.strip()
+    if action_type not in _CLEANUP_ACTION_TYPES:
+        raise ValueError("unsupported cleanup action type")
+    if not _CLEANUP_TARGET_RE.fullmatch(target):
+        raise ValueError("cleanup target contains unsupported characters")
+    if action_type == "remove_artifact":
+        parts = target.replace("\\", "/").split("/")
+        if target.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", target):
+            raise ValueError("artifact target must be run-relative")
+        if any(part in {"", ".", ".."} for part in parts) or parts[0] != "workers":
+            raise ValueError("artifact target must stay under workers/")
+    return action_type, target
 
 
 def _validated_shared_artifact(path_text: str) -> tuple[str | None, str]:
@@ -384,6 +412,90 @@ def _challenge_id(c: sqlite3.Connection) -> str:
         "WHERE challenge_id IS NOT NULL AND challenge_id != '' LIMIT 1"
     ).fetchone()
     return row[0] if row and row[0] else ""
+
+
+def register_cleanup(spec: str) -> None:
+    """Register one typed action in the append-only event log.
+
+    The target is never executed by this worker script.  It is stored privately in
+    the graph for the coordinator's run-scoped allowlisted executor.
+    """
+    c = _conn()
+    try:
+        action_type, target = _parse_cleanup_spec(spec)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+    cid = _challenge_id(c)
+    intent_id = _INTENT_ID
+    idem = f"{_ACTOR}:{action_type}:{target}:{intent_id}"
+    material = "|".join((cid, _ACTOR, action_type, target, intent_id, idem))
+    action_id = "cleanup-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    # Keep this fallback compatible with a pre-migration graph while still using
+    # the same append-only event contract as the coordinator implementation.
+    c.execute("CREATE TABLE IF NOT EXISTS cleanup_actions ("
+              "action_id TEXT PRIMARY KEY, challenge_id TEXT NOT NULL, "
+              "action_type TEXT NOT NULL, target TEXT NOT NULL, actor TEXT NOT NULL, "
+              "owner_key TEXT NOT NULL, intent_id TEXT, poc_id TEXT, "
+              "idempotency_key TEXT, registration_seq INTEGER NOT NULL, "
+              "status TEXT NOT NULL DEFAULT 'registered', execution_seq INTEGER, "
+              "failure_reason TEXT, result TEXT)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_idempotency "
+              "ON cleanup_actions(challenge_id, idempotency_key) "
+              "WHERE idempotency_key IS NOT NULL AND idempotency_key != ''")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cleanup_registration "
+              "ON cleanup_actions(challenge_id, registration_seq)")
+    row = c.execute("SELECT action_id, status FROM cleanup_actions "
+                    "WHERE challenge_id=? AND idempotency_key=?", (cid, idem)).fetchone()
+    if row:
+        print(json.dumps({"action_id": row[0], "status": row[1], "action_type": action_type,
+                          "target_digest": hashlib.sha256(target.encode()).hexdigest(),
+                          "target_length": len(target)}, sort_keys=True))
+        return
+    payload = json.dumps({"action_id": action_id, "action_type": action_type,
+                          "target": target, "actor": _ACTOR, "owner_key": _ACTOR,
+                          "intent_id": intent_id, "poc_id": "",
+                          "idempotency_key": idem}, ensure_ascii=False)
+    cur = c.execute("INSERT OR IGNORE INTO events "
+                    "(ts, challenge_id, actor, kind, payload, verified, confidence, dedupe_key) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (time.time(), cid, _ACTOR, "cleanup_action_registered", payload, 0, 1.0,
+                     "cleanup-register::" + action_id))
+    seq = int(cur.lastrowid or 0)
+    c.execute("INSERT OR IGNORE INTO cleanup_actions "
+              "(action_id, challenge_id, action_type, target, actor, owner_key, intent_id, "
+              "poc_id, idempotency_key, registration_seq, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+              (action_id, cid, action_type, target, _ACTOR, _ACTOR, intent_id or None,
+               None, idem, seq, "registered"))
+    c.commit()
+    print(json.dumps({"action_id": action_id, "status": "registered",
+                      "action_type": action_type,
+                      "target_digest": hashlib.sha256(target.encode()).hexdigest(),
+                      "target_length": len(target)}, sort_keys=True))
+
+
+def read_cleanups() -> None:
+    c = _conn()
+    if not _table_exists(c, "cleanup_actions"):
+        print("(no cleanup actions registered)")
+        return
+    cid = _challenge_id(c)
+    rows = c.execute("SELECT action_id, action_type, actor, status, registration_seq, "
+                     "execution_seq, failure_reason, target FROM cleanup_actions "
+                     "WHERE challenge_id=? ORDER BY registration_seq", (cid,)).fetchall()
+    if not rows:
+        print("(no cleanup actions registered)")
+        return
+    for action_id, action_type, actor, status, reg, exe, reason, target in rows:
+        digest = hashlib.sha256(str(target).encode()).hexdigest()[:16]
+        if reason:
+            reason_text = str(reason)[:512]
+            failure = (f" failure_digest={hashlib.sha256(reason_text.encode()).hexdigest()[:16]}"
+                       f" failure_length={len(reason_text)}")
+        else:
+            failure = ""
+        print(f"{action_id} {action_type} actor={actor} status={status} "
+              f"registered_seq={reg} execution_seq={exe or ''} target_digest={digest}{failure}")
 
 
 def read_facts(verified_only: bool) -> None:
@@ -925,6 +1037,9 @@ def main() -> None:
     sub.add_parser("read-deadends")
     sub.add_parser("read-flags")
     sub.add_parser("list-intents")
+    p = sub.add_parser("register-cleanup")
+    p.add_argument("spec")
+    sub.add_parser("read-cleanups")
     p = sub.add_parser("write-fact")
     p.add_argument("text")
     p.add_argument("--verified", action="store_true")
@@ -962,6 +1077,10 @@ def main() -> None:
         read_flags()
     elif args.cmd == "list-intents":
         list_intents()
+    elif args.cmd == "register-cleanup":
+        register_cleanup(args.spec)
+    elif args.cmd == "read-cleanups":
+        read_cleanups()
     elif args.cmd == "write-fact":
         write_fact(args.text, args.verified, args.artifact)
     elif args.cmd == "mark-deadend":

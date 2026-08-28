@@ -45,7 +45,7 @@
 而 flag 只有**逐字出现在真实执行输出里**才被接受。
 
 它解决的是单个 AI agent 的两个老大难：容易在一个点上死循环、效率低下。办法不是换更强的脑子，
-而是 **共享证据 + 独立 Reason 规划相位 + 硬编码溯源门 + 两阶段协调**：CTF 只是基础功能，同一套
+而是 **共享证据 + 独立 Reason 规划相位 + 硬编码溯源门 + 图驱动调度**：CTF 只是基础功能，同一套架构也支持渗透测试、代码审计等多 agent 协同目标驱动场景。
 架构经实测可独立完成渗透测试、代码审计等多 agent 协同目标驱动场景（pentest 模式下漏洞还需通过
 Verified-PoC 门：注册复现命令在验证容器内重放、攻击指示物再次真实出现才算 confirmed）。
 
@@ -108,22 +108,22 @@ D-Swarm 让一群基于 `pi` CLI agent 的 worker 扑同一道题，在一张**�
 
 ![image-20260624164618066](./assets/image-20260624164618066.png)
 
-> *web 指挥台:左侧 run 列表、中间协调器对话流、右侧带 per-worker 状态的实时 run 控制面板。*
+> *web 指挥台:左侧 run 列表、中间 Reason 调度对话流、右侧带 per-worker 状态的实时 run 控制面板。*
 
 ### 一张图看懂：解题阶段 × agent 循环
 
-外层 `①②③④` 是一次 run 的四个阶段，内层 `(1)~(5)` 是阶段 ③ 每一拍的协作循环。难题的功夫全在 ③ 这个圈里，而圈里 worker ↔ 黑板的每一次读写都走 `dswarm-blackboard` skill。
+一次 run 由 Prepare、Reason、Schedule/Execute、Review/revalidation、Finalize 组成；worker ↔ 黑板的每一次读写都走 `dswarm-blackboard` skill。
 
 ![1782305107059](./assets/1782305107059.png)
 
-`**(1)→(5)` 一圈就是无敵的核心**：协调器读黑板 → Reason 规划下一步 → intent 上黑板 → worker 各认一个跑真实命令 → **经 skill 把结果写回黑板（flag 还要过闸门）**，然后再读……每 2 秒转一圈，难题就是这样一圈圈把证据攒厚的。外层 `①②③④` 则是一次 run 的完整时间线。
+`**Reason → Schedule → Execute → Review** 是核心循环**：Reason 读 SharedGraph 并提出 typed intent，scheduler 派给 worker，worker 跑真实命令并经 skill 写回结果，review/revalidation 再审计证据；flag 始终要过 provenance gate。
 
 
 | 阶段            | 什么时候进                 | 干什么                                   | 产出                    |
 | ------------- | --------------------- | ------------------------------------- | --------------------- |
 | **① 准备**      | run 一开始               | 建黑板、暂存附件、探活引擎、装好 skill、（容器模式）起容器+反向连接 | 空黑板 + 可用引擎 + 接好通道     |
-| **② 侦察 Race** | 仅冷启动（复盘已解的题跳过）        | 多引擎并行单发扑整题，做广度侦察                      | flag（→快路径）或一批 fact    |
-| **③ 协调主循环**   | 侦察没直接解出时              | `(1)~(5)` 不断转圈，随证据扩张 swarm            | 黑板持续长大，直到攒够 flag      |
+| **② 启动与首轮执行** | run 开始时准备 SharedGraph，并按方向启动首批 worker | Reason 读取图中证据并生成 typed intent | 可执行的 intent 与初始事实 |
+| **③ Reason 调度循环** | 首批 worker 未直接完成时 | scheduler 读取图、派发 intent、收集执行结果，并触发 review/revalidation | 证据图持续增长，直到满足完成条件 |
 | **④ 收尾**      | 攒够 flag / 操作员停 / 预算耗尽 | 落 winner、释放认领、发终态事件、清扫                | RUN_FINISHED + 可复盘的黑板 |
 
 
@@ -320,7 +320,7 @@ DSWARM_WEB_PASSWORD='choose-a-strong-one' \
 3. 运行环境推荐选择本地，如有特殊需求可以选择容器，容器会提醒你配置相关的凭据，这块请自行配置，你可以通过点击测模型来测试是否正确工作，测试方式会调用agent并让模型重复 ok。
   ![image-20260624192439759](./assets/image-20260624192439759.png)
 4. 接下来可以详细配置你的 worker情况，推荐按照图中的方式进行配置。
-  起始worker数量表示竞速阶段的数量，数量跟随着你的引擎数，会三个agent引擎同时进行，直至flag解出或者题目超时。用于解决简单题的快速抢血和快速解答。
+  起始worker数量表示启动时并行的 worker 数量；它们分别认领图上可执行的 intent，结果会回写 SharedGraph，直到满足完成条件或题目超时。
    最大worker数推荐保留5-6个左右，因为对于web题目来讲，过多的worker可能会造成ddos的情况。
    ![image-20260624192517250](./assets/image-20260624192517250.png)
 5. 推荐配置和测联通这块推理模型，更好的规划和把控题目节奏。
@@ -376,7 +376,7 @@ D-Swarm 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 
 | 路径                   | 内容                                                                                |
 | -------------------- | --------------------------------------------------------------------------------- |
-| `dswarm/`            | 核心:`swarm/`(协调器)、`solver/`(CLI driver、gate、控制平面)、`models/`、`platform/`、`sandbox/` |
+| `dswarm/`            | 核心:`swarm/`(ReasonScheduler 与证据图)、`solver/`(CLI driver、gate、控制平面)、`models/`、`platform/`、`sandbox/` |
 | `apps/web/`          | FastAPI 后端(`server.py`)+ Next.js 操作者 UI(`ui/`)                                    |
 | `apps/tui/`          | Textual TUI 指挥台 （未完工）                                                             |
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
@@ -456,7 +456,7 @@ go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtim
 - **本项目是 [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) 的 fork（魔改分支）**，
   遵循 GNU AGPL-3.0。归属与分叉声明详见根目录 `NOTICE` 文件。
 - **D-Swarm 是独立项目**：自 fork 起实现已大幅分叉——单引擎路线（`pi`）、event-sourced 共享图、
-  内核不可变加固（M3）、唯一 token 账本（M5）、两阶段 stage_policy 协调、Docker-first 运行时池
+  内核不可变加固（M3）、唯一 token 账本（M5）、ReasonSwarm 图驱动调度与 review/revalidation、Docker-first 运行时池
   （M9a）、pentest Verified-PoC 门与 scope 审计（M9）等均为本项目自有演进；除血统外与上游无
   代码同步关系。
 

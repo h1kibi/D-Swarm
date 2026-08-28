@@ -243,7 +243,6 @@ def test_swarm_wires_metrics_next_to_graph_workspace(tmp_path):
     workspace = tmp_path / "sessions" / "run-m6" / "workspace"
     swarm = Swarm(
         challenge(),
-        [],
         llm=None,
         sandbox=SimpleNamespace(root=tmp_path / "sandbox"),
         graph_dir=workspace / "graph",
@@ -267,7 +266,7 @@ def test_swarm_graph_survives_metrics_sink_creation_failure(tmp_path, monkeypatc
     monkeypatch.setattr(swarm_module, "MetricsSink", unavailable_metrics)
     workspace = tmp_path / "sessions" / "run-m6-degraded" / "workspace"
     swarm = swarm_module.Swarm(
-        challenge(), [], llm=None,
+        challenge(), llm=None,
         sandbox=SimpleNamespace(root=tmp_path / "sandbox"),
         graph_dir=workspace / "graph",
         run_id="run-m6-degraded",

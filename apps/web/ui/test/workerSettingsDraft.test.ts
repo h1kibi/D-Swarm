@@ -41,7 +41,6 @@ const profile = (
   base_url: "https://api.example.test/v1",
   runtime: "docker-web",
   roles: ["recon", "bootstrap", "explore", "respond", "review"],
-  race: true,
   max_running: 2,
   max_review_running: 1,
   priority: 20,
@@ -54,16 +53,12 @@ const profile = (
 
 const config = (profiles: WorkerSettings["worker_profiles"]): WorkerSettings => ({
   engines: [],
-  start_workers: 1,
   max_workers: 0,
   worker_backend: "container",
   wall_clock_budget: 0,
   max_total_workers: 0,
   cost_budget_usd: 0,
-  stage_policy: {
-    prepare: {},
-    budgets: { max_total_workers: 0, cost_budget_usd: 0 },
-  },
+  review_policy: { enabled: true, engine: "pi-worker" },
   llm_providers: [],
   llm_profiles: {
     planner: { provider: "deepseek", model: "planner" },

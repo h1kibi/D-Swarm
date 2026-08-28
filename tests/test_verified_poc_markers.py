@@ -176,9 +176,11 @@ def test_conflicting_indicator_is_rejected_and_original_is_preserved(tmp_path):
     asyncio.run(solver._stream_markers("POC_REPRO=poc.py|different"))
 
     assert graph.repros == []
-    assert events[-1][0] == "poc_reproduction_rejected"
-    assert events[-1][1]["poc_id"] == "poc-1"
-    assert "different" not in repr(events[-1][1])
+    rejected = [fields for kind, fields in events
+                if kind == "poc_reproduction_rejected"]
+    assert rejected
+    assert rejected[-1]["poc_id"] == "poc-1"
+    assert "different" not in repr(rejected[-1])
 
 
 def test_unresolved_pending_repros_are_discarded_at_worker_cleanup(tmp_path):

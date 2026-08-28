@@ -167,6 +167,8 @@ def _read_binding_material(source: Path, *, mode: CredentialMode) -> dict[str, b
 
 
 def _write_private_file(path: Path, value: bytes) -> None:
+    # Native Windows may not honor POSIX owner-only bits. Keep the request for
+    # Linux/Docker and do not treat host-side credential staging as isolation.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -252,6 +254,8 @@ class CredentialProjector:
             operation_root.mkdir(parents=True, exist_ok=False, mode=0o700)
             credential_root.mkdir(mode=0o700)
             binding_root.mkdir(mode=0o700)
+            # Directory modes are enforced by the Linux container runtime;
+            # on native Windows they are only best-effort ACL/mode hints.
             for private_dir in (operation_root, credential_root, binding_root):
                 try:
                     private_dir.chmod(0o700)

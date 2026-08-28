@@ -130,8 +130,10 @@ def test_migration_preserves_seat_fields():
     )
     seat = res.seats[0]
     assert seat.model == "deepseek-v4-pro"
-    assert seat.race is False           # explicit race-opt-out survives
-    assert seat.roles == ["race", "review"]
+    # Retired Race workers normalize into the current explore role; the
+    # retired boolean must never reappear in the canonical seat contract.
+    assert seat.roles == ["explore", "review"]
+    assert "race" not in seat.to_dict()
     assert seat.max_running == 3
     assert seat.priority == 10
     assert res.seat_alias["pi-local"] == seat.id
@@ -179,7 +181,8 @@ def test_adapter_round_trip_preserves_scheduler_fields():
     assert back["model"] == "deepseek-v4-pro"
     assert back["credential_account"] == "pi-main"
     assert back["runtime"] == "docker-web"
-    assert back["roles"] == ["race", "review"]
+    assert back["roles"] == ["explore", "review"]
+    assert "race" not in back
     assert back["max_running"] == 3
     assert back["priority"] == 10
 

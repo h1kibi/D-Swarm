@@ -472,7 +472,7 @@ def _exact_mapping(value: object, keys: set[str], code: str) -> Mapping[str, Any
 
 
 class RuntimeSnapshotStore:
-    """Create-once durable storage for coordinator-private runtime snapshots."""
+    """Create-once durable storage for scheduler-private runtime snapshots."""
 
     def __init__(self, root: str | Path = "sessions") -> None:
         self.root = Path(root)
@@ -510,6 +510,9 @@ class RuntimeSnapshotStore:
                 )
             try:
                 runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # Native Windows cannot reproduce POSIX owner-only isolation;
+                # this mode is best-effort and Docker/Linux is the production
+                # security boundary for runtime material.
                 try:
                     os.chmod(runtime_dir, 0o700)
                 except OSError:

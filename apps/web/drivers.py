@@ -11,7 +11,6 @@ Kinds:
 
 from __future__ import annotations
 
-import copy
 import re
 import os
 import logging
@@ -28,9 +27,7 @@ from apps.web.worker_config import (
 )
 from dswarm.solver.credential_accounts import account_store_root
 from dswarm.core.runtime_env import is_web_container
-from dswarm.solver.direction_rules import (
-    normalize_operator_direction as _canonicalize_operator_direction,
-)
+from dswarm.solver.direction_rules import normalize_operator_direction
 from dswarm.solver.runtime_policy import RuntimePolicyError
 from dswarm.solver.worker_profiles import (
     base_engine_for_profile,
@@ -54,17 +51,6 @@ def runtime_context_kwargs(run: Run) -> dict[str, Any]:
         "runtime_snapshot": getattr(run, "runtime_snapshot", None),
         "pool_manager": getattr(run, "pool_manager", None),
     }
-
-
-def normalize_operator_direction(value: Any) -> tuple[str, str]:
-    """Normalize a CTF operator direction before it enters the kernel."""
-    canonical, resolution = _canonicalize_operator_direction(value)
-    if resolution == "invalid":
-        LOG.warning(
-            "invalid_operator_direction raw=%r resolution=%s",
-            value, resolution,
-        )
-    return canonical, resolution
 
 
 def _format_missing(p: dict, h: "ProfileHealth") -> str:
@@ -152,24 +138,23 @@ def _planner_llm_credentials(
     return str(resolved.get("api_key") or ""), str(resolved.get("base_url") or "")
 
 
-_LEGACY_SWARM_FIELDS = (
+_RETIRED_SWARM_FIELDS = (
     "cli_race",
     "race_scout",
     "race_timeout",
     "race_engines",
     "coordinator",
     "cold_start",
+    "start_workers",
+    "n_solvers",
+    "stall_seconds",
 )
 
 
-def _reject_legacy_swarm_fields(body: dict[str, Any]) -> None:
-    present = [k for k in _LEGACY_SWARM_FIELDS if body.get(k) is not None]
-    stage = body.get("stage_policy")
-    if isinstance(stage, dict):
-        if isinstance(stage.get("race"), dict):
-            present.append("stage_policy.race")
-        if isinstance(stage.get("coordinator"), dict):
-            present.append("stage_policy.coordinator")
+def _reject_retired_swarm_fields(body: dict[str, Any]) -> None:
+    present = [k for k in _RETIRED_SWARM_FIELDS if body.get(k) is not None]
+    if "stage_policy" in body:
+        present.append("stage_policy")
     if present:
         raise ValueError(
             "legacy swarm fields are no longer supported: "
@@ -183,7 +168,7 @@ def build_driver(
     *,
     runtime_operation_kind: str = "",
 ) -> Driver:
-    _reject_legacy_swarm_fields(body or {})
+    _reject_retired_swarm_fields(body or {})
     # Real solving is the DEFAULT now 鈥?the deck launches the CLI executor swarm.
     # "mock" is opt-in (UI dev / e2e only).
     kind = (body or {}).get("kind", "swarm")
@@ -344,14 +329,12 @@ def _swarm_driver(
     Knobs from the request body (all optional):
       challenge.{name,category,target,description,flag_format}  (inferred from prompt)
       cli_engine: "pi"                        鈥?worker engine (pi only)
-      legacy race/coordinator fields are rejected at the API boundary; the only
-      runtime path is ReasonSwarm.
+      retired dispatch fields are rejected at the API boundary; the only runtime
+      path is ReasonSwarm.
       offline: bool (default False)           鈥?deny worker web tools (clean eval);
                                                 also denies the KB unless `kb` is set
       kb: bool (default: True online / False offline) 鈥?let the worker query the KB
-      n_solvers: int (default 2)              鈥?bootstrap lineup size
       engines: list[str] (default = worker-config roster) 鈥?engine roster
-      start_workers: int (default len(engines)) 鈥?bootstrap workers (one per engine)
     """
     async def drive(run: Run) -> None:
         import os
@@ -362,7 +345,6 @@ def _swarm_driver(
         from dswarm.sandbox.manager import SandboxManager
         from dswarm.solver.result import ArtifactStore
         from dswarm.solver.types import SolverConfig
-        from dswarm.swarm.models import default_lineup
         from dswarm.swarm.swarm import Swarm
 
         ch = body.get("challenge", {})
@@ -413,14 +395,12 @@ def _swarm_driver(
         )
         executor = body.get("executor", "cli")
         cli_engine = body.get("cli_engine", "pi")
-        reason_swarm = bool(body.get("reason_swarm", True))
         offline = bool(body.get("offline", False))
         web_access = not offline
         # offline implies NO KB (a clean black-box eval denies every external
         # dependency, KB included) 鈥?but `kb` can still be set explicitly to
         # override either way. Default KB on only when online.
         kb = bool(body.get("kb", not offline))
-        n = int(body.get("n_solvers", 2))
         # engine roster: a single all-in-one pi-worker profile. Resolution order:
         # explicit body.engines > the operator's per-category worker-config default
         # (apps/web/worker_config.py) > the hardcoded pi roster.
@@ -447,10 +427,7 @@ def _swarm_driver(
                 and str(r.get("backend") or "") == "container" else r
                 for r in runtime_profiles
             ]
-        # bootstrap worker count: explicit body wins, else the config default, else
-        # one per engine (heterogeneous rush). max_workers likewise from config.
-        default_sw = wc.get("start_workers") or len(engines)
-        start_workers = int(body.get("start_workers", default_sw))
+        # The scheduler derives dispatch from the selected roster and max_workers.
         max_workers = int(body.get("max_workers", wc.get("max_workers", 10)))
         # wall-clock cap. ABSENT 鈫?the Swarm default (infinite: the interactive deck
         # never gives up on its own; only solve / operator-stop ends it). A batch
@@ -462,26 +439,7 @@ def _swarm_driver(
         cost_budget_usd = float(body.get("cost_budget_usd", wc.get("cost_budget_usd", 0.0)) or 0.0) or None
         llm_profiles = body.get("llm_profiles") or wc.get("llm_profiles") or {}
         llm_providers = body.get("llm_providers") or wc.get("llm_providers") or []
-        if "stage_policy" in body:
-            stage_policy = copy.deepcopy(body.get("stage_policy") or {})
-        elif wc.get("stage_policy"):
-            stage_policy = copy.deepcopy(wc["stage_policy"])
-        else:
-            stage_policy = {
-                "coordinator": {"wall_clock_budget": 0 if wall_clock_budget == float("inf") else int(wall_clock_budget)},
-                "budgets": {"max_total_workers": max_total_workers or 0,
-                            "cost_budget_usd": cost_budget_usd or 0.0},
-            }
-        if "wall_clock_budget" in body:
-            v = float(body["wall_clock_budget"] or 0)
-            stage_policy.setdefault("coordinator", {})["wall_clock_budget"] = (
-                int(v) if v > 0 else 0)
-        if "max_total_workers" in body:
-            stage_policy.setdefault("budgets", {})["max_total_workers"] = int(
-                body["max_total_workers"] or 0)
-        if "cost_budget_usd" in body:
-            stage_policy.setdefault("budgets", {})["cost_budget_usd"] = float(
-                body["cost_budget_usd"] or 0.0)
+        review_policy = body.get("review_policy") or wc.get("review_policy") or {}
         # worker execution backend: "local" (host subprocess) or "container" (each
         # worker in the run's Kali tool container). Request body wins, else config,
         # else env, else default 鈥?with the container_dockerexec alias, invalid
@@ -559,100 +517,99 @@ def _swarm_driver(
                 ),
             ))
 
-        # LLMClient: the coordinator needs it for the Reason planner. A plain CLI
-        # race needs none. Resolve the host-side Planner through the same account
+        # LLMClient powers the Reason planner. Resolve the host-side planner
+        # through the same account
         # model the settings UI tests, so a relay-backed Worker account can power
         # Reason without requiring a separate DeepSeek env key.
         llm_cm = None
         llm = None
         reason_planner_diagnostic: dict[str, Any] = {}
         reason_usage_writer = None
-        if reason_swarm:
-            from apps.web.reason_llm import (
-                base_url_host,
-                classify_llm_exception,
-                resolve_reason_llm_endpoint,
-            )
-            from dswarm.core.events import Event, EventType, blackboard_delta_payload
-            from dswarm.core.llm import LLMClient
+        from apps.web.reason_llm import (
+            base_url_host,
+            classify_llm_exception,
+            resolve_reason_llm_endpoint,
+        )
+        from dswarm.core.events import Event, EventType, blackboard_delta_payload
+        from dswarm.core.llm import LLMClient
 
-            planner_profile = dict(llm_profiles.get("planner") or {})
-            try:
-                resolved = resolve_reason_llm_endpoint(
-                    sessions_root=(mgr.sessions_root if mgr is not None else None),
-                    worker_profiles=worker_profiles,
-                    profile=planner_profile,
-                    llm_providers=llm_providers,
+        planner_profile = dict(llm_profiles.get("planner") or {})
+        try:
+            resolved = resolve_reason_llm_endpoint(
+                sessions_root=(mgr.sessions_root if mgr is not None else None),
+                worker_profiles=worker_profiles,
+                profile=planner_profile,
+                llm_providers=llm_providers,
+            )
+            reason_planner_diagnostic = {
+                "code": "ok" if resolved.get("has_api_key") else "missing_api_key",
+                "detail": (
+                    "Planner LLM endpoint resolved."
+                    if resolved.get("has_api_key")
+                    else "Planner API key is missing; select a credential account or set DSWARM_DEEPSEEK_API_KEY."
+                ),
+                "planner": str(resolved.get("model") or planner_profile.get("model") or "deepseek-v4-pro"),
+                "base_url_host": str(resolved.get("base_url_host") or base_url_host(str(resolved.get("base_url") or ""))),
+                "credential_source": str(resolved.get("credential_source") or "auto"),
+                "credential_account": str(resolved.get("credential_account") or ""),
+                "base_url_source": str(resolved.get("base_url_source") or ""),
+            }
+            if resolved.get("has_api_key"):
+                timeout = float(planner_profile.get("timeout") or 120)
+                reason_usage_writer = (
+                    mgr.internal_usage_writer(
+                        run,
+                        solver_id="reason",
+                        profile_id="planner",
+                        configured_account_id=(
+                            str(resolved.get("credential_account") or "").strip() or None
+                        ),
+                    )
+                    if mgr is not None else None
                 )
-                reason_planner_diagnostic = {
-                    "code": "ok" if resolved.get("has_api_key") else "missing_api_key",
-                    "detail": (
-                        "Planner LLM endpoint resolved."
-                        if resolved.get("has_api_key")
-                        else "Planner API key is missing; select a credential account or set DSWARM_DEEPSEEK_API_KEY."
+                llm_cm = LLMClient(
+                    api_key=str(resolved.get("api_key") or ""),
+                    base_url=str(resolved.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
+                    timeout=timeout,
+                    overall_timeout=max(timeout + 30.0, timeout),
+                    cost=run.cost,
+                    bus=run.bus,
+                    usage_writer=reason_usage_writer,
+                    usage_context=(
+                        reason_usage_writer.context
+                        if reason_usage_writer is not None else None
                     ),
-                    "planner": str(resolved.get("model") or planner_profile.get("model") or "deepseek-v4-pro"),
-                    "base_url_host": str(resolved.get("base_url_host") or base_url_host(str(resolved.get("base_url") or ""))),
-                    "credential_source": str(resolved.get("credential_source") or "auto"),
-                    "credential_account": str(resolved.get("credential_account") or ""),
-                    "base_url_source": str(resolved.get("base_url_source") or ""),
-                }
-                if resolved.get("has_api_key"):
-                    timeout = float(planner_profile.get("timeout") or 120)
-                    reason_usage_writer = (
-                        mgr.internal_usage_writer(
-                            run,
-                            solver_id="reason",
-                            profile_id="planner",
-                            configured_account_id=(
-                                str(resolved.get("credential_account") or "").strip() or None
-                            ),
-                        )
-                        if mgr is not None else None
-                    )
-                    llm_cm = LLMClient(
-                        api_key=str(resolved.get("api_key") or ""),
-                        base_url=str(resolved.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
-                        timeout=timeout,
-                        overall_timeout=max(timeout + 30.0, timeout),
-                        cost=run.cost,
-                        bus=run.bus,
-                        usage_writer=reason_usage_writer,
-                        usage_context=(
-                            reason_usage_writer.context
-                            if reason_usage_writer is not None else None
-                        ),
-                    )
-                    llm = await llm_cm.__aenter__()
-                else:
-                    await run.bus.emit(Event(
-                        event_type=EventType.BLACKBOARD_DELTA,
-                        run_id=run.run_id,
-                        challenge_id=challenge.id,
-                        payload=blackboard_delta_payload(
-                            "reason_planner_unavailable",
-                            actor="reason",
-                            delta_type="reason_planner_unavailable",
-                            stage="reason",
-                            failures=0,
-                            max_failures=0,
-                            **reason_planner_diagnostic,
-                        ),
-                    ))
-            except Exception as exc:  # noqa: BLE001
-                # no key / client unavailable 鈫?coordinator Reason will no-op,
-                # bootstrap workers still run. Never block the run on this.
-                diag = classify_llm_exception(exc)
-                reason_planner_diagnostic = {
-                    "code": str(diag.get("code") or "network_error"),
-                    "detail": str(diag.get("detail") or "Planner LLM unavailable."),
-                    "planner": str(planner_profile.get("model") or "deepseek-v4-pro"),
-                    "base_url_host": base_url_host(str(planner_profile.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL)),
-                    "credential_source": str(planner_profile.get("credential_source") or "auto"),
-                    "credential_account": str(planner_profile.get("credential_account") or ""),
-                }
-                llm_cm = None
-                llm = None
+                )
+                llm = await llm_cm.__aenter__()
+            else:
+                await run.bus.emit(Event(
+                    event_type=EventType.BLACKBOARD_DELTA,
+                    run_id=run.run_id,
+                    challenge_id=challenge.id,
+                    payload=blackboard_delta_payload(
+                        "reason_planner_unavailable",
+                        actor="reason",
+                        delta_type="reason_planner_unavailable",
+                        stage="reason",
+                        failures=0,
+                        max_failures=0,
+                        **reason_planner_diagnostic,
+                    ),
+                ))
+        except Exception as exc:  # noqa: BLE001
+            # no key / client unavailable 鈫?Reason planning will no-op,
+            # bootstrap workers still run. Never block the run on this.
+            diag = classify_llm_exception(exc)
+            reason_planner_diagnostic = {
+                "code": str(diag.get("code") or "network_error"),
+                "detail": str(diag.get("detail") or "Planner LLM unavailable."),
+                "planner": str(planner_profile.get("model") or "deepseek-v4-pro"),
+                "base_url_host": base_url_host(str(planner_profile.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL)),
+                "credential_source": str(planner_profile.get("credential_source") or "auto"),
+                "credential_account": str(planner_profile.get("credential_account") or ""),
+            }
+            llm_cm = None
+            llm = None
 
         # 搂16 flywheel store (optional; recall prior + distill on solve)
         from dswarm.learning.distill import TemplateStore
@@ -663,19 +620,19 @@ def _swarm_driver(
             if mgr is not None else None
         )
         swarm = Swarm(
-            challenge, default_lineup(n), llm=llm, sandbox=sandbox,
+            challenge, llm=llm, sandbox=sandbox,
             bus=run.bus, cost=run.cost, artifacts=arts,
             config=SolverConfig(), run_id=run.run_id, knowledge=knowledge,
             hitl_inbox=run.hitl,  # HITL: human commands reach the solvers
             worker_cmds=run.worker_cmds,  # operator spawn/kill of specific engines
             executor=executor, cli_engine=cli_engine,
-            engines=engines, start_workers=start_workers, max_workers=max_workers,
+            engines=engines, max_workers=max_workers,
             web_access=web_access, kb=kb,
             graph_dir=graph_dir, worker_root=worker_root,
             wall_clock_budget=wall_clock_budget,
             max_total_workers=max_total_workers,
             cost_budget_usd=cost_budget_usd,
-            stage_policy=stage_policy,
+            review_policy=review_policy,
             llm_profiles=llm_profiles,
             llm_providers=llm_providers,
             reason_model=(llm_profiles.get("planner") or {}).get("model", "deepseek-v4-pro"),
@@ -706,7 +663,7 @@ def _swarm_driver(
 
 # ---- standby (post-solve HITL) ----------------------------------------------
 # After a run finishes (or the server restarted), a human follow-up no longer has
-# a live swarm to reach. The standby driver COLD-STARTS a single worker from disk:
+# a live swarm to reach. The standby driver starts a single worker from disk:
 # it reads winner.json (the winning worker's CLI session) + the persisted
 # shared_graph, resumes that SAME session, and serves one command 鈥?answer a
 # question, mark the flag a false-positive and keep solving, or write a writeup.

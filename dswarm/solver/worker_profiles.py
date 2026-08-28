@@ -1,13 +1,14 @@
 """WorkerProfile normalization shared by the web config and swarm scheduler.
 
-Profiles are the scheduling unit.  ``profile["name"]`` is what the coordinator
-selects; ``profile["engine"]`` is the concrete CLI transport family.
+Profiles are the scheduling unit. ``profile["name"]`` is what the Reason
+scheduler selects; ``profile["engine"]`` is the concrete CLI transport family.
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
+from dswarm.core.normalization import clean_text
 from dswarm.solver.direction_rules import DEFAULT_DIRECTION_REGISTRY
 
 
@@ -69,7 +70,7 @@ def direction_image(direction: str) -> str:
 
 def direction_account_id(direction: str) -> str:
     """Default credential account id for one direction profile."""
-    return f"pi-{(direction or '').strip().lower()}-main"
+    return f"pi-{clean_text(direction).lower()}-main"
 
 
 def coerce_nonneg_int(value: Any, default: int) -> int:
@@ -99,10 +100,10 @@ def base_engine_for_profile(profile_or_name: Any) -> str:
     string is returned only when nothing resolves, so callers can still error clearly.
     """
     if isinstance(profile_or_name, dict):
-        transport = str(profile_or_name.get("transport") or "").strip()
-        engine = str(profile_or_name.get("engine") or "").strip()
+        transport = clean_text(profile_or_name.get("transport"))
+        engine = clean_text(profile_or_name.get("engine"))
         return TRANSPORT_TO_ENGINE.get(transport, engine)
-    s = str(profile_or_name or "").strip()
+    s = clean_text(profile_or_name)
     if s in TRANSPORT_TO_ENGINE:
         return TRANSPORT_TO_ENGINE[s]
     if s in VALID_BASE_ENGINES:
@@ -122,23 +123,26 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
             raise ValueError("worker profile must be an object")
         return None
     enabled = bool(item.get("enabled", True))
-    transport = str(item.get("transport") or item.get("engine") or "").strip()
-    engine = TRANSPORT_TO_ENGINE.get(transport, str(item.get("engine") or "").strip())
+    transport = clean_text(item.get("transport") or item.get("engine"))
+    engine = TRANSPORT_TO_ENGINE.get(transport, clean_text(item.get("engine")))
     if engine not in VALID_BASE_ENGINES:
         if reject_invalid:
             raise ValueError("worker profile requires valid transport/engine")
         return None
-    pid = str(item.get("name") or item.get("id") or "").strip()
+    pid = clean_text(item.get("name") or item.get("id"))
     if not pid:
         if reject_invalid:
             raise ValueError("worker profile requires name or id")
         return None
     raw_roles = item.get("roles")
     roles = [
-        str(r).strip()
+        ("explore" if clean_text(r) == "race" else clean_text(r))
         for r in raw_roles
-        if isinstance(r, str) and str(r).strip()
+        if isinstance(r, str) and clean_text(r)
     ] if isinstance(raw_roles, list) else []
+    # The retired race role is normalized into the current execution role once,
+    # so persisted historical profiles cannot reintroduce a second scheduling mode.
+    roles = list(dict.fromkeys(roles))
     if not roles:
         roles = list(DEFAULT_ROLES)
     elif "review" not in roles and any(
@@ -149,17 +153,17 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         # single core review worker unless the operator made a non-execution-only
         # profile on purpose.
         roles = [*roles, "review"]
-    credential_mode = str(
+    credential_mode = clean_text(
         item.get("credential_mode") or item.get("auth") or "subscription"
-    ).strip() or "subscription"
+    ) or "subscription"
     if "credential_account" in item:
         raw_account = item.get("credential_account")
     elif "credential_account_ref" in item:
         raw_account = item.get("credential_account_ref")
     else:
         raw_account = f"{engine}-main"
-    credential_account = str(raw_account or "").strip()
-    provider_ref = str(item.get("provider_ref") or "").strip()
+    credential_account = clean_text(raw_account)
+    provider_ref = clean_text(item.get("provider_ref"))
     # A provider binding owns the endpoint, protocol and secret.  Keep only the
     # provider reference so a stale legacy credential_account/base_url cannot
     # shadow or double-bind the profile.
@@ -172,19 +176,19 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         auth_header = "Authorization"
         auth_prefix = "Bearer"
     else:
-        base_url = str(item.get("base_url") or "").strip()
-        api_key_ref = str(item.get("api_key_ref") or "").strip()
-        wire_api = str(item.get("wire_api") or "auto").strip().lower()
-        auth_mode = str(item.get("auth_mode") or "bearer").strip().lower()
-        auth_header = str(item.get("auth_header") or "Authorization").strip()
-        auth_prefix = str(item.get("auth_prefix") if item.get("auth_prefix") is not None else "Bearer").strip()
+        base_url = clean_text(item.get("base_url"))
+        api_key_ref = clean_text(item.get("api_key_ref"))
+        wire_api = clean_text(item.get("wire_api") or "auto").lower()
+        auth_mode = clean_text(item.get("auth_mode") or "bearer").lower()
+        auth_header = clean_text(item.get("auth_header") or "Authorization")
+        auth_prefix = clean_text(item.get("auth_prefix") if item.get("auth_prefix") is not None else "Bearer")
     normalized = {
         "id": pid,
         "name": pid,
         # human-readable display name, carried through so a seat-id-based pid (post
         # identity migration) still renders a friendly name in the UI. Defaults to
         # the pid when no explicit label is given.
-        "label": str(item.get("label") or pid).strip(),
+        "label": clean_text(item.get("label") or pid),
         "engine": engine,
         "transport": transport or engine,
         "credential_mode": credential_mode,
@@ -197,25 +201,23 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "auth_mode": auth_mode,
         "auth_header": auth_header,
         "auth_prefix": auth_prefix,
-        "runtime": str(item.get("runtime") or "docker-web").strip(),
+        "runtime": clean_text(item.get("runtime") or "docker-web"),
         "image": _normalize_worker_image(item.get("image")),
         "roles": roles,
-        "race": bool(item.get("race", "race" in roles)),
         "max_running": coerce_pos_int(item.get("max_running"), 1),
         # 0 means "inherit the global review.max_concurrent"; review capacity is
-        # intentionally separate from max_running, which now only gates ordinary
-        # race/bootstrap/explore/respond workers.
+        # intentionally separate from max_running, which gates execution workers.
         "max_review_running": coerce_nonneg_int(item.get("max_review_running"), 0),
         "priority": coerce_nonneg_int(item.get("priority"), 100),
-        "model": str(item.get("model") or "").strip(),
-        "effort": str(item.get("effort") or "").strip().lower(),
+        "model": clean_text(item.get("model")),
+        "effort": clean_text(item.get("effort")).lower(),
         "enabled": enabled,
     }
     return normalized
 
 
 def _normalize_worker_image(raw: Any) -> str:
-    image = str(raw or "").strip()
+    image = clean_text(raw)
     if not image:
         return DEFAULT_WORKER_IMAGE
     # Historical migration only: the FIRST per-category images
@@ -256,12 +258,12 @@ def profile_names(profiles: list[dict[str, Any]]) -> list[str]:
 
 def profile_label(profile: Mapping[str, Any]) -> str:
     """Human-facing worker label: explicit label, name, or id."""
-    return str(profile.get("label") or profile.get("name") or profile.get("id") or "").strip()
+    return clean_text(profile.get("label") or profile.get("name") or profile.get("id"))
 
 
 def profile_ref(profile: Mapping[str, Any]) -> str:
     """Stable dispatch reference: name/id before the display label."""
-    return str(profile.get("name") or profile.get("id") or profile_label(profile)).strip()
+    return clean_text(profile.get("name") or profile.get("id") or profile_label(profile))
 
 
 def normalize_profile_roster(values: Any, profiles: list[dict[str, Any]]) -> list[str]:
@@ -358,8 +360,8 @@ def normalize_runtime_profile(
         if reject_invalid:
             raise ValueError("runtime profile must be an object")
         return None
-    runtime_id = str(item.get("id") or "").strip()
-    backend = str(item.get("backend") or "").strip().lower()
+    runtime_id = clean_text(item.get("id"))
+    backend = clean_text(item.get("backend")).lower()
     if not runtime_id or backend not in {"container", "local"}:
         if reject_invalid:
             raise ValueError("runtime profile requires id and valid backend")
@@ -376,15 +378,15 @@ def normalize_runtime_profile(
     normalized = {
         "id": runtime_id,
         "backend": backend,
-        "label": str(item.get("label") or runtime_id).strip(),
-        "network": str(
+        "label": clean_text(item.get("label") or runtime_id),
+        "network": clean_text(
             item.get("network") or ("bridge" if backend == "container" else "")
-        ).strip(),
-        "cpus": str(item.get("cpus") or "1").strip(),
-        "memory": str(item.get("memory") or "1g").strip(),
+        ),
+        "cpus": clean_text(item.get("cpus") or "1"),
+        "memory": clean_text(item.get("memory") or "1g"),
         "pids_limit": item.get("pids_limit") or 256,
         "tmpfs_bytes": item.get("tmpfs_bytes") or 67108864,
-        "runtime_features": tuple(sorted({str(value).strip() for value in raw_features if str(value).strip()})),
+        "runtime_features": tuple(sorted({clean_text(value) for value in raw_features if clean_text(value)})),
         "protocol_version": item.get("protocol_version") or 2,
         "pool_max_concurrent_workers": item.get("pool_max_concurrent_workers"),
     }

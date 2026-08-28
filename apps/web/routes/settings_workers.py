@@ -224,18 +224,17 @@ async def test_worker_settings(request: Request) -> Any:
 async def put_worker_settings(request: Request) -> Any:
     body = await _require_dict_body(request)
     try:
-        from apps.web.drivers import _reject_legacy_swarm_fields
+        from apps.web.drivers import _reject_retired_swarm_fields
 
-        _reject_legacy_swarm_fields(body)
+        _reject_retired_swarm_fields(body)
         cfg = request.app.state.manager.worker_config.set(
             engines=body.get("engines"),
-            start_workers=body.get("start_workers"),
             max_workers=body.get("max_workers"),
             worker_backend=body.get("worker_backend"),
             wall_clock_budget=body.get("wall_clock_budget"),
             max_total_workers=body.get("max_total_workers"),
             cost_budget_usd=body.get("cost_budget_usd"),
-            stage_policy=body.get("stage_policy"),
+            review_policy=body.get("review_policy"),
             llm_profiles=body.get("llm_profiles"),
             llm_providers=body.get("llm_providers"),
             runtime_profiles=body.get("runtime_profiles"),

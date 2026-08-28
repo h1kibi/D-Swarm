@@ -111,7 +111,7 @@ class LLMResponse:
 
 @dataclass
 class ModelSpec:
-    """A configured model 'persona' in the swarm lineup."""
+    """A configured model 'persona' in the worker roster."""
 
     solver_id: str
     model: str

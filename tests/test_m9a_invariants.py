@@ -41,7 +41,7 @@ def _challenge() -> Challenge:
 
 
 def test_swarm_has_no_run_global_container_fields() -> None:
-    swarm = Swarm(_challenge(), [], llm=None, sandbox=None)
+    swarm = Swarm(_challenge(), llm=None, sandbox=None)
 
     for name in (
         "_container_handle",

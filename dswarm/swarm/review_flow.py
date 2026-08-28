@@ -11,9 +11,85 @@ from dswarm.swarm.budget import WorkerBudgetExhausted
 from dswarm.swarm.errors import WorkerSpawnRejected
 from dswarm.swarm.lane_gate import WorkerLaneDisabled, WorkerLaneStopped
 from dswarm.swarm.shared_graph import EV_REVIEW_FINDING, canonicalize_lane
+from dswarm.swarm.scope_audit import format_violation_finding, scope_violations
 
 
 class ReviewFlowMixin:
+
+    def _scope_audit_corpus(self) -> str:
+        """Build a bounded audit corpus from the graph's effective facts.
+
+        Scope review must inspect worker-produced evidence, not challenge source,
+        prompts, or arbitrary filesystem contents.  Keep the corpus tied to the
+        append-only graph projection and retain fact sequence provenance so a
+        finding can point back to the evidence that mentioned the host.
+        """
+        graph = getattr(self, "shared_graph", None)
+        if graph is None:
+            return ""
+        rows = graph.effective_facts(active_only=True)
+        parts: list[str] = []
+        for row in rows:
+            # ``effective_facts()`` exposes the typed projection names (for
+            # example ``fact_text``/``fact_source``), while older callers and
+            # raw event payloads use ``fact``/``source``.  Keep this boundary
+            # tolerant so the audit actually sees durable worker evidence
+            # rather than silently auditing an empty corpus.
+            fact = str(row.get("fact_text") or row.get("fact") or "").strip()
+            if not fact:
+                continue
+            fact_seq = int(row.get("fact_seq") or 0)
+            source = str(
+                row.get("fact_source")
+                or row.get("source")
+                or row.get("source_solver")
+                or ""
+            ).strip()
+            provenance = f"{source}: {fact}" if source else fact
+            parts.append(f"[fact #{fact_seq}] {provenance}")
+        return "\n".join(parts)
+
+    def _run_scope_audit(self) -> int:
+        """Persist post-hoc pentest scope findings and return new finding count.
+
+        This is deliberately called from the live run finalization path, after
+        workers have written their evidence and before the graph is drained to
+        the UI bus/closed.  CTF runs and pentest runs without a usable scope are
+        no-ops.
+        """
+        challenge = getattr(self, "challenge", None)
+        if challenge is None or str(getattr(challenge, "mode", "ctf")) != "pentest":
+            return 0
+        scope = str(getattr(challenge, "scope", "") or "")
+        if not scope.strip() or getattr(self, "shared_graph", None) is None:
+            return 0
+        corpus = self._scope_audit_corpus()
+        violations = scope_violations(scope, corpus)
+        if not violations:
+            return 0
+
+        graph = self.shared_graph
+        rows = graph.effective_facts(active_only=True)
+        added = 0
+        for violation in violations:
+            payload = format_violation_finding(violation)
+            host = str(violation.get("host") or "").lower()
+            evidence_seqs = [
+                int(row.get("fact_seq") or 0)
+                for row in rows
+                if int(row.get("fact_seq") or 0) > 0
+                and host in str(
+                    row.get("fact_text") or row.get("fact") or ""
+                ).lower()
+            ]
+            seq = graph.add_review_finding(
+                actor="scope-audit",
+                evidence_seqs=evidence_seqs,
+                **payload,
+            )
+            if seq > 0:
+                added += 1
+        return added
 
     @staticmethod
     def _clean_review_policy(value: Any) -> dict[str, Any]:
@@ -22,7 +98,6 @@ class ReviewFlowMixin:
         defaults = {
             "enabled": configured,
             "engine": "",
-            "after_race": True,
             "after_fruitless_workers": 3,
             "after_duplicate_intents": 2,
             "on_course_correct": True,
@@ -41,7 +116,7 @@ class ReviewFlowMixin:
             "max_challenges_per_cycle": 8,
         }
         out = dict(defaults)
-        for key in ("enabled", "after_race", "on_course_correct", "on_reason_dry",
+        for key in ("enabled", "on_course_correct", "on_reason_dry",
                     "on_candidate_spike", "on_operator_hint", "on_unverified_flag", "allow_review_fallback"):
             if key in raw:
                 out[key] = bool(raw.get(key))
@@ -881,13 +956,38 @@ class ReviewFlowMixin:
                 if accepted:
                     applied += 1
             except Exception as exc:  # noqa: BLE001
+                failure_reason = f"review application failed ({type(exc).__name__})"
                 try:
                     self.shared_graph.decide_review_proposal(  # type: ignore[attr-defined]
                         actor="coordinator", proposal_seq=seq,
-                        decision="rejected", reason=str(exc)[:500])
+                        decision="rejected", reason=failure_reason)
+                except Exception as decision_exc:
+                    # The rejection delta below keeps the operator informed even
+                    # when the append-only decision row is unavailable.  Surface
+                    # that durable-state loss separately, but only once per
+                    # proposal and without leaking the exception message/path.
+                    noted = getattr(self, "_review_decision_db_failures_noted", None)
+                    if noted is None:
+                        noted = set()
+                        setattr(self, "_review_decision_db_failures_noted", noted)
+                    if seq not in noted:
+                        if len(noted) >= 128:
+                            noted.clear()
+                        noted.add(seq)
+                        try:
+                            await emit_bb(
+                                "review_db_write_failed",
+                                marker=marker,
+                                proposal_seq=seq,
+                                op="decide_review_proposal",
+                                reason=type(decision_exc).__name__,
+                            )
+                        except Exception:
+                            pass
+                try:
                     await emit_bb("review_proposal_decision", proposal_seq=seq,
                                   marker=marker, decision="rejected",
-                                  reason=str(exc)[:500])
+                                  reason=failure_reason)
                 except Exception:
                     pass
         return applied

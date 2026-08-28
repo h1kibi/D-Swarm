@@ -266,23 +266,23 @@ def test_reverse_skill_module_references_resolve_in_rev_home(tmp_path: Path) -> 
 
 
 def test_ensure_base_skill_links_creates_links(tmp_path: Path) -> None:
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
     home = tmp_path / "home"
     home.mkdir()
-    swarm_mod._ensure_base_skill_links(home)
-    for name in swarm_mod._BASE_SKILLS:
+    assets._ensure_base_skill_links(home)
+    for name in assets._BASE_SKILLS:
         link = home / ".pi" / "agent" / "skills" / name
         assert link.is_symlink()
         assert link.readlink() == Path(f"/home/ctf/.pi/agent/skills/{name}")
 
 
 def test_ensure_direction_links_surfaces_vendored_web_skills(tmp_path: Path) -> None:
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
     home = tmp_path / "home"
     home.mkdir()
-    swarm_mod._ensure_direction_links(home, "web")
+    assets._ensure_direction_links(home, "web")
     for name in ("ctf-web", "linux-privilege-escalation"):
         link = home / ".pi" / "agent" / "skills" / name
         assert link.is_symlink(), f"missing link for {name}"
@@ -292,11 +292,11 @@ def test_ensure_direction_links_surfaces_vendored_web_skills(tmp_path: Path) -> 
 
 
 def test_ensure_direction_links_surfaces_vendored_rev_skills(tmp_path: Path) -> None:
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
     home = tmp_path / "home"
     home.mkdir()
-    swarm_mod._ensure_direction_links(home, "rev")
+    assets._ensure_direction_links(home, "rev")
     for name in ("reverse-engineering", "ctf-reverse"):
         link = home / ".pi" / "agent" / "skills" / name
         assert link.is_symlink(), f"missing link for {name}"

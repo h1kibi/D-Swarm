@@ -76,6 +76,9 @@ class CredentialAccountStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # Native Windows cannot enforce POSIX owner-only bits. This protects
+        # the account store on POSIX; production isolation is Docker/Linux,
+        # not the development host's staging filesystem.
         try:
             self.root.chmod(0o700)
         except OSError:
@@ -564,6 +567,8 @@ def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
+    # This projection is intentionally container-readable. On native Windows,
+    # chmod is best-effort and host staging is not a security boundary.
     try:
         os.chmod(dest, 0o755)
     except OSError:
@@ -596,6 +601,8 @@ def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:
 
 
 def _chmod_tree(root: Path, *, dir_mode: int, file_mode: int) -> None:
+    # Permission modes remain functional metadata for the Linux container;
+    # native Windows hosts cannot provide equivalent owner/group isolation.
     for p in root.rglob("*"):
         try:
             os.chmod(p, dir_mode if p.is_dir() else file_mode)

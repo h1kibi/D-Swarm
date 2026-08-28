@@ -15,12 +15,7 @@ and the invariants — facts live in the code and in `README.md` / `README_CN.md
 - **The swarm shares one event-sourced evidence graph** (`dswarm/swarm/shared_graph.py`,
   append-only). An independent **Reason phase** (`dswarm/solver/reason.py`) reads the
   graph and proposes typed intents for workers to claim.
-- **Race vs coordinator.** Pi worker profiles can attack the same challenge in
-  parallel, first past the gate wins. A two-stage coordinator is configured via
-  `Swarm(stage_policy={"coordinator": {...}})` (`dswarm/swarm/stage_policy.py`;
-  read at `swarm.py` when planning review stages) and dispatches focused workers
-  from graph-planned intents. (A top-level `coordinator` request field is legacy
-  and rejected by `apps/web/drivers.py`; do not document or use it.)
+- **ReasonSwarm scheduling.** Pi worker profiles execute graph-planned typed intents through the shared evidence graph. The scheduler dispatches focused workers, review/revalidation audits results, and the hard provenance gate decides acceptance. Retired Race/Coordinator mode configuration is rejected at the API boundary.
 - **Multi-flag.** `Challenge.expected_flags` (default 1). `expected_flags=1` is
   byte-identical to "first flag wins"; only `>1` engages the multi-flag paths. Until
   `Swarm._flags_complete()`, a flag is not a stop signal.
@@ -55,7 +50,7 @@ and the invariants — facts live in the code and in `README.md` / `README_CN.md
 - **The evidence graph is append-only.** Never make `shared_graph` overwrite in place;
   it is an event-sourced log.
 - **Don't touch the substrate** unless asked: the event spine, provenance gate,
-  first-valid-flag race, cost ledger, and the shared evidence graph.
+  first-valid-flag completion rule, cost ledger, and the shared evidence graph.
 - **One feature at a time.** Finish and verify before starting the next; stay in scope —
   don't expand into adjacent refactors without asking.
 - **Secrets come from the environment** (e.g. `DSWARM_DEEPSEEK_API_KEY`). Entrypoints

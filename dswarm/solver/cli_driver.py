@@ -1113,8 +1113,6 @@ def driver_for(profile_or_name: str | dict[str, Any]) -> CliDriver:
 # `cursor-agent status` shows logged-in). health_detail() shells a real one-turn
 # hello, so it's expensive: cache it on its OWN throttle (>= the deck's 60s poll)
 # with last-good reuse, exactly like quota. Decorative + never blocks the bar.
-_HEALTH_TTL = 55.0
-_health_cache: dict = {"ts": 0.0, "data": None}
 
 
 import contextlib as _contextlib
@@ -1155,30 +1153,6 @@ def _probe_health_with_creds(name: str, drv: "CliDriver",
     with _patched_env(env):
         return drv.health_detail()
 
-
-def engine_liveness(account_root: "Optional[str]" = None) -> dict:
-    """Best-effort {engine: {healthy: bool, detail: str}} from a DEEP one-turn
-    probe, throttled to one real run per _HEALTH_TTL with last-good reuse. This is
-    what lets the engine bar show "cursor unavailable: Authentication required"
-    instead of a green dot, even when no run is active. NEVER raises / blocks.
-
-    `account_root` (the credential-account store) lets the probe inject each engine's
-    default-account auth so cursor (CURSOR_API_KEY-only headless) isn't falsely
-    reported down — mirrors the live-worker / _healthy_engines credential path."""
-    now = time.time()
-    cached = _health_cache.get("data")
-    if cached is not None and now - _health_cache["ts"] < _HEALTH_TTL:
-        return cached
-    out: dict = {}
-    for name, drv in DRIVERS.items():
-        try:
-            healthy, detail = _probe_health_with_creds(name, drv, account_root)
-        except Exception as exc:  # noqa: BLE001 — bar must never break
-            healthy, detail = False, str(exc)[:160]
-        out[name] = {"healthy": bool(healthy), "detail": detail or ""}
-    _health_cache["data"] = out
-    _health_cache["ts"] = now
-    return out
 
 
 def engine_status(account_root: "Optional[str]" = None,

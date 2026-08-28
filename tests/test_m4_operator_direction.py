@@ -115,6 +115,21 @@ def test_operator_direction_normalization_accepts_alias_and_rejects_dirty_value(
     assert normalize_operator_direction("not-a-direction")[0] == ""
 
 
+def test_operator_direction_has_one_shared_public_implementation():
+    from apps.web import drivers
+    from dswarm.solver.direction_rules import normalize_operator_direction
+
+    assert drivers.normalize_operator_direction is normalize_operator_direction
+
+
+def test_graph_key_normalizers_delegate_to_dependency_free_leaf():
+    from dswarm.core import normalization
+
+    assert SQLiteSharedGraph.normalize_route_hash("sqli on /login") == normalization.normalize_route_hash("sqli on /login")
+    assert SQLiteSharedGraph.normalize_lane_key("destructive:https:443@example.test") == normalization.normalize_lane_key("destructive:https:443@example.test")
+    assert SQLiteSharedGraph.normalize_resource_key(" target / 443 ") == normalization.normalize_resource_key(" target / 443 ")
+
+
 def test_resolve_direction_merge_distinguishes_missing_from_explicit_auto():
     from apps.web.run_manager import merge_resolve_dispatch
 
@@ -139,7 +154,7 @@ async def test_web_driver_threads_canonical_operator_direction_into_ctf_challeng
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kwargs):
+        def __init__(self, challenge, **kwargs):
             captured["challenge"] = challenge
 
         async def run(self):
@@ -188,7 +203,7 @@ async def test_web_driver_ignores_operator_direction_in_pentest(monkeypatch):
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kwargs):
+        def __init__(self, challenge, **kwargs):
             captured["challenge"] = challenge
 
         async def run(self):

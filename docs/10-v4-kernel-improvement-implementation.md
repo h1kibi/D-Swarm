@@ -1467,12 +1467,14 @@ provenance gate 均未改动；生产代码也不反向导入任何 M8 模块。
 
 **Status (2026-08-19): Verified-PoC M9 implemented and verified; other M9 items remain separate.**
 
+> Scope-audit status (2026-08-27): production finalization wiring and the typed cleanup registry are implemented and verified; raw command cleanup is intentionally unsupported.
+
 | 项 | 实现要点 | 测试 |
 |---|---|---|
 | **Verified-PoC 门**（pentest） | `cli_solver._handle_poc_save` 扩展：POC 记录 `Reproduction{command, indicator}`；review_flow 对高严重度 finding 生成 verifier intent；verifier 重跑后 indicator 必须出现在 `_provenance_corpus` 才把 finding 置 verified（复用 witness gate 模式，不新增可信度语义） | test_pentest_mode.py：无复现证据的 finding 不得 verified；indicator 命中即 verified |
 | **scope 事后审计** | `dswarm/swarm/scope_audit.py`：解析 `Challenge.scope` 白名单（复用 canonicalize_lane 的 host 归一化），扫描 provenance corpus 检 out-of-scope 引用 → `EV_REVIEW_FINDING(kind="scope_violation")` + 报告排除 + HITL 提示 | 白名单命中/越界/无 scope 三态；violation 不进 verified 集合 |
-| **cleanup registry** | blackboard skill 增 `CLEANUP=<cmd>` 标记 → `cleanup_actions` 表（intent 关联）；wind-down（`_finalize_coordinator_run`）逆序执行 + 报告清单 | 逆序执行；失败不阻断 finalize；清单可读 |
-| **上游合并补丁** | ① custom-endpoint 健康检查跑真实 CLI 回合（0.2.4 语义，EndpointDriver 已有 hello 机制，补齐 schema 错误预检）；② worker 镜像 UID/GID 探测后 chown（0.2.5）；③ 容器内强制 container backend、拒绝静默回退 host | 各自独立确定性测试；全量回归 |
+| **cleanup registry** | blackboard skill 与 CLI solver 仅接受 typed `CLEANUP=<action_type>:<target>`；SharedGraph 记录 action/intent/owner 关联并由事件流重建投影；`_finalize_coordinator_run` 按逆序执行，artifact 动作仅限 `workers/...` unlink，其余动作必须使用注入的授权 runtime adapter；无 host shell/raw command fallback | typed marker 拒绝、注册幂等、projection rebuild、逆序执行、失败不阻断 finalize、bridge 脱敏与路径边界 |
+| **上游补丁核对** | 0.2.4 是 Codex 专用 custom-endpoint 修复（`base_url` 注入 profile、真实 Responses CLI turn、file-backed key 注入）；D-Swarm 已淘汰 Codex，仅保留 pi。当前 `worker_config.py` + `EndpointDriver` + `endpoint_probe.py` 以直接 HTTP `/models` 与实际模型 Chat/Responses 请求完成认证、协议和 schema/model 预检，不恢复 CLI hello；0.2.5 的 worker UID/GID 探测+chown 与容器 backend 边界已自有实现 | `tests/test_worker_endpoint.py`、`tests/test_cli_executor.py`、`tests/test_connectivity_probes.py`、`tests/test_worker_config.py`；全量回归 |
 
 ---
 

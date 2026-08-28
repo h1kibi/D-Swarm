@@ -97,9 +97,9 @@ def test_worker_profiles_rename_cascades_foreign_keys(tmp_path):
     st.set_identity_model(seats=ident["seats"], credentials=ident["credentials"],
                           environments=ident["environments"])
     cfg = WorkerConfigStore(root=tmp_path).get()
-    # review.engine must still resolve to a real profile name (not dangling)
+    # review_policy.engine must still resolve to a real profile name (not dangling)
     names = {p["name"] for p in cfg["worker_profiles"]}
-    assert cfg["stage_policy"]["coordinator"]["review"]["engine"] in names
+    assert cfg["review_policy"]["engine"] in names
     # engines roster non-empty
     assert cfg["engines"]
 
@@ -116,13 +116,19 @@ def test_inflight_legacy_name_alias_resolves(tmp_path):
     assert sid == alias["pi-web-local"]
 
 
-# 5) the additive API accepts legacy AND new fields
-def test_api_keeps_legacy_fields_additive(tmp_path):
+# 5) live API projects the current worker/review contract only
+def test_api_discards_retired_stage_and_race_fields(tmp_path):
     st = _store(tmp_path, LEGACY_CONFIG)
     cfg = st.get()
-    # old + new coexist in the same payload
-    for legacy in ("worker_profiles", "engines", "stage_policy"):
-        assert legacy in cfg
+    # Legacy flat worker projection remains an internal driver boundary, but
+    # retired dispatch fields are migration-only and cannot re-enter live config.
+    for retained in ("worker_profiles", "engines", "review_policy"):
+        assert retained in cfg
+    for retired in ("stage_policy", "race_engines"):
+        assert retired not in cfg
+    assert all("race" not in seat for seat in cfg["seats"])
+    assert all("race" not in profile for profile in cfg["worker_profiles"])
+    assert all("race" not in profile["roles"] for profile in cfg["worker_profiles"])
     for new in ("seats", "credentials", "environments", "seat_alias"):
         assert new in cfg
 
@@ -178,18 +184,19 @@ def test_model_pin_survives_migration(tmp_path):
     assert web_prof["model"] == "deepseek-v4-pro"
 
 
-# 9) race:false survives migration and still gates the race role
-def test_race_false_survives_migration(tmp_path):
+# 9) retired race input is normalized once and never leaks back out
+def test_retired_race_fields_are_normalized_on_migration(tmp_path):
     cfg = dict(LEGACY_CONFIG)
     cfg["worker_profiles"] = [dict(LEGACY_CONFIG["worker_profiles"][0], race=False)]
     cfg["engines"] = ["pi-web-local"]
     cfg["race_engines"] = []
     cfg["stage_policy"] = {"coordinator": {"review": {"engine": "pi-web-local"}}}
-    st = _store(tmp_path, cfg)
-    got = st.get()
-    seat = got["seats"][0]
-    assert seat["race"] is False
-    assert got["worker_profiles"][0]["race"] is False
+    got = _store(tmp_path, cfg).get()
+    assert got["seats"][0]["roles"] == ["explore", "review"]
+    assert "race" not in got["seats"][0]
+    assert "race" not in got["worker_profiles"][0]
+    assert "stage_policy" not in got
+    assert "race_engines" not in got
 
 
 # 10) binding fields are additive (don't break old health consumers)

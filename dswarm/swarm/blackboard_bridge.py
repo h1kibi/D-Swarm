@@ -7,6 +7,7 @@ from typing import Any
 
 from dswarm.swarm.shared_graph import _is_runtime_infra_fact_text
 from dswarm.swarm.poc_verification import sanitize_public_text
+from dswarm.swarm.cleanup_registry import public_cleanup_target, public_cleanup_text
 
 
 class BlackboardBridgeMixin:
@@ -108,6 +109,31 @@ class BlackboardBridgeMixin:
                 "candidate_indicator_digest": sanitize_public_text(
                     p.get("candidate_indicator_digest") or "", limit=80
                 ),
+            })]
+        if kind == "cleanup_action_registered":
+            target = str(p.get("target") or "")
+            return [("cleanup_action_registered", {
+                "seq": seq,
+                "action_id": sanitize_public_text(p.get("action_id") or "", limit=160),
+                "action_type": sanitize_public_text(p.get("action_type") or "", limit=64),
+                "actor": sanitize_public_text(p.get("actor") or actor, limit=120),
+                "intent_id": sanitize_public_text(p.get("intent_id") or "", limit=160),
+                "status": "registered",
+                **public_cleanup_target(target),
+            })]
+        if kind == "cleanup_executed":
+            return [("cleanup_executed", {
+                "seq": seq,
+                "action_id": sanitize_public_text(p.get("action_id") or "", limit=160),
+                "status": "executed",
+                **public_cleanup_text(p.get("result") or "", prefix="result"),
+            })]
+        if kind == "cleanup_failed":
+            return [("cleanup_failed", {
+                "seq": seq,
+                "action_id": sanitize_public_text(p.get("action_id") or "", limit=160),
+                "status": "failed",
+                **public_cleanup_text(p.get("reason") or "cleanup failed", prefix="reason"),
             })]
         if kind == "poc_verification_started":
             return [("poc_verification_started", {

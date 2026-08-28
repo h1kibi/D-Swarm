@@ -42,6 +42,37 @@ export enum EventType {
   PROVIDER_BATCH_ALERT = "provider.batch_alert",
 }
 
+// Kinds with an explicit reducer branch. Keeping this set beside the switch
+// makes the boundary deliberate: a newly emitted blackboard kind is allowed to
+// reach the generic timeline, but it must not accidentally create typed state
+// (or a solver graph node) until its UI contract is implemented.
+const BLACKBOARD_CONSUMED_KINDS = new Set([
+  "metrics_summary", "intent_proposed", "intent_claimed", "intent_concluded",
+  "fact_added", "dead_end", "poc_saved", "poc_claimed", "poc_concluded",
+  "runtime_degraded", "worker_backend_degraded", "engine_degraded",
+  "phase_transition", "worker_budget_exhausted", "cost_budget_exhausted",
+  "intent_reopened", "fact_rejected", "fact_superseded", "fact_merged",
+  "intent_state_changed", "operator_directive_changed", "hitl_classified",
+  "resource_lock_changed", "flag_invalidated", "flag_found", "flag_unverified",
+  "flag_audit", "review_proposal", "need_input", "awaiting_operator",
+  "operator_paused", "operator_resumed", "worker_spawned", "review_started",
+  "review_finished", "review_finding", "fact_challenged", "fact_revalidated",
+  "route_suppressed", "route_reopened", "branch_split", "branch_resolved",
+  "provider_recovery_directive", "worker_recovery_scheduled",
+  "provider_dispatch_paused", "worker_recovery_exhausted", "provider_batch_alert",
+  "coordinator_directive", "worker_killed", "worker_spawn_rejected",
+  "worker_finished", "goal_complete", "budget_exhausted", "reason_start",
+  "reason_done", "race_started", "race_concluded",
+  // Secondary typed consumers (reason-loop and pheromone finding folds).
+  "finding_upserted", "recon_started", "recon_completed", "reason_cycle_started",
+  "intent_skipped", "dispatch_decision", "fallback_dispatch", "intent_completed",
+  "intent_failed", "reason_cycle_completed", "reason_loop_finished",
+]);
+
+function isConsumedBlackboardKind(kind: unknown): kind is string {
+  return typeof kind === "string" && BLACKBOARD_CONSUMED_KINDS.has(kind);
+}
+
 export function isRuntimeInfraFactText(x: unknown): boolean {
   const s = String(x ?? "").trim().toLowerCase();
   if (!s) return false;
@@ -690,7 +721,9 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
   const p = ev.payload || {};
   const isMetricsSummary =
     ev.event_type === EventType.BLACKBOARD_DELTA && p.kind === "metrics_summary";
-  if (sid && !isMetricsSummary) ensureSolverNode(m, sid);
+  const isTypedBlackboardEvent =
+    ev.event_type !== EventType.BLACKBOARD_DELTA || isConsumedBlackboardKind(p.kind);
+  if (sid && isTypedBlackboardEvent && !isMetricsSummary) ensureSolverNode(m, sid);
   switch (ev.event_type) {
     case EventType.RUN_STARTED: {
       // RUN_STARTED fires once PER worker; only the first one opens the thread.
@@ -906,12 +939,15 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
     }
     case EventType.BLACKBOARD_DELTA: {
       const bb = s.blackboard;
-      const actor = isMetricsSummary ? "" : (p.actor ?? sid ?? "");
-      if (!isMetricsSummary && actor && !bb.workers.includes(actor)) {
+      const actor = isMetricsSummary ? "" : (typeof p.actor === "string" ? p.actor : sid);
+      if (isTypedBlackboardEvent && !isMetricsSummary && actor && !bb.workers.includes(actor)) {
         bb.workers = [...bb.workers, actor];
       }
+      const kind = typeof p.kind === "string" && p.kind.trim()
+        ? p.kind.trim()
+        : "(missing kind)";
       const tlabel = (txt: string) => {
-        bb.events = [...bb.events, { id: gid("bbe"), kind: p.kind, actor, ts: ev.ts, label: txt }].slice(-300);
+        bb.events = [...bb.events, { id: gid("bbe"), kind, actor, ts: ev.ts, label: txt }].slice(-300);
       };
       switch (p.kind) {
         case "metrics_summary": {
@@ -1727,8 +1763,13 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           tlabel(`${actor} legacy execution activity`);
           break;
         }
-        default:
+        default: {
+          // Contract v1: unknown/malformed kinds are observable but inert.
+          // They must not mutate typed blackboard projections, scheduling, or
+          // provenance/flag state; replay remains forward-compatible.
+          tlabel(`unrecognized blackboard event: ${kind}`);
           break;
+        }
       }
       // Phase 2: fold the reason scheduler's own narration (actor="reason"
       // deltas) into the reason-loop view. No-op (same reference) otherwise.

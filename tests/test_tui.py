@@ -32,7 +32,7 @@ def test_format_event_covers_key_types() -> None:
 async def test_tui_renders_mock_solve_and_captures_flag() -> None:
     bus = EventBus()
     cost = CostController(bus=bus)
-    app = DSwarmTUI(bus, lineup="mock-flash", stop_on_finish=False)
+    app = DSwarmTUI(bus, status_label="mock-flash", stop_on_finish=False)
 
     async with app.run_test() as pilot:
         # give the subscriber a moment to attach, then drive the solve
@@ -56,7 +56,7 @@ async def test_tui_hitl_command_reaches_sink() -> None:
     async def sink(target: str, action: str, text: str) -> None:
         got.append((target, action, text))
 
-    app = DSwarmTUI(bus, hitl=sink, lineup="mock")
+    app = DSwarmTUI(bus, hitl=sink, status_label="mock")
     async with app.run_test() as pilot:
         await pilot.pause()
         inp = app.query_one("#cmd")

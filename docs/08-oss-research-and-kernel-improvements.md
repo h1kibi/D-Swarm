@@ -50,12 +50,12 @@
 | PSA + 腾讯文 | 触发器谓词：环境变化直接唤醒行动，不等中央规划周期 | §5.6 Advisor（AdvisorySuggestion 模型，不直接派发） | No-Go（缺消费协议与延迟证据） |
 | PSA | 写入门槛与记忆投毒防御：clamp、限速、burst 指纹、类型越权 | §5.7 注意力卫生 + §5.4 write-rate telemetry（独立 metrics 载体；硬限速/actor cap 先测量后决定） | 部分采纳（先 telemetry） |
 | PSA | per-agent token 预算：软警告 → 硬上限 → 暂停派发 | §5.3 token accounting 三层 identity 重设计 | Redesign before Go |
-| PSA | Verified-PoC 门：finding 必须带 Reproduction 重放验证 | **§5.8-1（本轮补回挂起项）** | 待办（v1→v3 重构时漏挂，见 §5.8） |
-| PSA | scope 双层强制 → 事后审计形态 | **§5.8-2（本轮补回挂起项）** | 待办（同上） |
-| PSA | cleanup registry：清理先注册、逆序执行 | **§5.8-3（本轮补回挂起项）** | 待办（同上） |
+| PSA | Verified-PoC 门：finding 必须带 Reproduction 重放验证 | **§5.8-1（本轮补回挂起项）** | 已落地（2026-08-27；pentest review/revalidation） |
+| PSA | scope 双层强制 → 事后审计形态 | **§5.8-2（本轮补回挂起项）** | 已落地（2026-08-27；pentest finalize audit） |
+| PSA | cleanup registry：清理先注册、逆序执行 | **§5.8-3（本轮补回挂起项）** | 已落地（2026-08-27；typed registry） |
 | upstream muteki | 并行 race/recon（多引擎单发冲刺） | §6 否决（成本均衡 vs 首血速度） | 否决（维护者决策） |
 | upstream muteki | 多引擎异构盲区互补 | §6 否决（per-profile provider/model/effort 已是配置问题） | 否决 |
-| upstream muteki | custom-endpoint 健康检查跑真实 CLI 回合（0.2.4） | **§5.8-4（本轮补回挂起项）** | 待办合并补丁 |
+| upstream muteki | custom-endpoint 健康检查跑真实 CLI 回合（0.2.4） | **§5.8-4（本轮补回挂起项）** | 已核实：Codex 专用 CLI 路径不直接移植；pi-only 由 EndpointDriver 共享 HTTP model/schema probe 覆盖 |
 | 腾讯文 | 去中心化的调试成本 / alpha 成熟度争议 | §6「否决全面去中心化」的论据 | 佐证 |
 | upstream muteki | Reviewer 机制 | 非提案——D-Swarm 已有 `review_flow.py` | 已有 |
 
@@ -93,8 +93,7 @@ intent → 截断到 max_intents_per_reason → 对 fresh decisions 直接 `asyn
 （内容与 v1/v2 相同，摘要）异构多模型 CTF swarm（claude/codex/cursor），NYU 200/200
 （~$214、~370M tokens、中位 2-4 分钟；引擎分布 cursor 80 / claude 75 / codex 45），四阶段
 架构（Prepare / Recon Race / 协调主循环 2s 一圈 / Wind-down）+ Reviewer。与 D-Swarm 的关系：
-同源 fork 各自演进——D-Swarm 在 gate 加固（`_TEST_MARKER_RE` 等）、btw、模块化领先；上游在
-race 模式、多引擎驱动、custom-endpoint 真实健康检查（0.2.4）、容器一致性强制领先。
+同源 fork 各自演进——D-Swarm 在 gate 加固（`_TEST_MARKER_RE` 等）、btw、模块化领先；上游的 race 模式、多引擎驱动仍属历史差异，0.2.4 的 Codex custom-endpoint CLI 健康检查不应当被当作当前 pi-only 内核的缺失。
 
 ## 3. 参考材料二：Armur-Ai/Pentest-Swarm-AI
 
@@ -217,10 +216,9 @@ pause/stop/budget 约束。且 multi-flag 的 Reason prompt 已能看到已捕�
 token accounting 并入第三批（redesign 版）；write-rate telemetry 并入第四批（独立 metrics
 载体）；硬限速与 burst 指纹/actor cap 仍为"先测量后决定"，不做生产常量。
 
-### 5.8 OSS 遗产待办（v1→v3 批次重构时漏挂，本轮显式补回；不进六批，独立小项）
+### 5.8 OSS 遗产待办与核实（v1→v3 批次重构时漏挂，本轮显式补回；不进六批，独立小项）
 
-以下四项来自调研、在 v1 方案中提出、但在 v2/v3 的六批重构中失去了落点。它们不是六批的
-前置条件，也不阻塞六批实施，作为**显式挂起项**记录，防止思想吸收链条断裂：
+以下四项来自调研、在 v1 方案中提出、但在 v2/v3 的六批重构中失去了落点。本轮显式补回并逐项核实：前三项已按 D-Swarm 语义落地，第四项已确认采用 pi-only 等价实现，不恢复已淘汰的 Race/Coordinator 或 Codex 专用路径：
 
 1. **Pentest 模式 Verified-PoC 门**（PSA §4.3 → flag gate 哲学迁移）：高严重度 finding 只有
    通过 verifier intent 重跑 `{Command, HTTPRequest, ExpectedIndicator}` 且指标出现在真实
@@ -233,9 +231,7 @@ token accounting 并入第三批（redesign 版）；write-rate telemetry 并入
 3. **cleanup registry**（PSA §1.3.1 → 目标侧产物治理）：worker 在目标侧创建的产物
    （listener 端口、上传文件、残留会话）登记进 shared_graph（`resource_locks` 已有雏形），
    wind-down 逆序释放 + 报告清单。
-4. **上游合并补丁**（muteki 0.2.4/0.2.5）：custom-endpoint 健康检查跑真实 CLI 回合、开跑前
-   暴露 LiteLLM/DeepSeek schema 错误；探测 worker 镜像真实 UID/GID 再 chown；容器内强制
-   container backend、拒绝静默回退 host。均为小合并，各自独立验证。
+4. **上游补丁核对**（muteki 0.2.4/0.2.5）：0.2.4 是 Codex 专用 custom-endpoint 修复（账户 `base_url` 注入 profile、真实 Responses CLI turn、file-backed key 注入）；D-Swarm 已是 pi-only，不恢复 Codex CLI hello。当前 `worker_config.py` 将 endpoint account overlay 到 profile，`EndpointDriver.health_detail()` 调用共享 `probe_endpoint(validate_model=True)`，执行 `/models` 认证/发现并按配置或 auto fallback 对实际模型发送 Chat/Responses 请求，已覆盖开跑前的模型/schema 预检语义。0.2.5 的 worker 镜像 UID/GID 探测+chown 及容器 backend 边界也已在本仓实现；三项均不再是待办。
 
 ---
 

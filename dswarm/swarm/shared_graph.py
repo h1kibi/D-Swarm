@@ -34,7 +34,6 @@ import sqlite3
 import threading
 import time
 import uuid
-from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, runtime_checkable
@@ -52,7 +51,23 @@ from dswarm.swarm.fact_events import (
 )
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 from dswarm.swarm.route_telemetry import RouteMetricRecord
-from dswarm.solver.direction_rules import sanitize_raw_direction
+from dswarm.core.normalization import (
+    LANE_RISK_CLASSES as _LANE_RISK_CLASSES,
+    ROUTE_ALIAS as _ROUTE_ALIAS,
+    ROUTE_STOPWORDS as _ROUTE_STOPWORDS,
+    normalize_fact_identity as _normalize_fact_identity,
+    normalize_lane_host as _clean_lane_host,
+    normalize_lane_key as _normalize_lane_key,
+    normalize_lane_risk as _clean_lane_risk,
+    normalize_observed_route as _normalize_observed_route_value,
+    normalize_resource_key as _normalize_resource_key,
+    normalize_route_hash as _normalize_route_hash,
+    sanitize_raw_direction,
+)
+from dswarm.swarm.cleanup_registry import (
+    cleanup_action_id,
+    validate_cleanup_action,
+)
 from dswarm.swarm.poc_verification import (
     VerificationFailure,
     normalize_reproduction_indicator,
@@ -110,8 +125,16 @@ EV_HITL_CLASSIFIED = "hitl_classified"
 # E: unified resource lock (coexists with lane_locks via the adapter).
 EV_RESOURCE_LOCKED = "resource_locked"
 EV_RESOURCE_RELEASED = "resource_released"
+# M9: typed, run-scoped cleanup lifecycle. Raw shell commands are never stored.
+EV_CLEANUP_ACTION_REGISTERED = "cleanup_action_registered"
+EV_CLEANUP_EXECUTED = "cleanup_executed"
+EV_CLEANUP_FAILED = "cleanup_failed"
 # H: long-run graph compaction.
 EV_GRAPH_COMPACTED = "graph_compacted"
+
+
+from dswarm.swarm.event_reader import GraphEventReader
+from dswarm.swarm.poc_lifecycle import PocLifecycle
 
 
 # A: fact lifecycle states. unresolved/challenged/revalidated keep the legacy
@@ -184,66 +207,6 @@ _SERVICE_DEFAULT_PORTS = {
     "kerberos": 88,
     "postgres": 5432,
 }
-_LANE_RISK_CLASSES = {
-    "destructive",
-    "exclusive_shell",
-    "listener_port",
-    "relay_service",
-    "rate_limited",
-}
-
-
-# A worker records the SAME finding through two entrances: the blackboard skill
-# (write_fact → bare text, verified) AND its CLI stream's VERIFIED_FACT= marker
-# (_record_fact → "[codex] <text>", often witness-downgraded to a candidate). The
-# old dedupe key `fact::{actor}::{artifact_id}::{text}` treated these as two facts
-# (engine prefix + artifact differ), so one finding became 1 verified + 1 candidate
-# echo — the dominant source of candidate inflation (run-75377: 97 candidates, most
-# of them prefixed marker echoes of 33 bare verified skill facts). The fact's
-# IDENTITY is who-said-what, not which entrance or which artifact carried it: strip
-# the leading "[engine] " tag and normalize whitespace so both entrances collide on
-# one key. artifact_id is provenance, not identity — it is excluded from the key.
-_FACT_ENGINE_PREFIX_RE = re.compile(r"^\[[a-z0-9 _.-]{1,40}\]\s*", re.IGNORECASE)
-
-
-def _normalize_fact_identity(fact: str) -> str:
-    s = _FACT_ENGINE_PREFIX_RE.sub("", str(fact or ""))
-    return " ".join(s.split()).lower()
-
-
-def _clean_lane_risk(risk_class: str) -> str:
-    risk = re.sub(r"[^a-z0-9_]+", "_", (risk_class or "").strip().lower()).strip("_")
-    return risk if risk in _LANE_RISK_CLASSES else "destructive"
-
-
-def _clean_lane_host(host: str) -> tuple[str, float, str]:
-    raw = (host or "").strip()
-    if not raw:
-        return "", 0.0, "missing_host"
-    parsed = urlparse(raw if "://" in raw else f"//{raw}")
-    candidate = parsed.hostname or raw
-    candidate = candidate.strip().strip("[]").lower()
-    candidate = re.sub(r"^https?://", "", candidate)
-    candidate = candidate.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    if "@" in candidate:
-        candidate = candidate.rsplit("@", 1)[-1]
-    candidate = candidate.strip().strip("[]")
-    if not candidate:
-        if raw:
-            bucket = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-")[:120]
-            return f"unknown-host:{bucket or hashlib.sha1(raw.encode()).hexdigest()[:10]}", 0.30, "host_unparsed"
-        return "", 0.0, "missing_host"
-    if re.fullmatch(r"[0-9a-f:.]+", candidate) and ":" in candidate:
-        # Keep IPv6 usable without DNS. We do not resolve names here.
-        return candidate, 0.95, ""
-    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", candidate):
-        return candidate, 1.0, ""
-    if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", candidate):
-        return candidate.rstrip("."), 0.85, "host_not_verified"
-    bucket = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-")[:120]
-    return f"unknown-host:{bucket or hashlib.sha1(raw.encode()).hexdigest()[:10]}", 0.30, "host_unparsed"
-
-
 def canonicalize_lane(
     host: str = "",
     port: str | int | None = None,
@@ -436,6 +399,20 @@ class SharedGraph(Protocol):
                                   indicator: str) -> dict[str, Any]: ...
 
     def get_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]: ...
+
+    def register_cleanup_action(
+        self, *, actor: str, action_type: str, target: str,
+        intent_id: str = "", poc_id: str = "", owner_key: str = "",
+        idempotency_key: str = "",
+    ) -> dict[str, Any]: ...
+
+    def cleanup_actions(self, *, include_terminal: bool = True) -> list[dict[str, Any]]: ...
+
+    def cleanup_action_executed(self, *, actor: str, action_id: str,
+                                result: str = "") -> int: ...
+
+    def cleanup_action_failed(self, *, actor: str, action_id: str,
+                              reason: str = "") -> int: ...
 
     def poc_verification_status(self, poc_id: str) -> Optional[dict[str, Any]]: ...
 
@@ -699,11 +676,29 @@ CREATE TABLE IF NOT EXISTS pocs (
     created_seq   INTEGER NOT NULL,
     result_seq    INTEGER
 );
--- P4 action-level dedup: a worker claims a high-cost ACTIVITY (e.g.
--- "nmap:8.130.96.176", "shiro-key-brute:8080") before doing it; a parallel worker
--- that finds the activity already claimed (lease not expired) avoids redoing it.
--- This is the "two workers nmap the same target" fix that intent-level claim can't
--- reach (whole-challenge workers don't claim per-action). Lease-expiry self-heals.
+-- M9: typed, run-scoped cleanup actions. Targets are private graph data;
+-- public bridge payloads expose only a digest and length.
+CREATE TABLE IF NOT EXISTS cleanup_actions (
+    action_id       TEXT PRIMARY KEY,
+    challenge_id    TEXT NOT NULL,
+    action_type     TEXT NOT NULL,
+    target          TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    owner_key       TEXT NOT NULL,
+    intent_id       TEXT,
+    poc_id          TEXT,
+    idempotency_key TEXT,
+    registration_seq INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'registered',
+    execution_seq   INTEGER,
+    failure_reason  TEXT,
+    result          TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_idempotency
+    ON cleanup_actions(challenge_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL AND idempotency_key != '';
+CREATE INDEX IF NOT EXISTS idx_cleanup_registration
+    ON cleanup_actions(challenge_id, registration_seq);
 CREATE TABLE IF NOT EXISTS poc_reproductions (
     reproduction_id TEXT PRIMARY KEY,
     poc_id          TEXT NOT NULL,
@@ -903,6 +898,8 @@ class SQLiteSharedGraph:
         self.artifacts = artifacts  # ArtifactStore, for the P-B gate
         # M6 telemetry is a best-effort sidecar, never an evidence source.
         self._metrics_sink = metrics_sink
+        self._poc_lifecycle = PocLifecycle(self)
+        self._event_reader = GraphEventReader(self)
         db_file = Path(self.db_path)
         is_new_database = not db_file.exists() or db_file.stat().st_size == 0
         db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -994,6 +991,7 @@ class SQLiteSharedGraph:
         if is_new_database or user_version(self._conn) == self.SUPPORTED_USER_VERSION:
             install_fact_event_contract(self._conn)
         self._rebuild_poc_reproduction_projection()
+        self._rebuild_cleanup_projection()
 
     def _table_exists(self, name: str) -> bool:
         with self._lock:
@@ -1073,15 +1071,7 @@ class SQLiteSharedGraph:
 
     @classmethod
     def _normalize_observed_route(cls, route_hash: Any) -> str:
-        value = str(route_hash or "").strip().lower()
-        if not value:
-            return ""
-        # normalize_route_hash() creates this fallback form when the input has
-        # no route tokens. Preserve that already-canonical identity instead of
-        # stripping the reserved ``route:`` prefix on a second normalization.
-        if re.fullmatch(r"route:[0-9a-f]{10}", value):
-            return value
-        return cls.normalize_route_hash(value)
+        return _normalize_observed_route_value(route_hash)
 
     def route_observations(
         self, fact_seqs: Iterable[int]
@@ -1201,6 +1191,284 @@ class SQLiteSharedGraph:
             dedupe_key=f"fact_verified::{int(fact_seq)}",
         )
 
+    # ── M9 PoC lifecycle delegation ──────────────────────────────────────────
+    # The domain implementation is composed, not inherited, so shared_graph.py
+    # remains the persistence host and callers retain the existing API surface.
+    @staticmethod
+    def _intent_result_marks_poc_spent(result: str) -> bool:
+        return is_genuine_giveup(result)
+
+    def _intent_owned_by(self, actor: str, intent_id: str, *, row: Optional[tuple] = None) -> bool:
+        return self._poc_lifecycle._intent_owned_by(actor, intent_id, row=row)
+
+    def _rebuild_poc_reproduction_projection(self) -> None:
+        self._poc_lifecycle._rebuild_poc_reproduction_projection()
+
+    def save_poc(self, *, actor: str, poc_id: str, path: str,
+                 entry_command: str, status: str = "available",
+                 note: str = "", artifact_id: Optional[str] = None,
+                 intent_id: Optional[str] = None, name: str = "") -> int:
+        return self._poc_lifecycle.save_poc(
+            actor=actor, poc_id=poc_id, path=path, entry_command=entry_command,
+            status=status, note=note, artifact_id=artifact_id, intent_id=intent_id,
+            name=name,
+        )
+
+    def claim_poc(self, *, worker: str, poc_id: str,
+                  lease_s: float = 300.0) -> bool:
+        return self._poc_lifecycle.claim_poc(worker=worker, poc_id=poc_id, lease_s=lease_s)
+
+    def conclude_poc(self, *, actor: str, poc_id: str,
+                     status: str = "spent", note: str = "") -> int:
+        return self._poc_lifecycle.conclude_poc(
+            actor=actor, poc_id=poc_id, status=status, note=note,
+        )
+
+    def pocs(self, *, inheritable_only: bool = False) -> list[dict]:
+        return self._poc_lifecycle.pocs(inheritable_only=inheritable_only)
+
+    def _poc_reproduction_row(self, row: sqlite3.Row | tuple | None) -> Optional[dict[str, Any]]:
+        return self._poc_lifecycle._poc_reproduction_row(row)
+
+    def _select_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]:
+        return self._poc_lifecycle._select_poc_reproduction(poc_id)
+
+    def register_poc_reproduction(self, *, actor: str, poc_id: str,
+                                  indicator: str) -> dict[str, Any]:
+        return self._poc_lifecycle.register_poc_reproduction(
+            actor=actor, poc_id=poc_id, indicator=indicator,
+        )
+
+    def get_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]:
+        return self._poc_lifecycle.get_poc_reproduction(poc_id)
+
+    def poc_verification_status(self, poc_id: str) -> Optional[dict[str, Any]]:
+        return self._poc_lifecycle.poc_verification_status(poc_id)
+
+    def begin_poc_verification(self, *, actor: str, poc_id: str,
+                               verification_id: str, reproduction_id: str,
+                               worker_id: str = "", finding_id: str = "",
+                               intent_id: str = "", pool_identity: str = "",
+                               lease_s: float = 600.0) -> Optional[dict[str, Any]]:
+        return self._poc_lifecycle.begin_poc_verification(
+            actor=actor, poc_id=poc_id, verification_id=verification_id,
+            reproduction_id=reproduction_id, worker_id=worker_id,
+            finding_id=finding_id, intent_id=intent_id, pool_identity=pool_identity,
+            lease_s=lease_s,
+        )
+
+    def append_poc_verification_terminal(
+        self, *, actor: str, poc_id: str, verification_id: str,
+        verified: bool, exit_code: Optional[int] = None,
+        failure_reason: Optional[VerificationFailure | str] = None,
+        observed_location: str = "",
+        provenance_artifact_ids: Optional[list[str]] = None,
+        diagnostics: str = "", elapsed_ms: Optional[int] = None,
+    ) -> int:
+        return self._poc_lifecycle.append_poc_verification_terminal(
+            actor=actor, poc_id=poc_id, verification_id=verification_id,
+            verified=verified, exit_code=exit_code, failure_reason=failure_reason,
+            observed_location=observed_location,
+            provenance_artifact_ids=provenance_artifact_ids, diagnostics=diagnostics,
+            elapsed_ms=elapsed_ms,
+        )
+
+    def mark_review_finding_verified(
+        self, *, actor: str, finding_id: str, poc_id: str,
+        reproduction_id: str, verification_id: str,
+    ) -> int:
+        return self._poc_lifecycle.mark_review_finding_verified(
+            actor=actor, finding_id=finding_id, poc_id=poc_id,
+            reproduction_id=reproduction_id, verification_id=verification_id,
+        )
+
+    # ── M9 typed cleanup registry and lifecycle projection ───────────────────
+    @staticmethod
+    def _cleanup_row(row: Any) -> Optional[dict[str, Any]]:
+        if row is None:
+            return None
+        keys = ("action_id", "challenge_id", "action_type", "target", "actor",
+                "owner_key", "intent_id", "poc_id", "idempotency_key",
+                "registration_seq", "status", "execution_seq", "failure_reason",
+                "result")
+        return dict(zip(keys, row))
+
+    def _select_cleanup_action(self, action_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT action_id, challenge_id, action_type, target, actor, owner_key, "
+                "intent_id, poc_id, idempotency_key, registration_seq, status, "
+                "execution_seq, failure_reason, result FROM cleanup_actions "
+                "WHERE challenge_id=? AND action_id=?",
+                (self.challenge.id, str(action_id)),
+            ).fetchone()
+        return self._cleanup_row(row)
+
+    def _rebuild_cleanup_projection(self) -> None:
+        """Fold cleanup lifecycle events into the rebuildable action table."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM cleanup_actions WHERE challenge_id=?", (self.challenge.id,)
+            )
+            rows = self._conn.execute(
+                "SELECT seq, kind, actor, payload FROM events WHERE challenge_id=? "
+                "AND kind IN (?,?,?) ORDER BY seq",
+                (self.challenge.id, EV_CLEANUP_ACTION_REGISTERED,
+                 EV_CLEANUP_EXECUTED, EV_CLEANUP_FAILED),
+            ).fetchall()
+            for seq, kind, actor, raw_payload in rows:
+                try:
+                    payload = json.loads(raw_payload or "{}")
+                except (TypeError, ValueError):
+                    # A malformed external event must not prevent the remaining
+                    # append-only log from rebuilding its projections.
+                    continue
+                action_id = str(payload.get("action_id") or "")
+                if not action_id:
+                    continue
+                if kind == EV_CLEANUP_ACTION_REGISTERED:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO cleanup_actions "
+                        "(action_id, challenge_id, action_type, target, actor, owner_key, "
+                        "intent_id, poc_id, idempotency_key, registration_seq, status) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (action_id, self.challenge.id, payload.get("action_type") or "",
+                         payload.get("target") or "", payload.get("actor") or actor,
+                         payload.get("owner_key") or payload.get("actor") or actor,
+                         payload.get("intent_id") or None, payload.get("poc_id") or None,
+                         payload.get("idempotency_key") or None, int(seq), "registered"),
+                    )
+                elif kind == EV_CLEANUP_EXECUTED:
+                    self._conn.execute(
+                        "UPDATE cleanup_actions SET status='executed', execution_seq=?, "
+                        "failure_reason=NULL, result=? WHERE challenge_id=? AND action_id=?",
+                        (int(seq), payload.get("result") or "", self.challenge.id, action_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE cleanup_actions SET status='failed', execution_seq=?, "
+                        "failure_reason=?, result=NULL WHERE challenge_id=? AND action_id=?",
+                        (int(seq), str(payload.get("reason") or "cleanup failed")[:512],
+                         self.challenge.id, action_id),
+                    )
+            self._conn.commit()
+
+    def register_cleanup_action(
+        self, *, actor: str, action_type: str, target: str,
+        intent_id: str = "", poc_id: str = "", owner_key: str = "",
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        kind, target_text, actor_text, owner_text = validate_cleanup_action(
+            action_type, target, actor=actor, owner_key=owner_key or actor,
+        )
+        if not actor_text or not owner_text:
+            raise ValueError("cleanup actor and owner are required")
+        intent_text = str(intent_id or "").strip()
+        poc_text = str(poc_id or "").strip()
+        idem = str(idempotency_key or "").strip()
+        if len(intent_text) > 256 or len(poc_text) > 256 or len(idem) > 512:
+            raise ValueError("invalid cleanup binding")
+        action_id = cleanup_action_id(
+            challenge_id=self.challenge.id, actor=actor_text, action_type=kind,
+            target=target_text, intent_id=intent_text, idempotency_key=idem,
+        )
+        existing = self._select_cleanup_action(action_id)
+        if existing is not None:
+            return existing
+        if idem:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT action_id FROM cleanup_actions WHERE challenge_id=? "
+                    "AND idempotency_key=?", (self.challenge.id, idem),
+                ).fetchone()
+            if row is not None:
+                return self._select_cleanup_action(str(row[0])) or {}
+        payload = {
+            "action_id": action_id, "action_type": kind, "target": target_text,
+            "actor": actor_text, "owner_key": owner_text, "intent_id": intent_text,
+            "poc_id": poc_text, "idempotency_key": idem,
+        }
+        seq = self._append(
+            EV_CLEANUP_ACTION_REGISTERED, actor_text, payload,
+            dedupe_key=f"cleanup-register::{action_id}",
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO cleanup_actions "
+                "(action_id, challenge_id, action_type, target, actor, owner_key, "
+                "intent_id, poc_id, idempotency_key, registration_seq, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (action_id, self.challenge.id, kind, target_text, actor_text, owner_text,
+                 intent_text or None, poc_text or None, idem or None, int(seq), "registered"),
+            )
+            self._conn.commit()
+        return self._select_cleanup_action(action_id) or payload
+
+    def cleanup_actions(self, *, include_terminal: bool = True) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT action_id, challenge_id, action_type, target, actor, owner_key, "
+            "intent_id, poc_id, idempotency_key, registration_seq, status, execution_seq, "
+            "failure_reason, result FROM cleanup_actions WHERE challenge_id=?"
+        )
+        params: list[Any] = [self.challenge.id]
+        if not include_terminal:
+            sql += " AND status='registered'"
+        sql += " ORDER BY registration_seq"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._cleanup_row(row) for row in rows if row is not None]
+
+    def cleanup_action_executed(self, *, actor: str, action_id: str,
+                                result: str = "") -> int:
+        actor_text = str(actor or "").strip()
+        if not actor_text:
+            raise ValueError("cleanup executor actor is required")
+        action = self._select_cleanup_action(action_id)
+        if action is None:
+            raise ValueError("unknown cleanup action")
+        if action["status"] == "executed":
+            return int(action.get("execution_seq") or 0)
+        if action["status"] not in {"registered", "failed"}:
+            raise ValueError("cleanup action is not executable")
+        seq = self._append(
+            EV_CLEANUP_EXECUTED, actor_text, {
+                "action_id": str(action_id), "result": str(result or "")[:512],
+            }, dedupe_key=f"cleanup-executed::{action_id}",
+        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE cleanup_actions SET status='executed', execution_seq=?, "
+                "failure_reason=NULL, result=? WHERE challenge_id=? AND action_id=?",
+                (int(seq), str(result or "")[:512], self.challenge.id, str(action_id)),
+            )
+            self._conn.commit()
+        return seq
+
+    def cleanup_action_failed(self, *, actor: str, action_id: str,
+                              reason: str = "") -> int:
+        actor_text = str(actor or "").strip()
+        if not actor_text:
+            raise ValueError("cleanup executor actor is required")
+        action = self._select_cleanup_action(action_id)
+        if action is None:
+            raise ValueError("unknown cleanup action")
+        if action["status"] == "executed":
+            return int(action.get("execution_seq") or 0)
+        reason_text = str(reason or "cleanup failed").strip()[:512]
+        seq = self._append(
+            EV_CLEANUP_FAILED, actor_text, {
+                "action_id": str(action_id), "reason": reason_text,
+            },
+        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE cleanup_actions SET status='failed', execution_seq=?, "
+                "failure_reason=?, result=NULL WHERE challenge_id=? AND action_id=?",
+                (int(seq), reason_text, self.challenge.id, str(action_id)),
+            )
+            self._conn.commit()
+        return seq
+
     # ── classmethod ctor ────────────────────────────────────────────────
     @classmethod
     def open(cls, *, db_path: str | Path, challenge: Challenge,
@@ -1231,6 +1499,8 @@ class SQLiteSharedGraph:
         inst.db_path = p
         inst.challenge = challenge
         inst.artifacts = None
+        inst._poc_lifecycle = PocLifecycle(inst)
+        inst._event_reader = GraphEventReader(inst)
         inst._lock = threading.Lock()
         # URI mode=ro: open the file read-only at the SQLite VFS layer.
         inst._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
@@ -1320,7 +1590,7 @@ class SQLiteSharedGraph:
                 )
             )
         except Exception:
-            # Metrics must never turn a successful graph operation into a failure.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             pass
 
     def add_evidence(self, *, actor: str, source: str, fact: str,
@@ -1362,13 +1632,13 @@ class SQLiteSharedGraph:
             payload["route_hash"] = route
         iid = (intent_id or "").strip()
         if iid:
-            # Facts may be emitted by race workers before the coordinator has
-            # assigned a real intent (or with a stale worker-local default).
-            # Never materialize a dangling intent_products edge: the graph must
-            # not claim lineage to an intent that does not exist for this run,
-            # and never to one owned by ANOTHER worker (stale/closed intent the
-            # worker was spawned with — run-3154 B/C: unaccounted workers'
-            # products landed on cli-pi-2/3's closed I1/I2).
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             with self._lock:
                 intent_row = self._conn.execute(
                     "SELECT worker FROM intents "
@@ -1390,8 +1660,8 @@ class SQLiteSharedGraph:
                            confidence=confidence, dedupe_key=dk)
         duplicate_fact_seq = -1
         if seq <= 0:
-            # The write collided with an existing fact identity. Preserve the
-            # canonical fact seq for telemetry and optional intent-product linking.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             with self._lock:
                 row = self._conn.execute(
                     "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
@@ -1399,8 +1669,8 @@ class SQLiteSharedGraph:
                     (self.challenge.id, EV_FACT_ADDED, dk),
                 ).fetchone()
             duplicate_fact_seq = int(row[0]) if row else -1
-            # If this duplicate carries stronger verified evidence, append the
-            # immutable promotion transition rather than mutating the base fact.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             if row and verified and not int(row[1] or 0):
                 self._append_fact_promotion(
                     actor=actor, fact_seq=duplicate_fact_seq,
@@ -1476,10 +1746,10 @@ class SQLiteSharedGraph:
         payload = {"flag": flag}
         iid = (intent_id or "").strip()
         if iid:
-            # run-3156: an unaccounted worker attributed its flag to a stale,
-            # CLOSED intent (I1 owned by cli-pi-2). Flags must not claim lineage
-            # to an intent this worker doesn't own — same fence as
-            # add_evidence/save_poc: record orphan_intent_id, drop the edge.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             with self._lock:
                 row = self._conn.execute(
                     "SELECT worker FROM intents "
@@ -1530,52 +1800,17 @@ class SQLiteSharedGraph:
                             dedupe_key=f"flag-unverified::{key}")
 
     # ── review-arbiter events/state ────────────────────────────────────
-    _ROUTE_STOPWORDS = {
-        "the", "a", "an", "to", "of", "for", "on", "in", "at", "and",
-        "or", "with", "via", "try", "test", "probe", "inspect", "attack",
-        "exploit", "route", "path", "endpoint", "issue",
-    }
-    _ROUTE_ALIAS = (
-        (re.compile(r"\bsql\s+injection\b|\bunion\s+(?:select\s+)?(?:payload|sqli)\b", re.I), "sqli"),
-        (re.compile(r"\bcross\s+site\s+scripting\b|\bxss\b", re.I), "xss"),
-        (re.compile(r"\bserver\s+side\s+request\s+forgery\b|\bssrf\b", re.I), "ssrf"),
-        (re.compile(r"\bserver\s+side\s+template\s+injection\b|\bssti\b", re.I), "ssti"),
-        (re.compile(r"\bpath\s+traversal\b|\bdirectory\s+traversal\b", re.I), "traversal"),
-        (re.compile(r"\bfile\s+upload\b|\bupload\b", re.I), "upload"),
-        (re.compile(r"\bjson\s+web\s+token\b|\bjwts?\b", re.I), "jwt"),
-        (re.compile(r"\bcommand\s+injection\b|\bcmdi\b", re.I), "cmdi"),
-    )
+    # Compatibility aliases for callers that inspected these class constants.
+    _ROUTE_STOPWORDS = _ROUTE_STOPWORDS
+    _ROUTE_ALIAS = _ROUTE_ALIAS
 
     @classmethod
     def normalize_route_hash(cls, route_hash: str, *, label: str = "") -> str:
-        raw = (route_hash or label or "").strip().lower()
-        for rx, repl in cls._ROUTE_ALIAS:
-            raw = rx.sub(repl, raw)
-        parts = [
-            p for p in re.findall(r"[a-z0-9]+", raw)
-            if p and p not in cls._ROUTE_STOPWORDS
-        ]
-        if not parts:
-            h = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:10]
-            return f"route:{h}"
-        return ":".join(parts[:6])
+        return _normalize_route_hash(route_hash, label=label)
 
     @staticmethod
     def normalize_lane_key(lane_key: str) -> str:
-        raw = (lane_key or "").strip().lower()
-        raw = re.sub(r"\s+", "", raw)
-        raw = raw.replace("://", ":")
-        raw = re.sub(r"[^a-z0-9_:@.*-]+", "-", raw).strip("-")
-        if not raw:
-            return ""
-        m = re.match(r"^(?P<risk>[a-z0-9_]+):(?P<proto>[a-z0-9_]+):(?P<port>[0-9*]+)@(?P<host>.+)$", raw)
-        if not m:
-            return raw[:180]
-        risk = _clean_lane_risk(m.group("risk"))
-        proto = m.group("proto") or "tcp"
-        port = m.group("port") or "*"
-        host = m.group("host").strip("[]")
-        return f"{risk}:{proto}:{port}@{host}"[:180]
+        return _normalize_lane_key(lane_key)
 
     @staticmethod
     def _safe_review_severity(value: str) -> str:
@@ -1884,7 +2119,7 @@ class SQLiteSharedGraph:
                     (marker_seq if marker_seq > 0 else None, self.challenge.id, *superseded),
                 )
                 self._conn.commit()
-            # mirror the dispatch transition so the deck dims them immediately.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             self._append(
                 EV_INTENT_STATE_CHANGED, actor,
                 {"intent_id": ",".join(superseded),
@@ -2057,7 +2292,7 @@ class SQLiteSharedGraph:
                                 generated_intent_id: Optional[str] = None,
                                 bound_worker: Optional[str] = None,
                                 conflicts: Optional[list[str]] = None) -> int:
-        """B: advance a directive through received→queued→bound→acted (or
+        """B: advance a directive through received→ queued→ bound→ acted (or
         superseded/expired/rejected). Stamps the per-status seq column + payload."""
         valid = {"received", "queued", "bound", "acted", "superseded",
                  "expired", "rejected"}
@@ -2393,10 +2628,7 @@ class SQLiteSharedGraph:
     # ── E: unified resource locks (adapter over lane_locks) ──────────────
     @staticmethod
     def normalize_resource_key(resource_key: str) -> str:
-        raw = (resource_key or "").strip().lower()
-        raw = re.sub(r"\s+", "", raw)
-        raw = re.sub(r"[^a-z0-9_:@.*/-]+", "-", raw).strip("-")
-        return raw[:180]
+        return _normalize_resource_key(resource_key)
 
     def request_resource_lock(self, *, actor: str, resource_key: str,
                               scope: str = "activity", risk_class: str = "",
@@ -2634,11 +2866,11 @@ class SQLiteSharedGraph:
                     reason="closed by solved run", status="closed_by_solve")
         elif terminal_reason == "operator_stop":
             # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
-            # active intents like a solved run, do NOT park them as resume. Parking
-            # them stranded a pile of verify/review intents as "resume" noise that no
-            # running coordinator ever revives (revive only runs at next launch), and
-            # it polluted the backlog the operator was complaining about (run-75377: 53
-            # stranded). budget/runtime_failure still resume (a crash may be retried).
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             with self._lock:
                 rows = self._conn.execute(
                     "SELECT intent_id FROM intents WHERE challenge_id=? AND status='open' "
@@ -2667,11 +2899,11 @@ class SQLiteSharedGraph:
                      "dispatch_state": "closed",
                      "stop_reason": "operator_stop"})
         else:
-            # budget_exhausted / runtime_failure: hold the run's intents back from a
-            # future dispatch (resume) so a re-opened / standby run doesn't immediately
-            # re-hurl workers at directions the prior run left mid-flight, while keeping
-            # them auditable + revivable. Released claims + still-active opens become
-            # resume; stop_reason records which terminal caused it.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             with self._lock:
                 rows = self._conn.execute(
                     "SELECT intent_id FROM intents WHERE challenge_id=? AND status='open' "
@@ -2712,17 +2944,17 @@ class SQLiteSharedGraph:
                 (self.challenge.id,),
             ).fetchone()
             now_seq = int((row[0] if row and row[0] is not None else 0))
-            # stale = fact-less intents (to_fact_seq IS NULL) that are ALREADY
-            # non-dispatchable, so retiring them can never steal queued work:
-            #   • status='done' AND dispatch_state='closed'  — concluded barren attempts
-            #   • dispatch_state='resume'                    — stranded by a prior
-            #     finalize; no production revival re-activates them mid-run, so without
-            #     this they accumulate forever (the run-75375 "34 open/resume" leak).
-            # HARD GUARD (Codex trap #1): dispatch_state='active' is the live dispatch
-            # queue (_open_intents / claim_intent only take 'active'); it is NEVER
-            # compacted here. 'claimed' rows are also excluded — a claimed intent is
-            # owned by a live worker; lease-expiry reclaim is _open_intents' job, not
-            # the compactor's, so we never retire a row a worker might still be on.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             rows = self._conn.execute(
                 "SELECT intent_id FROM intents WHERE challenge_id=? "
                 "AND to_fact_seq IS NULL AND ("
@@ -2950,9 +3182,9 @@ class SQLiteSharedGraph:
         closed rows are held back even if their status is still 'open'."""
         now = time.time()
         with self._lock:
-            # Idempotent same-owner claim doubles as a lease renewal.  Do this as a
-            # separate atomic UPDATE so renewals do not emit duplicate claim events,
-            # while another worker still cannot take a live lease.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             renewed = self._conn.execute(
                 "UPDATE intents SET lease_until=? "
                 "WHERE intent_id=? AND challenge_id=? "
@@ -2997,7 +3229,7 @@ class SQLiteSharedGraph:
             return True  # nothing to lock on → don't block
         now = time.time()
         with self._lock:
-            # take over only if no row, or the existing lease expired.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             cur = self._conn.execute(
                 "INSERT INTO activity_locks "
                 "(activity_key, challenge_id, worker, lease_until, claimed_ts) "
@@ -3125,478 +3357,21 @@ class SQLiteSharedGraph:
             self._conn.commit()
         return seq
 
-    @staticmethod
-    def _intent_result_marks_poc_spent(result: str) -> bool:
-        return is_genuine_giveup(result)
 
-    def save_poc(self, *, actor: str, poc_id: str, path: str,
-                 entry_command: str, status: str = "available",
-                 note: str = "", artifact_id: Optional[str] = None,
-                 intent_id: Optional[str] = None, name: str = "") -> int:
-        """Register a PoC as metadata for a shared artifact body.
 
-        The body lives in workspace/shared CAS; this graph is the source of truth
-        for inheritance state.
-        """
-        status = status if status in {"available", "wip", "directional", "spent", "quarantined"} else "available"
-        iid = str(intent_id or "").strip() or None
-        if iid and not self._intent_owned_by(actor, iid):
-            # A PoC belongs to the intent the worker actually owns; a stale
-            # intent_id (e.g. an unaccounted worker reusing a closed intent) must
-            # not be recorded on the poc row. Keep the artifact, drop the edge.
-            payload_orphan = iid
-            iid = None
-        else:
-            payload_orphan = None
-        payload = {
-            "poc_id": poc_id,
-            "intent_id": iid,
-            "name": name or Path(path).name,
-            "path": path,
-            "entry_command": entry_command,
-            "status": status,
-            "note": note,
-        }
-        if payload_orphan:
-            payload["orphan_intent_id"] = payload_orphan
-        seq = self._append(EV_POC_SAVED, actor, payload,
-                           artifact_id=artifact_id,
-                           dedupe_key=f"poc::{poc_id}::{status}::{entry_command}::{note}")
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO pocs "
-                "(poc_id, challenge_id, intent_id, name, path, artifact_id, "
-                " entry_command, status, note, created_seq) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(poc_id) DO UPDATE SET "
-                " intent_id=excluded.intent_id, name=excluded.name, path=excluded.path, "
-                " artifact_id=excluded.artifact_id, entry_command=excluded.entry_command, "
-                " status=excluded.status, note=excluded.note",
-                 (poc_id, self.challenge.id, iid, payload["name"], path,
-                  artifact_id, entry_command, status, note, seq if seq > 0 else 0),
-            )
-            self._conn.commit()
-        return seq
 
-    def _intent_owned_by(self, actor: str, intent_id: str, *, row: "Optional[tuple]" = None) -> bool:
-        """True if `actor` may attach products to `intent_id`: the intent is
-        unclaimed (worker IS NULL), owned by `actor`, or `actor` is the
-        coordinator/reviewer. `row` is an optional pre-fetched (worker,) row to
-        avoid a second query."""
-        if actor in ("coordinator", "review"):
-            return True
-        if row is None:
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT worker FROM intents "
-                    "WHERE challenge_id=? AND intent_id=? LIMIT 1",
-                    (self.challenge.id, intent_id),
-                ).fetchone()
-        if row is None:
-            return False
-        owner = row[0]
-        return owner is None or owner == actor
 
-    def claim_poc(self, *, worker: str, poc_id: str,
-                  lease_s: float = 300.0) -> bool:
-        now = time.time()
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE pocs SET worker=?, status='wip', lease_until=? "
-                "WHERE poc_id=? AND challenge_id=? "
-                "AND status IN ('available','directional','wip') "
-                "AND (worker IS NULL OR lease_until IS NULL OR lease_until < ?)",
-                (worker, now + lease_s, poc_id, self.challenge.id, now),
-            )
-            self._conn.commit()
-            won = cur.rowcount == 1
-        if won:
-            self._append(EV_POC_CLAIMED, worker, {"poc_id": poc_id})
-        return won
 
-    def conclude_poc(self, *, actor: str, poc_id: str,
-                     status: str = "spent", note: str = "") -> int:
-        status = status if status in {"available", "directional", "spent", "quarantined"} else "spent"
-        seq = self._append(EV_POC_CONCLUDED, actor,
-                           {"poc_id": poc_id, "status": status, "note": note})
-        fence = " AND (worker=? OR worker IS NULL)"
-        with self._lock:
-            self._conn.execute(
-                "UPDATE pocs SET status=?, result_seq=? "
-                "WHERE poc_id=? AND challenge_id=?" + fence,
-                (status, seq if seq > 0 else None, poc_id, self.challenge.id, actor),
-            )
-            self._conn.commit()
-        return seq
-
-    def pocs(self, *, inheritable_only: bool = False) -> list[dict]:
-        sql = ("SELECT poc_id, intent_id, name, path, artifact_id, entry_command, "
-               "status, note, worker FROM pocs WHERE challenge_id=?")
-        params: list[Any] = [self.challenge.id]
-        if inheritable_only:
-            # A PoC is inheritable if it's available/directional, OR it was claimed
-            # ('wip') but the claiming worker's lease has EXPIRED (#9). claim_poc
-            # flips status→'wip' to mark "in use by the current worker"; without the
-            # expired-lease clause a wip PoC would vanish from the pool forever the
-            # moment any worker claimed it (single-use inheritance — nothing ever
-            # resets wip→available). Mirrors how _open_intents re-offers an
-            # expired-lease 'claimed' intent. now() bound below.
-            sql += (" AND (status IN ('available','directional') OR "
-                    "(status='wip' AND (lease_until IS NULL OR lease_until < ?)))")
-            params.append(time.time())
-        sql += " ORDER BY created_seq"
-        with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-        return [
-            {"poc_id": r[0], "intent_id": r[1], "name": r[2], "path": r[3],
-             "artifact_id": r[4], "entry_command": r[5], "status": r[6],
-             "note": r[7], "worker": r[8]}
-            for r in rows
-        ]
 
     # ── M9 Verified-PoC registration and lifecycle projection ────────────────
-    @staticmethod
-    def _poc_reproduction_row(row: sqlite3.Row | tuple | None) -> Optional[dict[str, Any]]:
-        if row is None:
-            return None
-        values = list(row)
-        return {
-            "reproduction_id": values[0],
-            "poc_id": values[1],
-            "intent_id": values[2] or "",
-            "artifact_id": values[3],
-            "command": values[4],
-            "indicator": values[5],
-            "registration_seq": int(values[6] or 0),
-            "status": values[7],
-            "verification_id": values[8] or "",
-            "started_seq": int(values[9]) if values[9] is not None else None,
-            "terminal_seq": int(values[10]) if values[10] is not None else None,
-            "worker_id": values[11] or "",
-            "finding_id": values[12] or "",
-            "pool_identity": values[13] or "",
-            "failure_reason": values[14] or "",
-            "exit_code": int(values[15]) if values[15] is not None else None,
-            "observed_location": values[16] or "",
-            "provenance_artifact_ids": tuple(json.loads(values[17] or "[]")),
-            "diagnostics": values[18] or "",
-            "elapsed_ms": int(values[19]) if values[19] is not None else None,
-        }
 
-    def _select_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT reproduction_id, poc_id, intent_id, artifact_id, command, "
-                "indicator, registration_seq, status, verification_id, started_seq, "
-                "terminal_seq, worker_id, finding_id, pool_identity, failure_reason, "
-                "exit_code, observed_location, provenance_artifact_ids, diagnostics, "
-                "elapsed_ms FROM poc_reproductions WHERE challenge_id=? AND poc_id=?",
-                (self.challenge.id, str(poc_id)),
-            ).fetchone()
-        return self._poc_reproduction_row(row)
 
-    def _rebuild_poc_reproduction_projection(self) -> None:
-        """Fold M9 PoC lifecycle events into the rebuildable projection table."""
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM poc_reproductions WHERE challenge_id=?",
-                (self.challenge.id,),
-            )
-            rows = self._conn.execute(
-                "SELECT seq, kind, payload FROM events WHERE challenge_id=? "
-                "AND kind IN (?,?,?,?,?,?) ORDER BY seq",
-                (self.challenge.id, EV_POC_REPRODUCTION_REGISTERED,
-                 EV_POC_REPRODUCTION_REJECTED, EV_POC_VERIFICATION_STARTED,
-                 EV_POC_VERIFIED, EV_POC_VERIFICATION_FAILED,
-                 EV_REVIEW_FINDING_VERIFIED),
-            ).fetchall()
-            for seq, kind, raw_payload in rows:
-                payload = json.loads(raw_payload or "{}")
-                if kind == EV_POC_REPRODUCTION_REGISTERED:
-                    self._conn.execute(
-                        "INSERT OR REPLACE INTO poc_reproductions "
-                        "(reproduction_id, poc_id, challenge_id, intent_id, artifact_id, "
-                        "command, indicator, registration_seq, status) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (payload["reproduction_id"], payload["poc_id"], self.challenge.id,
-                         payload.get("intent_id") or None, payload["artifact_id"],
-                         payload["command"], payload["indicator"], int(seq), "registered"),
-                    )
-                elif kind == EV_POC_VERIFICATION_STARTED:
-                    self._conn.execute(
-                        "UPDATE poc_reproductions SET status='started', "
-                        "verification_id=?, started_seq=?, worker_id=?, finding_id=?, "
-                        "pool_identity=? WHERE challenge_id=? AND reproduction_id=?",
-                        (payload["verification_id"], int(seq), payload.get("worker_id") or "",
-                         payload.get("finding_id") or "", payload.get("pool_identity") or "",
-                         self.challenge.id, payload["reproduction_id"]),
-                    )
-                elif kind in (EV_POC_VERIFIED, EV_POC_VERIFICATION_FAILED):
-                    status = "verified" if kind == EV_POC_VERIFIED else "failed"
-                    artifact_ids = json.dumps(payload.get("provenance_artifact_ids") or [])
-                    self._conn.execute(
-                        "UPDATE poc_reproductions SET status=?, terminal_seq=?, "
-                        "failure_reason=?, exit_code=?, observed_location=?, "
-                        "provenance_artifact_ids=?, diagnostics=?, elapsed_ms=? "
-                        "WHERE challenge_id=? AND reproduction_id=?",
-                        (status, int(seq), payload.get("reason") or "",
-                         payload.get("exit_code"), payload.get("observed_location") or "",
-                         artifact_ids, payload.get("diagnostics") or "", payload.get("elapsed_ms"),
-                         self.challenge.id, payload["reproduction_id"]),
-                    )
-            self._conn.commit()
 
-    def register_poc_reproduction(self, *, actor: str, poc_id: str,
-                                  indicator: str) -> dict[str, Any]:
-        if getattr(self.challenge, "mode", "ctf") != "pentest":
-            raise ValueError("Verified-PoC reproduction requires pentest mode")
-        normalized = normalize_reproduction_indicator(indicator)
-        with self._lock:
-            poc = self._conn.execute(
-                "SELECT poc_id, intent_id, artifact_id, entry_command FROM pocs "
-                "WHERE challenge_id=? AND poc_id=?",
-                (self.challenge.id, str(poc_id)),
-            ).fetchone()
-        if poc is None:
-            raise ValueError("unknown PoC")
-        _, intent_id, artifact_id, command = poc
-        reproduction_id = reproduction_id_for(
-            artifact_id=artifact_id or "", command=command or "", indicator=normalized
-        )
-        existing = self._select_poc_reproduction(str(poc_id))
-        if existing is not None:
-            if existing["reproduction_id"] == reproduction_id:
-                return dict(existing)
-            self._append(
-                EV_POC_REPRODUCTION_REJECTED,
-                actor,
-                {
-                    "poc_id": str(poc_id),
-                    "existing_reproduction_id": existing["reproduction_id"],
-                    "candidate_indicator_digest": hashlib.sha256(
-                        normalized.encode("utf-8")
-                    ).hexdigest(),
-                    "reason": "conflicting_registration",
-                },
-                dedupe_key=(f"poc-repro-rejected::{poc_id}::"
-                            f"{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"),
-            )
-            raise ValueError("conflicting reproduction registration")
-        payload = {
-            "poc_id": str(poc_id),
-            "intent_id": intent_id or "",
-            "artifact_id": str(artifact_id or ""),
-            "command": str(command or ""),
-            "indicator": normalized,
-            "reproduction_id": reproduction_id,
-        }
-        seq = self._append(
-            EV_POC_REPRODUCTION_REGISTERED,
-            actor,
-            payload,
-            dedupe_key=f"poc-repro::{poc_id}::{reproduction_id}",
-        )
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO poc_reproductions "
-                "(reproduction_id, poc_id, challenge_id, intent_id, artifact_id, command, "
-                "indicator, registration_seq, status) VALUES (?,?,?,?,?,?,?,?,?)",
-                (reproduction_id, str(poc_id), self.challenge.id, intent_id or None,
-                 artifact_id or "", command or "", normalized, seq if seq > 0 else 0,
-                 "registered"),
-            )
-            self._conn.commit()
-        return dict(self._select_poc_reproduction(str(poc_id)) or {})
 
-    def get_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]:
-        """Return a reproduction only when it still binds to its saved PoC row.
 
-        This is the canonical resolution boundary for the Docker verifier: the
-        lifecycle projection supplies the registered command/indicator while the
-        saved-PoC projection supplies the immutable CAS path and user-facing name.
-        """
-        row = self._select_poc_reproduction(str(poc_id))
-        if row is None:
-            return None
-        with self._lock:
-            poc = self._conn.execute(
-                "SELECT artifact_id, path, name, entry_command FROM pocs "
-                "WHERE challenge_id=? AND poc_id=?",
-                (self.challenge.id, str(poc_id)),
-            ).fetchone()
-        if poc is None:
-            return None
-        artifact_id, path, name, entry_command = poc
-        if (
-            str(artifact_id or "") != row["artifact_id"]
-            or str(entry_command or "") != row["command"]
-        ):
-            return None
-        resolved = dict(row)
-        resolved["path"] = str(path or "")
-        resolved["name"] = str(name or "")
-        resolved["entry_command"] = str(entry_command or "")
-        return resolved
 
-    def poc_verification_status(self, poc_id: str) -> Optional[dict[str, Any]]:
-        row = self._select_poc_reproduction(str(poc_id))
-        if row is None:
-            return None
-        return {
-            "poc_id": row["poc_id"],
-            "reproduction_id": row["reproduction_id"],
-            "status": row["status"],
-            "verification_id": row["verification_id"],
-            "started_seq": row["started_seq"],
-            "terminal_seq": row["terminal_seq"],
-            "failure_reason": row["failure_reason"],
-            "exit_code": row["exit_code"],
-            "observed_location": row["observed_location"],
-            "provenance_artifact_ids": tuple(row["provenance_artifact_ids"]),
-            "diagnostics": row["diagnostics"],
-            "elapsed_ms": row["elapsed_ms"],
-        }
 
-    def begin_poc_verification(self, *, actor: str, poc_id: str,
-                               verification_id: str, reproduction_id: str,
-                               worker_id: str = "", finding_id: str = "",
-                               intent_id: str = "", pool_identity: str = "",
-                               lease_s: float = 600.0) -> Optional[dict[str, Any]]:
-        row = self._select_poc_reproduction(str(poc_id))
-        if row is None or row["reproduction_id"] != reproduction_id:
-            return None
-        if row["status"] in {"started", "verified", "failed"}:
-            return None
-        owner = str(worker_id or actor)
-        lock_key = f"poc-verification:{reproduction_id}"
-        if not self.try_claim_activity(worker=owner, key=lock_key, lease_s=lease_s):
-            return None
-        payload = {
-            "poc_id": row["poc_id"],
-            "reproduction_id": reproduction_id,
-            "verification_id": str(verification_id),
-            "finding_id": str(finding_id or ""),
-            "intent_id": str(intent_id or ""),
-            "worker_id": owner,
-            "pool_identity": sanitize_public_text(pool_identity, limit=160),
-        }
-        try:
-            seq = self._append(
-                EV_POC_VERIFICATION_STARTED,
-                actor,
-                payload,
-                dedupe_key=f"poc-verification-start::{reproduction_id}::{verification_id}",
-            )
-        except Exception:
-            self.release_activity(worker=owner, key=lock_key)
-            raise
-        with self._lock:
-            self._conn.execute(
-                "UPDATE poc_reproductions SET status='started', verification_id=?, "
-                "started_seq=?, worker_id=?, finding_id=?, pool_identity=? "
-                "WHERE challenge_id=? AND reproduction_id=?",
-                (str(verification_id), seq if seq > 0 else 0, owner,
-                 payload["finding_id"], payload["pool_identity"], self.challenge.id,
-                 reproduction_id),
-            )
-            self._conn.commit()
-        return dict(self._select_poc_reproduction(str(poc_id)) or {})
 
-    def append_poc_verification_terminal(
-        self, *, actor: str, poc_id: str, verification_id: str,
-        verified: bool, exit_code: Optional[int] = None,
-        failure_reason: Optional[VerificationFailure | str] = None,
-        observed_location: str = "",
-        provenance_artifact_ids: Optional[list[str]] = None,
-        diagnostics: str = "", elapsed_ms: Optional[int] = None,
-    ) -> int:
-        row = self._select_poc_reproduction(str(poc_id))
-        if row is None:
-            raise ValueError("unknown PoC reproduction")
-        if row["verification_id"] != str(verification_id):
-            raise ValueError("verification does not own reproduction")
-        if row["status"] in {"verified", "failed"}:
-            return -1
-        if row["status"] != "started":
-            raise ValueError("verification must be started before terminal append")
-        if not verified:
-            reason = verification_failure_value(
-                failure_reason or VerificationFailure.EXECUTION_ERROR
-            )
-        else:
-            reason = ""
-        artifact_ids = tuple(
-            sanitize_public_text(item, limit=160)
-            for item in (provenance_artifact_ids or [])
-            if str(item or "").strip()
-        )[:16]
-        payload = {
-            "poc_id": row["poc_id"],
-            "reproduction_id": row["reproduction_id"],
-            "verification_id": str(verification_id),
-            "exit_code": int(exit_code) if exit_code is not None else None,
-            "observed_location": sanitize_public_text(observed_location, limit=80),
-            "provenance_artifact_ids": list(artifact_ids),
-            "diagnostics": sanitize_public_text(diagnostics),
-            "elapsed_ms": max(0, int(elapsed_ms)) if elapsed_ms is not None else None,
-        }
-        kind = EV_POC_VERIFIED if verified else EV_POC_VERIFICATION_FAILED
-        if reason:
-            payload["reason"] = reason
-        seq = self._append(
-            kind,
-            actor,
-            payload,
-            dedupe_key=f"poc-verification-terminal::{verification_id}",
-        )
-        with self._lock:
-            self._conn.execute(
-                "UPDATE poc_reproductions SET status=?, terminal_seq=?, failure_reason=?, "
-                "exit_code=?, observed_location=?, provenance_artifact_ids=?, diagnostics=?, "
-                "elapsed_ms=? WHERE challenge_id=? AND reproduction_id=?",
-                ("verified" if verified else "failed", seq if seq > 0 else 0,
-                 reason, payload["exit_code"], payload["observed_location"],
-                 json.dumps(list(artifact_ids)), payload["diagnostics"],
-                 payload["elapsed_ms"], self.challenge.id, row["reproduction_id"]),
-            )
-            self._conn.commit()
-        self.release_activity(
-            worker=row["worker_id"] or actor,
-            key=f"poc-verification:{row['reproduction_id']}",
-        )
-        return seq
-
-    def mark_review_finding_verified(
-        self, *, actor: str, finding_id: str, poc_id: str,
-        reproduction_id: str, verification_id: str,
-    ) -> int:
-        row = self._select_poc_reproduction(str(poc_id))
-        if row is None:
-            raise ValueError("unknown PoC reproduction")
-        if row["reproduction_id"] != str(reproduction_id):
-            raise ValueError("review finding verification does not match reproduction")
-        if row["verification_id"] != str(verification_id):
-            raise ValueError("review finding verification does not own reproduction")
-        if row["status"] != "verified":
-            raise ValueError("review finding requires durable verified PoC")
-        payload = {
-            "finding_id": sanitize_public_text(finding_id, limit=160),
-            "poc_id": row["poc_id"],
-            "reproduction_id": row["reproduction_id"],
-            "verification_id": str(verification_id),
-            "status": "verified",
-        }
-        if not payload["finding_id"]:
-            raise ValueError("finding_id is required")
-        return self._append(
-            EV_REVIEW_FINDING_VERIFIED,
-            actor,
-            payload,
-            dedupe_key=(
-                f"review-finding-verified::{payload['finding_id']}::"
-                f"{row['reproduction_id']}::{verification_id}"
-            ),
-        )
 
     def reopen_after_false_positive(self, *, actor: str, flag: str,
                                     reason: str = "") -> dict:
@@ -3616,20 +3391,20 @@ class SQLiteSharedGraph:
                      dedupe_key=f"flaginvalid::{flag}")
         reopened: list[str] = []
         with self._lock:
-            # reopen every intent that was concluded with result 'solved' — the solve
-            # they led to is now invalid. Clear the produced-fact link too. (Intent→
-            # flag linkage isn't stored, so we reopen the SOLVED set and let the
-            # worker, seeded with the still-valid flags, re-find only the missing
-            # one — the worker prompt's already-found list keeps it from re-hunting
-            # the good ones.)
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             #
-            # #11: DON'T reopen non-solved 'done' intents. supersede_open_intents
-            # also flips intents to status='done' (result 'superseded') when the
-            # operator supplies a resource that obsoletes an "ask the operator for X"
-            # intent. Blindly reopening every 'done' row resurrected those retired
-            # asks on a false-positive (run-11190's 238-worker "request the password"
-            # loop came back). Fence on the concluding event's result text via the
-            # result_seq → events.payload pattern (LEFT JOIN, used elsewhere).
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             linked_intents: set[str] = set()
             for (payload,) in self._conn.execute(
                 "SELECT payload FROM events WHERE challenge_id=? AND kind=?",
@@ -3701,8 +3476,8 @@ class SQLiteSharedGraph:
             ids = [r[0] for r in rows]
         marker_seq = 0
         if ids:
-            # append the provenance marker OUTSIDE the lock (._append takes the lock),
-            # then stamp result_seq under the lock.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             marker_seq = self._append(
                 EV_INTENT_CONCLUDED, actor,
                 {"intent_id": ",".join(ids), "result": "superseded",
@@ -3776,83 +3551,20 @@ class SQLiteSharedGraph:
         return out
 
     def events(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, ts, actor, kind, payload, artifact_id, verified, "
-                "confidence FROM events ORDER BY seq"
-            ).fetchall()
-        out = []
-        for seq, ts, actor, kind, payload, aid, verified, conf in rows:
-            out.append({"seq": seq, "ts": ts, "actor": actor, "kind": kind,
-                        "payload": json.loads(payload), "artifact_id": aid,
-                        "verified": bool(verified), "confidence": conf})
-        return out
+        return self._event_reader.events()
 
     def recent_events(self, limit: int = 40) -> list[dict]:
-        """Last `limit` events, oldest-first, filtered to this challenge.
-
-        Unlike `events()[-limit:]` this is bounded at the SQL layer (no full-table
-        scan) and scopes to challenge_id so a shared sessions DB stays correct.
-        Used by the read-only btw observer to build a recent timeline snapshot.
-        """
-        if limit <= 0:
-            return []
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, ts, actor, kind, payload, artifact_id, verified, "
-                "confidence FROM events WHERE challenge_id=? "
-                "ORDER BY seq DESC LIMIT ?",
-                (self.challenge.id, int(limit)),
-            ).fetchall()
-        out = []
-        for seq, ts, actor, kind, payload, aid, verified, conf in reversed(rows):
-            try:
-                p = json.loads(payload)
-            except Exception:
-                p = {}
-            out.append({"seq": seq, "ts": ts, "actor": actor, "kind": kind,
-                        "payload": p, "artifact_id": aid,
-                        "verified": bool(verified), "confidence": conf})
-        return out
+        return self._event_reader.recent_events(limit)
 
     def events_since(self, after_seq: int, kinds: Optional[list[str]] = None) -> list[dict]:
-        after = int(after_seq or 0)
-        params: list[Any] = [after]
-        kind_list = [str(k) for k in (kinds or []) if str(k)]
-        where = "WHERE seq > ?"
-        if kind_list:
-            where += " AND kind IN (" + ",".join("?" for _ in kind_list) + ")"
-            params.extend(kind_list)
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, ts, actor, kind, payload, artifact_id, verified, "
-                f"confidence FROM events {where} ORDER BY seq",
-                tuple(params),
-            ).fetchall()
-        out = []
-        for seq, ts, actor, kind, payload, aid, verified, conf in rows:
-            try:
-                parsed = json.loads(payload)
-            except (json.JSONDecodeError, TypeError):
-                parsed = {}
-            out.append({"seq": seq, "ts": ts, "actor": actor, "kind": kind,
-                        "payload": parsed, "artifact_id": aid,
-                        "verified": bool(verified), "confidence": conf})
-        return out
+        return self._event_reader.events_since(after_seq, kinds=kinds)
 
     async def subscribe_events(self, after_seq: int = 0,
                                kinds: Optional[list[str]] = None,
                                poll_interval: float = 0.5) -> Any:
-        cursor = int(after_seq or 0)
-        while True:
-            events = self.events_since(cursor, kinds=kinds)
-            for ev in events:
-                seq = int(ev.get("seq") or 0)
-                if seq <= cursor:
-                    continue
-                cursor = seq
-                yield ev
-            await asyncio.sleep(max(0.05, float(poll_interval)))
+        async for event in self._event_reader.subscribe_events(
+                after_seq=after_seq, kinds=kinds, poll_interval=poll_interval):
+            yield event
 
     def intent_products(self, intent_id: str) -> list[int]:
         with self._lock:
@@ -4031,7 +3743,7 @@ class SQLiteSharedGraph:
             if not chain_seqs:
                 # temporal fallback: verified facts discovered before this flag
                 chain_seqs = [s for s in verified_seqs if s <= fseq]
-            # de-dup preserve order, resolve to text
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             seen: set[int] = set()
             chain: list[str] = []
             for s in chain_seqs:
@@ -4098,7 +3810,7 @@ class SQLiteSharedGraph:
 
     # The credential belongs to the entity it UNLOCKS, not the one whose home it was
     # found in. "X authenticates as ghost3" / "is the ghost3 password" / "unlocks
-    # ghost3" / "认证 ghost3" → the TARGET entity is ghost3, even if the fact opens
+    # ghost3" / "璁よ瘉 ghost3" → the TARGET entity is ghost3, even if the fact opens
     # with "ghost2 hidden lead contains X". Prefer this target over a leading entity.
     _CRED_TARGET = re.compile(
         r"(?:authenticat\w*|logs? in|logg?ed in|unlock\w*|is the|为|认证|登录)\s+"
@@ -4137,12 +3849,12 @@ class SQLiteSharedGraph:
             ent_m = self._CRED_ENTITY.search(fact)
             if not ent_m:
                 continue                              # need a concrete entity
-            # the entity the credential UNLOCKS (authenticates-as / is-the-X-password)
-            # wins over a leading "found in X's home" entity — fixes mis-attributing
-            # a cred to the box it was discovered on rather than the box it opens.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             tgt_m = self._CRED_TARGET.search(fact)
             entity = tgt_m.group(1) if tgt_m else ent_m.group(1)
-            # value: prefer an explicit entity:value pair, else a keyword-introduced token
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             value = None
             pair = self._CRED_PAIR.search(fact)
             if pair and not tgt_m:
@@ -4678,8 +4390,8 @@ class SQLiteSharedGraph:
                     result = str((json.loads(payload) or {}).get("result", "")).lower()
                 except (json.JSONDecodeError, TypeError):
                     result = ""
-            # only barren outcomes — never 'solved' (that has a flag) or anything
-            # that produced evidence. 'explored'/'dead_end'/'no verified flag'/''.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             if "solved" in result:
                 continue
             out.append(str(goal))
@@ -4691,7 +4403,7 @@ class SQLiteSharedGraph:
         planner kept re-proposing paraphrases of concluded directions because the
         summary never showed them). The result comes from the EV_INTENT_CONCLUDED
         event the row's result_seq points at; superseded/no-result rows render a
-        placeholder. Most recent `limit` shown (oldest→newest); earlier ones are
+        placeholder. Most recent `limit` shown (oldest→ newest); earlier ones are
         collapsed into a count line — a goal is one line, so 40 stays cheap."""
         with self._lock:
             rows = self._conn.execute(
@@ -4706,7 +4418,7 @@ class SQLiteSharedGraph:
         lines = ["\n## Already attempted (concluded intents — do NOT re-propose; "
                  "build on their results)"]
         if omitted:
-            lines.append(f"  (… {omitted} earlier attempted intents omitted)")
+            lines.append(f"  (—{omitted} earlier attempted intents omitted)")
         for goal, payload, worker_class, route_hash, branch_id, row_detail in rows[-limit:]:
             result = ""
             detail = str(row_detail or "")
@@ -4728,7 +4440,7 @@ class SQLiteSharedGraph:
             if branch_id:
                 meta.append(f"branch={branch_id}")
             suffix = f" ({', '.join(meta)})" if meta else ""
-            lines.append(f"- {str(goal)[:160]}{suffix} → {tail}")
+            lines.append(f"- {str(goal)[:160]}{suffix} →{tail}")
         return "\n".join(lines)
 
     def challenged_facts(self) -> list[dict]:
@@ -4897,7 +4609,7 @@ class SQLiteSharedGraph:
             for f in retired[-30:]:
                 tag = f['state']
                 if f['state'] == FACT_STATE_MERGED and f.get('merged_into'):
-                    tag = f"merged→#{f['merged_into']}"
+                    tag = f"merged→{f['merged_into']}"
                 parts.append(f"- [#{f['fact_seq']}] ({tag}) {f['fact'][:160]} :: {f['reason'][:160]}")
         suppressed = self.suppressed_routes()
         if suppressed:
@@ -4912,7 +4624,7 @@ class SQLiteSharedGraph:
             for b in branches[-30:]:
                 parts.append(
                     f"- {b['branch_id']} [{b['status']}]: {b['assumption'][:180]} "
-                    f"→ {b['prove_or_disprove'][:180]}")
+                    f"→{b['prove_or_disprove'][:180]}")
         directives = self.coordinator_directives()
         if directives:
             parts.append("\n## Review directives")
@@ -4941,7 +4653,7 @@ class SQLiteSharedGraph:
             out: list[str] = []
             for p in items:
                 iid = f" intent={p['intent_id']}" if p.get("intent_id") else ""
-                note = f" — {str(p.get('note') or '')[:100]}" if p.get("note") else ""
+                note = f" —{str(p.get('note') or '')[:100]}" if p.get("note") else ""
                 out.append(f"- {p['poc_id']} ({p['status']}){iid}: "
                            f"{p['entry_command']}{note}")
             return out
@@ -4956,8 +4668,8 @@ class SQLiteSharedGraph:
                 lines.append(f"  (... {omitted} older inheritable PoCs omitted)")
             lines.extend(_render(inheritable[-limit:]))
         if historical:
-            # in-use (wip, currently leased) or spent — listed for context, but NOT
-            # mounted; don't tell a worker to run them from ./inherited/.
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
             lines.append("\n## Historical PoCs (in-use or spent; metadata only, not mounted)")
             omitted = max(0, len(historical) - limit)
             if omitted:

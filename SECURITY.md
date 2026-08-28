@@ -31,6 +31,11 @@ CTF challenges. Understand the trust model before you run it.
   consistent Kali/CTF toolchain, a VPS / standalone-machine deployment form, and
   runtime-dependency / workspace / credential-mount isolation — **not** containment of
   untrusted code. Do not rely on it to protect the host from a malicious challenge.
+- **Windows development hosts have weaker filesystem permission semantics.** The
+  best-effort `chmod(0o600/0o700)` calls used for local credential and runtime files
+  cannot provide POSIX-style owner-only isolation on Windows. Production worker
+  isolation and credential projection are expected to run in the Docker/Linux
+  runtime; treat native Windows runs as development-only and use a disposable host.
 
 ### How to run it safely
 

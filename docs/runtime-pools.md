@@ -26,6 +26,11 @@ still sibling containers:
 ./run.sh tui --swarm
 ```
 
+On a native Windows development host, filesystem mode bits are best-effort only:
+`chmod(0o600/0o700)` does not reproduce POSIX owner-only permissions. Do not treat
+that host-side credential/runtime staging as a security boundary; use the Docker/Linux
+worker runtime and a disposable machine for any untrusted challenge.
+
 For a fully containerized control plane, set an absolute host data root and use
 Compose:
 

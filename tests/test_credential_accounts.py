@@ -449,7 +449,7 @@ def test_local_runtime_does_not_override_host_home(tmp_path):
         description="local home",
         flag_format="flag{...}",
     )
-    swarm = Swarm(ch, [], llm=None, sandbox=None, worker_root=tmp_path / "workers")
+    swarm = Swarm(ch, llm=None, sandbox=None, worker_root=tmp_path / "workers")
 
     env = swarm._runtime_env_for("pi", "cli-pi", container=None)
 
@@ -469,7 +469,7 @@ def test_swarm_worker_profile_selects_credential_account_and_runtime(tmp_path, m
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_backend="local",
         credential_accounts_root=root,
@@ -586,7 +586,7 @@ def test_swarm_profile_roles_and_capacity_are_hard_limits(tmp_path):
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -629,7 +629,7 @@ def test_review_profile_capacity_is_isolated_from_explore_capacity(tmp_path):
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -644,7 +644,7 @@ def test_review_profile_capacity_is_isolated_from_explore_capacity(tmp_path):
                 "enabled": True,
             }
         ],
-        stage_policy={"coordinator": {"review": {"enabled": True, "max_concurrent": 1}}},
+        review_policy={"enabled": True, "max_concurrent": 1},
     )
 
     review_profile = swarm._profile_for_engine("pi", role="review")
@@ -667,7 +667,7 @@ async def test_done_review_profile_stays_unavailable_until_account_release(tmp_p
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -679,16 +679,12 @@ async def test_done_review_profile_stays_unavailable_until_account_release(tmp_p
                 "enabled": True,
             }
         ],
-        stage_policy={
-            "coordinator": {
-                "review": {
+        review_policy={
                     "enabled": True,
                     "engine": "pi-main",
                     "max_concurrent": 1,
                     "allow_review_fallback": False,
-                }
-            }
-        },
+                },
     )
     profile = swarm._profile_for_engine("pi-main", role="review")
     assert profile is not None
@@ -729,7 +725,7 @@ def test_review_engine_profile_id_uses_base_engine_health(tmp_path):
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -744,16 +740,12 @@ def test_review_engine_profile_id_uses_base_engine_health(tmp_path):
                 "enabled": True,
             }
         ],
-        stage_policy={
-            "coordinator": {
-                "review": {
+        review_policy={
                     "enabled": True,
                     "engine": "pi-sub-container",
                     "max_concurrent": 1,
                     "allow_review_fallback": False,
-                }
-            }
-        },
+                },
     )
 
     assert swarm._healthy_matches("pi-sub-container", ["pi"]) is True
@@ -771,7 +763,7 @@ def test_pick_engine_uses_configured_profile_roster_with_base_health(tmp_path):
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -817,7 +809,7 @@ async def test_worker_cmd_spawn_base_engine_resolves_to_configured_profile(
     )
     queue: asyncio.Queue = asyncio.Queue()
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -878,7 +870,7 @@ def test_ordinary_profile_capacity_is_isolated_from_review_capacity(tmp_path):
         flag_format="flag{...}",
     )
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, llm=None, sandbox=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
         worker_profiles=[
             {
@@ -894,7 +886,7 @@ def test_ordinary_profile_capacity_is_isolated_from_review_capacity(tmp_path):
                 "enabled": True,
             }
         ],
-        stage_policy={"coordinator": {"review": {"enabled": True, "max_concurrent": 1}}},
+        review_policy={"enabled": True, "max_concurrent": 1},
     )
 
     ordinary_profile = swarm._profile_for_engine("pi", role="explore")

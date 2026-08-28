@@ -31,3 +31,12 @@ def test_init_sh_guards_against_wsl_on_windows_workspace() -> None:
     assert "WSL" in script
     assert "Windows workspace" in script
     assert "before running uv" in script
+
+
+def test_worker_runtime_mixin_has_no_swarm_backedge() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dswarm" / "swarm" / "worker_runtime_mixin.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from dswarm.swarm.swarm import" not in source
+    assert "from dswarm.swarm._bootstrap_assets import" in source

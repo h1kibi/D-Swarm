@@ -1087,8 +1087,8 @@ async def test_resolve_driver_failure_emits_terminal_runtime_failure(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_resolve_infers_pre_sidecar_roster_from_worker_history(tmp_path, monkeypatch) -> None:
-    """Old runs without a dispatch sidecar must not silently use today's roster."""
+async def test_resolve_does_not_infer_dispatch_from_worker_history(tmp_path, monkeypatch) -> None:
+    """Old runs without a dispatch sidecar use the current dispatch defaults."""
     from dswarm.core.events import Event
 
     mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
@@ -1106,7 +1106,6 @@ async def test_resolve_infers_pre_sidecar_roster_from_worker_history(tmp_path, m
 
     captured: dict = {}
     async def driver(_run):
-        captured.update(_run.manager_dispatch if hasattr(_run, "manager_dispatch") else {})
         await _run.bus.emit(Event(
             event_type=EventType.RUN_FINISHED, run_id=_run.run_id,
             payload={"solved": False, "reason": "mock"}))
@@ -1119,15 +1118,15 @@ async def test_resolve_infers_pre_sidecar_roster_from_worker_history(tmp_path, m
     monkeypatch.setattr("apps.web.drivers.build_driver", build)
     assert await mgr.resolve(run.run_id, {"kind": "mock"})
     await asyncio.wait_for(run.task, timeout=5)
-    # the historical base engine "pi" is recovered as the category's direction
-    # profile (web), keeping old-run resolve on a single worker
-    assert captured["engines"] == ["pi-web"]
-    assert captured["worker_backend"] == "container"
+    # Worker status is replay-only evidence. It must not resurrect a historical
+    # roster/backend into the current live dispatch contract.
+    assert "engines" not in captured
+    assert "worker_backend" not in captured
     assert "race_scout" not in captured
 
 
 @pytest.mark.asyncio
-async def test_resolve_strips_legacy_fields_from_saved_sidecar(tmp_path, monkeypatch) -> None:
+async def test_resolve_rejects_retired_fields_in_saved_sidecar(tmp_path, monkeypatch) -> None:
     from dswarm.core.events import Event
 
     mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
@@ -1143,20 +1142,44 @@ async def test_resolve_strips_legacy_fields_from_saved_sidecar(tmp_path, monkeyp
         "stage_policy": {"race": {"enabled": False}, "budgets": {"max_total_workers": 2}},
     })
     captured: dict = {}
-    async def driver(_run):
-        await _run.bus.emit(Event(
-            event_type=EventType.RUN_FINISHED, run_id=_run.run_id,
-            payload={"solved": False, "reason": "mock"}))
-    def build(body, mgr=None, runtime_operation_kind=""):
-        assert runtime_operation_kind == "resolve"
-        captured.update(body)
-        return driver
+    def build(*args, **kwargs):
+        captured["called"] = True
+        raise AssertionError("retired sidecar must be rejected before build_driver")
     monkeypatch.setattr("apps.web.drivers.build_driver", build)
-    assert await mgr.resolve(run.run_id, {})
-    await asyncio.wait_for(run.task, timeout=5)
-    assert "race_scout" not in captured
-    assert "cold_start" not in captured
-    assert "race" not in captured["stage_policy"]
+
+    with pytest.raises(ValueError, match="legacy swarm fields"):
+        await mgr.resolve(run.run_id, {})
+
+    assert captured == {}
+    assert run.finished is True
+    assert run.task is None or run.task.done()
+    sidecar = mgr.workspace_dir(run.run_id) / ".dswarm_dispatch.json"
+    assert "race_scout" in sidecar.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_resolve_rejects_retired_fields_in_request_before_reopen(tmp_path, monkeypatch) -> None:
+    from dswarm.core.events import Event
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("legacy-request")
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED, run_id=run.run_id,
+        payload={"challenge": {"name": "legacy", "category": "web"}}))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED, run_id=run.run_id,
+        payload={"solved": False, "reason": "finished"}))
+    monkeypatch.setattr(
+        "apps.web.drivers.build_driver",
+        lambda *args, **kwargs: pytest.fail("retired request must be rejected first"),
+    )
+
+    with pytest.raises(ValueError, match="legacy swarm fields"):
+        await mgr.resolve(run.run_id, {"kind": "mock", "stage_policy": {}})
+
+    assert run.finished is True
+    events = [ev async for ev in run.store.replay(run.run_id)]
+    assert not any(ev.event_type is EventType.RUN_REOPENED for ev in events)
 
 
 @pytest.mark.asyncio

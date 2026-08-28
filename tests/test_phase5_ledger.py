@@ -314,7 +314,7 @@ def test_swarm_make_cli_worker_budget_rejection_does_not_reserve_spawn(tmp_path:
         "runtime": "local", "enabled": True, "max_running": 2,
     }
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=SandboxManager(root=tmp_path / "sandbox"),
         artifacts=ArtifactStore(root=tmp_path / "artifacts"), executor="cli",
         engines=["p1"], worker_profiles=[profile], budget_gate=gate,
@@ -345,7 +345,7 @@ def test_swarm_make_cli_worker_billing_account_block_is_independent(tmp_path: Pa
         "billing_account_id": "billing-1",
     }
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=SandboxManager(root=tmp_path / "sandbox"),
         artifacts=ArtifactStore(root=tmp_path / "artifacts"), executor="cli",
         engines=["p1"], worker_profiles=[profile], budget_gate=gate,

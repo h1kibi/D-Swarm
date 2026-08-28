@@ -12,6 +12,18 @@ from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_
 from dswarm.solver.runtime_policy import RuntimePolicyError
 from dswarm.solver.worker_profiles import base_engine_for_profile, direction_profile_name, normalize_profile_roster, normalize_worker_profiles
 from dswarm.solver.workspace import ensure_workspace
+from dswarm.swarm._bootstrap_assets import (
+    _CONTAINER_BLACKBOARD_SKILL,
+    _CONTAINER_DIRECTION_PROMPT,
+    _CONTAINER_PI_CONFIG,
+    _direction_from_profile_id,
+    _ensure_base_skill_links,
+    _ensure_blackboard_skill_links,
+    _ensure_direction_links,
+    _ensure_pi_config_links,
+    _materialize_runtime_pi_config,
+    _repo_direction_root,
+)
 from dswarm.swarm.budget import WorkerBudgetExhausted
 from dswarm.swarm.errors import WorkerSpawnRejected
 from dswarm.swarm.lane_gate import WorkerLaneDisabled, WorkerLaneStopped
@@ -85,8 +97,6 @@ class WorkerRuntimeMixin:
     def _profile_allows_role(profile: dict, role: "Optional[str]") -> bool:
         if role is None:
             return True
-        if role == "race" and profile.get("race") is False:
-            return False
         roles = profile.get("roles") or []
         return role in roles
 
@@ -255,7 +265,7 @@ class WorkerRuntimeMixin:
     def _alloc_workdir(self, engine: str) -> "Optional[str]":
         """Carve a fresh per-worker cwd under worker_root, or return None to let
         CliSolver fall back to a system mkdtemp. The monotonic _worker_seq keeps
-        two same-engine workers (race + a later explore) from colliding."""
+        multiple workers on the same engine from colliding."""
         if self.worker_root is None:
             return None
         if self.workspace_root is not None:
@@ -281,18 +291,6 @@ class WorkerRuntimeMixin:
         task_token: str | None = None,
     ) -> dict[str, str]:
         """Per-worker runtime env: Credential Account plus isolated HOME."""
-        from dswarm.swarm.swarm import (
-            _CONTAINER_BLACKBOARD_SKILL,
-            _CONTAINER_DIRECTION_PROMPT,
-            _CONTAINER_PI_CONFIG,
-            _direction_from_profile_id,
-            _ensure_base_skill_links,
-            _ensure_blackboard_skill_links,
-            _ensure_direction_links,
-            _ensure_pi_config_links,
-            _materialize_runtime_pi_config,
-            _repo_direction_root,
-        )
 
         explicit_endpoint = bool(
             (profile or {}).get("base_url")
@@ -747,7 +745,7 @@ class WorkerRuntimeMixin:
         if converted:
             # D: claim the pre-empted open intent atomically under THIS worker's
             # solver_id (so conclude's owner-fence accepts exactly this worker).
-            # If someone else won the race, do not duplicate their work — release
+            # If someone else claimed the intent, do not duplicate their work — release
             # the slot and let the caller pick another path.
             try:
                 won = self.shared_graph.claim_intent(
@@ -763,7 +761,7 @@ class WorkerRuntimeMixin:
 
     async def _apply_worker_cmds(self, *, tasks: dict, task_solvers: dict,
                                  healthy: list[str], running_engines_fn, emit_bb) -> None:
-        """Drain operator spawn/kill worker commands onto the LIVE coordinator
+        """Drain operator spawn/kill worker commands onto the live scheduler
         state (BE-worker-management runtime control). Mutates tasks/task_solvers
         in place. A spawn adds a fresh bootstrap worker for the requested engine
         (capped at max_workers; engine must be in the roster or currently healthy);

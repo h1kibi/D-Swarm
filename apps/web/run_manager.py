@@ -95,7 +95,7 @@ class Run:
     runtime_snapshot: RuntimeSnapshot | None = None
     pool_manager: ContainerPoolManager | None = None
     hitl: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
-    # operator worker commands (spawn/kill a specific engine) the coordinator drains
+    # operator worker commands (spawn/kill a specific engine) the scheduler drains
     worker_cmds: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
     task: Optional[asyncio.Task] = None
     # post-solve standby: a short-lived worker spun up to serve a HITL command when
@@ -225,7 +225,7 @@ Driver = Callable[[Run], Awaitable[None]]
 
 
 def _apply_blackboard_meta(run: "Run", ev: Event) -> None:
-    """Reflect coordinator BLACKBOARD_DELTA lifecycle into the rail/summary state so
+    """Reflect scheduler BLACKBOARD_DELTA lifecycle into the rail/summary state so
     the deck shows mid-run progress, not just the terminal RUN_FINISHED. Two things
     the operator complained were invisible (run-11189):
       • flag_found — a flag landed mid-run (collect mode keeps going); merge it into
@@ -589,27 +589,6 @@ class RunManager:
             return value
         return str(value)
 
-    @staticmethod
-    def _strip_legacy_dispatch_fields(body: dict[str, Any]) -> dict[str, Any]:
-        """Remove pre-v3 swarm knobs from a persisted recovery snapshot.
-
-        ``build_driver`` intentionally rejects these fields for new requests. Older
-        runs, however, were started while the knobs were still accepted and may
-        have a sidecar containing them. Replaying that sidecar must not turn a
-        valid historical run into an unrecoverable configuration error.
-        """
-        config = dict(body or {})
-        for key in ("cli_race", "race_scout", "race_timeout", "race_engines",
-                    "coordinator", "cold_start"):
-            config.pop(key, None)
-        stage = config.get("stage_policy")
-        if isinstance(stage, dict):
-            stage = dict(stage)
-            stage.pop("race", None)
-            stage.pop("coordinator", None)
-            config["stage_policy"] = stage
-        return config
-
     def remember_dispatch(self, run_id: str, body: dict[str, Any] | None) -> dict[str, Any]:
         """Persist the non-secret dispatch settings needed by ``resolve``.
 
@@ -619,9 +598,7 @@ class RunManager:
         """
         run = self.runs.get(run_id) or self.create(run_id)
         safe = self._redact_dispatch_value(dict(body or {}))
-        config = self._strip_legacy_dispatch_fields(
-            safe if isinstance(safe, dict) else {}
-        )
+        config = safe if isinstance(safe, dict) else {}
         run.dispatch_body = config
         path = self.workspace_dir(run_id) / ".dswarm_dispatch.json"
         try:
@@ -636,75 +613,14 @@ class RunManager:
     def _load_dispatch(self, run_id: str) -> dict[str, Any]:
         run = self.runs.get(run_id)
         if run is not None and run.dispatch_body:
-            return self._strip_legacy_dispatch_fields(run.dispatch_body)
+            return dict(run.dispatch_body)
         path = self.sessions_root / run_id.replace("/", "_").replace("..", "_") / "workspace" / ".dswarm_dispatch.json"
         try:
             import json
             raw = json.loads(path.read_text(encoding="utf-8"))
-            return self._strip_legacy_dispatch_fields(raw) if isinstance(raw, dict) else {}
+            return raw if isinstance(raw, dict) else {}
         except (OSError, ValueError, TypeError):
             return {}
-
-    async def _infer_dispatch_from_history(self, run_id: str) -> dict[str, Any]:
-        """Recover enough of a pre-sidecar dispatch to continue old runs.
-
-        Sidecars were introduced after some runs already existed. For those runs,
-        resolving with today's global roster can select a different profile (or a
-        host-only health probe) and leave the reopened run with no worker. The
-        event log contains the non-secret facts needed for a safe best-effort
-        reconstruction: engines that actually came online and the runtime backend
-        reported by those workers. Never infer credentials or arbitrary options.
-        """
-        engines: list[str] = []
-        backend = ""
-        online_workers: set[str] = set()
-        try:
-            async for ev in self.runs[run_id].store.replay(run_id):
-                if ev.event_type is not EventType.WORKER_STATUS:
-                    continue
-                payload = ev.payload or {}
-                if payload.get("online"):
-                    engine = str(payload.get("engine") or "").strip()
-                    if engine and engine not in engines:
-                        engines.append(engine)
-                    # worker.status is a heartbeat stream, not a spawn stream.
-                    # Counting every online heartbeat inflated start_workers (run
-                    # 1806 would recover with eight workers although only one was
-                    # ever active). Prefer the durable solver id; old events without
-                    # one fall back to the engine/role pair and therefore count once.
-                    solver_id = str(getattr(ev, "solver_id", "") or "").strip()
-                    role = str(payload.get("worker_role") or "").strip()
-                    online_workers.add(solver_id or f"{engine}:{role}")
-                runtime = payload.get("runtime")
-                if isinstance(runtime, dict) and runtime.get("backend"):
-                    backend = str(runtime["backend"]).strip()
-        except Exception:
-            return {}
-        started_workers = len({key for key in online_workers if key.strip(":")})
-        inferred: dict[str, Any] = {}
-        if engines:
-            # Historical worker events report the BASE engine (pi). Map it to the
-            # run category's direction profile so an old-run resolve keeps the
-            # single-worker behavior instead of expanding "pi" across all
-            # direction profiles.
-            from dswarm.solver.worker_profiles import direction_profile_name
-
-            run = self.runs.get(run_id)
-            category = str(getattr(run, "category", "") or "").strip()
-            resolved: list[str] = []
-            for engine in engines:
-                if engine == "pi":
-                    profile = direction_profile_name(category) or "pi-worker"
-                else:
-                    profile = engine
-                if profile not in resolved:
-                    resolved.append(profile)
-            inferred["engines"] = resolved
-        if backend in ("local", "container"):
-            inferred["worker_backend"] = backend
-        if started_workers:
-            inferred["start_workers"] = min(started_workers, 8)
-        return inferred
 
     def workspace_dir(self, run_id: str) -> Path:
         """Per-run persistent workspace: sessions/{id}/workspace/.
@@ -1570,17 +1486,17 @@ class RunManager:
                 payload=hitl_response_payload(target, action, **fields)))
             if run.task is not None and not run.task.done():
                 # ⑤ Route stop THROUGH the hitl queue first so the swarm's _drain_hitl
-                # sets _operator_stop=True and the coordinator finalizes as
+                # sets _operator_stop=True and the scheduler finalizes as
                 # "operator_stop" — NOT "runtime_failure". A bare task.cancel() (the old
                 # path) skipped that flag, so finalize mislabeled an operator stop as a
                 # crash and parked every in-flight intent as resume noise (run-75377: 53
-                # stranded intents). Give the coordinator a brief window to drain + exit
+                # stranded intents). Give the scheduler a brief window to drain + exit
                 # cleanly on its own; cancel only as a backstop if it doesn't.
                 try:
                     run.hitl.put_nowait({"action": "stop", "target": target})
                 except Exception:
                     pass
-                for _ in range(40):  # ~4s: _drain_hitl runs each coordinator tick
+                for _ in range(40):  # ~4s: _drain_hitl runs each scheduler tick
                     await asyncio.sleep(0.1)
                     if run.task.done():
                         break
@@ -1645,9 +1561,9 @@ class RunManager:
     async def post_worker_cmd(self, run_id: str, action: str, *,
                               engine: Optional[str] = None,
                               solver_id: Optional[str] = None) -> bool:
-        """Queue an operator worker command (spawn/kill) for the LIVE coordinator
+        """Queue an operator worker command (spawn/kill) for the LIVE scheduler
         to drain. Only meaningful while the run is running; a finished/ghost run
-        has no coordinator loop to act on it, so we reject it."""
+        has no scheduler loop to act on it, so we reject it."""
         run = self.runs.get(run_id)
         if run is None:
             return False
@@ -1677,22 +1593,16 @@ class RunManager:
         if run is None:
             return False
         if run.task is not None and not run.task.done():
-            return False  # already live — nothing to relaunch (use HITL instead)
+            return False  # already live - nothing to relaunch (use HITL instead)
         # A previous failed recovery must not leave a scheduler slot or queue entry
         # that makes the next click look successful but never dispatch.
         if self.scheduler.is_active(run_id) or self.scheduler.is_queued(run_id):
             return False
-        await self._reconcile_ledger(run)
-        if run.runtime_snapshot is not None:
-            await self._cleanup_before_reopen(run)
-        self._ensure_runtime_pool_manager(run)
-        if run.spawn_guard is not None:
-            await run.spawn_guard.ensure_ready(run_id)
 
         # Reconstruct the challenge from the durable winner/event history, then
-        # layer the saved dispatch body underneath it. This preserves custom
-        # engines/profiles/backend across a server restart instead of silently
-        # using today's global settings.
+        # layer the saved dispatch body underneath it. Historical worker events
+        # are evidence for replay only; they are never a source of live roster or
+        # backend configuration.
         ch: dict[str, Any] = {}
         try:
             import json
@@ -1712,11 +1622,13 @@ class RunManager:
             except Exception:
                 ch = {}
         saved = self._load_dispatch(run_id)
-        if not saved:
-            # Compatibility for runs created before .dswarm_dispatch.json existed.
-            # Prefer the roster/backend that really produced prior worker events over
-            # whatever global worker settings happen to be active today.
-            saved = await self._infer_dispatch_from_history(run_id)
+        request_body = dict(body or {})
+        # Retired swarm fields must fail closed before any runtime cleanup,
+        # reopening, or scheduler submission. A historical sidecar is read-only
+        # data; do not silently strip or migrate it into a live dispatch.
+        from apps.web.drivers import _reject_retired_swarm_fields
+        _reject_retired_swarm_fields(saved)
+        _reject_retired_swarm_fields(request_body)
         saved_ch = saved.get("challenge") if isinstance(saved.get("challenge"), dict) else {}
         if not ch:
             ch = dict(saved_ch)
@@ -1724,12 +1636,17 @@ class RunManager:
             ch = {"name": run.name or run_id, "category": run.category or "web",
                   "expected_flags": run.expected_flags,
                   "multi_flag": run.multi_flag}
-        merged = merge_resolve_dispatch(saved, body, historical_challenge=ch)
+        merged = merge_resolve_dispatch(saved, request_body, historical_challenge=ch)
 
-        # Continue directly in the coordinator on the existing evidence graph.
-        # Do not inject the former race_scout/cold_start knobs here: current
-        # build_driver deliberately rejects those legacy fields. Reusing the same
-        # workspace already gives the coordinator its existing graph context.
+        # Continue directly in the Reason scheduler on the existing evidence graph.
+        # Recovery reuses the existing graph context and passes the current
+        # dispatch contract directly to the Reason scheduler.
+        await self._reconcile_ledger(run)
+        if run.runtime_snapshot is not None:
+            await self._cleanup_before_reopen(run)
+        self._ensure_runtime_pool_manager(run)
+        if run.spawn_guard is not None:
+            await run.spawn_guard.ensure_ready(run_id)
 
         self.configure_budget(run_id, merged)
         # Build synchronously before changing lifecycle state. Configuration errors

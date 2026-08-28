@@ -427,7 +427,6 @@ async def test_reason_scheduler_empty_health_roster_finishes_explicitly(tmp_path
     bus = EventBus()
     sw = Swarm(
         challenge,
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=SandboxManager(root=tmp_path / "sbx"),
         artifacts=ArtifactStore(root=tmp_path / "arts"),
@@ -463,7 +462,6 @@ async def test_swarm_reason_path_starts_with_one_recon(tmp_path):
     arts = ArtifactStore(root=tmp_path / "arts")
     swarm = Swarm(
         challenge,
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=sandbox,
         artifacts=arts,
@@ -648,7 +646,6 @@ async def test_reason_path_hitl_pause_resume_gates_reason_loop(tmp_path):
     hitl: asyncio.Queue = asyncio.Queue()
     swarm = Swarm(
         challenge,
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=sandbox,
         artifacts=arts,
@@ -948,6 +945,35 @@ async def test_reason_swarm_bus_failure_does_not_break_scheduling():
     assert result["flags"] == ["flag{ok}"]
 
 
+async def test_reason_intent_registration_failure_is_surfaced_once_without_blocking():
+    class _FailingGraph:
+        def propose_intent(self, **kwargs):
+            raise RuntimeError("sqlite secret=/tmp/private.db")
+
+    bus = _Bus()
+    swarm = ReasonSwarm(_challenge(), graph=_FailingGraph(), bus=bus)
+    decision = DispatchDecision(
+        intent_id="I-db-fail", profile="pi-worker", direction="web",
+        goal="probe the endpoint", mode="explore",
+    )
+
+    swarm._register_decision(decision)
+    swarm._register_decision(decision)
+    await asyncio.sleep(0)
+
+    failures = [
+        e.payload for e in bus.events
+        if e.payload.get("delta_type") == "intent_db_write_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["intent_id"] == "I-db-fail"
+    assert failures[0]["op"] == "propose"
+    assert failures[0]["reason"] == "RuntimeError"
+    assert "sqlite secret" not in repr(failures[0])
+    assert len(failures[0]["reason"]) <= 160
+    assert "probe the endpoint" not in failures[0]["reason"]
+
+
 async def test_reason_registers_intents_before_worker_dispatch(tmp_path):
     """Reason decisions must exist in SQLite before workers attach products to them."""
     import sqlite3
@@ -1022,7 +1048,6 @@ async def test_reason_path_finalizes_board_and_persists_real_winner(tmp_path):
     arts = ArtifactStore(root=workspace / "arts")
     swarm = Swarm(
         challenge,
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=sandbox,
         artifacts=arts,
@@ -1349,7 +1374,6 @@ async def test_swarm_injects_its_worker_lane_gate_into_reason_scheduler(
     challenge = _challenge()
     swarm = Swarm(
         challenge,
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=SandboxManager(root=tmp_path / "sbx"),
         artifacts=ArtifactStore(root=tmp_path / "arts"),
@@ -1357,11 +1381,7 @@ async def test_swarm_injects_its_worker_lane_gate_into_reason_scheduler(
         executor="cli",
         engines=["pi"],
         max_workers=3,
-        stage_policy={
-            "coordinator": {
-                "review": {"enabled": True, "max_concurrent": 2}
-            }
-        },
+        review_policy={"enabled": True, "max_concurrent": 2},
     )
     captured = {}
 
@@ -1388,18 +1408,13 @@ async def test_swarm_injects_its_worker_lane_gate_into_reason_scheduler(
 def test_swarm_preserves_zero_review_lane_capacity(tmp_path):
     swarm = Swarm(
         _challenge(),
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=SandboxManager(root=tmp_path / "sbx"),
         artifacts=ArtifactStore(root=tmp_path / "arts"),
         config=SolverConfig(),
         executor="cli",
         engines=["pi"],
-        stage_policy={
-            "coordinator": {
-                "review": {"enabled": True, "max_concurrent": 0}
-            }
-        },
+        review_policy={"enabled": True, "max_concurrent": 0},
     )
 
     assert swarm.review_policy["max_concurrent"] == 0

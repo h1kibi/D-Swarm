@@ -22,6 +22,7 @@ from dswarm.solver.runtime_policy import (
 )
 from dswarm.swarm import runtime as runtime_module
 from dswarm.swarm.agents import AgentProfile, DispatchDecision
+from dswarm.swarm.runtime_degradation import RuntimeDegradationMixin
 
 
 def make_pool(profile_id: str, *, capacity: int = 2) -> PoolSpec:
@@ -418,6 +419,135 @@ async def test_same_route_runtime_failover_retries_frozen_profile_without_direct
         "failure_code": "runtime_link_lost",
     }
     assert _Swarm._reason_stop_event.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_failover_records_degradation_once_and_keeps_actual_backend():
+    snapshot = make_snapshot("pi-web-a", "pi-web-b")
+    pools = {pool.profile_id: pool for pool in snapshot.pools}
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    class _Bus:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        async def emit(self, event):
+            self.events.append(event)
+            return event
+
+    class _LaneGate:
+        @staticmethod
+        def lane_for(*, mode: str, worker_class: str) -> str:
+            return "ordinary"
+
+    class _Manager:
+        async def mark_failure(self, **_kwargs):
+            return True
+
+        def snapshot_view(self):
+            return (
+                view(
+                    pools["pi-web-a"], "degraded",
+                    failure=RuntimeFailure("infrastructure", "runtime_link_lost"),
+                ),
+                view(pools["pi-web-b"], "new"),
+            )
+
+    class _Worker:
+        def __init__(self, engine: str):
+            self.engine = engine
+            self.solver_id = engine
+            self.runtime_pool_id = pools[engine].pool_id
+            self.runtime_pool_instance_id = f"instance-{engine}"
+
+        async def run(self):
+            if self.engine == "pi-web-a":
+                raise RuntimeFailure("infrastructure", "runtime_link_lost")
+            return SimpleNamespace(solved=False, engine=self.engine)
+
+    class _Swarm(RuntimeDegradationMixin):
+        challenge = SimpleNamespace(id="ch-failover", category="web")
+        _worker_lane_gate = _LaneGate()
+        shared_graph = None
+        runtime_snapshot = snapshot
+        pool_manager = _Manager()
+        worker_backend = "container"
+
+        def __init__(self):
+            self._reason_stop_event = asyncio.Event()
+            self._runtime_degraded: list[dict] = []
+            self._degraded_engines: dict[str, str] = {}
+            self.bus = _Bus()
+            self.run_id = "run-failover"
+
+        @staticmethod
+        def _healthy_matches(engine: str, healthy: list[str]) -> bool:
+            return engine in healthy
+
+        @staticmethod
+        def _make_cli_worker(engine: str, **_kwargs):
+            return _Worker(engine)
+
+        @staticmethod
+        def _release_worker_account(_worker):
+            return None
+
+        @staticmethod
+        def _cancel_solver(_worker):
+            return None
+
+        @staticmethod
+        async def _emit_bb_bus(kind: str, **fields):
+            emitted.append((kind, fields))
+
+        @staticmethod
+        def _profile_for_engine(engine: str, *, advance: bool = False):
+            return {"name": engine} if engine else None
+
+        @staticmethod
+        def _runtime_for_engine(engine: str, profile):
+            return {"id": f"rt-{engine}", "backend": "container"}
+
+        @staticmethod
+        def _backend_for_engine(engine: str, profile=None):
+            return "container"
+
+    swarm = _Swarm()
+    decision = DispatchDecision(
+        intent_id="I-web",
+        profile="pi-web-a",
+        goal="inspect web target",
+        direction="web",
+        canonical_direction="web",
+        direction_source="model",
+        direction_resolution="explicit_canonical",
+        mode="explore",
+    )
+    runtime = runtime_module.SwarmWorkerRuntime(
+        swarm, healthy=["pi-web-a", "pi-web-b"]
+    )
+
+    outcome = await runtime.run(
+        decision,
+        AgentProfile(id="pi-web-a", worker_profile="pi-web-a", mode="explore"),
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert outcome.engine == "pi-web-b"
+    assert [kind for kind, _ in emitted] == ["runtime_failover"]
+    assert len(swarm._runtime_degraded) == 1
+    record = swarm._runtime_degraded[0]
+    assert record["engine"] == "pi-web-a"
+    assert record["requested_backend"] == "container"
+    assert record["backend"] == "container"
+    assert record["reason"] == "infrastructure:runtime_link_lost"
+    assert [event.payload["kind"] for event in swarm.bus.events] == [
+        "runtime_degraded"
+    ]
+    metadata = swarm._runtime_metadata_for(outcome)
+    assert metadata["backend"] == "container"
+    assert metadata["runtime"] == "rt-pi-web-b"
 
 @pytest.mark.asyncio
 async def test_runtime_lease_binding_records_acquired_frozen_identity():

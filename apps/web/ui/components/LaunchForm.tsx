@@ -24,7 +24,6 @@ export function LaunchForm({
   const [target, setTarget] = useState("http://127.0.0.1:8000");
   const [description, setDescription] = useState("Solve the web challenge.");
   const [hints, setHints] = useState("");
-  const [nSolvers, setNSolvers] = useState(2);
 
   const launch = (kind: "swarm" | "mock") => {
     if (kind === "mock") {
@@ -38,7 +37,6 @@ export function LaunchForm({
       target,
       description,
       hints,
-      nSolvers,
     }));
   };
 
@@ -78,11 +76,6 @@ export function LaunchForm({
           <span>Hints (optional, one per line)</span>
           <textarea value={hints} onChange={(e) => setHints(e.target.value)} rows={2}
             placeholder="known facts to seed the swarm with" />
-        </label>
-        <label>
-          <span>Solvers</span>
-          <input type="number" min={1} max={6} value={nSolvers}
-            onChange={(e) => setNSolvers(Math.max(1, Math.min(6, Number(e.target.value) || 1)))} />
         </label>
       </div>
       <div className="launch-actions">

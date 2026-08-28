@@ -1,6 +1,6 @@
 """Reason-centered swarm scheduler.
 
-This scheduler replaces the race path. A run starts with one recon worker,
+A run starts with one recon worker,
 then Reason audits the board and produces DispatchDecisions. The scheduler
 only executes those decisions; it never plans an attack path itself.
 """
@@ -36,6 +36,7 @@ from dswarm.solver.direction_rules import (
     DEFAULT_DIRECTION_REGISTRY,
     sanitize_raw_direction,
 )
+from dswarm.swarm.poc_verification import sanitize_public_text
 from dswarm.solver.worker_profiles import direction_profile_name
 from dswarm.swarm.lane_gate import WorkerLaneGate
 from dswarm.solver.reason import ReasonResult
@@ -141,6 +142,10 @@ class ReasonSwarm:
             fatal_threshold=int(os.environ.get("DSWARM_PROVIDER_FATAL_THRESHOLD", "3") or 3),
             majority_ratio=float(os.environ.get("DSWARM_PROVIDER_MAJORITY_RATIO", "0.5") or 0.5),
         )
+        # One bounded diagnostic per intent registration failure.  Intent
+        # persistence is best-effort so a graph outage cannot stop dispatch,
+        # but a lost row must remain visible to operators.
+        self._intent_registration_failures_noted: set[str] = set()
 
     async def _emit(self, delta_type: str, *, stage: Optional[str] = None, **fields: Any) -> None:
         """Structured observability delta (D-Swarm Phase 2, docs/07 §7.1).
@@ -378,6 +383,33 @@ class ReasonSwarm:
             decision_source="reason",
         )
 
+    def _note_intent_registration_failure(
+        self, decision: DispatchDecision, exc: BaseException
+    ) -> None:
+        """Surface a failed Reason intent write without blocking dispatch.
+
+        ``propose_intent`` runs before a worker is launched, so dropping its
+        exception can leave worker evidence orphaned in the shared graph.  Keep
+        this diagnostic bounded and public-safe, and emit it asynchronously just
+        like worker-side intent write diagnostics.
+        """
+        intent_id = str(getattr(decision, "intent_id", "") or "")
+        if not intent_id or intent_id in self._intent_registration_failures_noted:
+            return
+        if len(self._intent_registration_failures_noted) >= 32:
+            self._intent_registration_failures_noted.clear()
+        self._intent_registration_failures_noted.add(intent_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._emit(
+            "intent_db_write_failed",
+            intent_id=intent_id,
+            op="propose",
+            reason=sanitize_public_text(type(exc).__name__, limit=160),
+        ))
+
     def _register_decision(self, decision: DispatchDecision) -> None:
         """Persist a Reason dispatch before the worker can produce graph products.
 
@@ -416,8 +448,8 @@ class ReasonSwarm:
                 },
                 from_fact_seqs=decision.from_facts or None,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self._note_intent_registration_failure(decision, exc)
 
     def _board_summary(self) -> str:
         active = self.board.query_findings(FindingPredicate(limit=200))

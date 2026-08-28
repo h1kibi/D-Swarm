@@ -387,7 +387,7 @@ export const STRINGS: Dict = {
   "settings.imgRefresh": { zh: "刷新", en: "Refresh" },
   "settings.imgPull": { zh: "拉取镜像", en: "Pull image" },
   "settings.imgPulling": { zh: "拉取中…", en: "Pulling…" },
-  "settings.secComposer": { zh: "Worker 编队", en: "Worker lineup" },
+  "settings.secComposer": { zh: "Worker 编队", en: "Worker roster" },
   "settings.composerAddTitle": { zh: "添加一个该引擎的实例", en: "Add an instance of this engine" },
   "settings.composerEmpty": {
     zh: "还没有 worker 实例。用上面的按钮拖出一个，例如三个 pi profile 各配 deepseek-v4-flash / deepseek-v4-pro / 自定义模型。",

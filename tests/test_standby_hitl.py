@@ -28,7 +28,7 @@ def test_persist_winner_writes_session_handle(tmp_path):
 
     graph_dir = tmp_path / "graph"
     sw = Swarm(
-        _challenge(), [], llm=None,
+        _challenge(), llm=None,
         sandbox=SandboxManager(root=tmp_path / "sbx"),
         graph_dir=graph_dir, run_id="run-x",
     )
@@ -53,7 +53,7 @@ def test_persist_winner_carries_all_flags(tmp_path):
 
     graph_dir = tmp_path / "graph"
     sw = Swarm(
-        _challenge(), [], llm=None,
+        _challenge(), llm=None,
         sandbox=SandboxManager(root=tmp_path / "sbx"),
         graph_dir=graph_dir, run_id="run-multi",
     )
@@ -73,7 +73,7 @@ def test_persist_winner_skips_without_session(tmp_path):
     from dswarm.sandbox.manager import SandboxManager
 
     graph_dir = tmp_path / "graph"
-    sw = Swarm(_challenge(), [], llm=None,
+    sw = Swarm(_challenge(), llm=None,
                sandbox=SandboxManager(root=tmp_path / "sbx"),
                graph_dir=graph_dir, run_id="run-x")
     # no session → nothing to resume → no file

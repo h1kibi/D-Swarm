@@ -939,7 +939,7 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
   const [llmTests, setLlmTests] = useState<Record<LlmProfileKey, { busy?: boolean; result?: ReasonLlmProbe }>>({
     planner: {}, titler: {},
   });
-  const review = draft.stage_policy.coordinator?.review || {};
+  const review = draft.review_policy || {};
   const reviewOptions = draft.worker_profiles
     .filter((profile) => profile.roles?.includes("review"))
     .map(profileLabel);
@@ -950,10 +950,7 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
     engine: "api", mode: "managed", present: false, writable_state: true, details: {},
   } as CredentialAccount];
   const updateReview = (patch: Record<string, unknown>) => onChange({
-    ...draft, stage_policy: { ...draft.stage_policy, coordinator: {
-      ...(draft.stage_policy.coordinator || { wall_clock_budget: 0 }),
-      review: { ...review, ...patch },
-    } },
+    ...draft, review_policy: { ...review, ...patch },
   });
   const updateLlm = (key: LlmProfileKey, patch: Partial<WorkerSettings["llm_profiles"][LlmProfileKey]>) => onChange({
     ...draft, llm_profiles: { ...draft.llm_profiles,

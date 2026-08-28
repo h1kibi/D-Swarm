@@ -10,7 +10,6 @@ describe("LaunchForm direction payload", () => {
       target: "http://target",
       description: "Solve it",
       hints: "",
-      nSolvers: 2,
     });
 
     expect(body.challenge).toMatchObject({
@@ -27,7 +26,6 @@ describe("LaunchForm direction payload", () => {
       target: "",
       description: "Solve it",
       hints: "hint",
-      nSolvers: 1,
     });
 
     expect(body.challenge).toMatchObject({

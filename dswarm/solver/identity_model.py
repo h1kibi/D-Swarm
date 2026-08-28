@@ -152,7 +152,6 @@ class Seat:
     model: str = ""
     effort: str = ""
     roles: list[str] = field(default_factory=lambda: list(DEFAULT_ROLES))
-    race: bool = True
     max_running: int = 1
     max_review_running: int = 0
     priority: int = 100
@@ -162,7 +161,7 @@ class Seat:
         return {
             "id": self.id, "label": self.label, "engine": self.engine,
             "credential_id": self.credential_id, "environment_id": self.environment_id,
-            "model": self.model, "roles": list(self.roles), "race": self.race,
+            "model": self.model, "roles": list(self.roles),
             "effort": self.effort,
             "capacity": {
                 "max_running": self.max_running,
@@ -321,7 +320,11 @@ def migrate_legacy_config(
         sid = seat_id_for(engine, legacy_name=legacy_name)
         cid = _ensure_credential(engine, p)
         env_id = str(p.get("runtime") or "docker-web").strip()
-        roles = [str(r).strip() for r in (p.get("roles") or []) if str(r).strip()] or list(DEFAULT_ROLES)
+        roles = [
+            ("explore" if str(r).strip() == "race" else str(r).strip())
+            for r in (p.get("roles") or []) if str(r).strip()
+        ] or list(DEFAULT_ROLES)
+        roles = list(dict.fromkeys(roles))
         cap = p.get("capacity") if isinstance(p.get("capacity"), dict) else {}
         # label survives re-migration: prefer an explicit label, else the legacy
         # name — but never let the label BE the seat id (which happens on the 2nd
@@ -335,7 +338,6 @@ def migrate_legacy_config(
             model=str(p.get("model") or "").strip(),
             effort=str(p.get("effort") or "").strip().lower(),
             roles=roles,
-            race=bool(p.get("race", "race" in roles)),
             max_running=coerce_pos_int(p.get("max_running", cap.get("max_running")), 1),
             max_review_running=coerce_nonneg_int(p.get("max_review_running", cap.get("max_review_running")), 0),
             priority=coerce_nonneg_int(p.get("priority"), 100),
@@ -441,7 +443,6 @@ def seat_to_legacy_profile(
         "image": _seat_direction_image(seat),
         "runtime": str(seat.get("environment_id") or environment.get("id") or "docker-web").strip(),
         "roles": roles,
-        "race": bool(seat.get("race", "race" in roles)),
         "max_running": coerce_pos_int(seat.get("max_running", cap.get("max_running")), 1),
         "max_review_running": coerce_nonneg_int(seat.get("max_review_running", cap.get("max_review_running")), 0),
         "priority": coerce_nonneg_int(seat.get("priority"), 100),

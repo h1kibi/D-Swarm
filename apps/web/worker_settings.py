@@ -186,10 +186,7 @@ def derive_routing(profiles: list[dict[str, Any]]) -> tuple[list[str], dict[str,
         if not category or not enabled:
             continue
         engines.append(ref)
-        overrides[category] = {
-            "engines": [ref],
-            "start_workers": max(1, min(2, int(profile.get("max_running") or 1))),
-        }
+        overrides[category] = {"engines": [ref]}
     return engines, overrides, system_ref
 
 
@@ -494,8 +491,8 @@ def summarize_changes(
             changes.append({"scope": "worker", "id": label, "fields": fields})
     if current_runtimes != draft_runtimes:
         changes.append({"scope": "runtime", "id": "templates", "fields": ["runtime_profiles"]})
-    if current.get("stage_policy") != draft.get("stage_policy"):
-        changes.append({"scope": "reason", "id": "ReasonSwarm", "fields": ["stage_policy"]})
+    if current.get("review_policy") != draft.get("review_policy"):
+        changes.append({"scope": "reason", "id": "ReasonSwarm", "fields": ["review_policy"]})
     if current_llm_profiles != draft_llm_profiles:
         changes.append({"scope": "reason", "id": "LLM", "fields": ["llm_profiles"]})
     if current_llm_providers != draft_llm_providers:
@@ -622,23 +619,22 @@ def apply_workspace_draft(
 
         profiles, runtimes, llm_profiles, llm_providers = _normalized_candidate(draft)
         engines, overrides, system_ref = derive_routing(profiles)
-        stage_policy = copy.deepcopy(draft.get("stage_policy") or current.get("stage_policy") or {})
-        coordinator = stage_policy.setdefault("coordinator", {})
-        review = coordinator.setdefault("review", {})
-        review["enabled"] = bool(system_ref)
+        review_policy = copy.deepcopy(
+            draft.get("review_policy") or current.get("review_policy") or {}
+        )
+        review_policy["enabled"] = bool(system_ref)
         if system_ref:
-            review["engine"] = system_ref
+            review_policy["engine"] = system_ref
 
         config_store.set(
             # An explicit empty roster is meaningful: all direction/System
             # Workers may be disabled while custom Workers remain manual-only.
             engines=engines,
-            start_workers=draft.get("start_workers", current.get("start_workers")),
             worker_backend=draft.get("worker_backend", current.get("worker_backend")),
             wall_clock_budget=draft.get("wall_clock_budget", current.get("wall_clock_budget")),
             max_total_workers=draft.get("max_total_workers", current.get("max_total_workers")),
             cost_budget_usd=draft.get("cost_budget_usd", current.get("cost_budget_usd")),
-            stage_policy=stage_policy,
+            review_policy=review_policy,
             llm_profiles=llm_profiles,
             llm_providers=llm_providers,
             runtime_profiles=runtimes,

@@ -32,9 +32,9 @@ class EventType(str, Enum):
     WORKER_FINISHED = "worker.finished"  # ONE swarm sub-worker ended (worker-level,
     #   NOT the run). In coordinator mode many workers come and go while the run keeps
     #   going (re-bootstrap until solved/stopped), so a worker ending must NOT mark the
-    #   whole run finished — only the coordinator's own exit emits a run-level
-    #   RUN_FINISHED. A single-solver run (mock / race / standby) is its own run, so it
-    #   still emits RUN_FINISHED directly.
+    #   whole run finished — only the scheduler's own exit emits a run-level
+    #   RUN_FINISHED. A standalone run (mock / standby) is its own run, so it still
+    #   emits RUN_FINISHED directly.
     TEXT_MESSAGE_DELTA = "text.delta"
     REASONING_DELTA = "reasoning.delta"
     TOOL_CALL_START = "tool.start"

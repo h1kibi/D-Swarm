@@ -7,7 +7,7 @@ Reproduces the June-2026 NYU CTF Bench eval as an in-repo, CLI-driven harness:
 
 Design:
 - ONE engine per challenge run (attribution is the point): the ReasonSwarm
-  runs solo (start_workers=1) — the winner IS that engine.
+  runs one configured engine per challenge.
 - pi runs through the P3 container stack (ctf-swarm-pi-<cat> image + host
   model gateway + task token); claude/codex/cursor run local (and are
   skipped with a note when the CLI binary is absent).
@@ -351,7 +351,7 @@ async def run_challenge(
     worker_backend: str = "container",
 ) -> EvalResult:
     """One engine on one challenge. Mirrors scripts/smoke_pi_container.py's
-    verified swarm wiring (single engine, no race scout → clean attribution)."""
+    verified swarm wiring (single engine with clean attribution)."""
     from dswarm.core.cost import CostController
     from dswarm.core.event_bus import EventBus
     from dswarm.core.llm import LLMClient
@@ -372,20 +372,18 @@ async def run_challenge(
     arts = ArtifactStore(root=root / "arts")
     cost = CostController()
     sw = Swarm(
-        model, [],
+        model,
         llm=llm, sandbox=sandbox, bus=bus, cost=cost, artifacts=arts,
         run_id=f"eval-{ch.challenge_id}",
         executor="cli",
         engines=[engine],
         web_access=True,
-        start_workers=1,
         max_workers=2,
         worker_root=root / "workspace" / "workers",
         graph_dir=root / "workspace" / "graph",
         credential_accounts_root=credential_accounts_root,
         worker_backend=worker_backend,
         reason_model="deepseek-v4-flash",
-        stall_seconds=0.1,
         wall_clock_budget=max(30, int(budget_s)),
         barren_limit=3,
     )

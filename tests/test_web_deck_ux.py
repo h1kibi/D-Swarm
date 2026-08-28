@@ -1653,7 +1653,7 @@ async def test_swarm_driver_threads_attachments_and_offline_denies_kb(tmp_path, 
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             captured["challenge"] = challenge
             captured["web_access"] = kw.get("web_access")
             captured["kb"] = kw.get("kb")
@@ -1710,7 +1710,7 @@ async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             captured["web_access"] = kw.get("web_access")
             captured["kb"] = kw.get("kb")
 
@@ -1739,14 +1739,14 @@ async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
     assert captured["kb"] is True  # online default keeps KB
 
 
-async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_path, monkeypatch):
+async def test_swarm_driver_threads_review_policy_budgets_and_llm_profiles(tmp_path, monkeypatch):
     from apps.web import drivers
     import dswarm.swarm.swarm as sw
 
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             captured.update(kw)
         async def run(self):
             class O:
@@ -1780,19 +1780,19 @@ async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_pa
     assert captured["wall_clock_budget"] == 222
     assert captured["max_total_workers"] == 9
     assert captured["cost_budget_usd"] == 0.75
-    assert captured["stage_policy"]["budgets"]["max_total_workers"] == 9
+    assert "stage_policy" not in captured
     assert captured["llm_profiles"]["planner"]["model"] == "planner-x"
     assert captured["reason_model"] == "planner-x"
 
 
-async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, monkeypatch):
+async def test_swarm_driver_body_overrides_worker_config_budgets(tmp_path, monkeypatch):
     from apps.web import drivers
     import dswarm.swarm.swarm as sw
 
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             captured.update(kw)
         async def run(self):
             class O:
@@ -1803,18 +1803,17 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
     mgr = RunManager(sessions_root=tmp_path / "sessions")
     mgr.worker_config.resolve = lambda category: {
         "engines": ["claude"],
-        "start_workers": 1,
-        "stage_policy": {
-            "coordinator": {"wall_clock_budget": 999},
-            "budgets": {"max_total_workers": 42, "cost_budget_usd": 9.9},
-        },
+        "review_policy": {"enabled": True, "engine": "claude"},
+        "wall_clock_budget": 999,
+        "max_total_workers": 42,
+        "cost_budget_usd": 9.9,
     }
     body = {
         "kind": "swarm",
         "challenge": {"description": "solve"},
-        "wall_clock_budget": 0,
-        "max_total_workers": 0,
-        "cost_budget_usd": 0,
+        "wall_clock_budget": 1,
+        "max_total_workers": 1,
+        "cost_budget_usd": 0.25,
     }
     driver = drivers._swarm_driver(drivers._infer_challenge(body), mgr=mgr)
 
@@ -1828,10 +1827,11 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
         cost = None; flag = None
 
     await driver(FakeRun())
-    policy = captured["stage_policy"]
-    assert policy["coordinator"]["wall_clock_budget"] == 0
-    assert policy["budgets"]["max_total_workers"] == 0
-    assert policy["budgets"]["cost_budget_usd"] == 0.0
+    assert captured["wall_clock_budget"] == 1.0
+    assert captured["max_total_workers"] == 1
+    assert captured["cost_budget_usd"] == 0.25
+    assert captured["review_policy"] == {"enabled": True, "engine": "claude"}
+    assert "stage_policy" not in captured
 
 
 async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, monkeypatch):
@@ -1841,7 +1841,7 @@ async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, mo
     captured = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             captured["swarm_profiles"] = kw.get("worker_profiles")
         async def run(self):
             class O:
@@ -1857,7 +1857,6 @@ async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, mo
     mgr = RunManager(sessions_root=tmp_path / "sessions")
     mgr.worker_config.resolve = lambda category: {
         "engines": ["claude-local"],
-        "start_workers": 1,
         "worker_backend": "local",
         "runtime_profiles": [{"id": "local", "backend": "local"}],
         "worker_profiles": [
@@ -1899,7 +1898,7 @@ async def test_swarm_driver_threads_expected_flags(tmp_path, monkeypatch):
     cap = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             cap["expected_flags"] = challenge.expected_flags
             cap["flag_format"] = challenge.flag_format
 
@@ -1935,7 +1934,7 @@ async def test_swarm_driver_threads_custom_flag_wrapper_as_prompt_hint(tmp_path,
     cap = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             cap["flag_format"] = challenge.flag_format
             cap["flag_format_hint"] = challenge.flag_format_hint
 
@@ -1974,7 +1973,7 @@ async def test_swarm_driver_does_not_inject_flag_hint_without_wrapper(tmp_path, 
     cap = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             cap["flag_format_hint"] = challenge.flag_format_hint
 
         async def run(self):
@@ -2010,7 +2009,7 @@ async def test_swarm_driver_threads_multi_flag(tmp_path, monkeypatch):
     cap = {}
 
     class FakeSwarm:
-        def __init__(self, challenge, lineup, **kw):
+        def __init__(self, challenge, **kw):
             cap["multi_flag"] = challenge.multi_flag
 
         async def run(self):

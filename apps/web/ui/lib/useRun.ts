@@ -752,37 +752,33 @@ export interface ProviderSecretUpdate {
 
 export interface WorkerSettings {
   engines: string[];
-  start_workers: number;
   max_workers: number;
   worker_backend: "local" | "container";
   wall_clock_budget: number;
   max_total_workers: number;
   cost_budget_usd: number;
-  stage_policy: {
-    prepare: Record<string, unknown>;
-    coordinator?: {
-      wall_clock_budget: number;
-      review?: {
-        enabled?: boolean;
-        engine?: string;
-        timeout?: number;
-        after_race?: boolean;
-        after_fruitless_workers?: number;
-        after_duplicate_intents?: number;
-        on_course_correct?: boolean;
-        on_reason_dry?: boolean;
-        on_candidate_spike?: boolean;
-        on_operator_hint?: boolean;
-        allow_review_fallback?: boolean;
-        every_completed_workers?: number;
-        candidate_spike_threshold?: number;
-        max_concurrent?: number;
-        cooldown_events?: number;
-        max_review_workers?: number;
-      };
-    };
-    reason?: Record<string, unknown>;
-    budgets: { max_total_workers: number; cost_budget_usd: number };
+  review_policy: {
+    enabled?: boolean;
+    engine?: string;
+    provider_ref?: string;
+    credential_source?: string;
+    credential_account?: string;
+    base_url?: string;
+    wire_api?: string;
+    model?: string;
+    timeout?: number;
+    after_fruitless_workers?: number;
+    after_duplicate_intents?: number;
+    on_course_correct?: boolean;
+    on_reason_dry?: boolean;
+    on_candidate_spike?: boolean;
+    on_operator_hint?: boolean;
+    allow_review_fallback?: boolean;
+    every_completed_workers?: number;
+    candidate_spike_threshold?: number;
+    max_concurrent?: number;
+    cooldown_events?: number;
+    max_review_workers?: number;
   };
   llm_providers: LLMProvider[];
   llm_profiles: {
@@ -816,7 +812,6 @@ export interface WorkerSettings {
     auth_prefix?: string;
     runtime: string;
     roles: string[];
-    race: boolean;
     max_running: number;
     max_review_running?: number;
     priority: number;
@@ -825,7 +820,7 @@ export interface WorkerSettings {
     image?: string;
     enabled: boolean;
   }[];
-  overrides: Record<string, { engines: string[]; start_workers: number }>;
+  overrides: Record<string, { engines: string[] }>;
 }
 
 export interface CredentialAccount {

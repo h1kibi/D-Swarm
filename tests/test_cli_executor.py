@@ -4,6 +4,7 @@ external-USD cost accounting. Pure/unit (no real CLI subprocess, no API key)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 import time
 from pathlib import Path
@@ -3116,6 +3117,120 @@ def test_bootstrap_intent_lease_covers_execute_and_conclude_timeout(tmp_path):
     graph.close()
 
 
+class _ExplodingFlagGraph:
+    """Shared-graph stand-in whose flag writes always fail."""
+
+    def invalidated_flags(self):
+        return set()
+
+    def flag_found(self, **kw):
+        raise RuntimeError("flag graph down")
+
+
+async def test_flag_db_failure_is_surfaced_once_without_rejecting_real_flag():
+    ch = Challenge(id="t", name="t", category="pwn", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False, shared_graph=_ExplodingFlagGraph())
+    deltas: list[tuple[str, dict]] = []
+
+    async def fake_emit_bb(kind, **fields):
+        deltas.append((kind, fields))
+
+    solver._emit_bb = fake_emit_bb
+    solver._intent_id = "I-flag"
+
+    assert await solver._accept_flag("flag{real}") is True
+    await asyncio.sleep(0)
+    # A duplicate is a no-op and therefore cannot create a second failure note.
+    assert await solver._accept_flag("flag{real}") is False
+    await asyncio.sleep(0)
+
+    failures = [(kind, fields) for kind, fields in deltas
+                if kind == "flag_db_write_failed"]
+    assert len(failures) == 1
+    payload = failures[0][1]
+    assert payload["flag"] == "flag{real}"
+    assert payload["intent_id"] == "I-flag"
+    assert payload["op"] == "flag_found"
+    assert payload["reason"] == "RuntimeError"
+    assert "flag graph down" not in repr(payload)
+    assert solver._flag_db_failures_noted == {"flag{real}"}
+
+
+class _ExplodingFactGraph:
+    """Shared-graph stand-in whose evidence writes always fail."""
+
+    def add_evidence(self, **kw):
+        raise RuntimeError("fact graph down")
+
+
+async def test_fact_db_failure_is_surfaced_once_without_leaking_fact():
+    ch = Challenge(id="t", name="t", category="pwn", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False, shared_graph=_ExplodingFactGraph())
+    deltas: list[tuple[str, dict]] = []
+
+    async def fake_emit_bb(kind, **fields):
+        deltas.append((kind, fields))
+
+    solver._emit_bb = fake_emit_bb
+    solver._intent_id = "I-fact"
+    fact = "secret evidence that must not be copied into telemetry"
+
+    assert await solver._record_fact(
+        fact, verified=False, artifact_id="", witness="tool output"
+    ) == -1
+    assert await solver._record_fact(
+        fact, verified=False, artifact_id="", witness="tool output"
+    ) == -1
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    failures = [(kind, fields) for kind, fields in deltas
+                if kind == "fact_db_write_failed"]
+    assert len(failures) == 1
+    payload = failures[0][1]
+    assert payload["fact_digest"] == hashlib.sha256(fact.encode()).hexdigest()
+    assert payload["fact_length"] == len(fact)
+    assert payload["intent_id"] == "I-fact"
+    assert payload["op"] == "add_evidence"
+    assert payload["reason"] == "RuntimeError"
+    assert "fact graph down" not in repr(payload)
+    assert fact not in repr(payload)
+    assert len(solver._fact_db_failures_noted) == 1
+
+
+async def test_poc_and_review_db_failures_are_surfaced_once_without_payloads():
+    ch = Challenge(id="t", name="t", category="pwn", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False, shared_graph=object())
+    deltas: list[tuple[str, dict]] = []
+
+    async def fake_emit_bb(kind, **fields):
+        deltas.append((kind, fields))
+
+    solver._emit_bb = fake_emit_bb
+    solver._intent_id = "I-side-effect"
+    exc = RuntimeError("graph outage with private=/tmp/secret")
+
+    solver._note_poc_db_failure("poc-123", "save_poc", exc)
+    solver._note_poc_db_failure("poc-123", "save_poc", exc)
+    solver._note_review_db_failure("REVIEW_FINDING", "add_review_proposal", exc)
+    solver._note_review_db_failure("REVIEW_FINDING", "add_review_proposal", exc)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    by_kind = {kind: [fields for k, fields in deltas if k == kind]
+               for kind in {k for k, _ in deltas}}
+    assert len(by_kind["poc_db_write_failed"]) == 1
+    assert len(by_kind["review_db_write_failed"]) == 1
+    assert by_kind["poc_db_write_failed"][0]["poc_id"] == "poc-123"
+    assert by_kind["review_db_write_failed"][0]["marker"] == "REVIEW_FINDING"
+    for fields in (by_kind["poc_db_write_failed"][0],
+                   by_kind["review_db_write_failed"][0]):
+        assert fields["intent_id"] == "I-side-effect"
+        assert fields["reason"] == "RuntimeError"
+        assert "/tmp/secret" not in repr(fields)
+        assert "payload" not in fields
+
+
 class _ExplodingIntentGraph:
     """Shared-graph stand-in whose intent writes always fail."""
 
@@ -3150,7 +3265,8 @@ async def test_intent_db_failure_is_surfaced_once_without_disturbing_solve():
     payload = next(fields for k, fields in deltas if k == "intent_db_write_failed")
     assert payload["intent_id"] == "I-x"
     assert payload["op"] == "propose"
-    assert "graph down" in payload["reason"]
+    assert payload["reason"] == "RuntimeError"
+    assert "graph down" not in repr(payload)
     # The bound failure note never leaks unbounded per-op noise across intents.
     assert len(solver._intent_db_failures_noted) == 1
 

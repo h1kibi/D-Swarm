@@ -1,6 +1,6 @@
 """Cross-solver Insight Bus (§5.3).
 
-When N solvers race the same challenge, they share VERIFIED OBJECTIVE FACTS only
+When workers tackle the same challenge, they share VERIFIED OBJECTIVE FACTS only
 — never guesses or plans (sharing speculation would bias the whole swarm toward
 one solver's wrong idea). Three message kinds:
 

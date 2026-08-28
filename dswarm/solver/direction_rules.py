@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
+from dswarm.core.normalization import sanitize_raw_direction
+
 
 DIRECTION_SOURCES = ("model", "operator", "keyword", "category", "default")
 
@@ -32,9 +34,6 @@ DIRECTION_RESOLUTIONS = (
     "mechanical_fallback",
     "category_fallback",
 )
-
-_MAX_RAW_DIRECTION_LENGTH = 40
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -78,14 +77,6 @@ _DEFAULT_SPECS = (
         keywords=("aisec", "ai security", "prompt injection", "llm", "adversarial", "model poisoning", "jailbreak"),
     ),
 )
-
-
-def sanitize_raw_direction(value: Any, *, max_length: int = _MAX_RAW_DIRECTION_LENGTH) -> str:
-    """Return bounded, single-line direction text safe for events/UI diagnostics."""
-    if value is None:
-        return ""
-    text = _CONTROL_RE.sub("", str(value)).strip()
-    return text[:max(0, int(max_length))]
 
 
 class DirectionRegistry:
@@ -161,6 +152,7 @@ __all__ = [
     "DirectionRegistry",
     "DirectionSpec",
     "DEFAULT_DIRECTION_REGISTRY",
+    "normalize_operator_direction",
     "sanitize_raw_direction",
 ]
 

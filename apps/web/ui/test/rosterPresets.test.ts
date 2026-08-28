@@ -23,7 +23,6 @@ describe("roster presets", () => {
       "pi-forensics",
       "pi-aisec",
     ]);
-    expect(cfg.start_workers).toBe(1);
     expect(cfg.max_workers).toBe(17);
     expect(cfg.worker_backend).toBe("container");
     for (const p of cfg.worker_profiles) {
@@ -50,7 +49,6 @@ describe("roster presets", () => {
       credential_account: "pi-main",
     });
     expect(cfg.engines).toEqual(["pi-worker"]);
-    expect(cfg.start_workers).toBe(1);
     expect(cfg.max_workers).toBe(4);
   });
 

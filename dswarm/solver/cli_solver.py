@@ -56,6 +56,21 @@ from dswarm.solver.cli_stream import (
     _parse_lockout_seconds,
     classify_need_kind,
 )
+from dswarm.solver.marker_parser import (
+    extract_cleanup_markers as _parse_cleanup_markers,
+    extract_fact_witness as _parse_fact_witness,
+    extract_flag as _parse_flag,
+    extract_flags as _parse_flags,
+    extract_need_inputs as _parse_need_inputs,
+    extract_need_requests as _parse_need_requests,
+    extract_poc_repros as _parse_poc_repros,
+    extract_poc_saves as _parse_poc_saves,
+    extract_ready_to_submit as _parse_ready_to_submit,
+    extract_structured_facts as _parse_structured_facts,
+    extract_structured_findings as _parse_structured_findings,
+    fact_witnessed_in_chunk as _parse_fact_witnessed_in_chunk,
+    is_bare_raw_flag as _parse_bare_raw_flag,
+)
 from dswarm.solver.gate import flag_ok as _gate_flag_ok, is_placeholder_flag
 from dswarm.solver.container_pool import WorkerRuntimeLease
 from dswarm.solver.result import ArtifactStore
@@ -73,6 +88,9 @@ from dswarm.solver.result_codes import (
 from dswarm.solver.types import SolverConfig, SolveOutcome
 from dswarm.swarm.poc_verification import (
     normalize_reproduction_indicator, sanitize_public_text,
+)
+from dswarm.swarm.cleanup_registry import (
+    public_cleanup_target, validate_cleanup_action,
 )
 from dswarm.solver.workspace import (
     ensure_workspace,
@@ -323,6 +341,8 @@ _EXPLORE_PROMPT = (
     "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
     "  POC_SAVE=<path>|<entry_command>|<status>|<note>  (optional: register a reusable "
     "PoC/payload/script from YOUR cwd; status is available/wip/directional/spent)\n"
+    "  CLEANUP=<remove_artifact|stop_listener|close_session|revoke_credential>:<target> "
+    "(typed action only; never put a shell command here)\n"
     "  FOUND_FLAG=<the flag>  (only if you recovered it from REAL output; write this "
     "line IN YOUR REPLY, not only inside an echo/shell command or your reasoning)\n\n"
     "You may output multiple VERIFIED_FACT lines. The flag is shaped like {fmt}."
@@ -335,6 +355,7 @@ _EXPLORE_CONCLUDE_PROMPT = (
     "  VERIFIED_FACT=<a confirmed finding from real output>\n"
     "  DEADEND=<why this direction failed>\n"
     "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
+    "  CLEANUP=<remove_artifact|stop_listener|close_session|revoke_credential>:<target>\n"
     "  FOUND_FLAG=<the flag>  (only if seen in real output this session)\n"
     "If you found nothing, output DEADEND=<reason>. Do not guess."
 )
@@ -402,29 +423,8 @@ _REVIEW_PROMPT = (
     "state already handled by the normal gate, and unverified claims as audit leads only."
 )
 
-# Capture EVERYTHING after FOUND_FLAG= to end-of-line (not \S+), so a flag whose
-# body legitimately contains SPACES (e.g. CTF flags like `flag{H1570rY 12'N7 ...}`)
-# isn't truncated at the first space. _clean_flag_token() then extracts the real
-# token from the captured tail. (run-15161: \S+ truncated `flag{H1570rY 12'N7...}`
-# to `flag{H1570rY` → never closed → never registered, despite the worker solving.)
-_FLAG_LINE = re.compile(r"FOUND_FLAG=\s*(.+)")
-# A xxx{...} brace-structured flag anywhere in the captured tail — inner spaces OK.
-_VERIFIED_FACT_LINE = re.compile(r"VERIFIED_FACT=\s*(.+)")
-_FINDING_TYPE_LINE = re.compile(r"FINDING_TYPE=\s*(\S+)")
-_FINDING_TARGET_LINE = re.compile(r"FINDING_TARGET=\s*(\S+)")
-_FINDING_DATA_LINE = re.compile(r"FINDING_DATA=\s*(.+)")
-_BARE_RAW_FLAG_BAD_BODY = re.compile(r"[\s;:()\[\]{}<>]")
-_FACT_WITNESS_LINE = re.compile(r"FACT_WITNESS\s*=\s*(.+)", re.IGNORECASE)
-_DEADEND_LINE = re.compile(r"DEADEND=\s*(.+)")
-# the worker raises its hand: it needs something it cannot get on its own (a VPS /
-# reverse-shell host, a credential, a tool) OR the challenge environment is
-# objectively unusable (target unreachable / instance expired). This is NOT a
-# dead-end (a ruled-out direction) — it's a request for the operator to supply
-# something, after which the run can continue. Surfaced as a HITL_REQUEST.
-_NEED_INPUT_LINE = re.compile(r"NEED_INPUT=\s*(.+)")
-_NEED_KIND_LINE = re.compile(r"NEED_KIND\s*=\s*([a-z_]+)", re.IGNORECASE)
-_POC_SAVE_LINE = re.compile(r"POC_SAVE=\s*([^|]+)\|([^|]+)\|([^|]+)\|(.*)")
-_POC_REPRO_LINE = re.compile(r"POC_REPRO=\s*([^|]+)\|(.*)")
+# Worker-output marker regexes and pure parsing helpers live in marker_parser.py.
+
 _SECRET_LITERAL_RE = re.compile(
     r"(-----BEGIN [A-Z ]*PRIVATE KEY-----|"
     r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{12,})",
@@ -446,7 +446,6 @@ _SECRET_LITERAL_RE = re.compile(
 # coordinator can serialize submissions (grant the submit-lock to one worker at a
 # time). The value is a one-line self-check summary (e.g. "local validator OK,
 # 18/18 people, admiralty conservative").
-_READY_TO_SUBMIT_LINE = re.compile(r"READY_TO_SUBMIT=\s*(.+)")
 _REVIEW_JSON_MARKERS = {
     "REVIEW_FINDING", "FLAG_AUDIT", "FACT_CHALLENGE", "FACT_REVALIDATION",
     "FACT_REJECT", "FACT_MERGE", "FACT_SUPERSEDE",
@@ -600,7 +599,7 @@ class CliSolver:
         # worker a UNIQUE one like "cli-pi#3" so the deck draws one lane per
         # worker — without it every pi worker would collapse onto the single
         # "cli-pi" lane and you couldn't tell parallel/re-bootstrapped workers
-        # apart). Then the spec's label; in race mode specs may be shared or None,
+        # apart). Then the spec's label; worker specs may be shared or None,
         # so fall back to the engine. The "cli-<engine>" prefix is preserved in all
         # cases so workerEngine() on the deck still detects the engine badge.
         base = (solver_label
@@ -648,7 +647,7 @@ class CliSolver:
         # {action, text} that this respond worker is serving.
         self.resume_session = resume_session
         self.hitl_cmd = hitl_cmd or {}
-        # lifecycle_scope: "run" = this solver IS the run (mock / race / standby) →
+        # lifecycle_scope: "run" = this solver IS the run (mock / standby) →
         # its terminal emit is a run-level RUN_FINISHED. "worker" = a swarm sub-worker
         # under a coordinator that re-bootstraps until solved/stopped → its terminal
         # emit is a worker-level WORKER_FINISHED, so the deck does NOT mark the whole
@@ -743,11 +742,23 @@ class CliSolver:
         self._published_markers: "set[tuple[str, str]]" = set()
         self._published_pocs: "set[str]" = set()
         self._published_poc_repros: "set[str]" = set()
+        self._published_cleanups: "set[str]" = set()
         self._pending_poc_repros: "dict[str, str]" = {}
         self._poc_paths: "dict[str, str]" = {}
         # intent lifecycle for which a shared-graph write failure was already
         # surfaced to the bus (one bounded delta per intent, never silent spam).
         self._intent_db_failures_noted: "set[str]" = set()
+        # A flag can be accepted locally even if the shared-graph write fails;
+        # surface that durability gap once per flag without spamming the bus.
+        self._flag_db_failures_noted: "set[str]" = set()
+        # Shared-graph evidence writes can fail after the local solve graph has
+        # accepted the same fact; surface each durability gap once without
+        # broadcasting the raw fact text.
+        self._fact_db_failures_noted: "set[str]" = set()
+        # Durable PoC/review writes are side effects of a live worker.  Keep
+        # their failures visible without allowing graph outages to abort work.
+        self._poc_db_failures_noted: "set[str]" = set()
+        self._review_db_failures_noted: "set[str]" = set()
         self._claimed_pocs: "set[str]" = set()
         self._inherited_pocs: "list[dict[str, str]]" = []
         self._current_workdir: "Optional[Path]" = None
@@ -836,10 +847,92 @@ class CliSolver:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        reason = sanitize_public_text(str(exc), limit=160)
+        reason = sanitize_public_text(type(exc).__name__, limit=160)
         loop.create_task(self._emit_bb(
             "intent_db_write_failed",
             intent_id=self._intent_id, op=op, reason=reason))
+
+    def _note_flag_db_failure(self, flag: str, exc: BaseException) -> None:
+        """Surface a failed shared-graph flag write without weakening acceptance.
+
+        The provenance gate has already accepted the flag before this path runs,
+        so a graph outage must not turn a real solve into a false negative. It
+        must, however, be observable because the durable graph may lag the live
+        worker/event stream. Emit at most one bounded delta per flag.
+        """
+        key = str(flag or "")
+        if not key or key in self._flag_db_failures_noted:
+            return
+        if len(self._flag_db_failures_noted) >= 32:
+            self._flag_db_failures_noted.clear()
+        self._flag_db_failures_noted.add(key)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reason = sanitize_public_text(type(exc).__name__, limit=160)
+        loop.create_task(self._emit_bb(
+            "flag_db_write_failed", flag=key,
+            intent_id=getattr(self, "_intent_id", "") or None,
+            op="flag_found", reason=reason))
+
+    def _note_fact_db_failure(self, fact: str, exc: BaseException) -> None:
+        """Surface a failed durable evidence write without exposing the fact text.
+
+        The local solve graph and live worker stream may continue after a shared
+        graph outage, but the durable evidence projection is then incomplete.
+        Keep that gap observable once per fact while publishing only a digest and
+        length to the blackboard.
+        """
+        key = hashlib.sha256(str(fact or "").encode("utf-8")).hexdigest()
+        if key in self._fact_db_failures_noted:
+            return
+        if len(self._fact_db_failures_noted) >= 32:
+            self._fact_db_failures_noted.clear()
+        self._fact_db_failures_noted.add(key)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reason = sanitize_public_text(type(exc).__name__, limit=160)
+        loop.create_task(self._emit_bb(
+            "fact_db_write_failed",
+            fact_digest=key,
+            fact_length=len(str(fact or "")),
+            intent_id=getattr(self, "_intent_id", "") or None,
+            op="add_evidence", reason=reason))
+
+    def _note_poc_db_failure(self, poc_id: str, op: str, exc: BaseException) -> None:
+        key = f"{op}:{poc_id}"
+        if key in self._poc_db_failures_noted:
+            return
+        if len(self._poc_db_failures_noted) >= 32:
+            self._poc_db_failures_noted.clear()
+        self._poc_db_failures_noted.add(key)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._emit_bb(
+            "poc_db_write_failed", poc_id=str(poc_id),
+            intent_id=getattr(self, "_intent_id", "") or None, op=op,
+            reason=sanitize_public_text(type(exc).__name__, limit=160)))
+
+    def _note_review_db_failure(self, marker: str, op: str, exc: BaseException) -> None:
+        key = f"{op}:{marker}"
+        if key in self._review_db_failures_noted:
+            return
+        if len(self._review_db_failures_noted) >= 32:
+            self._review_db_failures_noted.clear()
+        self._review_db_failures_noted.add(key)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._emit_bb(
+            "review_db_write_failed", marker=str(marker),
+            intent_id=getattr(self, "_intent_id", "") or None, op=op,
+            reason=sanitize_public_text(type(exc).__name__, limit=160)))
 
     def _claim_intent_db(self) -> bool:
         """Claim or renew this worker's assigned intent, owner-fenced in SQLite."""
@@ -849,7 +942,8 @@ class CliSolver:
             return bool(self.shared_graph.claim_intent(
                 worker=self.solver_id, intent_id=self._intent_id,
                 lease_s=self._intent_lease_s()))
-        except Exception:
+        except Exception as exc:
+            self._note_intent_db_failure("claim", exc)
             return False
 
     def _record_intent_db(self, goal: str) -> None:
@@ -890,7 +984,7 @@ class CliSolver:
                              flags: Optional[list[str]] = None) -> None:
         """Emit this solver's terminal lifecycle event, scoped correctly.
 
-        scope="run"    → RUN_FINISHED (this solver IS the run: mock / race / standby).
+        scope="run"    → RUN_FINISHED (this solver IS the run: mock / standby).
         scope="worker" → WORKER_FINISHED (a swarm sub-worker; the coordinator owns the
                          single run-level RUN_FINISHED emitted when its loop exits).
         Payload carries `flag` (first, back-compat) + `flags` (all, multi-flag) +
@@ -1620,6 +1714,8 @@ class CliSolver:
                     self._stream_accepted.append(f)
         for path_text, entry_command, status, note in self._extract_poc_saves(text):
             await self._handle_poc_save(path_text, entry_command, status, note)
+        for cleanup_spec in self._extract_cleanup_markers(text):
+            await self._handle_cleanup_marker(cleanup_spec)
         # Verified-PoC registration is pentest-only. Keep the branch completely
         # outside the CTF marker path so CTF output and dispatch stay unchanged.
         if getattr(self.challenge, "mode", "ctf") == "pentest":
@@ -1856,16 +1952,7 @@ class CliSolver:
     # the REAL provenance gate — the one shared, hardcoded acceptance check.
     @staticmethod
     def _is_bare_raw_flag(flag: str) -> bool:
-        """Guard for bare flags found in raw tool output without a FOUND_FLAG=
-        marker. The loose default brace regex also matches CSS like
-        `app{position:fixed;...}`, so require a clean single-token brace body."""
-        m = re.search(r"\{([^}]*)\}", flag or "")
-        if not m:
-            return False
-        body = m.group(1)
-        if len(body) < 8 or _BARE_RAW_FLAG_BAD_BODY.search(body):
-            return False
-        return bool(re.search(r"[A-Za-z0-9]", body))
+        return _parse_bare_raw_flag(flag)
 
     def _flag_ok(self, flag: str, raw_output: str) -> bool:
         # run-75379 defense-in-depth: a flag the operator invalidated as a false
@@ -2429,36 +2516,7 @@ class CliSolver:
             fmt=self._flag_hint())
 
     def _extract_flag(self, text: str) -> Optional[str]:
-        """Extract a flag the worker EXPLICITLY claimed via a FOUND_FLAG= marker.
-
-        We deliberately do NOT blind-scan the transcript for a flag_format-shaped
-        token. That fallback was the source of every false positive: the worker
-        writes the flag SHAPE in prose ("scanning pages for flag{...}",
-        "icon={name}.ico", or even a whole sentence `flag{`, which means …}`) and a
-        greedy `\\{[^}]{1,200}\\}` scoops it up as the answer (run-1619 flag{...},
-        run-3613 {name}, run-4305 a full reasoning sentence). The flag is the
-        worker's CLAIM, signalled by the marker — not any brace-shaped substring.
-        If the worker really found it but forgot the marker, the conclude/resume
-        turn re-asks for FOUND_FLAG=. Provenance + placeholder checks in the gate
-        are the second line of defense on whatever the marker yields."""
-        from dswarm.solver.gate import is_placeholder_flag
-        cand: Optional[str] = None
-        # take the LAST FOUND_FLAG= marker (the conclude turn's is the most final).
-        for m in _FLAG_LINE.finditer(text):
-            raw = m.group(1).strip()
-            if raw.upper().startswith("NONE"):
-                continue
-            tok = _clean_flag_token(raw)
-            if tok and tok != "NONE":
-                cand = tok
-        if cand is None:
-            return None
-        # the marker value should itself be a single flag-shaped token; if the
-        # model appended trailing prose on the same line, _FLAG_LINE's \\S+ already
-        # stopped at whitespace, so `cand` is the bare token. Reject placeholders.
-        if is_placeholder_flag(cand):
-            return None
-        return cand
+        return _parse_flag(text)
 
     def _expected_flags(self) -> int:
         return max(1, getattr(self.challenge, "expected_flags", 1) or 1)
@@ -2644,179 +2702,104 @@ class CliSolver:
             )
 
     def _extract_flags(self, text: str) -> list[str]:
-        """Every distinct flag the worker explicitly claimed via FOUND_FLAG=
-        markers (dedup, in marker order, placeholders rejected). Multi-flag: one
-        turn can legitimately yield several flags. _extract_flag stays the
-        single-flag convenience (= last marker) for back-compat callers."""
-        from dswarm.solver.gate import is_placeholder_flag
-        out: list[str] = []
-        for m in _FLAG_LINE.finditer(text):
-            raw = m.group(1).strip()
-            if raw.upper().startswith("NONE"):
-                continue
-            tok = _clean_flag_token(raw)
-            if not tok or tok == "NONE" or is_placeholder_flag(tok):
-                continue
-            if tok not in out:
-                out.append(tok)
-        return out
+        return _parse_flags(text)
 
     def _extract_structured_facts(self, text: str) -> tuple[list[str], list[str]]:
-        """Parse VERIFIED_FACT= and DEADEND= markers from worker output."""
-        facts, deadends = [], []
-        for line in (text or "").splitlines():
-            m = _VERIFIED_FACT_LINE.match(line.strip())
-            if m:
-                facts.append(m.group(1).strip())
-            m2 = _DEADEND_LINE.match(line.strip())
-            if m2:
-                deadends.append(m2.group(1).strip())
-        return facts, deadends
+        return _parse_structured_facts(text)
 
     @staticmethod
     def _extract_structured_findings(text: str) -> list[dict[str, str]]:
-        """Parse FINDING_TYPE / FINDING_TARGET / FINDING_DATA triples."""
-        out: list[dict[str, str]] = []
-        current: dict[str, str] = {}
-        for line in (text or "").splitlines():
-            s = line.strip()
-            m = _FINDING_TYPE_LINE.match(s)
-            if m:
-                current = {"kind": m.group(1).strip()}
-                continue
-            if not current:
-                continue
-            m = _FINDING_TARGET_LINE.match(s)
-            if m:
-                current["target"] = m.group(1).strip()
-                continue
-            m = _FINDING_DATA_LINE.match(s)
-            if m:
-                current["data"] = m.group(1).strip()
-                if current.get("kind") and current.get("target"):
-                    out.append(dict(current))
-                    current = {}
-        return out
+        return _parse_structured_findings(text)
 
     @staticmethod
     def _extract_fact_witness(text: str) -> str:
-        for line in (text or "").splitlines():
-            m = _FACT_WITNESS_LINE.match(line.strip())
-            if m:
-                return m.group(1).strip()[:500]
-        return ""
+        return _parse_fact_witness(text)
 
     @staticmethod
     def _fact_witnessed_in_chunk(fact: str, text: str) -> bool:
-        """A VERIFIED_FACT must be backed by non-marker output in the same chunk.
-
-        The marker line itself is the worker's claim; it cannot be its own proof.
-        We accept either an exact fact-text hit in the surrounding output or a
-        strong overlap of significant tokens, which keeps concise factual markers
-        usable while rejecting bare assertions.
-        """
-        fact = (fact or "").strip()
-        if not fact:
-            return False
-        raw_lines = []
-        for line in (text or "").splitlines():
-            s = line.strip()
-            if (_VERIFIED_FACT_LINE.match(s) or _DEADEND_LINE.match(s)
-                    or _FLAG_LINE.match(s) or _NEED_INPUT_LINE.match(s)
-                    or _POC_SAVE_LINE.match(s) or _FACT_WITNESS_LINE.match(s)):
-                continue
-            raw_lines.append(line)
-        raw = "\n".join(raw_lines).strip().lower()
-        if not raw:
-            return False
-        fact_l = fact.lower()
-        if fact_l in raw:
-            return True
-        tokens = [
-            t for t in re.findall(r"[a-z0-9_./:-]{4,}", fact_l)
-            if t not in {"http", "https", "true", "false", "with", "from",
-                         "that", "this", "there", "have", "confirmed"}
-        ]
-        if not tokens:
-            return False
-        hits = sum(1 for t in dict.fromkeys(tokens) if t in raw)
-        needed = max(2, int(len(set(tokens)) * 0.6 + 0.5))
-        return hits >= needed
+        return _parse_fact_witnessed_in_chunk(fact, text)
 
     def _extract_need_requests(self, text: str) -> list[tuple[str, str]]:
-        """Parse NEED_INPUT= markers — the worker asking the operator for a resource
-        / flagging an unusable environment.
-
-        A NEED_INPUT ask is often MULTI-LINE (the worker explains what it needs and
-        why). The old single-line match truncated the ask at the first newline, so
-        the operator's decision card showed only the first sentence (the "...the
-        data, or" cut-off). We accumulate from a NEED_INPUT= line through to the end
-        of its block — a blank line, or the next FOUND_FLAG=/VERIFIED_FACT=/
-        DEADEND=/POC_SAVE=/NEED_INPUT= marker — to capture the whole request.
-        """
-        _STOP = ("FOUND_FLAG=", "VERIFIED_FACT=", "DEADEND=", "DEAD_END=",
-                 "POC_SAVE=", "READY_TO_SUBMIT=", "ALL_FLAGS_FOUND=")
-        lines = (text or "").splitlines()
-        out: list[tuple[str, str]] = []
-        i = 0
-        while i < len(lines):
-            m = _NEED_INPUT_LINE.match(lines[i].strip())
-            if not m:
-                i += 1
-                continue
-            buf = [m.group(1).strip()]
-            reported_kind = ""
-            i += 1
-            while i < len(lines):
-                nxt = lines[i].strip()
-                if not nxt:  # blank line ends the block
-                    break
-                if _NEED_INPUT_LINE.match(nxt) or any(nxt.startswith(s) for s in _STOP):
-                    break
-                km = _NEED_KIND_LINE.match(nxt)
-                if km:
-                    reported_kind = _normalize_need_kind(km.group(1))
-                    i += 1
-                    continue
-                buf.append(nxt)
-                i += 1
-            need = "\n".join(buf).strip()
-            if need:
-                out.append((need, reported_kind))
-        return out
+        return _parse_need_requests(text)
 
     def _extract_need_inputs(self, text: str) -> list[str]:
-        return [need for need, _kind in self._extract_need_requests(text)]
+        return _parse_need_inputs(text)
 
     def _extract_ready_to_submit(self, text: str) -> list[str]:
-        """Parse READY_TO_SUBMIT= markers — the worker declaring its answer passed
-        offline self-check and it is about to run the rate-limited verifier."""
-        out = []
-        for line in (text or "").splitlines():
-            m = _READY_TO_SUBMIT_LINE.match(line.strip())
-            if m:
-                note = m.group(1).strip()
-                if note:
-                    out.append(note)
-        return out
+        return _parse_ready_to_submit(text)
 
     def _extract_poc_saves(self, text: str) -> list[tuple[str, str, str, str]]:
-        out: list[tuple[str, str, str, str]] = []
-        for line in (text or "").splitlines():
-            m = _POC_SAVE_LINE.match(line.strip())
-            if m:
-                out.append(tuple(part.strip() for part in m.groups()))
-        return out
+        return _parse_poc_saves(text)
 
     def _extract_poc_repros(self, text: str) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        for line in (text or "").splitlines():
-            m = _POC_REPRO_LINE.match(line.strip())
-            if m:
-                path_text, indicator = (part.strip() for part in m.groups())
-                if path_text:
-                    out.append((path_text, indicator))
-        return out
+        return _parse_poc_repros(text)
+
+    def _extract_cleanup_markers(self, text: str) -> list[str]:
+        return _parse_cleanup_markers(text)
+
+    async def _handle_cleanup_marker(self, spec: str) -> None:
+        """Register a typed, worker-owned cleanup action; never accept raw commands."""
+        if self.shared_graph is None:
+            return
+        text = str(spec or "").strip()
+        if ":" not in text:
+            await self._emit_bb("cleanup_action_rejected", reason="marker must be <type>:<target>")
+            return
+        action_type, target = (part.strip() for part in text.split(":", 1))
+        action_type = action_type.lower()
+        # Artifact markers are relative to this worker cwd at the point of
+        # registration. Convert them to a workspace-relative path before the graph
+        # validator sees them; this binds ownership without exposing a host path.
+        if action_type == "remove_artifact":
+            cwd = (self._current_workdir
+                   or (Path(self._workdir).resolve() if self._workdir else None))
+            if cwd is None:
+                await self._emit_bb("cleanup_action_rejected", reason="worker cwd unavailable")
+                return
+            try:
+                src = ((cwd / target).resolve()
+                       if not Path(target).is_absolute() else Path(target).resolve())
+                src.relative_to(cwd)
+                workspace = workspace_root_for_worker(cwd).resolve()
+                target = src.relative_to(workspace).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                await self._emit_bb("cleanup_action_rejected",
+                                    reason="artifact target must stay inside worker cwd")
+                return
+        try:
+            kind, canonical_target, _actor, _owner = validate_cleanup_action(
+                action_type, target, actor=self.solver_id, owner_key=self.solver_id,
+            )
+        except ValueError as exc:
+            await self._emit_bb("cleanup_action_rejected", reason=str(exc)[:160])
+            return
+        marker_key = f"{kind}:{canonical_target}"
+        if marker_key in self._published_cleanups:
+            return
+        self._published_cleanups.add(marker_key)
+        register = getattr(self.shared_graph, "register_cleanup_action", None)
+        if not callable(register):
+            await self._emit_bb("cleanup_action_rejected", reason="cleanup registry unavailable")
+            return
+        try:
+            action = register(
+                actor=self.solver_id, action_type=kind, target=canonical_target,
+                intent_id=str(getattr(self, "_intent_id", "") or ""),
+                owner_key=self.solver_id,
+                idempotency_key=f"{self.solver_id}:{marker_key}:{getattr(self, '_intent_id', '')}",
+            )
+        except Exception as exc:
+            await self._emit_bb(
+                "cleanup_action_rejected",
+                reason=sanitize_public_text(type(exc).__name__, limit=160),
+            )
+            return
+        await self._emit_bb(
+            "cleanup_action_registered",
+            action_id=str(action.get("action_id") or ""), action_type=kind,
+            status=str(action.get("status") or "registered"),
+            **public_cleanup_target(canonical_target),
+        )
 
     def _poc_flag_literals(self, body: str) -> list[str]:
         matches = set(_BRACE_FLAG.findall(body or ""))
@@ -2922,8 +2905,8 @@ class CliSolver:
                     name=src.name,
                 )
                 graph_saved = True
-            except Exception:
-                pass
+            except Exception as exc:
+                self._note_poc_db_failure(poc_id, "save_poc", exc)
         if graph_saved:
             normalized_path = str(src.resolve())
             self._poc_paths[normalized_path] = poc_id
@@ -2962,11 +2945,13 @@ class CliSolver:
                 actor=self.solver_id, poc_id=poc_id, indicator=indicator
             )
         except Exception as exc:
+            self._note_poc_db_failure(
+                poc_id, "register_poc_reproduction", exc)
             await self._emit_bb(
                 "poc_reproduction_rejected",
                 status="rejected",
                 poc_id=poc_id,
-                note=str(exc)[:160],
+                note=sanitize_public_text(type(exc).__name__, limit=160),
             )
             return
         await self._emit_bb(
@@ -3039,7 +3024,8 @@ class CliSolver:
                 self.shared_graph.conclude_poc(
                     actor=self.solver_id, poc_id=poc_id, status="spent",
                     note=f"direction dead-end: {reason[:160]}")
-            except Exception:
+            except Exception as exc:
+                self._note_poc_db_failure(poc_id, "conclude_poc", exc)
                 continue
             await self._emit_bb(
                 "poc_concluded", poc_id=poc_id, status="spent",
@@ -3190,19 +3176,27 @@ class CliSolver:
                 )
                 proposed += 1
             except Exception as exc:  # noqa: BLE001
+                self._note_review_db_failure(marker, "add_review_proposal", exc)
                 try:
                     seq = self.shared_graph.add_review_proposal(
                         actor=self.solver_id, marker="REVIEW_FINDING",
                         payload={"kind": "invalid_action", "severity": "warn",
-                                 "summary": f"{marker} rejected: {exc}"},
+                                 "summary": (
+                                     f"{marker} rejected "
+                                     f"({type(exc).__name__})"
+                                 )},
                         tier="tier1")
                     await self._emit_bb("review_proposal", seq=seq,
                                         marker="REVIEW_FINDING", tier="tier1",
                                         severity="warn",
-                                        summary=f"{marker} rejected: {exc}")
+                                        summary=(
+                                            f"{marker} rejected "
+                                            f"({type(exc).__name__})"
+                                        ))
                     proposed += 1
-                except Exception:
-                    pass
+                except Exception as fallback_exc:
+                    self._note_review_db_failure(
+                        marker, "add_review_proposal_fallback", fallback_exc)
         return proposed
 
     def _revoke_gateway_token(self) -> None:
@@ -3773,13 +3767,9 @@ class CliSolver:
         # fact pointer. Concluding a no-fact intent retires the direction so it stops
         # resurrecting.
         if self.shared_graph is not None:
-            try:
-                self.shared_graph.conclude_intent(
-                    actor=self.solver_id, intent_id=self._intent_id,
-                    result=result_label, to_fact_seq=lfs,
-                    result_detail=result_detail)
-            except Exception:
-                pass
+            self._conclude_intent_db(
+                result=result_label, to_fact_seq=lfs,
+                result_detail=result_detail)
         await self._emit_bb("intent_concluded", intent_id=self._intent_id,
                             worker=self.solver_id, result=result_label,
                             to_fact_seq=lfs, result_detail=result_detail)
@@ -3840,17 +3830,13 @@ class CliSolver:
                                     severity="info",
                                     summary="Review completed without executable markers.")
                 applied += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                self._note_review_db_failure(
+                    "REVIEW_FINDING", "add_review_proposal", exc)
 
         result = f"reviewed: {applied} proposal(s)"
         if self.shared_graph is not None:
-            try:
-                self.shared_graph.conclude_intent(
-                    actor=self.solver_id, intent_id=self._intent_id,
-                    result=result, to_fact_seq=None)
-            except Exception:
-                pass
+            self._conclude_intent_db(result=result, to_fact_seq=None)
         await self._emit_bb("intent_concluded", intent_id=self._intent_id,
                             worker=self.solver_id, result=result,
                             artifact_id=aid)
@@ -4089,8 +4075,8 @@ class CliSolver:
                     witness=witness or None, verifier=self.driver.name,
                     intent_id=getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or None,
                     finding=finding)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._note_fact_db_failure(fact, exc)
             if fact_seq <= 0:
                 return fact_seq
         await self._emit(
@@ -4291,8 +4277,8 @@ class CliSolver:
                 self.shared_graph.flag_found(
                     actor=self.solver_id, flag=flag,
                     intent_id=getattr(self, "_intent_id", "") or None)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._note_flag_db_failure(flag, exc)
         await self._emit(EventType.SOLVE_GRAPH_DELTA,
                          **solve_graph_delta_payload("flag", flag=flag))
         await self._emit(EventType.INSIGHT_BUS_EVENT,

@@ -44,7 +44,6 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--target", default="", help="ad-hoc challenge target URL/host")
     p.add_argument("--category", default="web",
                    help="track: web/crypto/reverse/forensics/misc/pwn")
-    p.add_argument("--n-solvers", type=int, default=2, help="swarm size")
     return p.parse_args(argv)
 
 
@@ -98,7 +97,6 @@ async def _swarm_driver(
     from dswarm.solver.result import ArtifactStore
     from dswarm.solver.types import SolverConfig
     from dswarm.swarm.budget import ProfileBudgetGate
-    from dswarm.swarm.models import default_lineup
     from dswarm.swarm.swarm import Swarm
 
     sessions_root = Path(
@@ -168,12 +166,11 @@ async def _swarm_driver(
             "engines": names,
             "worker_profiles": selected_profiles,
             "runtime_profiles": cfg.get("runtime_profiles"),
-            "max_workers": cfg.get("max_workers", args.n_solvers),
-            "start_workers": cfg.get("start_workers", args.n_solvers),
+            "max_workers": cfg.get("max_workers", 8),
             "wall_clock_budget": cfg.get("wall_clock_budget"),
             "max_total_workers": cfg.get("max_total_workers"),
             "cost_budget_usd": cfg.get("cost_budget_usd"),
-            "stage_policy": cfg.get("stage_policy"),
+            "review_policy": cfg.get("review_policy"),
             "budget_gate": budget_gate,
             "credential_accounts_root": account_store_root(sessions_root),
             "worker_root": root / "workspace",
@@ -184,7 +181,7 @@ async def _swarm_driver(
 
     async with LLMClient(cost=cost, bus=bus) as llm:
         swarm = Swarm(
-            challenge, default_lineup(args.n_solvers), llm=llm, sandbox=sandbox,
+            challenge, llm=llm, sandbox=sandbox,
             bus=bus, cost=cost, artifacts=arts, config=SolverConfig(),
             run_id=run_id, knowledge=knowledge, executor="cli",
             **swarm_kwargs,
@@ -202,7 +199,7 @@ def _driver_for_args(
 ):
     """Select a driver without touching runtime/Docker state for mock mode."""
     if args.swarm:
-        lineup = f"swarm×{args.n_solvers} ({args.category})"
+        status = f"ReasonSwarm ({args.category})"
         driver = _swarm_driver(
             bus,
             cost,
@@ -211,16 +208,16 @@ def _driver_for_args(
             runtime_context_factory=runtime_context_factory,
         )
     else:
-        lineup = "mock (UI demo — pass --swarm to solve for real)"
+        status = "mock (UI demo — pass --swarm to solve for real)"
         driver = _mock_driver(bus, cost, run_id)
-    return lineup, driver
+    return status, driver
 
 
 async def _amain(args: argparse.Namespace) -> None:
     run_id = "tui-run"
     bus = EventBus()
     cost = CostController(bus=bus)
-    lineup, driver = _driver_for_args(bus, cost, run_id, args)
+    status, driver = _driver_for_args(bus, cost, run_id, args)
 
     async def _run_driver() -> None:
         try:
@@ -236,7 +233,7 @@ async def _amain(args: argparse.Namespace) -> None:
             payload=hitl_response_payload(target, action, text=text),
         ))
 
-    app = DSwarmTUI(bus, hitl=hitl, lineup=lineup, stop_on_finish=False)
+    app = DSwarmTUI(bus, hitl=hitl, status_label=status, stop_on_finish=False)
     try:
         await app.run_async()
     finally:

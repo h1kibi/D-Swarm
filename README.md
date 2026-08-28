@@ -15,9 +15,11 @@ result traces back to **real execution output** — nothing else counts.
 - **One shared blackboard**: discovered facts, dead ends, PoC artifacts and intents
   live on an event-sourced SQLite graph (append-only, replayable). Workers coordinate
   through it; an independent Reason phase reads the graph and proposes typed intents.
-- **A race past a hardcoded provenance gate**: first worker whose flag appears in
-  real stdout/stderr/artifacts scores; placeholder or laundered flags are rejected,
-  zero false positives by design.
+- **ReasonSwarm scheduling:** the independent Reason phase reads the shared graph,
+  emits typed intents, and the scheduler dispatches workers to execute them;
+  review/revalidation feeds verified evidence back into the graph. A flag only
+  scores when it appears in real stdout/stderr/artifacts; placeholder or laundered
+  flags are rejected, with zero false positives by design.
 - **Verified-PoC gate for pentest mode**: blocker findings are confirmed only after
   the registered reproduction command is replayed inside the verifier container and
   its indicator reappears in fresh output.
@@ -29,7 +31,7 @@ result traces back to **real execution output** — nothing else counts.
 | Worker runtime | Docker-first runtime pools (M9a): frozen pool generations, RCP-v2 control link, reverse-dial supervisor; workers never see Docker socket / host HOME / full credential stores |
 | Credentials | Task-token model gateway: worker containers exchange tokens, never upstream API keys |
 | Budgets | Unique usage ledger (M5): run-scoped accounting, profile budget gates, spawn guard |
-| Coordination | Race mode by default; opt-in two-stage coordinator via `stage_policy` (explore → review) |
+| Coordination | ReasonSwarm scheduling with typed intents, shared evidence graph, review/revalidation, and provenance-gated acceptance |
 | Pentest | Origin/Goal/Hints framing, Verified-PoC reproduction gate, post-hoc scope audit (M9) |
 | Correctness | Strict event immutability guards (M3), direction authority chain with audit trail (M4) |
 

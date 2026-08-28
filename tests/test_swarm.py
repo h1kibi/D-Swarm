@@ -2,7 +2,7 @@
 
 The execution layer is now CLI-only (the code-driven scripted-LLM path was
 retired), so these tests exercise the swarm's coordination machinery directly:
-the InsightBus fan-out, the CLI race lineup + degrade logic, and the coordinator's
+the InsightBus fan-out, the CLI worker roster + degrade logic, and the reason scheduler's
 plan / dispatch loop — all with the CLI subprocess stubbed out (no real engine).
 """
 
@@ -78,10 +78,10 @@ def test_unverified_flag_claim_queues_review(challenge, tmp_path: Path):
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         graph_dir=tmp_path / "graph",
-        stage_policy={"coordinator": {"review": {"enabled": True}}},
+        review_policy={"enabled": True},
     )
     assert sw.shared_graph is not None
     sw.shared_graph.flag_unverified(
@@ -97,10 +97,10 @@ def test_flag_unverified_graph_event_bridges_to_blackboard(challenge, tmp_path: 
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         graph_dir=tmp_path / "graph",
-        stage_policy={"coordinator": {"review": {"enabled": True}}},
+        review_policy={"enabled": True},
     )
     assert sw.shared_graph is not None
     seq = sw.shared_graph.flag_unverified(actor="cli-pi-1", flag="flag{claimed}", reason="no witness")
@@ -119,11 +119,62 @@ def test_flag_unverified_graph_event_bridges_to_blackboard(challenge, tmp_path: 
     })]
 
 
+def test_pentest_scope_audit_persists_and_bridges_review_finding(tmp_path: Path):
+    challenge = Challenge(
+        id="scope-audit-run", name="scope audit", category="web",
+        mode="pentest", goal="find the issue", scope="target.example.com",
+    )
+    sw = Swarm(
+        challenge,
+        llm=None,
+        sandbox=SandboxManager(root=tmp_path / "sbx"),
+        artifacts=ArtifactStore(root=tmp_path / "arts"),
+        executor="cli",
+        graph_dir=tmp_path / "graph",
+    )
+    assert sw.shared_graph is not None
+    try:
+        fact_seq = sw.shared_graph.add_evidence(
+            actor="cli-pi-1",
+            source="worker-output",
+            fact=(
+                "Observed the authorized target at https://target.example.com/health "
+                "and an unexpected callback to https://evil.example.net/collect."
+            ),
+            verified=True,
+        )
+
+        assert sw._run_scope_audit() == 1
+        findings = [
+            event for event in sw.shared_graph.events()
+            if event["kind"] == "review_finding"
+        ]
+        assert len(findings) == 1
+        finding = findings[0]["payload"]
+        assert finding["kind"] == "scope_violation"
+        assert finding["severity"] == "warn"
+        assert finding["evidence_seqs"] == [fact_seq]
+        assert "evil.example.net" in finding["summary"]
+
+        emitted: list[tuple[str, dict]] = []
+
+        async def emit_bb(kind, **fields):
+            emitted.append((kind, fields))
+
+        asyncio.run(sw._drain_graph_to_bus(emit_bb=emit_bb))
+        deltas = [fields for kind, fields in emitted if kind == "review_finding"]
+        assert len(deltas) == 1
+        assert deltas[0]["finding_kind"] == "scope_violation"
+        assert deltas[0]["seq"] == findings[0]["seq"]
+    finally:
+        sw.shared_graph.close()
+
+
 def test_poc_reproduction_graph_event_bridge_redacts_indicator_and_command(challenge, tmp_path: Path):
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         graph_dir=tmp_path / "graph",
     )
@@ -158,7 +209,7 @@ def test_runtime_infra_fact_graph_event_does_not_bridge_to_blackboard(challenge,
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         graph_dir=tmp_path / "graph",
     )
@@ -207,7 +258,7 @@ async def test_insight_bus_backlog_for_late_subscriber() -> None:
     assert InsightKind.FACT in kinds and InsightKind.DEAD_END in kinds
 
 
-# ── CLI executor: race lineup + degrade (no real subprocess) ─────────────────
+# ── CLI executor: worker roster + degrade (no real subprocess) ───────────────
 
 
 
@@ -232,7 +283,7 @@ async def test_insight_bus_backlog_for_late_subscriber() -> None:
 def test_engines_roster_deduped(challenge, tmp_path: Path) -> None:
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+    sw = Swarm(challenge,
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                engines=["pi", "pi", "pi", "pi", "pi"])
     assert sw.engines == ["pi"]
@@ -274,10 +325,10 @@ def test_pick_engine_honors_priority_order(challenge, tmp_path: Path) -> None:
     # same-engine instances are NOT priority-distinguished (heterogeneity-first
     # treats them as "the codex slot, already covered"). Priority is authoritative
     # exactly when the contenders are idle — which is the all-idle pick below and
-    # the classic-race lineup order (test_engines_roster_sorted_by_priority).
+    # the classic worker-roster order (test_engines_roster_sorted_by_priority).
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+    sw = Swarm(challenge,
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                worker_profiles=_pi_trio_profiles())
     healthy = ["pi-a", "pi-b", "pi-c"]
@@ -302,7 +353,7 @@ def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     # zero-prio declared LAST; must still sort first (not demoted to 100).
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+    sw = Swarm(challenge,
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                worker_profiles=[mk("pi-ten", 10), mk("pi-zero", 0)])
     assert sw.engines == ["pi-zero", "pi-ten"], sw.engines
@@ -311,11 +362,11 @@ def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None
 def test_engines_priority_sort_only_when_profiles(challenge, tmp_path: Path) -> None:
     # GUARD: the priority sort is scoped to worker_profiles. A bare engine-name
     # roster (no profiles) must keep its given order untouched — this is what
-    # test_engines_roster_deduped relies on and what the historical race lineup
+    # test_engines_roster_deduped relies on and what the historical worker roster
     # expects.
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+    sw = Swarm(challenge,
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                engines=["pi", "pi"])
     assert sw.engines == ["pi"]
@@ -338,7 +389,7 @@ def _bus_health_swarm(challenge, tmp_path, *, healthy: dict[str, bool]):
     arts = ArtifactStore(root=tmp_path / "arts")
     bus = EventBus()
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         bus=bus,
         engines=["pi"],
@@ -421,7 +472,7 @@ def test_container_backend_health_probe_defers_to_worker_container(
     """Container workers must not be health-checked by a host-side CLI probe."""
     import dswarm.solver.cli_driver as cd
 
-    sw = _coordinator_swarm(challenge, tmp_path, worker_backend="container")
+    sw = _reason_swarm(challenge, tmp_path, worker_backend="container")
     called = {"driver_for": False}
 
     def fail_driver_for(*args, **kwargs):
@@ -447,7 +498,7 @@ async def test_healthy_engines_async_does_not_block_event_loop(
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     sw = Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         engines=["pi"],
     )
@@ -485,7 +536,7 @@ def _probe_swarm(challenge, tmp_path, engines):
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     return Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
         engines=list(engines),
     )
@@ -496,7 +547,7 @@ def test_healthy_engines_probes_run_in_parallel(challenge, tmp_path: Path,
     # three profiles, each probe sleeps 0.3s. SERIAL → ~0.9s; PARALLEL → ~0.3s.
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+    sw = Swarm(challenge,
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                worker_profiles=_pi_trio_profiles())
 
@@ -615,13 +666,13 @@ async def test_reconcile_blackboard_skill_skips_container_backend(challenge, tmp
     assert called["n"] == 0
 
 
-# ── Coordinator: evidence-driven plan / dispatch loop ────────────────────────
+# ── Reason phase: evidence-driven plan / dispatch loop ────────────────────────
 
-def _coordinator_swarm(challenge, tmp_path, **kw):
+def _reason_swarm(challenge, tmp_path, **kw):
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
     return Swarm(
-        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        challenge,
         llm=None, sandbox=sandbox, artifacts=arts,
         executor="cli", **kw,
     )
@@ -643,7 +694,7 @@ def test_pick_engine_prefers_direction_profile(challenge, tmp_path: Path) -> Non
         {"id": "pi-web", "name": "pi-web", "engine": "pi", "transport": "pi_cli"},
         {"id": "pi-pwn", "name": "pi-pwn", "engine": "pi", "transport": "pi_cli"},
     ])
-    sw = _coordinator_swarm(challenge, tmp_path, worker_profiles=profiles,
+    sw = _reason_swarm(challenge, tmp_path, worker_profiles=profiles,
                             engines=["pi-web", "pi-pwn"])
     # _profile_for_direction only returns profiles on this run's roster
     assert sw._profile_for_direction("pwn") == "pi-pwn"
@@ -665,7 +716,7 @@ def test_healthy_matches_seat_label_aliases(challenge, tmp_path: Path) -> None:
         {"id": "seat_pi_pwn_x", "name": "seat_pi_pwn_x", "label": "pi-pwn",
          "engine": "pi", "transport": "pi_cli"},
     ])
-    sw = _coordinator_swarm(challenge, tmp_path, worker_profiles=profiles,
+    sw = _reason_swarm(challenge, tmp_path, worker_profiles=profiles,
                             engines=["seat_pi_web_x", "seat_pi_pwn_x"])
 
     assert sw._healthy_matches("pi-web", ["seat_pi_web_x"]) is True
@@ -681,7 +732,7 @@ def test_pick_engine_resolves_seat_label_alias(challenge, tmp_path: Path) -> Non
         {"id": "seat_pi_pwn_x", "name": "seat_pi_pwn_x", "label": "pi-pwn",
          "engine": "pi", "transport": "pi_cli"},
     ])
-    sw = _coordinator_swarm(challenge, tmp_path, worker_profiles=profiles,
+    sw = _reason_swarm(challenge, tmp_path, worker_profiles=profiles,
                             engines=["seat_pi_web_x", "seat_pi_pwn_x"])
     healthy = ["seat_pi_web_x", "seat_pi_pwn_x"]
 
@@ -690,7 +741,7 @@ def test_pick_engine_resolves_seat_label_alias(challenge, tmp_path: Path) -> Non
 
 
 def test_open_intents_carry_direction(challenge, tmp_path: Path) -> None:
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I-dir", goal="crack the key",
         payload={"worker_class": "code", "direction": "crypto"})
@@ -700,32 +751,32 @@ def test_open_intents_carry_direction(challenge, tmp_path: Path) -> None:
 
 
 def test_direction_from_profile_id_and_link_helpers() -> None:
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
-    assert swarm_mod._direction_from_profile_id("pi-web") == "web"
-    assert swarm_mod._direction_from_profile_id("pi-aisec") == "aisec"
-    assert swarm_mod._direction_from_profile_id("pi-worker") == ""
-    assert swarm_mod._direction_from_profile_id("") == ""
+    assert assets._direction_from_profile_id("pi-web") == "web"
+    assert assets._direction_from_profile_id("pi-aisec") == "aisec"
+    assert assets._direction_from_profile_id("pi-worker") == ""
+    assert assets._direction_from_profile_id("") == ""
 
 
 def test_ensure_direction_links_graceful_for_all_directions(tmp_path: Path) -> None:
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
     home = tmp_path / "home"
     home.mkdir()
     for direction in ("web", "pwn", "rev", "crypto", "misc", "forensics", "aisec"):
-        swarm_mod._ensure_direction_links(home, direction)
+        assets._ensure_direction_links(home, direction)
     # vendored direction skills are linked for web; no crash for the others
     assert (home / ".pi" / "agent" / "skills" / "ctf-web").is_symlink()
     assert not (home / ".pi" / "agent" / "skills" / "dswarm-web").exists()
 
 
 def test_ensure_direction_links_surfaces_btfly_category_skill(tmp_path: Path) -> None:
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
     home = tmp_path / "home"
     home.mkdir()
-    swarm_mod._ensure_direction_links(home, "web")
+    assets._ensure_direction_links(home, "web")
     link = home / ".pi" / "agent" / "skills" / "web"
     assert link.is_symlink()
     # dangling container-absolute target (the worker container has it baked)
@@ -733,7 +784,7 @@ def test_ensure_direction_links_surfaces_btfly_category_skill(tmp_path: Path) ->
 
 
 def test_reason_backpressure_trips_on_large_ordinary_queue(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path, max_workers=2)
+    sw = _reason_swarm(challenge, tmp_path, max_workers=2)
     for i in range(4):
         sw.shared_graph.propose_intent(
             actor="reason", intent_id=f"I-{i}", goal=f"ordinary task {i}",
@@ -784,7 +835,7 @@ def _async_return(value):
 
 async def test_graph_tail_bridge_drains_direct_db_writes_once_in_seq_order(
         challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path, max_workers=1)
+    sw = _reason_swarm(challenge, tmp_path, max_workers=1)
     assert sw.shared_graph is not None
     g = sw.shared_graph
     fact_seq = g.add_evidence(actor="skill", source="blackboard",
@@ -830,7 +881,7 @@ async def test_graph_tail_bridge_drains_direct_db_writes_once_in_seq_order(
 
 async def test_graph_tail_bridge_advances_watermark_only_after_emit_success(
         challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path, max_workers=1)
+    sw = _reason_swarm(challenge, tmp_path, max_workers=1)
     assert sw.shared_graph is not None
     fact_seq = sw.shared_graph.add_evidence(
         actor="skill", source="blackboard", fact="service is nginx", verified=True)
@@ -854,7 +905,7 @@ async def test_graph_tail_bridge_advances_watermark_only_after_emit_success(
 
 async def test_graph_tail_bridge_skips_poison_event_after_bounded_retries(
         challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path, max_workers=1)
+    sw = _reason_swarm(challenge, tmp_path, max_workers=1)
     assert sw.shared_graph is not None
     fact_seq = sw.shared_graph.add_evidence(
         actor="skill", source="blackboard", fact="poison bridge event",
@@ -880,7 +931,7 @@ async def test_graph_tail_bridge_skips_poison_event_after_bounded_retries(
 
 
 def test_operator_hint_intent_orders_before_existing_queue(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path, max_workers=2)
+    sw = _reason_swarm(challenge, tmp_path, max_workers=2)
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I-old", goal="old queued task",
         payload={"worker_class": "code"})
@@ -897,11 +948,11 @@ def test_operator_hint_intent_orders_before_existing_queue(challenge, tmp_path: 
 
 
 async def test_review_intents_wait_when_review_concurrency_full(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path,
-        stage_policy={"coordinator": {"review": {
+        review_policy={
             "enabled": True, "max_concurrent": 1,
-        }}},
+        },
     )
 
     async def sleeper():
@@ -929,12 +980,12 @@ async def test_review_intents_wait_when_review_concurrency_full(challenge, tmp_p
 async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
     challenge, tmp_path: Path, monkeypatch,
 ):
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, max_workers=1,
-        stage_policy={"coordinator": {"review": {
+        review_policy={
             "enabled": True, "engine": "pi", "max_concurrent": 1,
             "cooldown_events": 0, "max_review_workers": 3,
-        }}},
+        },
     )
 
     async def long_running():
@@ -997,11 +1048,11 @@ async def test_review_worker_uses_reserved_capacity_when_ordinary_slots_full(
 async def test_review_intent_remains_dispatchable_when_ordinary_slots_full(
     challenge, tmp_path: Path,
 ):
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, max_workers=1,
-        stage_policy={"coordinator": {"review": {
+        review_policy={
             "enabled": True, "max_concurrent": 1,
-        }}},
+        },
     )
 
     async def long_running():
@@ -1028,7 +1079,7 @@ async def test_review_intent_remains_dispatchable_when_ordinary_slots_full(
 async def test_run_reason_passes_standing_guidance(challenge, tmp_path: Path, monkeypatch):
     from dswarm.solver.reason import ReasonResult
 
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.llm = object()
     sw._standing_guidance = ["Use the VPS tunnel; do not test internal hosts from the Mac."]
     seen: dict[str, list[str]] = {}
@@ -1054,7 +1105,7 @@ async def test_run_reason_persists_model_selected_fact_pins(
         challenge, tmp_path: Path, monkeypatch):
     from dswarm.solver.reason import ReasonResult
 
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.llm = object()
     fact_seq = sw.shared_graph.add_evidence(
         actor="cli-a", source="cmd", fact="后台口令是 admin / 猎人二号",
@@ -1080,8 +1131,74 @@ async def test_run_reason_persists_model_selected_fact_pins(
     assert "后台口令是 admin" in sw.shared_graph.to_reason_summary()
 
 
+async def test_run_reason_surfaces_fact_pin_failure_without_blocking(
+        challenge, tmp_path: Path, monkeypatch):
+    from dswarm.core.event_bus import EventBus
+    from dswarm.solver.reason import ReasonResult
+
+    events = []
+    bus = EventBus()
+    async def _sink(ev):
+        events.append(ev)
+    bus.add_sink(_sink)
+    sw = _reason_swarm(challenge, tmp_path, bus=bus)
+    sw.llm = object()
+    fact_seq = sw.shared_graph.add_evidence(
+        actor="cli-a", source="pi", fact="durable fact", verified=True)
+
+    async def fake_run_reason(**_kwargs):
+        return ReasonResult(goal_met=False, intents=[], audit_notes=[],
+                            pinned_facts=[fact_seq])
+
+    def fail_pin_facts(**_kwargs):
+        raise RuntimeError("sqlite path=C:/private/graph.db")
+
+    monkeypatch.setattr("dswarm.solver.reason.run_reason", fake_run_reason)
+    monkeypatch.setattr(sw.shared_graph, "pin_facts", fail_pin_facts)
+
+    assert await sw._run_reason() == 0
+    failures = [e for e in events
+                if e.payload.get("kind") == "fact_db_write_failed"]
+    assert len(failures) == 1
+    assert failures[0].payload["op"] == "pin_facts"
+    assert failures[0].payload["reason"] == "RuntimeError"
+    assert "private" not in str(failures[0].payload)
+
+
+async def test_run_reason_surfaces_intent_dispatch_failure_once(
+        challenge, tmp_path: Path, monkeypatch):
+    from dswarm.core.event_bus import EventBus
+    from dswarm.solver.reason import ReasonResult
+
+    events = []
+    bus = EventBus()
+    async def _sink(ev):
+        events.append(ev)
+    bus.add_sink(_sink)
+    sw = _reason_swarm(challenge, tmp_path, bus=bus)
+    sw.llm = object()
+
+    async def fake_run_reason(**_kwargs):
+        return ReasonResult(goal_met=False, intents=[], audit_notes=[])
+
+    def fail_dispatch(*_args, **_kwargs):
+        raise RuntimeError("sqlite payload=/private/secret")
+
+    monkeypatch.setattr("dswarm.solver.reason.run_reason", fake_run_reason)
+    monkeypatch.setattr("dswarm.solver.reason.dispatch_intents", fail_dispatch)
+
+    assert await sw._run_reason() == 0
+    assert await sw._run_reason() == 0
+    failures = [e for e in events
+                if e.payload.get("kind") == "intent_db_write_failed"]
+    assert len(failures) == 1
+    assert failures[0].payload["op"] == "propose"
+    assert failures[0].payload["reason"] == "RuntimeError"
+    assert "secret" not in str(failures[0].payload)
+
+
 async def test_coordinator_applies_tier1_review_proposal(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     fact_seq = sw.shared_graph.add_evidence(
         actor="cli-a", source="pi", fact="JWT alg is HS256",
         verified=True, artifact_id="a1")
@@ -1106,10 +1223,37 @@ async def test_coordinator_applies_tier1_review_proposal(challenge, tmp_path: Pa
                for k, f in emitted)
 
 
+async def test_review_decision_write_failure_is_surfaced_without_blocking(
+        challenge, tmp_path: Path, monkeypatch):
+    sw = _reason_swarm(challenge, tmp_path)
+    sw.shared_graph.add_review_proposal(
+        actor="cli-review", marker="UNKNOWN_MARKER", payload={})
+
+    def fail_decision(**_kwargs):
+        raise RuntimeError("sqlite path=/private/review.db")
+
+    monkeypatch.setattr(sw.shared_graph, "decide_review_proposal", fail_decision)
+    emitted: list[tuple[str, dict]] = []
+
+    async def emit_bb(kind, **fields):
+        emitted.append((kind, fields))
+
+    assert await sw._drain_review_proposals(emit_bb=emit_bb) == 0
+    failures = [fields for kind, fields in emitted
+                if kind == "review_db_write_failed"]
+    assert len(failures) == 1
+    assert failures[0]["op"] == "decide_review_proposal"
+    assert failures[0]["reason"] == "RuntimeError"
+    assert "private" not in str(failures[0])
+    assert any(kind == "review_proposal_decision" and
+               fields["decision"] == "rejected"
+               for kind, fields in emitted)
+
+
 async def test_route_suppress_proposal_requires_three_real_failures(
     challenge, tmp_path: Path,
 ):
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph.add_review_proposal(
         actor="cli-review", marker="ROUTE_SUPPRESS",
         payload={"route_hash": "web:login:sqli", "reason": "loop", "confidence": 0.95},
@@ -1145,7 +1289,7 @@ async def test_route_suppress_proposal_requires_three_real_failures(
 
 
 def test_open_intents_dedupes_same_route_but_keeps_review(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I-a", goal="try login SQLi variant A",
         payload={"worker_class": "code", "route_hash": "web:login:sqli"})
@@ -1165,7 +1309,7 @@ def test_lane_lock_proposal_locks_and_next_intent_keeps_lane(
     challenge, tmp_path: Path,
 ):
     async def _run():
-        sw = _coordinator_swarm(challenge, tmp_path)
+        sw = _reason_swarm(challenge, tmp_path)
         lane = "destructive:tcp:445@172.22.11.45"
         sw.shared_graph.add_review_proposal(
             actor="cli-review", marker="LANE_LOCK",
@@ -1199,7 +1343,7 @@ def test_lane_lock_proposal_locks_and_next_intent_keeps_lane(
 
 def test_next_intent_infers_lane_from_goal_text(challenge, tmp_path: Path):
     async def _run():
-        sw = _coordinator_swarm(challenge, tmp_path)
+        sw = _reason_swarm(challenge, tmp_path)
         emitted: list[tuple[str, dict]] = []
 
         async def emit_bb(kind, **fields):
@@ -1235,7 +1379,7 @@ def test_next_intent_infers_lane_from_goal_text(challenge, tmp_path: Path):
 
 
 def test_open_intents_stays_pure_when_lane_is_locked(challenge, tmp_path: Path):
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     lane = "destructive:tcp:445@172.22.11.45"
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I-lane", goal="exploit smb",
@@ -1256,7 +1400,7 @@ def test_open_intents_stays_pure_when_lane_is_locked(challenge, tmp_path: Path):
 def test_open_intents_backfills_structured_lane_from_existing_goal_text(
     challenge, tmp_path: Path,
 ):
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph.propose_intent(
         actor="coordinator",
         intent_id="I-old-lane",
@@ -1296,7 +1440,7 @@ def test_open_intents_uses_shared_graph_public_dispatch_api(
     This keeps the Swarm layer backend-swappable: an HTTP/future graph adapter can
     expose the SharedGraph protocol without leaking SQLite's private _conn/_lock.
     """
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     graph = sw.shared_graph
     graph.propose_intent(
         actor="coordinator",
@@ -1369,7 +1513,7 @@ def test_pick_engine_three_profiles_no_heterogeneity(challenge, tmp_path: Path):
     # falls back to the priority-ordered least-loaded candidate.
     sandbox = SandboxManager(root=tmp_path / "sbx")
     arts = ArtifactStore(root=tmp_path / "arts")
-    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+    sw = Swarm(challenge,
                llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
                worker_profiles=_pi_trio_profiles())
     healthy = ["pi-a", "pi-b", "pi-c"]
@@ -1393,7 +1537,7 @@ class _FakeWorker:
 
 @pytest.mark.asyncio
 async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatch):
-    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi", "codex"])
+    sw = _reason_swarm(challenge, tmp_path, engines=["pi", "codex"])
     sw.worker_cmds = asyncio.Queue()
     worker_factory_calls: list[dict[str, object]] = []
 
@@ -1444,7 +1588,7 @@ async def test_apply_worker_cmds_spawn_then_kill(challenge, tmp_path, monkeypatc
 async def test_apply_worker_cmds_multiple_spawns_keep_worker_and_lane_isolated(
     challenge, tmp_path, monkeypatch,
 ):
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, engines=["pi", "codex"], max_workers=2,
     )
     sw.worker_cmds = asyncio.Queue()
@@ -1482,7 +1626,7 @@ async def test_apply_worker_cmds_multiple_spawns_keep_worker_and_lane_isolated(
 
 @pytest.mark.asyncio
 async def test_apply_worker_cmds_rejects_unknown_engine_and_max(challenge, tmp_path, monkeypatch):
-    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi"])
+    sw = _reason_swarm(challenge, tmp_path, engines=["pi"])
     sw.worker_cmds = asyncio.Queue()
     monkeypatch.setattr(sw, "_make_cli_worker",
                         lambda engine, **kw: _FakeWorker(engine))
@@ -1522,11 +1666,11 @@ async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, mo
     from dswarm.solver.types import SolveOutcome
 
     challenge.expected_flags = 2
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
+    sw = _reason_swarm(challenge, tmp_path, )
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "codex"])
 
     # each engine returns a DIFFERENT single flag; neither alone completes the run.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
+    sw = _reason_swarm(challenge, tmp_path, )
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
 
     flag_pool = ["flag{a}", "flag{b}"]
@@ -1553,10 +1697,10 @@ async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, mo
 
 async def test_coordinator_singleflag_stops_on_first(challenge, tmp_path: Path, monkeypatch):
     """expected_flags=1 (default): the first flag completes the run immediately —
-    byte-identical to the legacy 'first flag wins'."""
+    byte-identical to the single-flag completion rule."""
     from dswarm.solver.types import SolveOutcome
 
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=2)
+    sw = _reason_swarm(challenge, tmp_path, )
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi"])
 
     class FakeWorker:
@@ -1582,11 +1726,11 @@ async def test_coordinator_singleflag_stops_on_first(challenge, tmp_path: Path, 
 
 
 async def test_operator_hint_queues_review_request(challenge, tmp_path):
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path,
-        stage_policy={"coordinator": {"review": {
+        review_policy={
             "enabled": True, "on_operator_hint": True,
-        }}},
+        },
     )
 
     await _drain_one(sw, {
@@ -1628,7 +1772,7 @@ async def test_reason_worker_runtime_worker_creation_does_not_block_event_loop(c
     from dswarm.swarm.agents import AgentProfile, DispatchDecision
     from dswarm.swarm.runtime import SwarmWorkerRuntime
 
-    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi-web"])
+    sw = _reason_swarm(challenge, tmp_path, engines=["pi-web"])
     release_creation = threading.Event()
 
     class NeverRunWorker:
@@ -1677,7 +1821,7 @@ async def test_reason_worker_runtime_cancels_underlying_worker_on_task_cancel(ch
     from dswarm.swarm.agents import AgentProfile, DispatchDecision
     from dswarm.swarm.runtime import SwarmWorkerRuntime
 
-    sw = _coordinator_swarm(challenge, tmp_path, engines=["pi-web"])
+    sw = _reason_swarm(challenge, tmp_path, engines=["pi-web"])
     events: list[str] = []
 
     class BlockingWorker:
@@ -1745,7 +1889,7 @@ def test_retry_goal_lists_dead_ends(challenge, tmp_path):
     retry them) AND pushes the worker to DRIVE a lead to a working exploit — not the
     old 're-examine / try a different angle' wording that made retry workers conclude
     after a few probes (run-7349)."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     try:
         sw.shared_graph.add_dead_end(actor="cli-pi", reason="SQLi on /login is sanitized")
     except Exception:
@@ -1763,7 +1907,7 @@ def test_make_cli_worker_assigns_unique_labels(challenge, tmp_path):
     """Each spawned worker gets a UNIQUE solver_id (so the deck draws one lane per
     worker), keeping the cli-<engine> prefix (so the engine badge still resolves).
     The first worker of an engine keeps the bare cli-<engine> for back-compat."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     a = sw._make_cli_worker("pi", mode="bootstrap")
     b = sw._make_cli_worker("pi", mode="explore")
     c = sw._make_cli_worker("pi", mode="bootstrap")
@@ -1798,7 +1942,7 @@ async def test_m11_cancelled_coordinator_finalizes_and_closes_graph(
         captured.append(ev)
     bus.add_sink(_sink)
 
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, bus=bus)
+    sw = _reason_swarm(challenge, tmp_path, bus=bus)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
 
     closed = {"n": 0}
@@ -1852,7 +1996,7 @@ async def test_finalize_merges_shared_graph_flags_before_finished(tmp_path):
         events.append(ev)
     bus.add_sink(_sink)
 
-    sw = _coordinator_swarm(ch, tmp_path, bus=bus)
+    sw = _reason_swarm(ch, tmp_path, bus=bus)
     assert sw.shared_graph is not None
     sw.shared_graph.flag_found(actor="cli-a", flag="flag{one}")
     sw.shared_graph.flag_found(actor="cli-b", flag="flag{two}")
@@ -1866,19 +2010,56 @@ async def test_finalize_merges_shared_graph_flags_before_finished(tmp_path):
     assert fin.payload["flags"] == ["flag{one}", "flag{two}"]
 
 
+async def test_winner_persist_failure_is_surfaced_once_without_blocking(
+        challenge, tmp_path):
+    """Continuation-state loss is visible, but never changes solve finalization."""
+    from types import SimpleNamespace
+
+    from dswarm.core.event_bus import EventBus
+
+    events = []
+    bus = EventBus()
+    async def _sink(ev):
+        events.append(ev)
+    bus.add_sink(_sink)
+
+    sw = _reason_swarm(challenge, tmp_path, bus=bus,
+                       graph_dir=tmp_path / "graph")
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    # _persist_winner writes beside graph_dir.  Making that parent a file gives a
+    # deterministic failure without patching filesystem primitives globally.
+    sw._graph_dir = blocked / "graph"
+    outcome = SimpleNamespace(
+        session="session-1", engine="pi", workdir="/worker/cli-pi-1",
+        flag="flag{winner}", flags=["flag{winner}"],
+    )
+
+    sw._persist_winner(outcome, "flag{winner}")
+    sw._persist_winner(outcome, "flag{winner}")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    failures = [e for e in events
+                if e.payload.get("kind") == "winner_persist_failed"]
+    assert len(failures) == 1
+    assert failures[0].payload["op"] == "winner_json"
+    assert failures[0].payload["reason"] == "FileExistsError"
+    assert str(tmp_path) not in str(failures[0].payload)
+
+
 # ── lease + OODA refactor: stall-kill removed, lease closes the loop ──────────
 
 async def test_coordinator_does_not_steer_kill_on_global_fact_stall(
         challenge, tmp_path: Path, monkeypatch):
     """The run-7352 fix: a worker that emits no GLOBAL verified fact must NOT be
-    steer-killed. The old design called request_steer() after stall_seconds of no
+    steer-killed. The current design does not kill workers based on a stall knob;
     global fact, which murdered freshly-spawned workers mid-exploit. There is no
     stall-kill anymore — a worker runs until it finishes on its own."""
     from dswarm.solver.types import SolveOutcome
 
-    # stall_seconds tiny: under the OLD code this would steer-kill the worker fast.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
-                            wall_clock_budget=2.0)
+    # A long-running worker is not steer-killed by a retired stall threshold.
+    sw = _reason_swarm(challenge, tmp_path, wall_clock_budget=2.0)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
 
@@ -1913,9 +2094,8 @@ async def test_REDLINE_no_global_signal_kills_a_progressless_worker(
     in any form (steer OR cancel)."""
     from dswarm.solver.types import SolveOutcome
 
-    # tiny stall_seconds: the OLD stall-kill would have fired almost immediately.
-    sw = _coordinator_swarm(challenge, tmp_path, start_workers=1, stall_seconds=0.01,
-                            wall_clock_budget=2.0)
+    # No retired stall-kill threshold is configured.
+    sw = _reason_swarm(challenge, tmp_path, wall_clock_budget=2.0)
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["claude"])
     monkeypatch.setattr(sw, "_run_reason", lambda: _async_zero())
 
@@ -1954,7 +2134,7 @@ def test_make_cli_worker_explore_gets_short_timeout(challenge, tmp_path):
     """Dual to the above: the ONLY backstop that frees a slot held by a stuck explore
     is its SHORT per-turn timeout. explore must get explore_timeout; bootstrap keeps
     the long default (whole-challenge rush)."""
-    sw = _coordinator_swarm(challenge, tmp_path, explore_timeout=720)
+    sw = _reason_swarm(challenge, tmp_path, explore_timeout=720)
     boot = sw._make_cli_worker("pi", mode="bootstrap")
     expl = sw._make_cli_worker("pi", mode="explore",
                                intent_goal="probe", intent_id="I1-abc")
@@ -1968,7 +2148,7 @@ def test_generic_bootstrap_prefers_open_reason_intent(challenge, tmp_path):
     must convert to a focused explore for the oldest compatible open reason
     intent, claim it under its own solver_id, and adopt the intent's goal —
     so focused intents are never starved by whole-challenge-rush churn."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I3-abc", goal="scan uploaded images for flag",
         payload={"worker_class": "shell_agent"})
@@ -1990,7 +2170,7 @@ def test_generic_bootstrap_prefers_open_reason_intent(challenge, tmp_path):
 def test_generic_bootstrap_skips_incompatible_direction_intent(challenge, tmp_path):
     """An open intent whose direction needs a different worker profile must NOT be
     hijacked by a generic spawn of the wrong engine."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph.propose_intent(
         actor="reason", intent_id="I-rev", goal="unpack the ELF",
         payload={"worker_class": "shell_agent", "direction": "rev"})
@@ -2006,7 +2186,7 @@ def test_generic_bootstrap_claim_lost_falls_back_rejected(challenge, tmp_path, m
     explore."""
     from dswarm.swarm.swarm import WorkerSpawnRejected
 
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     monkeypatch.setattr(
         sw, "_open_intents",
         lambda: [{"intent_id": "I-taken", "goal": "probe admin",
@@ -2021,7 +2201,7 @@ def test_open_intents_includes_expired_lease(challenge, tmp_path):
     must be re-offered by _open_intents, else a stuck worker orphans its intent
     forever. A still-live claim must NOT be re-offered."""
     import time
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I-open", goal="never claimed")
     g.propose_intent(actor="reason", intent_id="I-live", goal="claimed, live lease")
@@ -2042,7 +2222,7 @@ def test_conclude_intent_lease_fencing(challenge, tmp_path):
     lapsed (and which a new worker may now own) must NOT clobber the fresh claim.
     The conclusion event is still recorded, but the table state is not flipped."""
     import time
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I1-x", goal="g")
     # worker A claims with an already-expired lease (simulates a hung/slow worker)
@@ -2061,7 +2241,7 @@ def test_conclude_intent_lease_fencing(challenge, tmp_path):
 def test_conclude_intent_solved_always_wins(challenge, tmp_path):
     """The fence exempts a SOLVED conclusion: a real flag ends the run regardless of
     lease state, so it must always flip the intent to done."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I2-x", goal="g")
     g.claim_intent(worker="A", intent_id="I2-x", lease_s=-1.0)  # expired
@@ -2078,7 +2258,7 @@ def test_supersede_open_intents_retires_obsolete_asks(challenge, tmp_path):
     workers stop re-claiming them. supersede matches by goal substring and only
     touches open / expired-lease rows — a LIVE claim is left alone, and unrelated
     intents are untouched."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I-ask1",
                      goal="Request the operator for the L2 SSH password")
@@ -2112,7 +2292,7 @@ def test_reopen_false_positive_does_not_revive_superseded_intent(challenge, tmp_
     operator supplied the resource. The old reopen flipped EVERY status='done' row back
     to open, resurrecting the retired asks (run-11190 238-worker 'request the password'
     loop came back on a mark-false)."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     g = sw.shared_graph
     # a real solve
     fs = g.add_evidence(actor="cli-pi", source="pi", fact="real", verified=True)
@@ -2144,7 +2324,7 @@ async def test_drain_hitl_does_not_supersede_submit_intent(challenge, tmp_path):
     was removed from the supersede list — on a rate-limited chained-flag challenge
     (Specter), an irrelevant hint used to kill the active submission intent and stall
     the chain."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I-submit",
@@ -2166,7 +2346,7 @@ async def test_drain_hitl_hint_records_operator_directive(challenge, tmp_path):
     """B: an operator hint is now a FIRST-CLASS OperatorDirective (not a fake
     low-confidence candidate fact). It still binds a claimable directive-tagged
     intent the next worker batch picks up — but it is NOT injected as evidence."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     hint = "try /robots.txt and then /data/note.txt"
 
     await _drain_one(sw, {"target": "global", "action": "hint", "text": hint})
@@ -2199,7 +2379,7 @@ async def test_drain_hitl_directive_classification_recorded(challenge, tmp_path)
     from dswarm.core.events import Event, EventType, hitl_request_payload
 
     bus = EventBus()
-    sw = _coordinator_swarm(challenge, tmp_path, bus=bus)
+    sw = _reason_swarm(challenge, tmp_path, bus=bus)
 
     async def _help_sink(ev):
         if ev.event_type is EventType.HITL_REQUEST:
@@ -2227,7 +2407,7 @@ async def test_drain_hitl_directive_classification_recorded(challenge, tmp_path)
 
 
 def test_coordinator_rechecks_external_blocker_before_pausing(challenge, tmp_path):
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
 
     assert sw._rechecked_need_kind(
         "I am unsure whether to try JWT first or upload first",
@@ -2248,7 +2428,7 @@ async def test_drain_hitl_mark_false_invalidates_only_target_flag_live(challenge
     bus = EventBus()
     events = []
     bus.add_sink(lambda ev: events.append(ev) or _noop())
-    sw = _coordinator_swarm(challenge, tmp_path, bus=bus)
+    sw = _reason_swarm(challenge, tmp_path, bus=bus)
     sw._found_flags = ["flag{a}", "flag{b}", "flag{c}"]
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I-a", goal="get flag a")
@@ -2292,7 +2472,7 @@ async def test_m3_bare_hint_without_resource_does_not_supersede(challenge, tmp_p
     """M3: a contentless operator command (no text/url/standing) must NOT run the
     ask-operator supersede sweep — its broad needles (operator/unlock/dashboard)
     could wrongly retire a legitimate in-flight intent on an unrelated hint."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I-ask",
@@ -2306,7 +2486,7 @@ async def test_m3_bare_hint_without_resource_does_not_supersede(challenge, tmp_p
 async def test_m5_solver_scoped_command_only_clears_that_workers_help(challenge, tmp_path):
     """M5: a hint scoped solver:<id> must only clear THAT worker's pending help — a
     hint addressed to worker B must not wipe worker A's still-unmet blocker."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     sw._pending_help = [
         {"worker": "cli-pi-1", "need": "need a VPS"},
@@ -2323,7 +2503,7 @@ async def test_dismiss_clears_help_unfreezes_and_deadends(challenge, tmp_path):
     """Operator DISMISSES a hand-raise without supplying the resource: the pending
     ask is cleared, the swarm unpauses (operator_event set, _operator_paused False),
     and a dead-end is recorded so a re-spawned worker doesn't immediately re-raise."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     sw._operator_event = asyncio.Event()
     sw._operator_paused = True
@@ -2348,7 +2528,7 @@ async def test_dismiss_clears_help_unfreezes_and_deadends(challenge, tmp_path):
 
 async def test_dismiss_scoped_only_clears_that_worker(challenge, tmp_path):
     """A solver-scoped dismiss clears only that worker's ask, leaving others pending."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     sw._operator_event = asyncio.Event()
     sw._pending_help = [
@@ -2368,7 +2548,7 @@ def test_m6_help_sink_dedups_same_blocker_and_caps(challenge, tmp_path):
     from dswarm.core.event_bus import Event
 
     async def _run():
-        sw = _coordinator_swarm(challenge, tmp_path)
+        sw = _reason_swarm(challenge, tmp_path)
         # build the help sink exactly as _run_coordinator does
         async def _help_sink(ev):
             if ev.event_type is EventType.HITL_REQUEST:
@@ -2423,7 +2603,7 @@ async def test_defect4_standing_lru_caps_count(challenge, tmp_path):
     """defect-4: standing guidance is LRU-capped so the cumulative text can't bloat
     every new worker's prompt unbounded (the 36k-token claude empty-exit)."""
     from dswarm.swarm.swarm import _STANDING_MAX
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     for i in range(_STANDING_MAX + 5):
         await _drain_one(sw, {"action": "hint", "text": f"hint-{i}", "standing": True})
@@ -2435,7 +2615,7 @@ async def test_defect4_standing_lru_caps_count(challenge, tmp_path):
 async def test_defect4_clear_standing(challenge, tmp_path):
     """defect-4: clear_standing wipes all (or one by exact text) so an operator can
     retract a stale correction — the list was only-grew before."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
     await _drain_one(sw, {"action": "hint", "text": "a", "standing": True})
     await _drain_one(sw, {"action": "hint", "text": "b", "standing": True})
@@ -2466,7 +2646,7 @@ async def test_m3_redirect_reaches_next_spawned_worker(challenge, tmp_path, monk
     worker anymore, so it must reach the NEXT spawned worker — the redirect url as
     the new target override, the text as one-shot guidance — and the guidance is
     consumed (one-shot), not re-applied to every future worker."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.hitl_inbox = asyncio.Queue()
 
     # operator drops a non-standing redirect.
@@ -2492,7 +2672,7 @@ async def test_m3_redirect_reaches_next_spawned_worker(challenge, tmp_path, monk
     assert sw._next_worker_guidance == []
 
 
-# ── race-scout layer (DESIGN_race_scout_layer.md) ────────────────────────────
+# ── intent convergence and lease lifecycle ──────────────────────────────────
 
 
 
@@ -2501,16 +2681,6 @@ async def test_m3_redirect_reaches_next_spawned_worker(challenge, tmp_path, monk
 
 
 
-
-
-def test_stage_policy_reads_coordinator_key():
-    """The coordinator stage policy is keyed "coordinator"; from_config reads it and
-    round-trips it through model_dump. Unknown keys are ignored."""
-    from dswarm.swarm.stage_policy import StagePolicy
-    sp = StagePolicy.from_config({"coordinator": {"wall_clock_budget": 7},
-                                  "unknown_key": {"wall_clock_budget": 42}})
-    assert sp.coordinator == {"wall_clock_budget": 7}
-    assert sp.model_dump()["coordinator"] == {"wall_clock_budget": 7}
 
 
 
@@ -2533,7 +2703,7 @@ def test_nofact_deadend_conclude_is_not_redispatched(challenge, tmp_path):
     recorded) — leaving the row 'claimed' → lease expiry re-offered it forever
     (238-worker loop). The fix drops that gate; this asserts the DB side does the
     right thing for a None fact pointer so the unconditional conclude is safe."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     g = sw.shared_graph
     g.propose_intent(actor="reason", intent_id="I-nf", goal="a doomed direction")
     # worker claims with an already-expired lease (so without the fix the row would
@@ -2556,7 +2726,7 @@ def test_standing_guidance_injected_into_new_worker_turn1(challenge, tmp_path):
     must carry it in its turn-1 prompt. Before, the coordinator didn't persist
     standing, so _make_cli_worker built workers with an empty _standing_block and
     late workers never saw the VPS info."""
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     # operator gave standing guidance earlier in the run (coordinator persisted it)
     sw._standing_guidance.append("reverse shell: ssh root@38.247.145.244 (VPS relay)")
     # a worker spawned NOW must inherit it
@@ -2572,7 +2742,7 @@ def test_drain_hitl_persists_standing_on_coordinator(challenge, tmp_path):
     """_drain_hitl must store a standing hint on the coordinator's canonical list
     (so future _make_cli_worker calls inherit it), not just broadcast it live."""
     import asyncio as _aio
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     inbox: _aio.Queue = _aio.Queue()
     sw.hitl_inbox = inbox
 
@@ -2597,7 +2767,7 @@ def test_drain_hitl_stop_sets_operator_stop_and_wakes(challenge, tmp_path):
     coordinator — the graceful-terminate lever for a run that never gates a flag
     (run-10070). It is distinct from a steer, which only guides workers."""
     import asyncio as _aio
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     inbox: _aio.Queue = _aio.Queue()
     sw.hitl_inbox = inbox
     sw._operator_event = _aio.Event()
@@ -2620,7 +2790,7 @@ def test_drain_hitl_stop_sets_operator_stop_and_wakes(challenge, tmp_path):
 def test_drain_hitl_steer_does_not_stop(challenge, tmp_path):
     """A normal steer/hint must NOT set _operator_stop — only stop/complete do."""
     import asyncio as _aio
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     inbox: _aio.Queue = _aio.Queue()
     sw.hitl_inbox = inbox
     sw._operator_event = _aio.Event()
@@ -2662,7 +2832,7 @@ def test_missing_profile_does_not_leak_budget(challenge, tmp_path):
     bailed — leaking a phantom spawn toward max_total_workers and crashing the
     coordinator with a bare RuntimeError)."""
     from dswarm.swarm.swarm import WorkerSpawnRejected
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path,
         worker_profiles=[{"id": "pi-sub", "engine": "pi",
                           "roles": ["review"], "runtime": "local"}],
@@ -2679,7 +2849,7 @@ def test_missing_profile_does_not_leak_budget(challenge, tmp_path):
 def test_pi_subscription_uses_profile_capacity_not_account_mutex(challenge, tmp_path):
     """pi subscription profiles are not account-mutexed. They obey the profile's
     ordinary worker capacity just like any other profile."""
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path,
         worker_profiles=[{
             "id": "pi-sub",
@@ -2710,7 +2880,7 @@ def test_pi_subscription_uses_profile_capacity_not_account_mutex(challenge, tmp_
 
 
 def test_pi_config_links_replace_stale_copied_config(tmp_path):
-    from dswarm.swarm import swarm as swarm_mod
+    from dswarm.swarm import _bootstrap_assets as assets
 
     home = tmp_path / "home"
     ext = home / ".pi" / "agent" / "extensions"
@@ -2719,7 +2889,7 @@ def test_pi_config_links_replace_stale_copied_config(tmp_path):
     settings = home / ".pi" / "agent" / "settings.json"
     settings.write_text("{}", encoding="utf-8")
 
-    swarm_mod._ensure_pi_config_links(home, config_target_root="/fresh/pi-config")
+    assets._ensure_pi_config_links(home, config_target_root="/fresh/pi-config")
 
     assert (home / ".pi/agent/extensions").is_symlink()
     assert str((home / ".pi/agent/extensions").readlink()).replace("\\", "/") == (
@@ -2734,7 +2904,7 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
 
     wroot = tmp_path / "workspace" / "workers"
     wroot.mkdir(parents=True, exist_ok=True)
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=wroot,
     )
     monkeypatch.delenv("DSWARM_GATEWAY_URL", raising=False)
@@ -2796,7 +2966,7 @@ async def test_run_teardown_revokes_all_tokens_for_run(challenge, tmp_path, monk
         profile_id="pi", configured_account_id=None, token_scope="worker",
     ))
     monkeypatch.setattr(ModelGateway, "instance", staticmethod(lambda: gateway))
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.run_id = "teardown-run"
     monkeypatch.setattr(sw, "_reconcile_blackboard_skill", lambda: asyncio.sleep(0))
     async def finish():
@@ -2818,7 +2988,7 @@ def test_container_runtime_prefers_mapped_shared_graph_db(
     workspace = tmp_path / "workspace"
     worker_root = workspace / "workers"
     worker_root.mkdir(parents=True)
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=worker_root,
         graph_dir=workspace / "graph", blackboard_token="bb-token",
     )
@@ -2846,7 +3016,7 @@ def test_container_runtime_explicit_blackboard_url_overrides_shared_db(
     workspace = tmp_path / "workspace"
     worker_root = workspace / "workers"
     worker_root.mkdir(parents=True)
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=worker_root,
         graph_dir=workspace / "graph", blackboard_token="bb-token",
     )
@@ -2870,7 +3040,7 @@ def test_container_runtime_explicit_blackboard_url_overrides_shared_db(
 
 def test_runtime_uses_http_blackboard_fallback_without_shared_graph(
         challenge, tmp_path, monkeypatch):
-    sw = _coordinator_swarm(challenge, tmp_path, blackboard_token="bb-token")
+    sw = _reason_swarm(challenge, tmp_path, blackboard_token="bb-token")
     if sw.shared_graph is not None:
         sw.shared_graph.close()
     sw.shared_graph = None
@@ -2899,7 +3069,7 @@ def test_runtime_env_injects_profile_effort_and_endpoint(
         base_url="https://custom.example/v1",
         target_engine="pi",
     )
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, credential_accounts_root=str(root)
     )
     profile = {
@@ -2951,7 +3121,7 @@ def test_container_runtime_endpoint_uses_secret_file_and_runtime_pi_config(
         base_url="https://custom.example/v1",
         target_engine="pi",
     )
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, worker_backend="container", worker_root=worker_root,
         credential_accounts_root=str(root),
     )
@@ -3000,7 +3170,7 @@ async def test_finalize_refreshes_workspace_board_atomically_and_idempotently(
     workspace = tmp_path / "workspace"
     worker_root = workspace / "workers"
     worker_root.mkdir(parents=True)
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, worker_root=worker_root, graph_dir=workspace / "graph")
     assert sw.shared_graph is not None
     sw.shared_graph.propose_intent(
@@ -3058,7 +3228,7 @@ def test_lifecycle_integration_directive_review_resource_compact(challenge, tmp_
     mock challenge: operator directive (B) → claimable directive intent; fact review
     reject/merge (A) → snapshot filtering; resource lock (E) → dispatch preflight;
     finalize-by-stop-reason (J); compaction (H). No API key / scripted worker."""
-    sw = _coordinator_swarm(challenge, tmp_path, max_workers=2)
+    sw = _reason_swarm(challenge, tmp_path, max_workers=2)
     g = sw.shared_graph
 
     # --- A: facts + review lifecycle ---
@@ -3128,7 +3298,7 @@ def test_sync_flags_from_graph_absorbs_graph_only_flags(challenge, tmp_path: Pat
     every verdict, so a lost clean outcome can no longer blind completion."""
     challenge.expected_flags = 2
     challenge.multi_flag = True
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     assert sw.shared_graph is not None
     # two flags land on the graph (as _accept_flag would) but _found_flags is empty:
     # the worker outcomes never delivered them (cancelled-after-accept / DB bridge).
@@ -3147,7 +3317,7 @@ def test_sync_flags_drops_operator_invalidated_flag(challenge, tmp_path: Path):
     which already excludes invalidated flags, removes it from the in-memory set."""
     challenge.expected_flags = 2
     challenge.multi_flag = True
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     assert sw.shared_graph is not None
     sw.shared_graph.flag_found(actor="cli-x", flag="flag{real}", intent_id=None)
     sw.shared_graph.flag_found(actor="cli-y", flag="flag{bogus}", intent_id=None)
@@ -3166,7 +3336,7 @@ def test_sync_flags_noop_without_graph(challenge, tmp_path: Path):
     """No shared graph → reconcile is a no-op and never wipes the in-memory set
     (a transient/absent graph must not erase genuinely-held flags)."""
     challenge.expected_flags = 1
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     sw.shared_graph = None
     sw._found_flags = ["flag{kept}"]
     assert sw._sync_flags_from_graph() == []
@@ -3180,7 +3350,7 @@ def test_flags_complete_falls_back_to_memory_when_graph_unreadable(
     be read (DB failure), completion degrades to the pre-wiring memory-only
     verdict instead of raising or wiping held flags."""
     challenge.expected_flags = 1
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     assert sw.shared_graph is not None
     real_graph = sw.shared_graph
 
@@ -3206,10 +3376,10 @@ def test_flags_complete_falls_back_to_memory_when_graph_unreadable(
 
 
 def test_flags_complete_absorbs_single_flag_run_from_graph(challenge, tmp_path: Path):
-    """expected_flags=1 race mode: one graph-only accepted flag finishes the run —
-    byte-identical guarantee to first-flag-wins, now backed by the graph."""
+    """expected_flags=1 single-flag run: one graph-only accepted flag finishes the run —
+    byte-identical guarantee to single-flag completion, now backed by the graph."""
     challenge.expected_flags = 1
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     assert sw._flags_complete() is False
     sw.shared_graph.flag_found(actor="cli-x", flag="flag{single}", intent_id=None)
     assert sw._flags_complete() is True
@@ -3222,7 +3392,7 @@ def test_flags_complete_never_finishes_unknown_count_collect_mode(
     the graph holds many accepted flags."""
     challenge.multi_flag = True
     challenge.expected_flags = 1
-    sw = _coordinator_swarm(challenge, tmp_path)
+    sw = _reason_swarm(challenge, tmp_path)
     for i in range(5):
         sw.shared_graph.flag_found(actor=f"cli-{i}", flag=f"flag{{{i}}}",
                                    intent_id=None)
@@ -3231,12 +3401,12 @@ def test_flags_complete_never_finishes_unknown_count_collect_mode(
 async def test_review_factory_exception_releases_reserved_lane(
     challenge, tmp_path: Path, monkeypatch,
 ):
-    sw = _coordinator_swarm(
+    sw = _reason_swarm(
         challenge, tmp_path, max_workers=1,
-        stage_policy={"coordinator": {"review": {
+        review_policy={
             "enabled": True, "engine": "pi", "max_concurrent": 1,
             "cooldown_events": 0,
-        }}},
+        },
     )
     monkeypatch.setattr(sw, "_select_review_engine", lambda healthy: "pi")
 
@@ -3270,7 +3440,6 @@ def test_container_backend_without_frozen_policy_fails_closed(
 
     swarm = Swarm(
         challenge,
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=SandboxManager(root=tmp_path / "sbx"),
         artifacts=ArtifactStore(root=tmp_path / "arts"),

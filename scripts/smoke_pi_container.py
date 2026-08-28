@@ -4,7 +4,7 @@ worker container (ctf-swarm-pi:0.2.0, rcp supervisor backend).
 - boots a local HTTP target (bound to 0.0.0.0; the container reaches it via
   host.docker.internal)
 - creates a credential account (pi-main/API_KEY) for the container key injection
-- runs the dswarm coordinator (executor=cli, engines=["pi"],
+- runs the dswarm ReasonSwarm scheduler (executor=cli, engines=["pi"],
   worker_backend="container")
 - expects: pi worker inside the container curls the target, the flag passes the
   provenance gate, the run finishes solved.
@@ -116,20 +116,18 @@ async def main() -> int:
     cost = CostController()
 
     sw = Swarm(
-        challenge, [],
+        challenge,
         llm=llm, sandbox=sandbox, bus=bus, cost=cost, artifacts=arts,
         run_id="smoke-pi-container",
         executor="cli",
         engines=["pi"],
         web_access=True,
-        start_workers=1,
         max_workers=2,
         worker_root=root / "workspace" / "workers",
         graph_dir=root / "workspace" / "graph",
         credential_accounts_root=str(accounts),
         worker_backend="container",
         reason_model="deepseek-v4-flash",
-        stall_seconds=0.1,
         wall_clock_budget=90.0,
         barren_limit=3,
     )

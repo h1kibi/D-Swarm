@@ -1121,7 +1121,3 @@ class BtwLimiter:
         cur = self._active.get(run_id)
         if cur is task:
             self._active.pop(run_id, None)
-
-
-def sse_frame(obj: dict[str, Any]) -> str:
-    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"

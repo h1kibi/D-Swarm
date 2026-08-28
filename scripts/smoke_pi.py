@@ -1,7 +1,7 @@
 """P1 acceptance smoke: a REAL swarm run with a pi (deepseek) worker.
 
 - boots a local HTTP target whose index page contains the flag
-- runs the dswarm coordinator (executor=cli, engines=["pi"])
+- runs the dswarm ReasonSwarm scheduler (executor=cli, engines=["pi"])
 - expects: worker curls the target, the flag passes the provenance gate,
   the run finishes solved with the flag on the shared graph
 """
@@ -87,18 +87,16 @@ async def main() -> int:
     cost = CostController()
 
     sw = Swarm(
-        challenge, [],  # lineup unused by the CLI executor
+        challenge,
         llm=llm, sandbox=sandbox, bus=bus, cost=cost, artifacts=arts,
         run_id="smoke-pi",
         executor="cli",
         engines=["pi"],
         web_access=True,
-        start_workers=1,
         max_workers=2,
         worker_root=root / "workspace" / "workers",
         graph_dir=root / "workspace" / "graph",
         reason_model="deepseek-v4-flash",
-        stall_seconds=0.1,
         wall_clock_budget=240.0,
         barren_limit=3,
     )

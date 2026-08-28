@@ -40,28 +40,16 @@
   violation finding 进图且被 bridge 正常转发为 `review_finding` 公开增量；
   全量回归绿。
 
-### A2. cleanup registry 未落地（M9 四件套最后一项）
+- ✅ **A1 closed (2026-08-27)**：scope audit 已接入 pentest 收尾路径；审计仅读取 SharedGraph 有效事实，越界 finding 会持久化并 bridge 到 `review_finding`，无 scope 不扫描。针对性测试与 `uv run pytest -q` 均通过。
 
-- **现象**：`docs/10 §M9` 计划了"`CLEANUP=<cmd>` 标记 → `cleanup_actions`
-  表 → wind-down（`_finalize_coordinator_run`）逆序执行 + 报告清单"，但
-  `skills/dswarm-blackboard/blackboard.py` 与 `dswarm/swarm/blackboard_skill.py`
-  中 `CLEANUP` 命中数为 **0**，无对应表、无执行器。
-- **影响**：pentest 收尾阶段无法自动还原现场（掉落的隧道/监听器/临时凭据），
-  报告也无法给出"已清理动作"清单。
-- **决策请求**：若决定**不做**，请在 `docs/10 §M9` 状态行显式降级并从
-  README 能力表中移除相应措辞（二选一，不许保持半悬空）。
-- **若实施的修复方向**：
-  1. blackboard skill 增解析 `CLEANUP=<command>`（worker 输出侧已有
-     `POC_SAVE=` 同型正则先例，`cli_solver.py` `_EXTRACT_POC_SAVES` 一族）；
-  2. 新增 events 种类 + `cleanup_actions` 投影表（复用 `poc_reproductions` 的
-     fold-rebuild 模式），记录 actor/poc/intent 关联与 command（命令文本仅存图内，
-     公开增量只给 digest/截断——遵循 Verified-PoC 的脱敏边界）;
-  3. `_finalize_coordinator_run` 在 release_claims_for_finalize 前逆序执行
-     （失败逐条记 `cleanup_failed`，绝不阻断 finalize 主路径）；
-  4. 执行容器与租约：直接用当次 run 已冻结的池代际，禁止新建 Docker 连接通道。
-- **验收标准**：注册→finalize 执行→报告清单事件的端到端测试（ScriptedLLM 模式）；
-  失败不阻断断言；bridge 公开字段脱敏断言（参照
-  `tests/test_verified_poc_compatibility.py` 手法）。
+### A2. cleanup registry 已落地（M9 四件套最后一项）
+
+- **核实结论（2026-08-27）**：安全版本已实现并接入生产收尾路径。实现不是原始草案中的任意命令执行，而是 typed cleanup registry；worker 只能注册四类动作：`remove_artifact`、`stop_listener`、`close_session`、`revoke_credential`。
+- **事件与投影**：`dswarm/swarm/shared_graph.py` 增加 `cleanup_action_registered`、`cleanup_executed`、`cleanup_failed` 事件及可由事件流重建的 `cleanup_actions` 投影，注册按 action ID/idempotency key 幂等。
+- **执行边界**：`remove_artifact` 仅允许 run-relative 的 `workers/...` 文件，并由 coordinator 直接执行受限 unlink；其余动作必须由 run owner 注入已授权 runtime adapter。没有 adapter 时记录失败，绝不 fallback 到宿主 shell、Docker shell 或 raw command。
+- **收尾语义**：`_finalize_coordinator_run` 在释放 claims 前按注册顺序逆序执行；单条失败追加 `cleanup_failed`，不阻断后续动作、claims release、graph drain 或 run close。重复/缺失文件按幂等语义处理。
+- **脱敏与黑板**：worker-facing blackboard 和 bridge 只公开 action type、ID、target digest/长度；原始 target 仅保存在 run-scoped graph 内。非法 marker（包括 `CLEANUP=rm -rf ...`、绝对路径和 `..`）被拒绝。
+- **验证**：新增确定性测试覆盖 typed marker 校验、graph append-only/rebuild/idempotency、CLI 注册脱敏、逆序执行、失败隔离和 artifact 路径边界；`uv run pytest -q tests/test_cleanup_registry.py` 通过。
 
 ### E1.（随 A 类顺带确认）上游 0.2.4 补丁现状
 
@@ -70,6 +58,10 @@
   （`container_exec.py` `_query_worker_uid_gid` 一族）。请核对 0.2.4 的
   EndpointDriver hello 机制是否已被自有实现覆盖，并把结论回写到 `docs/10 §M9`，
   让账本与代码一致。
+
+- ✅ **E1 closed (2026-08-28)**：已核实上游 0.2.4 是 Codex 专用修复，不是当前 pi-only 内核必须恢复的通用 CLI hello 路径。D-Swarm 的 `worker_config.py` 已把 endpoint account 的 `base_url` overlay 到 profile；`EndpointDriver._hello_argv()` 对 endpoint 明确不走 base CLI；profile readiness 由 `EndpointDriver.health_detail()` 调用 `probe_endpoint(validate_model=True)`，先做 `/models` 可达/认证/发现，再对实际 profile model 发配置协议或 auto fallback 的 Chat/Responses 请求，因此覆盖了开跑前的认证、协议与模型/schema 预检语义。
+- `apps/web/account_test.py` 的 custom-endpoint 账号测试仍保持有意的 model-agnostic direct HTTP probe：它验证账号级 base_url + key 可达，不等同于带 pinned model 的 profile readiness；两条路径均不恢复 Race/Coordinator 或 Codex 兼容层。0.2.5 的 worker 镜像 UID/GID 探测+chown 也已核实为本仓自有实现。
+- 验证：`tests/test_worker_endpoint.py`、`tests/test_cli_executor.py`、`tests/test_connectivity_probes.py`、`tests/test_worker_config.py` endpoint 相关测试通过；`uv run pytest -q` 全量通过。
 
 ---
 
@@ -86,6 +78,11 @@
   观测点。注意保持"绝不扰动 accept 主流程"、同一 worker 生命周期内去重。
 - **验收标准**：伪图抛错 →恰一条 bb delta 且 flag 流程继续；多次失败幂等单发。
 
+- ✅ **B1 closed (2026-08-28)**：`_accept_flag` 对
+  `shared_graph.flag_found` 的失败现已通过有界、去重的 `flag_db_write_failed` blackboard
+  delta 暴露；异常只公开类型，不携带 flag payload、路径或原始异常文本，且不阻断本地
+  accept、provenance gate 或 finalize。确定性失败/去重测试与全量回归通过。
+
 ### B2. 静默吞异常的全量排查与分级处置
 
 - **现象**：内核约 174 处 2 行内吞掉的 `except Exception`。其中合理的
@@ -98,16 +95,56 @@
   `# best-effort ok`，整改类按 B1 模式接观测），而非一次性大改。
 - **验收标准**：清单文档化（可附 PR 描述）；抽查任一"保留"类别归属正确。
 
-### B3. `_record_runtime_degraded` 已测未接线
+### B2 disposition ledger (2026-08-28)
 
-- **现象**：`runtime_degradation.py:69` 的运行时降级登记方法全仓无调用方
-  （配套单测于 commit `023c490` 已存在）。降级信息目前只有 `_note_engine_*`
-  引擎健康粒度，池代际回退粒度无叙事。
-- **修复方向**：在 `worker_runtime_mixin._handle_runtime_failure` 决定回退后端时
-  调用它；payload 已含 requested/fallback backend 与 reason 截断。
-- **验收标准**：fake executor 触发 failover → `_runtime_degraded` 收录 +
-  `runtime_degraded` bb delta 发射一次；`_runtime_metadata_for(outcome)`
-  的 backend 翻转反映真实结果（既有测试形态）。
+- ✅ **Closed (2026-08-28)**：本轮 AST 复核得到 **125 个** `except
+  Exception` + `pass` call site；其中 5 个证据/状态写入点已从静默吞异常改为一次性、
+  脱敏的 blackboard delta，剩余 **125 个** 均属于下列明确的 best-effort 类别。
+- **已整改（D，durable evidence/state）**：
+  - `dswarm/solver/cli_solver.py`：intent propose/claim/conclude、`add_evidence`、
+    `flag_found`、`save_poc`/`conclude_poc`、review proposal 写入；
+  - `dswarm/swarm/reason_scheduler.py`：Reason dispatch 的 intent registration。
+  这些路径分别发出 `intent_db_write_failed`、`fact_db_write_failed`、
+  `flag_db_write_failed`、`poc_db_write_failed`、`review_db_write_failed`；按 intent、
+  fact digest、flag 或 PoC/marker 有界去重，原始 fact、payload、host path 不进入诊断。
+  直接 conclude 路径也统一复用 `_conclude_intent_db`，避免回归静默写入。
+- **本轮继续核实/收口（2026-08-28）**：
+  - `dswarm/swarm/swarm.py::_persist_winner` 的 `winner.json` continuation-state
+    写失败现发出一次 `winner_persist_failed(op=winner_json)`；只公开异常类型，
+    不公开 payload 或 host path，且不阻断 solved finalize。
+  - advisory `_run_reason` 的 `pin_facts` 与 intent dispatch 写失败分别通过
+    `fact_db_write_failed(op=pin_facts)` / `intent_db_write_failed(op=propose)`
+    有界观测；live scheduler 路径仍是唯一正式 dispatch 路径，不恢复旧 Race /
+    Coordinator 模式。
+  - `review_flow` 的 proposal decision fallback 若自身 append 失败，现发出一次
+    `review_db_write_failed(op=decide_review_proposal)`；`cli_solver` 的
+    `register_poc_reproduction` 失败复用 `poc_db_write_failed`，并将 rejection
+    诊断限制为异常类型。
+- **保留（K，kernel isolation）**：
+  `dswarm/core/event_bus.py`；`dswarm/solver/cli_driver.py`、`container_exec.py`、
+  `container_pool.py`、`container_runtime.py`、`control_client.py`；
+  `dswarm/swarm/swarm.py` 的 bus/finalize/HITL/worker teardown；
+  `dswarm/swarm/worker_runtime_mixin.py`。这些异常发生在 sink/fan-out、进程/容器回收、
+  取消、运行时释放或前端通知边界；升级会遮蔽真实 worker outcome 或造成资源泄漏。
+- **保留（R，readonly/enrichment）**：
+  `dswarm/solver/btw.py`、`reason.py`、`summarizer.py`、`poc_verification_runtime.py`、
+  `review_flow.py`、`runtime.py`；以及 `cli_solver.py` 中的 board/flag 读取、环境映射、
+  marker/readonly enrichment。失败时已有空结果、降级文本或跳过语义，不写入事实或改变
+  provenance gate。
+- **保留（T，optional telemetry）**：
+  `dswarm/swarm/energy_capture.py`、`energy_sidecar.py`、`projection.py`、
+  `runtime_degradation.py`、`shared_graph.py` route metrics、`reason_scheduler.py`
+  的 bus/provider/energy telemetry，以及 `cli_solver.py` 的 lifecycle/cost/InsightBus
+  旁路。它们不能改变调度、flag acceptance、append-only graph 或 finalize。
+- **复核方式**：后续新增 `except Exception: pass` 必须归入 K/R/T 之一并在 call site
+  说明原因；涉及 durable graph、资金/ledger、intent 状态或 winner continuation 的新写入
+  不得直接使用静默 `pass`。
+
+### B3. `_record_runtime_degraded` 已接线
+
+- ✅ **2026-08-27 closed in working tree (committed as one reviewed batch)**：runtime pool failover 在选出冻结候选后调用 `_record_runtime_degraded`，记录 requested/fallback backend 与截断后的 failure category/code；观测路径为 best-effort，不改变 failover、flag 或 finalize 主流程。
+- **可见性**：记录会追加 `_runtime_degraded`，并通过 `runtime_degraded` blackboard delta 暴露一次；`_runtime_metadata_for(outcome)` 按实际 outcome backend 生成元数据，不再把所有降级错误地标成 `local`。
+- **验证**：新增 deterministic fake-runtime failover 测试，覆盖记录、blackboard delta 与 container-to-container fallback 的真实 backend 元数据；`tests/test_runtime_failover.py` 与 `tests/test_runtime_degradation.py` 通过。
 
 ### B4. 未知事件种类的"契约冻结"前置
 
@@ -122,6 +159,13 @@
   schema 化；此后新增 kind 必须改契约再发布。这是 UI 对接的前置条件，
   归档为本文件的姊妹任务，不必由内核修复人独立完成。
 
+- ✅ **B4 closed (2026-08-28)**：新增
+  `docs/ui-event-contract-v1.md`，冻结 envelope、`blackboard.delta` 最低契约与
+  stable/experimental/replay-only 分类。UI reducer 对未知、缺失或非字符串 kind
+  增加 generic timeline fallback：可见但 inert，不修改 typed blackboard state、调度、
+  证据图或 flag/provenance；新增 `apps/web/ui/test/events-contract.test.ts` 覆盖未知
+  与 malformed kind 的 replay 回归。
+
 ---
 
 ## C 类 · 结构债（P2，逐个立项、禁止顺手动）
@@ -131,7 +175,45 @@
 | C1 | `worker_runtime_mixin ↔ swarm` 循环依赖：`:284` 函数内延迟 import 一次性搬运 **10 个下划线私有符号** | worker_runtime_mixin.py:284 | 把被搬运者下沉为叶子模块（如 `swarm/_bootstrap_assets.py`），mixin 与 Swarm 都只向上引用叶子 |
 | C2 | 超大文件：`shared_graph.py` ≈5153 行 / `cli_solver.py` ≈4350 行 | 当前 HEAD | 建议按域拆分：图生命周期域（poc/budget/energy 已各自成形）外置为 mixin-free 模块；marker 解析器独立成 parser 模块。**拆分前先冻结行为快照测试** |
 | C3 | normalize/sanitize helper 繁殖：`normalize_operator_direction` 在 `direction_rules.py:168` 与 `apps/web/drivers.py:59` 两套同义不同体；`worker_profiles` 6 个 + `shared_graph` 5 个同类 | 各文件 | 统一入口收敛至公共叶子模块，web 侧重定向 import；受 `test_m4_operator_direction.py` 保护 |
+
+- ✅ **C3 closed (2026-08-28)**：新增无业务依赖的
+  `dswarm/core/normalization.py` 公共叶子模块，集中维护文本、方向原文、fact identity、
+  route/lane/resource key 与 lane host 的确定性归一化。`apps/web/drivers.py` 删除本地
+  `normalize_operator_direction` 包装，直接使用 `direction_rules` 的唯一实现；
+  `shared_graph.py` 保留兼容方法但转发至公共实现，`worker_profiles.py` 统一使用
+  `clean_text`。新增 M4 回归断言锁定单一入口与 graph wrapper 委托关系。
 | C4 | ~54 条事故编码注释（BUG①②③/run-ID/`鈥?` 型历史标签）承载回归知识 | `grep -rn "BUG①\|BUG②\|BUG③\|run-[0-9]" dswarm/ | wc` | 沉淀进 docs 或改名带案号的规范注释（例如 `// regression: run-75379 …`），建立索引表防止随重构失联 |
+
+- ✅ **C4 closed (2026-08-28)**：新增 `docs/regression-index.md`，将当前 `dswarm/**/*.py` 中的 29 个 run-ID（102 处引用）和独立 BUG-1/2/3/4 标签归档为稳定回归索引，明确它们不是运行模式、兼容注册表或 flag 来源。`tests/test_regression_index.py` 以源码扫描对索引做等集断言，防止后续拆分遗失历史回归锚点。
+
+- ✅ **C1 closed (2026-08-28)**：新增无 Swarm 依赖的
+  `dswarm/swarm/_bootstrap_assets.py` 叶子模块，承载 worker HOME、pi 配置、方向
+  skill 与 blackboard link 的 bootstrap helper。`worker_runtime_mixin.py` 改为模块级
+  依赖该叶子模块，移除运行时对 `dswarm.swarm.swarm` 的延迟私有导入；`swarm.py`
+  仅保留兼容导出，既不恢复 Race/Coordinator，也不改变正式调度路径。
+- **验证**：新增架构回归测试锁定 mixin 不得反向导入 `swarm.py`；helper 兼容测试、
+  `tests/test_architecture.py`、`tests/test_swarm.py` 与 `tests/test_external_skills.py`
+  通过。
+
+- 🔧 **C2 marker-parser slice closed (2026-08-28)**：将
+  `cli_solver.py` 的纯 worker-marker 正则与解析函数下沉至无 solver-state 依赖的
+  `dswarm/solver/marker_parser.py`；`CliSolver` 保留同名薄 wrapper，保持既有调用面、
+  provenance/gate 路径与 cleanup/review 处理不变。新增
+  `tests/test_marker_parser_snapshot.py` 冻结 FOUND_FLAG、fact/finding、NEED_INPUT、
+  READY_TO_SUBMIT、PoC、CLEANUP 与 raw-flag guard 的行为；solver 其余状态域仍保留在
+  `CliSolver`，避免为拆分而改变 provenance/gate 边界。
+
+- 🔧 **C2 event-reader slice closed (2026-08-28)**：将
+  `events`、`recent_events`、`events_since` 与异步 `subscribe_events` 的只读查询/轮询
+  逻辑下沉到无 `shared_graph` 反向依赖的 `dswarm/swarm/event_reader.py`。
+  `SQLiteSharedGraph` 仅保留兼容 wrapper；append-only 写入、challenge 过滤、kind 过滤、
+  顺序与轮询语义均由 `tests/test_shared_graph_event_reader_snapshot.py` 冻结。
+
+- ✅ **C2 closed (2026-08-28)**：C2 的可安全外置边界已
+  收口为 POC lifecycle、worker marker parser 与 event reader 三个无运行模式依赖的叶子域；
+  token budget (`budget.py`) 与 offline energy (`energy.py`) 原本已是独立模块。核心事实/意图
+  物化与 SQLite 事务仍留在 `shared_graph.py`，避免为了缩短文件而引入第二事实源或破坏
+  append-only 语义。以上切片均有确定性快照测试，全量 pytest 已通过。
 
 ---
 
@@ -149,6 +231,11 @@
 **验收**：删除前 `grep -rn <symbol> --include='*.py' .`（含 tests/apps/scripts）确认零引用；
 每删一类跑一次全量。
 
+- ✅ **D1 closed (2026-08-28)**：已确认当前仓库（含
+  `tests/`、`apps/`、`scripts/`）不再引用 `sse_frame`、`engine_liveness`、`new_finding_id`
+  或 `_is_control_failure`；SSE 序列化继续使用 `Event.to_sse()`，engine health 继续走
+  现有 health endpoint，相关回归测试通过。
+
 ### D2. Windows 开发宿主的两处已知差异
 
 1. token/key 文件 `chmod 0o600/0o700` 组位在 Windows 上无效（位置：
@@ -159,6 +246,15 @@
 2. 调试路径 `/tmp/dswarm_container_diag`（`container_exec.py`，debug env 触发）
    硬编码 POSIX tmp → 改 `tempfile.gettempdir()` 一致化。
 
+- ✅ **D2 closed (2026-08-28)**：已在凭据存储、
+  runtime credential projection、runtime snapshot/diagnostics 以及 RCP token
+  staging 的 `chmod(0o600/0o700)` call site 明确注明：native Windows 上权限位仅
+  best-effort，不能提供 POSIX owner-only isolation；生产安全边界仍是 Docker/Linux
+  runtime，不能把 Windows host staging 当成隔离。`container_exec.py` 的 debug
+  日志目录已使用 `tempfile.gettempdir()`，不再硬编码 `/tmp`。
+- **验证**：Windows 兼容性说明已同步至 `SECURITY.md` 与 `docs/runtime-pools.md`；
+  定向 runtime/credential/container 测试与 `uv run pytest -q` 通过。
+
 ### D3. 一个已定性 Windows 冒烟偶发
 
 - `tests/test_secret_store.py::test_atomic_write_replaces_existing_file`
@@ -167,6 +263,10 @@
 - **修复方向**：`atomic_write` 对 `tmp.replace(path)` 捕获 `PermissionError`
   后短暂退避重试一次（≤50ms），不吞第二次异常；严禁改成宽泛重试循环掩盖真问题。
 - **验收**：本地反复全量 3 轮无该 flake；Linux CI 行为不变。
+
+- ✅ **D3 closed (2026-08-28)**：`atomic_write` 仅对
+  `tmp.replace(path)` 的 `PermissionError` 做一次 10ms 短暂退避重试，第二次异常继续抛出；
+  定向 `tests/test_secret_store.py` 已连续 3 轮通过，且覆盖重试次数与退避行为的确定性测试。
 
 ---
 

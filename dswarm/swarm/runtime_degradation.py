@@ -96,8 +96,22 @@ class RuntimeDegradationMixin:
         engine = getattr(outcome, "engine", "") if outcome is not None else ""
         profile = self._profile_for_engine(engine, advance=False) if engine else None
         runtime = self._runtime_for_engine(engine, profile) if engine else None
+        # A degradation record describes the backend actually used after the
+        # decision (which may be another container pool, not necessarily local).
+        # Resolve from the outcome when possible; run-level metadata without an
+        # outcome uses the most recent recorded fallback as its best available
+        # execution identity.
+        backend = self.worker_backend
+        backend_for_engine = getattr(self, "_backend_for_engine", None)
+        if engine and callable(backend_for_engine):
+            try:
+                backend = str(backend_for_engine(engine, profile))
+            except Exception:
+                pass
+        elif self._runtime_degraded:
+            backend = str(self._runtime_degraded[-1].get("backend") or backend)
         return {
-            "backend": "local" if self._runtime_degraded else self.worker_backend,
+            "backend": backend,
             "runtime": (runtime or {}).get("id") or "",
             "runtime_degraded": list(self._runtime_degraded),
         }

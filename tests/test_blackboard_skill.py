@@ -70,6 +70,61 @@ def test_read_empty_board(tmp_path):
     assert "no dead-ends" in _run(db, "read-deadends").lower()
 
 
+def _run_blackboard_raw(db, *args, worker="cli-pi", intent_id="", cwd=None):
+    env = {**os.environ, "PYTHONUTF8": "1",
+           "DSWARM_BLACKBOARD_DB": str(db), "DSWARM_WORKER_ID": worker,
+           "DSWARM_CHALLENGE_ID": "c1"}
+    for key in ("DSWARM_BLACKBOARD_URL", "DSWARM_BLACKBOARD_RUN_ID",
+                "DSWARM_BLACKBOARD_TOKEN"):
+        env.pop(key, None)
+    if intent_id:
+        env["DSWARM_INTENT_ID"] = intent_id
+    return subprocess.run(
+        [sys.executable, str(_SKILL), *args], capture_output=True, text=True,
+        env=env, timeout=30, cwd=cwd, encoding="utf-8", errors="replace",
+    )
+
+
+def test_cleanup_cli_rejects_raw_commands_and_redacts_readback(tmp_path):
+    g = _board(tmp_path)
+    db = g.db_path
+    g.close()
+
+    for spec in (
+        "rm -f workers/cli-pi/output.txt",
+        "remove_artifact:workers/cli-pi/output.txt; whoami",
+        "unknown_action:resource-1",
+    ):
+        result = _run_blackboard_raw(db, "register-cleanup", spec)
+        assert result.returncode == 2
+        assert "ERROR:" in result.stderr
+
+    target = "workers/cli-pi/private-output.txt"
+    registered = _run_blackboard_raw(
+        db, "register-cleanup", f"remove_artifact:{target}", intent_id="I-cleanup",
+    )
+    assert registered.returncode == 0, registered.stderr
+    assert target not in registered.stdout
+    assert "target_digest" in registered.stdout
+    assert '"target"' not in registered.stdout
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE cleanup_actions SET status='failed', failure_reason=? "
+            "WHERE challenge_id=?",
+            ("adapter secret token leaked in internal reason", "c1"),
+        )
+        conn.commit()
+
+    readback = _run_blackboard_raw(db, "read-cleanups")
+    assert readback.returncode == 0, readback.stderr
+    assert target not in readback.stdout
+    assert "adapter secret token leaked in internal reason" not in readback.stdout
+    assert "target_digest=" in readback.stdout
+    assert "failure_digest=" in readback.stdout
+    assert "failure_length=" in readback.stdout
+
+
 def test_write_fact_verified_without_artifact_is_downgraded(tmp_path):
     g = _board(tmp_path)
     db = g.db_path

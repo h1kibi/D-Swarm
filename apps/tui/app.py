@@ -3,7 +3,7 @@
 In-process subscriber to an EventBus — no server needed (the kernel is Python,
 §15.1). Renders:
   - a scrolling transcript (reasoning / tool calls / terminal / insights / flag)
-  - a status bar (solver lineup, cost, last cost/context)
+  - a status bar (run mode, cost, last cost/context)
   - a command input (HITL: hint / pause / submit) routed to a callback
 
 Esc requests interrupt; the transcript updates live as events stream. Designed
@@ -97,11 +97,11 @@ class DSwarmTUI(App):
     BINDINGS = [("escape", "interrupt", "Interrupt"), ("ctrl+c", "quit", "Quit")]
 
     def __init__(self, bus: EventBus, *, hitl: Optional[HitlSink] = None,
-                 lineup: str = "", stop_on_finish: bool = False) -> None:
+                 status_label: str = "", stop_on_finish: bool = False) -> None:
         super().__init__()
         self.bus = bus
         self.hitl = hitl
-        self.lineup = lineup
+        self.status_label = status_label
         self.stop_on_finish = stop_on_finish
         self._usd = 0.0
         self._cost_by_solver: dict[str, float] = {}
@@ -118,7 +118,7 @@ class DSwarmTUI(App):
         yield Footer()
 
     def _status_text(self) -> str:
-        return f" lineup: {self.lineup or '—'}   cost: ${self._usd:.4f}   {self._ctx}"
+        return f" mode: {self.status_label or '—'}   cost: ${self._usd:.4f}   {self._ctx}"
 
     def on_mount(self) -> None:
         self._sub_task = asyncio.create_task(self._consume())

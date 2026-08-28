@@ -7,6 +7,9 @@ from pathlib import Path
 
 
 def chmod_private_dir(path: Path) -> None:
+    # Native Windows does not provide POSIX owner-only mode isolation here;
+    # these bits are best-effort. The Docker/Linux runtime, not host staging,
+    # is the production security boundary.
     try:
         path.chmod(0o700)
     except OSError:
@@ -18,11 +21,20 @@ def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{int(time.time() * 1000)}.tmp")
     tmp.write_text(text, encoding="utf-8")
+    # Keep requesting private-file permissions on POSIX; on Windows this is
+    # only a best-effort hint and must not be treated as host isolation.
     try:
         tmp.chmod(0o600)
     except OSError:
         pass
-    tmp.replace(path)
+    try:
+        tmp.replace(path)
+    except PermissionError:
+        # Windows can briefly hold the destination during antivirus/indexer or
+        # reader activity. A single short retry handles that transient lock
+        # without masking a persistent replacement failure.
+        time.sleep(0.01)
+        tmp.replace(path)
     try:
         path.chmod(0o600)
     except OSError:

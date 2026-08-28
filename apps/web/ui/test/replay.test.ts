@@ -1,7 +1,7 @@
 /**
  * Session-replay fixture tests (docs/07 Phase 1 acceptance): real historical
  * sessions must load through the normalizer + reducer with no exceptions,
- * retired-path events must map to generic legacy activity, and the deck state
+ * retired-path events must map to generic historical activity, and the deck state
  * must recover workers / evidence / terminal status.
  */
 import { readFileSync } from "node:fs";
@@ -34,12 +34,12 @@ describe("legacy session replay", () => {
     expect(Object.keys(state.lanes).length).toBeGreaterThan(0);
   });
 
-  it("maps race events to generic legacy activity, never a live mode", () => {
+  it("maps race events to generic historical activity, never a live mode", () => {
     const { norm } = replay("legacy-race.session.jsonl");
-    const race = norm.filter((n) => n.legacyActivity?.kind === "race");
-    expect(race.length).toBeGreaterThanOrEqual(2); // race_started + race_concluded
-    for (const n of race) {
-      expect(n.legacyActivity?.i18nKey).toMatch(/^legacy\./);
+    const historical = norm.filter((n) => n.historicalActivity?.kind === "historical");
+    expect(historical.length).toBeGreaterThanOrEqual(2); // race_started + race_concluded
+    for (const n of historical) {
+      expect(n.historicalActivity?.i18nKey).toMatch(/^legacy\./);
       expect(n.stage).toBe("legacy");
     }
   });

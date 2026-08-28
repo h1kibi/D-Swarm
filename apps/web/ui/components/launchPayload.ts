@@ -5,7 +5,6 @@
   target: string;
   description: string;
   hints: string;
-  nSolvers: number;
 };
 
 /** Build the CTF launch body without applying truthiness-based field merging. */
@@ -16,7 +15,6 @@ export function buildLaunchChallengePayload({
   target,
   description,
   hints,
-  nSolvers,
 }: LaunchChallengePayloadInput): Record<string, any> {
   const trimmedHints = hints.trim();
   const desc = trimmedHints
@@ -25,7 +23,6 @@ export function buildLaunchChallengePayload({
 
   return {
     kind: "swarm",
-    n_solvers: nSolvers,
     challenge: {
       name: name.trim() || "target",
       category,

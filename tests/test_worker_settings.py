@@ -126,7 +126,7 @@ def test_derive_routing_excludes_disabled_and_custom_workers():
     engines, overrides, system_ref = derive_routing(profiles)
 
     assert engines == ["pi-worker", "pi-web"]
-    assert overrides == {"web": {"engines": ["pi-web"], "start_workers": 2}}
+    assert overrides == {"web": {"engines": ["pi-web"]}}
     assert system_ref == "pi-worker"
 
 

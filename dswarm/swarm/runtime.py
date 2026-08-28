@@ -391,6 +391,55 @@ class SwarmWorkerRuntime:
                         # Runtime diagnostics are side effects, never a reason to
                         # fall back to host execution or abandon a frozen candidate.
                         pass
+
+                    # Keep the actual backend transition observable.  The pool
+                    # failover path is deliberately independent from the runtime
+                    # degradation ledger, so a successful retry must not be
+                    # reported as a silent healthy run.  Recording is best-effort:
+                    # an observability failure can never turn a valid frozen
+                    # failover into host execution or abort the retry.
+                    record_degraded = getattr(swarm, "_record_runtime_degraded", None)
+                    if callable(record_degraded):
+                        backend_for_engine = getattr(swarm, "_backend_for_engine", None)
+                        profile_for_engine = getattr(swarm, "_profile_for_engine", None)
+                        requested_profile = None
+                        if callable(profile_for_engine):
+                            try:
+                                requested_profile = profile_for_engine(
+                                    current_engine, advance=False
+                                )
+                            except Exception:
+                                requested_profile = None
+                        try:
+                            requested_backend = (
+                                str(backend_for_engine(current_engine, requested_profile))
+                                if callable(backend_for_engine)
+                                else str(getattr(swarm, "worker_backend", "container"))
+                            )
+                        except Exception:
+                            requested_backend = str(
+                                getattr(swarm, "worker_backend", "container")
+                            )
+                        try:
+                            fallback_backend = (
+                                str(backend_for_engine(chosen_profile))
+                                if callable(backend_for_engine)
+                                else requested_backend
+                            )
+                        except Exception:
+                            fallback_backend = requested_backend
+                        try:
+                            record_degraded(
+                                engine=current_engine,
+                                profile=requested_profile,
+                                reason=f"{failure.category}:{failure.code}",
+                                requested_backend=requested_backend,
+                                fallback_backend=fallback_backend,
+                            )
+                        except Exception:
+                            # Runtime diagnostics are side effects, never a reason
+                            # to abandon a frozen candidate.
+                            pass
                     return chosen_profile
 
         if runtime_route_unavailable(

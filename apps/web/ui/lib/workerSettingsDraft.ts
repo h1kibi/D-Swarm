@@ -64,7 +64,6 @@ function directionDefault(direction: (typeof WORKER_DIRECTIONS)[number], templat
     auth_prefix: "Bearer",
     runtime: template?.runtime || "docker-web",
     roles: ["recon", "bootstrap", "explore", "respond", "review"],
-    race: true,
     max_running: Math.max(1, Number(template?.max_running || 2)),
     max_review_running: Math.max(1, Number(template?.max_review_running || 1)),
     priority: Number(template?.priority || 20),

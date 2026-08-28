@@ -90,7 +90,7 @@ async def btw(run_id: str, request: Request) -> Any:
 
     # Normal BTW is a bounded evidence-pack summary. A shell worker is an
     # explicit deep-audit mode only; this prevents a routine side question
-    # from cold-starting a tool-using CLI for minutes.
+    # from starting a tool-using CLI for minutes.
     deep_audit = bool(body.get("deep_audit")) or str(body.get("mode") or "").strip().lower() in {
         "audit", "deep_audit", "deep-audit",
     } or body.get("worker_backend") is not None
@@ -244,7 +244,7 @@ async def btw(run_id: str, request: Request) -> Any:
         requested = str(
             body.get("profile") or body.get("engine") or ""
         ).strip()
-        review = ((wc.get("stage_policy") or {}).get("coordinator") or {}).get("review") or {}
+        review = wc.get("review_policy") or {}
         candidates = [
             requested,
             str(review.get("engine") or "").strip(),

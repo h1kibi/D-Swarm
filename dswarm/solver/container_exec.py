@@ -41,6 +41,7 @@ import shlex
 import shutil
 import signal as _signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -579,6 +580,8 @@ def _ensure_container_legacy_impl(run_id: str, host_workspace: str, *,
         try:
             with open(os.path.join(control_dir, "token"), "w") as f:
                 f.write(token)
+            # Windows mode bits are best-effort; the production boundary is
+            # the Docker/Linux runtime, not this host-side staging directory.
             os.chmod(os.path.join(control_dir, "token"), 0o600)
         except OSError:
             pass
@@ -1196,8 +1199,9 @@ class _DockerExecBackend:
             timed_out = True
         if os.environ.get("DSWARM_CONTAINER_DEBUG") and (not out_lines or stderr.strip()):
             try:
-                _dbg = f"/tmp/dswarm_container_diag/{tag}.log"
-                os.makedirs("/tmp/dswarm_container_diag", exist_ok=True)
+                _diag_root = os.path.join(tempfile.gettempdir(), "dswarm_container_diag")
+                _dbg = os.path.join(_diag_root, f"{tag}.log")
+                os.makedirs(_diag_root, exist_ok=True)
                 with open(_dbg, "w") as _f:
                     _f.write(f"=== argv ===\n{' '.join(full)}\n\n"
                              f"=== rc={client.poll()} elapsed={time.time()-t0:.2f}s "

@@ -94,11 +94,18 @@ def scope_violations(
 
     Private/reserved addresses (10.x, 172.16-31.x, 192.168.x, 127.x, ::1,
     link-local) are **always** considered in-scope and never flagged.
-    No scope defined = everything is out-of-scope by default (all hosts flagged).
+    No usable scope defined = no audit is performed.  A missing authorization
+    boundary must not turn every public host mentioned by ordinary evidence into a
+    false-positive violation.
     """
     if not corpus or not corpus.strip():
         return []
     whitelist = parse_scope(scope_text)
+    # Scope audit is a pentest-only post-hoc control.  Without an explicit,
+    # parseable authorization boundary there is nothing safe to compare against;
+    # fail closed by doing no scan rather than inventing a deny-all boundary.
+    if not whitelist:
+        return []
     whitelist_set: set[str] = set(whitelist)
     violations: list[dict] = []
     seen_hosts: set[str] = set()

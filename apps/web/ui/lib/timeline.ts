@@ -7,13 +7,13 @@
  *   recon → reason cycles (audits + intents) → dispatches → facts → flags
  *   plus HITL requests, operator directives (with their lifecycle), worker
  *   output SUMMARIES (collapsed — raw tool output stays in the worker panels),
- *   chat messages as one event class among many, and generic legacy-activity
- *   markers for retired paths (race / old coordinator).
+ *   chat messages as one event class among many, and generic historical-activity
+ *   markers for retired paths (retired execution).
  *
  * Everything in this module is a pure function over DeckState so the ordering,
  * cycle-card data and directive lifecycle migrations are unit-testable without
  * rendering. Legacy sessions simply have no reasonLoop data and degrade to a
- * chat + legacy-activity stream (§7.3) — no reducer changes required.
+ * chat + historical-activity stream (§7.3) — no reducer changes required.
  */
 
 import {
@@ -26,7 +26,7 @@ import {
   type SolverLane,
 } from "./events";
 import type { ReasonCycleView, ReasonIntentView, ReconView } from "./reason";
-import { legacyBlackboardActivity, STAGES, type Stage } from "./normalize";
+import { historicalBlackboardActivity, STAGES, type Stage } from "./normalize";
 
 /** Event ts values arrive as seconds OR milliseconds; normalise to ms. */
 export function tsMs(ts: number | undefined): number {
@@ -151,8 +151,8 @@ export function buildTimeline(deck: DeckState): TimelineItem[] {
       items.push({ kind: "flag", id: `flag:${e.id}`, ts: tsMs(e.ts), stage: "review", flag: e.label, actor: e.actor });
       continue;
     }
-    // Retired-path deltas (race / old coordinator) → generic legacy markers.
-    const legacy = legacyBlackboardActivity(e.kind);
+    // Retired-path deltas (retired execution) → generic legacy markers.
+    const legacy = historicalBlackboardActivity(e.kind);
     if (legacy) {
       items.push({ kind: "legacy", id: `legacy:${e.id}`, ts: tsMs(e.ts), stage: "legacy", i18nKey: legacy.i18nKey, label: e.label });
     }

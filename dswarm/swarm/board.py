@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterator, Optional, Protocol, runtime_checkable
@@ -474,7 +473,3 @@ class MemoryBoard:
             and row["used_tokens"] >= row["warn_at_tokens"]
         ):
             row["warned"] = True
-
-
-def new_finding_id() -> str:
-    return str(uuid.uuid4())

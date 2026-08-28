@@ -17,6 +17,9 @@ D-Swarm 是**自主多模型 CTF / 授权渗透测试解题智能体集群**：
   （引擎名册当前仅 `pi`），自带 agentic shell 循环与工具集；D-Swarm 负责规划、派发、证据管理
   与正确性把关。执行器边界：`dswarm/solver/cli_driver.py`（进程/健康）、
   `dswarm/solver/cli_solver.py`（marker 协议、分模式提示词、黑盒约束）。
+- **ReasonSwarm 调度**：独立 Reason 相位读取 SharedGraph，产出 typed intents，
+  scheduler 派发 worker，review/revalidation 将验证后的证据写回图中；已淘汰的
+  Race/Coordinator 模式配置只在 API 边界 fail-closed 拒绝，不进入 live 执行。
 - **血统**：本仓库是 [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki)
   （AGPL-3.0）的魔改 fork；自 fork 起实现已大幅分叉，与上游无代码同步关系——本文描述的
   全部机制均为 D-Swarm 自有演进。归属声明见根目录 `NOTICE` 与 `README` 上游节。
@@ -40,9 +43,10 @@ D-Swarm 是**自主多模型 CTF / 授权渗透测试解题智能体集群**：
 4. **Fail-closed 验证** — 一切"成功声明"默认不可信：M9 Verified-PoC 只认容器内干净终态
    （`finished` 且 rc=0、未 OOM/未 steer/未超时）且 indicator 命中真实输出；M5 账本先记账后放行。
 5. **前端是哑总线订阅者** — Web/TUI 只渲染事件流并经 HITL 通道下达指令，永不直连求解核心。
-6. **竞速 vs 协调两态** — 默认并行竞速：同题多 profile 各自打，先过溯源门者赢（单 flag 语义）。
-   两阶段协调经 `Swarm(stage_policy={"coordinator": {...}})` 启用（`dswarm/swarm/stage_policy.py`
-   ），从图上规划 typed intent 再派工。顶层 legacy `coordinator` 字段已被 web 层拒绝。
+6. **ReasonSwarm scheduling** — every run uses the same graph-driven lifecycle:
+   Reason reads SharedGraph, proposes typed intents, the scheduler dispatches focused
+   workers, and review/revalidation updates the graph. Retired Race/Coordinator mode
+   fields and `stage_policy` are rejected at the API boundary.
 
 ## 3. 分层架构与数据流
 
@@ -59,7 +63,7 @@ D-Swarm 是**自主多模型 CTF / 授权渗透测试解题智能体集群**：
 │  SwarmWorkerRuntime·ReviewFlow·RuntimeDegradation·Budget … │
 │  ReasonScheduler ← dswarm/solver/reason.py（独立 Reason 相位：│
 │      读图 → verdict/goal_met → ≤4 个不重叠 typed intents）    │
-│  两阶段 stage_policy：explore(单发冲刺) → review(审查回收)     │
+│  ReasonSwarm: graph evidence → typed intents → claim/dispatch → execute → review/revalidation │
 │         │ claim/dispatch（intent 租约 + SpawnGuard + 预算门禁）│ ▲ 事件
 │         ▼                                                  │ │
 │  SharedGraph(dswarm/swarm/shared_graph.py) append-only      │─┘
@@ -178,7 +182,7 @@ Advisor 建议（M8）仅限离线实验收集，生产永久 No-Go（污染风�
 | Provenance gate | flag 接受的唯一硬编码守卫（gate.py + cli_solver 反洗白） |
 | CAS / workspace | 共享对象存储（`shared/objects/.../<sha>`）+ 每 worker 工作区 |
 | RCP-v2 | 容器控制链路协议版本（run/streaming/审计帧），池代际冻结 |
-| stage_policy | 两阶段编配配置（explore → review；coordinator/budgets 子字典） |
+| review_policy | Reason review/revalidation triggers, engine, concurrency and cooldown settings |
 | Verified-PoC | pentest 下"重放注册 PoC + indicator 命中真输出才 verified"的门 |
 | HITL | 人机协同通道（hint/redirect/focus/pause/resume/submit），上下文而非 flag 来源 |
 

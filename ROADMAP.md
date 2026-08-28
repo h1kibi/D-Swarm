@@ -21,7 +21,7 @@ black-box, provenance gate held (no false flags)**. 114 tests green.
 P3 muteki_kit (the code-driven kernel's capability SDK) was **removed** — that
 kernel is retired; the CLI-agent swarm uses its own in-container tools. The
 crypto/reverse build-out below (I2/I3) is obsolete and kept only as a record.
-P5 (L0 coordinator / CTFBridge / auto-submit) is **user-skipped**.
+P5 (CTFBridge / auto-submit) is **user-skipped**; the current ReasonSwarm scheduler is already the supported orchestration path.
 
 ## The dominant lever (exact data)
 
@@ -118,9 +118,7 @@ By I5 all six tracks are attemptable; make it regression-proof.
 - On kernel timeout, append directed next-step guidance to the condensed Result.
 - Cap `InsightBus.history` to ~1000; bound terminal WS replay to a recent window.
 
-## Deferred (explicitly NOT next — and why)
-- **P5 coordinator / CTFBridge / auto-submit** — pure orchestration overhead until >1 track
-  solves. Pull forward only when a live CTFd/rCTF contest is concretely scheduled.
+- **P5 CTFBridge / auto-submit** — deferred product integration; the current ReasonScheduler remains the only orchestration path. Pull this forward only when a live CTFd/rCTF contest is concretely scheduled.
 - **microVM/Firecracker sandbox** — threat-model concern, not a solve-rate lever; local
   subprocess is fine for the trusted NYU env. Document as a known limitation.
 - **EIG/entropy hypothesis reranking** — over-engineering vs a good static+RAG taxonomy (I1).

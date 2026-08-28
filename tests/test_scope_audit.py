@@ -77,13 +77,10 @@ def test_extract_host_tokens_skips_private():
     assert "1.2.3.4" in hosts
 
 
-def test_scope_violations_no_scope_flags_all():
-    """No scope defined = every non-private host is a violation."""
+def test_scope_violations_no_scope_does_not_scan():
+    """No authorization boundary means the post-hoc audit is a no-op."""
     corpus = "Found target at https://evil.com and https://malicious.net"
-    violations = scope_violations("", corpus)
-    hosts = {v["host"] for v in violations}
-    assert "evil.com" in hosts
-    assert "malicious.net" in hosts
+    assert scope_violations("", corpus) == []
 
 
 def test_scope_violations_whitelist_pass():
@@ -101,7 +98,7 @@ def test_scope_violations_out_of_scope():
 
 def test_scope_violations_private_ips_always_in_scope():
     corpus = "Internal: 10.0.0.5, external: 1.2.3.4"
-    violations = scope_violations("", corpus)
+    violations = scope_violations("example.com", corpus)
     hosts = {v["host"] for v in violations}
     assert "10.0.0.5" not in hosts  # private, always in-scope
     assert "1.2.3.4" in hosts

@@ -7,7 +7,6 @@ type PresetConfig = Pick<
   WorkerSettings,
   | "worker_profiles"
   | "engines"
-  | "start_workers"
   | "max_workers"
   | "worker_backend"
   | "overrides"
@@ -57,7 +56,6 @@ const makeProfile = (
   runtime: "docker-web",
   roles: [...ROLES],
   image,
-  race: true,
   max_running: maxRunning,
   max_review_running: 1,
   priority,
@@ -67,14 +65,14 @@ const makeProfile = (
 });
 
 const categoryOverrides = (): PresetConfig["overrides"] => ({
-  web: { engines: ["pi-web"], start_workers: 1 },
-  pwn: { engines: ["pi-pwn"], start_workers: 1 },
-  reverse: { engines: ["pi-rev"], start_workers: 1 },
-  rev: { engines: ["pi-rev"], start_workers: 1 },
-  crypto: { engines: ["pi-crypto"], start_workers: 1 },
-  misc: { engines: ["pi-misc"], start_workers: 1 },
-  forensics: { engines: ["pi-forensics"], start_workers: 1 },
-  aisec: { engines: ["pi-aisec"], start_workers: 1 },
+  web: { engines: ["pi-web"] },
+  pwn: { engines: ["pi-pwn"] },
+  reverse: { engines: ["pi-rev"] },
+  rev: { engines: ["pi-rev"] },
+  crypto: { engines: ["pi-crypto"] },
+  misc: { engines: ["pi-misc"] },
+  forensics: { engines: ["pi-forensics"] },
+  aisec: { engines: ["pi-aisec"] },
 });
 
 const ctfSevenConfig = (): PresetConfig => {
@@ -104,7 +102,6 @@ const ctfSevenConfig = (): PresetConfig => {
       "pi-forensics",
       "pi-aisec",
     ],
-    start_workers: 1,
     max_workers: 17,
     worker_backend: "container",
     overrides: categoryOverrides(),
@@ -116,7 +113,6 @@ const quickSingleConfig = (): PresetConfig => ({
     makeProfile("pi-worker", `${IMAGE_ROOT}:${IMAGE_VERSION}`, 10, 3),
   ],
   engines: ["pi-worker"],
-  start_workers: 1,
   max_workers: 4,
   worker_backend: "container",
   overrides: {},
@@ -161,14 +157,13 @@ const sortedNames = (profiles: WorkerProfile[]): string =>
 
 export function isPresetActive(
   id: RosterPresetId,
-  cfg: Pick<WorkerSettings, "worker_profiles" | "engines" | "worker_backend" | "start_workers" | "max_workers">
+  cfg: Pick<WorkerSettings, "worker_profiles" | "engines" | "worker_backend" | "max_workers">
 ): boolean {
   const preset = buildPresetConfig(id);
   return (
     sortedNames(cfg.worker_profiles) === sortedNames(preset.worker_profiles) &&
     [...cfg.engines].sort().join(",") === [...preset.engines].sort().join(",") &&
     cfg.worker_backend === preset.worker_backend &&
-    cfg.start_workers === preset.start_workers &&
     cfg.max_workers === preset.max_workers
   );
 }

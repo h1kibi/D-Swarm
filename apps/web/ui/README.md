@@ -13,7 +13,7 @@ open as a focused canvas beside it:
 
 1. **③ Conversation (the spine).** A ChatGPT/Claude-style thread. Task dispatch
    is *conversational*: describe a challenge in the composer — the swarm reads it
-   and **infers** category, target, and how many solvers to race (no form). The
+   and **infers** category, target, and the initial worker count (no form). The
    swarm's reasoning, tool calls, and insight broadcasts stream in as bubbles;
    your input **commands the live swarm** (hint / redirect / focus / pause /
    resume / submit) through the HITL backend.

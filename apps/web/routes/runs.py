@@ -396,9 +396,9 @@ async def terminal(ws: WebSocket, run_id: str) -> None:
 
 @router.post("/{run_id}/resolve")
 async def resolve_run(run_id: str, request: Request) -> Any:
-    """"继续做题": relaunch the full coordinator swarm on a finished run (reuses
-    its workspace so verified facts carry over). Distinct from /hitl which, on a
-    finished run, only cold-starts a single standby worker for a follow-up."""
+    """"继续做题": continue a finished ReasonSwarm run through the current
+    scheduler (reuses its workspace so verified facts carry over). Distinct from
+    /hitl which, on a finished run, starts a single standby worker for follow-up."""
     body = await _require_dict_body(request, allow_empty=True)
     try:
         ok = await request.app.state.manager.resolve(run_id, body)
@@ -419,9 +419,9 @@ async def resolve_run(run_id: str, request: Request) -> Any:
 
 @router.post("/{run_id}/workers")
 async def spawn_worker(run_id: str, request: Request) -> Any:
-    # operator runtime control: add a worker to a LIVE coordinator run.
-    # Body {"engine": "pi"} is optional; omitted lets the coordinator pick
-    # from the configured healthy Pi worker profiles.
+    # Operator runtime control: add a worker to a live ReasonSwarm scheduler.
+    # Body {"engine": "pi"} is optional; omitted lets the scheduler select from
+    # the configured healthy Pi worker profiles.
     body = await _require_dict_body(request, allow_empty=True)
     ok = await request.app.state.manager.post_worker_cmd(
         run_id, "spawn", engine=body.get("engine"))

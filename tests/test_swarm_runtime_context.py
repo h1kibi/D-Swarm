@@ -8,7 +8,6 @@ import pytest
 
 from apps.tui import __main__ as tui_main
 from apps.web.run_manager import RunManager
-from dswarm.core.llm import ModelSpec
 from dswarm.models.solve_graph import Challenge
 from dswarm.sandbox.manager import SandboxManager
 from dswarm.solver.result import ArtifactStore
@@ -68,7 +67,6 @@ class _Manager:
 def _make_swarm(tmp_path: Path, run_id: str = "runtime-run", **kwargs: Any) -> Swarm:
     return Swarm(
         Challenge(id=run_id, name="runtime", category="web"),
-        [ModelSpec(solver_id="seat", model="mock")],
         llm=None,
         sandbox=SandboxManager(root=tmp_path / "sandbox"),
         artifacts=ArtifactStore(root=tmp_path / "artifacts"),
@@ -297,7 +295,7 @@ def test_mock_tui_selection_does_not_construct_runtime_context() -> None:
 
     bus = object()
     cost = object()
-    lineup, driver = tui_main._driver_for_args(
+    status, driver = tui_main._driver_for_args(
         bus,
         cost,
         "tui-run",
@@ -305,7 +303,7 @@ def test_mock_tui_selection_does_not_construct_runtime_context() -> None:
         runtime_context_factory=runtime_context_factory,
     )
     try:
-        assert lineup.startswith("mock")
+        assert status.startswith("mock")
         assert calls == []
     finally:
         driver.close()

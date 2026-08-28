@@ -1,15 +1,10 @@
-"""L1 parallel solver swarm (§5).
+"""ReasonSwarm run orchestration.
 
-Race N solvers on the SAME challenge. The first one to produce a provenance-
-verified, correctly-formatted flag wins; the rest are cancelled immediately
-(first-valid-flag-wins, §5.1). Solvers share verified facts + dead-ends through
-the InsightBus (§5.3) so the swarm behaves as "any model can solve" -> "the
-group solves", not N isolated attempts.
-
-Heterogeneity (different models/temperatures, §5.2) means their blind spots
-don't overlap; the Insight Bus means a fact one solver confirms accelerates the
-others. The orchestration here is deliberately thin — the design doc is explicit
-that the real edge is per-Solver cognition, not the racing harness.
+The run owns the lifecycle around the Reason phase: prepare the shared evidence
+graph, schedule typed intents, execute workers, review/revalidate their output,
+and finalize only after the provenance gate and completion rules have settled.
+The scheduler is the sole live dispatch path; retired race/coordinator mode
+configuration is not part of this module's runtime contract.
 """
 
 from __future__ import annotations
@@ -33,7 +28,7 @@ from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
 from dswarm.core.runtime_env import is_web_container
 from dswarm.core.events import Event, EventType, blackboard_delta_payload
-from dswarm.core.llm import LLMClient, ModelSpec
+from dswarm.core.llm import LLMClient
 from dswarm.core.usage_journal import UsageWriter
 from dswarm.core.usage_ledger import SpawnGuard
 from dswarm.models.solve_graph import Challenge
@@ -52,12 +47,13 @@ from dswarm.solver.worker_profiles import (
     profile_names,
 )
 from dswarm.solver.workspace import cleanup_worker_scratch, ensure_workspace
+from dswarm.swarm.cleanup_registry import validate_cleanup_action
 from dswarm.swarm.insight_bus import InsightBus
 from dswarm.swarm.lane_gate import WorkerLaneGate
-from dswarm.swarm.stage_policy import StagePolicy
 from dswarm.swarm.shared_graph import (
     SharedGraph, SQLiteSharedGraph, canonicalize_lane, _is_runtime_infra_fact_text,
 )
+from dswarm.swarm.poc_verification import sanitize_public_text
 from dswarm.swarm.agents import AgentRegistry
 from dswarm.swarm.board import Board, MemoryBoard
 from dswarm.swarm.blackboard_bridge import BlackboardBridgeMixin
@@ -93,254 +89,6 @@ _STANDING_MAX = 8
 # bounding it keeps the awaiting_operator count honest and memory flat.
 _PENDING_HELP_MAX = 16
 
-_CONTAINER_BLACKBOARD_SKILL = "/opt/dswarm/dswarm-blackboard"
-_BLACKBOARD_SKILL_LINKS = (
-    # pi (route A): pi discovers skills under ~/.pi/agent/skills
-    ".pi/agent/skills/dswarm-blackboard",
-)
-
-# pi's provider configuration (settings.json + models-store.json + models.json) is baked into
-# the image at /opt/dswarm/pi-config; the worker HOME is ISOLATED per worker, so
-# the files must be linked into each isolated HOME for pi to find its provider.
-_CONTAINER_PI_CONFIG = "/opt/dswarm/pi-config"
-_PI_CONFIG_LINKS = (
-    ".pi/agent/settings.json",
-    ".pi/agent/models-store.json",
-    ".pi/agent/models.json",
-    ".pi/agent/extensions",  # ctf-gateway provider extension (route A P3)
-)
-
-
-def _repo_pi_config_root() -> "Optional[Path]":
-    root = Path(__file__).resolve().parent.parent.parent / "docker" / "worker-pi" / "pi-config"
-    return root if root.exists() else None
-
-
-def _materialize_runtime_pi_config(workspace_root: str | Path) -> "Optional[Path]":
-    """Copy current pi provider config into the bind-mounted run workspace.
-
-    Worker images are long-lived; the checkout can add/fix provider extensions
-    without rebuilding the image.  Linking isolated HOME directly to the image copy
-    caused stale images to miss the ``dswarm-worker`` provider, so container workers
-    should prefer this run-local, version-matched config when a source checkout is
-    available.
-    """
-    src = _repo_pi_config_root()
-    if src is None:
-        return None
-    target = Path(workspace_root) / ".dswarm_runtime" / "pi-config"
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        for name in ("settings.json", "models-store.json", "models.json"):
-            s = src / name
-            if s.is_file():
-                d = target / name
-                payload = s.read_bytes()
-                if d.is_file() and d.read_bytes() == payload:
-                    continue
-                tmp = target / f".{name}.staging.{os.getpid()}.{time.time_ns()}"
-                try:
-                    tmp.write_bytes(payload)
-                    os.replace(tmp, d)
-                finally:
-                    try:
-                        tmp.unlink()
-                    except FileNotFoundError:
-                        pass
-        ext_src = src / "extensions"
-        ext_dst = target / "extensions"
-        if ext_src.is_dir():
-            shutil.copytree(ext_src, ext_dst, dirs_exist_ok=True)
-        return target
-    except OSError:
-        return None
-
-
-def _ensure_pi_config_links(home: Path, *, config_target_root: str = _CONTAINER_PI_CONFIG) -> None:
-    """Expose pi provider config inside an isolated worker HOME."""
-    for rel in _PI_CONFIG_LINKS:
-        link = home / rel
-        target = f"{config_target_root}/{link.name}"
-        try:
-            if link.is_symlink():
-                if os.readlink(link) == target:
-                    continue
-                link.unlink()
-            elif link.exists():
-                # Managed worker HOME directories may survive backend restarts.
-                # Older images/runs could leave a real copied pi-config directory or
-                # file here; if we keep it, fresh runtime providers such as
-                # dswarm-worker are shadowed and pi reports ``Unknown provider``.
-                if link.is_dir():
-                    shutil.rmtree(link)
-                else:
-                    link.unlink()
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=rel.endswith("extensions"))
-        except OSError:
-            continue
-
-
-def _ensure_blackboard_skill_links(
-    home: Path, *, skill_target: str = _CONTAINER_BLACKBOARD_SKILL,
-) -> None:
-    """Expose the current blackboard skill inside an isolated worker HOME.
-
-    Container runs normally pass a run-workspace target rather than the image copy,
-    so pi's skill auto-discovery follows the same source-versioned implementation
-    as ``DSWARM_BLACKBOARD_SCRIPT``.  The image target remains a safe fallback for
-    installed deployments without an adjacent source checkout.
-    """
-    for rel in _BLACKBOARD_SKILL_LINKS:
-        link = home / rel
-        try:
-            if link.is_symlink():
-                if os.readlink(link) == skill_target:
-                    continue
-                link.unlink()
-            elif link.exists():
-                continue
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(skill_target, target_is_directory=True)
-        except OSError:
-            continue
-
-
-_CONTAINER_DIRECTION_CONFIG = "/opt/dswarm/direction"
-_CONTAINER_DIRECTION_SKILLS = f"{_CONTAINER_DIRECTION_CONFIG}/skills"
-_CONTAINER_DIRECTION_PROMPT = f"{_CONTAINER_DIRECTION_CONFIG}/prompt.md"
-
-# BTFly bakes a per-category pi skill into the image default HOME
-# (~/.pi/agent/skills/<category>). The dswarm worker HOME is isolated per
-# worker, so link the category skill in by its image path (the worker container
-# has it; the host only needs the name).
-_BTFLY_CATEGORY_SKILL = {
-    "web": "web",
-    "pwn": "pwn",
-    "rev": "reverse",
-    "crypto": "crypto",
-    "misc": "misc",
-    "forensics": "forensics",
-    "aisec": "web",  # aisec image is built on the web toolchain base
-}
-
-
-def _direction_from_profile_id(profile_id: str) -> str:
-    """pi-web → web; pi-worker (the generic fallback) → ''."""
-    pid = (profile_id or "").strip()
-    if pid.startswith("pi-") and pid != "pi-worker":
-        return pid[len("pi-"):]
-    return ""
-
-
-def _repo_direction_root() -> "Optional[Path]":
-    # repo root = dswarm/swarm/swarm.py → parents[2]; the direction build
-    # context mirrors what gets baked into the worker image.
-    root = Path(__file__).resolve().parent.parent.parent / "docker" / "worker-pi" / "directions"
-    return root if root.exists() else None
-
-
-def _ensure_direction_links(
-    home: Path,
-    direction: str,
-    *,
-    skill_target_root: str = _CONTAINER_DIRECTION_SKILLS,
-) -> None:
-    """Expose the image-baked direction skill set inside an isolated worker HOME.
-
-    Skill NAMES are enumerated from the repo build context (the same files the
-    Dockerfile bakes into /opt/dswarm/direction/skills), and each is symlinked
-    into ~/.pi/agent/skills/ so pi's one-level skill discovery sees them. No-op
-    when the repo context is absent (installed deployments rely on the image's
-    default HOME copy for bare docker runs).
-    """
-    root = _repo_direction_root()
-    if root is None:
-        return
-    skills_src = root / direction / "skills"
-    if not skills_src.is_dir():
-        return
-    for child in sorted(skills_src.iterdir()):
-        # Skill directories AND loose root reference files (e.g. reverse-skill's
-        # tool-index.md) are exposed so ../ references resolve in the worker HOME.
-        if not (child.is_dir() or child.is_file()):
-            continue
-        if child.name.startswith("."):
-            # keep .gitkeep-style placeholders out of the worker skill dir
-            continue
-        name = child.name
-        link = home / ".pi" / "agent" / "skills" / name
-        target = f"{skill_target_root}/{name}"
-        try:
-            if link.is_symlink():
-                if os.readlink(link) == target:
-                    continue
-                link.unlink()
-            elif link.exists():
-                continue
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=child.is_dir())
-        except OSError:
-            continue
-    # The BTFly base image also bakes its category skill into the default HOME.
-    # Link it so the isolated worker can use it too (name it by category).
-    category = _BTFLY_CATEGORY_SKILL.get(direction)
-    if category:
-        link = home / ".pi" / "agent" / "skills" / category
-        target = f"/home/ctf/.pi/agent/skills/{category}"
-        try:
-            if link.is_symlink():
-                if os.readlink(link) == target:
-                    return
-                link.unlink()
-            elif link.exists():
-                return
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=True)
-        except OSError:
-            pass
-
-
-# Base (direction-agnostic) skills baked into every worker image default
-# HOME (docker/worker-pi/base-skills -> /home/ctf/.pi/agent/skills/).
-# Linked into isolated worker HOMEs unconditionally so triage/writeup
-# helpers are available to every profile, including the generic pi-worker.
-_BASE_SKILLS = ("solve-challenge", "ctf-writeup")
-
-
-def _ensure_base_skill_links(home: Path) -> None:
-    """Expose the image-baked base skills inside an isolated worker HOME."""
-    for name in _BASE_SKILLS:
-        link = home / ".pi" / "agent" / "skills" / name
-        target = f"/home/ctf/.pi/agent/skills/{name}"
-        try:
-            if link.is_symlink():
-                if os.readlink(link) == target:
-                    continue
-                link.unlink()
-            elif link.exists():
-                continue
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target, target_is_directory=True)
-        except OSError:
-            continue
-
-# ── shared health-probe cache ────────────────────────────────────────────────
-# `Swarm._healthy_engines` shells a REAL one-turn CLI hello per engine on EVERY
-# dispatch (subprocess.run, up to a 60s/150s timeout + a retry, run SERIALLY).
-# That whole-roster probe sits on the critical path BEFORE the first worker spawns
-# and the first RUN_STARTED reaches the deck — so a fresh dispatch "freezes for ~a
-# minute" with the rail stuck on WORKER 0/0 until it returns.
-#
-# This module-level cache memoizes the (ok, detail) verdict per probe-identity
-# (engine + role + resolved account) for a short TTL, so a SECOND dispatch — or a
-# sibling run in the same server, or a re-bootstrap round — reuses the roster we
-# JUST verified instead of re-shelling every CLI. A successful probe is the strong
-# signal (auth+quota+backend all round-tripped seconds ago); a FAILURE is cached
-# too but for a shorter window so a recovered engine rejoins quickly. monotonic
-# clock only (Date.now is banned in this codebase). Keyed process-wide so it
-# survives across Swarm instances; bounded by natural roster size (a handful of
-# engines × roles), so no eviction needed.
 _HEALTH_PROBE_CACHE: dict[tuple, "tuple[float, bool, str]"] = {}
 # failures expire faster than successes: a transiently-unhealthy engine (cold
 # binary, jittery websocket) should get re-probed soon, while a healthy verdict can
@@ -351,18 +99,6 @@ _HEALTH_PROBE_CACHE: dict[tuple, "tuple[float, bool, str]"] = {}
 
 
 
-
-
-def _is_control_failure(exc: BaseException) -> bool:
-    """True if `exc` is a Runtime Control Plane failure (the rcp supervisor died or
-    its reverse link dropped mid-worker) — surfaced as a ControlError from
-    control_client. Matched by class name to avoid importing control_client here
-    (and to catch it however it's wrapped). Such failures are runtime_degraded, not
-    ordinary worker crashes."""
-    for e in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
-        if e is not None and type(e).__name__ == "ControlError":
-            return True
-    return False
 
 
 
@@ -387,12 +123,11 @@ class Swarm(
     WorkerRuntimeMixin,
     ReviewFlowMixin,
 ):
-    """Runs a lineup of solvers against one challenge, first-valid-flag wins."""
+    """Owns one ReasonSwarm run against a challenge."""
 
     def __init__(
         self,
         challenge: Challenge,
-        lineup: list[ModelSpec],
         *,
         llm: LLMClient,
         sandbox: SandboxManager,
@@ -418,9 +153,7 @@ class Swarm(
         graph_dir: "Optional[Path]" = None,
         worker_root: "Optional[Path]" = None,
         max_workers: int = 10,
-        start_workers: int = 2,
         reason_model: str = "deepseek-v4-pro",
-        stall_seconds: float = 120.0,  # retained for back-compat; no longer used
         # how many NEW explore workers the coordinator may spawn per loop iteration.
         # 1 = smooth ramp (a slot refills within one ~2s poll anyway); higher values
         # re-introduce the "spawn a burst that shares a fate" problem (run-7352).
@@ -460,7 +193,7 @@ class Swarm(
         worker_profiles: "Optional[list[dict]]" = None,
         credential_accounts_root: "Optional[Path]" = None,
         blackboard_token: "Optional[str]" = None,
-        stage_policy: "Optional[dict[str, Any] | StagePolicy]" = None,
+        review_policy: "Optional[dict[str, Any]]" = None,
         max_total_workers: "Optional[int]" = None,
         cost_budget_usd: "Optional[float]" = None,
         llm_profiles: "Optional[dict[str, Any]]" = None,
@@ -472,9 +205,10 @@ class Swarm(
         budget_gate: Optional[Any] = None,
         metrics_sink: Optional[Any] = None,
         initial_runtime_operation_kind: str = "",
+        cleanup_executor: Optional[Any] = None,
     ) -> None:
         self.challenge = challenge
-        self.lineup = lineup
+        self.cleanup_executor = cleanup_executor
         self.llm = llm
         self.usage_writer = usage_writer
         self.fallback_usage_writer = fallback_usage_writer
@@ -539,12 +273,10 @@ class Swarm(
         # CliSolvers. The moat is the provenance gate + shared_graph + reason.
         self.executor = executor
         self.cli_engine = cli_engine
-        self.stage_policy = StagePolicy.from_config(stage_policy)
         self.llm_profiles = dict(llm_profiles or {})
         self.llm_providers = list(llm_providers or [])
         self.reason_planner_diagnostic = dict(reason_planner_diagnostic or {})
-        self.review_policy = self._clean_review_policy(
-            self.stage_policy.coordinator.get("review"))
+        self.review_policy = self._clean_review_policy(review_policy)
         self._last_review_seq = 0
         self._last_review_proposal_seq = 0
         self._last_directive_seq = 0
@@ -562,9 +294,6 @@ class Swarm(
         # below and the drivers.py convention (0 ⇄ inf). A bare `is not None` here
         # used to turn a 0 budget into a literal 0s deadline → instant
         # budget_exhausted. Only a POSITIVE value caps the wall clock.
-        _scb = self.stage_policy.coordinator.get("wall_clock_budget")
-        if _scb is not None:
-            wall_clock_budget = float(_scb) if float(_scb) > 0 else float("inf")
         if self.llm_profiles.get("planner", {}).get("model"):
             reason_model = str(self.llm_profiles["planner"]["model"])
         # short-task model for hand-raise translation (and any future cheap zh helper):
@@ -575,11 +304,11 @@ class Swarm(
             or "deepseek-v4-flash")
         self.max_total_workers = (
             int(max_total_workers) if max_total_workers not in (None, 0) else
-            self.stage_policy.budgets.max_total_workers
+            None
         )
         self.cost_budget_usd = (
             float(cost_budget_usd) if cost_budget_usd not in (None, 0) else
-            self.stage_policy.budgets.cost_budget_usd
+            None
         )
         self._spawned_total = 0
         self._budget_exhausted_kind: str | None = None
@@ -596,8 +325,8 @@ class Swarm(
             # ORDER == dispatch preference. Without this sort the priority field is
             # dead on the dispatch path (the roster kept its assembly order, which
             # for an explicit profile-name list is just declaration order). Sorting
-            # here makes priority authoritative for BOTH classic-race lineup and
-            # coordinator dispatch, and matches what the drag-drop composer writes
+            # here makes priority authoritative for scheduler dispatch and matches
+            # what the drag-drop composer writes
             # (top card = lowest priority number = picked first). Stable + total:
             # unknown names (defensive) sink to the end deterministically by name.
             # coerce_nonneg_int (NOT `priority or 100`): priority 0 is a legal,
@@ -682,9 +411,7 @@ class Swarm(
             max_workers=max(0, int(max_workers)),
             review_max_concurrent=review_limit,
         )
-        self.start_workers = start_workers
         self.reason_model = reason_model
-        self.stall_seconds = stall_seconds
         self.explore_spawn_batch = max(1, int(explore_spawn_batch))
         self.explore_timeout = int(explore_timeout)
         self.barren_limit = int(barren_limit)
@@ -718,6 +445,12 @@ class Swarm(
         # close shared_graph + RUN_FINISHED + worker-dir cleanup) runs EXACTLY once,
         # whether the loop returns normally OR is cancelled/errors out through the finally.
         self._run_finalized = False
+        # winner.json is continuation state, not a solve signal.  A failed best-
+        # effort write must remain observable without spamming one delta per
+        # finalize/retry path (and without exposing the payload or filesystem
+        # path in the public event stream).
+        self._winner_persist_failure_noted = False
+        self._reason_db_failures_noted: set[str] = set()
         # L3: bus sinks the coordinator added (help / submit-gate), detached on finalize
         # so a reused bus (standby/resolve restart re-entering the coordinator) doesn't
         # accumulate Swarm-closing sinks across cycles.
@@ -967,6 +700,9 @@ class Swarm(
         "branch_split",
         "branch_resolved",
         "coordinator_directive",
+        "cleanup_action_registered",
+        "cleanup_executed",
+        "cleanup_failed",
     }
 
     async def _drain_graph_to_bus(self, *, emit_bb) -> None:
@@ -1045,6 +781,94 @@ class Swarm(
             except FileNotFoundError:
                 pass
 
+    async def _execute_registered_cleanups(self) -> None:
+        """Execute registered typed actions in reverse registration order.
+
+        This method intentionally has no shell fallback.  ``remove_artifact`` is
+        handled as a bounded, run-workspace filesystem operation; listener/session/
+        credential actions require an injected runtime adapter that already owns the
+        frozen run generation.  Each failure becomes an append-only audit event and
+        never prevents claims release or graph closure.
+        """
+        graph = self.shared_graph
+        if graph is None:
+            return
+        getter = getattr(graph, "cleanup_actions", None)
+        if not callable(getter):
+            return
+        try:
+            actions = list(getter(include_terminal=False) or [])
+        except Exception:
+            return
+        for action in reversed(actions):
+            action_id = str(action.get("action_id") or "")
+            if not action_id:
+                continue
+            try:
+                result = await self._execute_one_cleanup_action(action)
+                graph.cleanup_action_executed(
+                    actor="coordinator", action_id=action_id, result=str(result or ""),
+                )
+            except Exception as exc:
+                try:
+                    graph.cleanup_action_failed(
+                        actor="coordinator", action_id=action_id,
+                        # Keep private adapter/path details out of the durable
+                        # failure record as well as the public bridge.
+                        reason=sanitize_public_text(type(exc).__name__, limit=160),
+                    )
+                except Exception:
+                    # The action itself is already isolated from the finalize path;
+                    # do not let a secondary audit write failure strand the run.
+                    pass
+
+    async def _execute_one_cleanup_action(self, action: dict[str, Any]) -> Any:
+        action_type = str(action.get("action_type") or "")
+        target = str(action.get("target") or "")
+        try:
+            validate_cleanup_action(
+                action_type, target, actor=action.get("actor") or "coordinator",
+                owner_key=action.get("owner_key") or action.get("actor") or "coordinator",
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"invalid registered cleanup action: {exc}") from exc
+        if action_type == "remove_artifact":
+            root = self.workspace_root
+            if root is None and self.shared_graph is not None:
+                try:
+                    root = Path(str(getattr(self.shared_graph, "db_path"))).resolve().parent.parent
+                except Exception:
+                    root = None
+            if root is None:
+                raise RuntimeError("cleanup workspace unavailable")
+            root_path = Path(root).resolve()
+            # Keep the final path lexical so a symlink target is unlinked rather
+            # than followed. Validate the parent after resolving it to prevent a
+            # symlinked directory below workers/ from reaching outside the run.
+            candidate = root_path / Path(target)
+            workers = (root_path / "workers").resolve()
+            try:
+                candidate.relative_to(workers)
+                candidate.parent.resolve().relative_to(workers)
+            except ValueError as exc:
+                raise RuntimeError("artifact cleanup target outside workers") from exc
+            if candidate.is_dir() and not candidate.is_symlink():
+                raise RuntimeError("artifact cleanup target is a directory")
+            # Missing is success: cleanup actions are idempotent.
+            existed = candidate.exists() or candidate.is_symlink()
+            if existed:
+                candidate.unlink()
+            return "removed" if existed else "already absent"
+        executor = self.cleanup_executor
+        if not callable(executor):
+            raise RuntimeError(f"typed cleanup executor unavailable for {action_type}")
+        result = executor(dict(action))
+        if hasattr(result, "__await__"):
+            result = await result
+        if result is False:
+            raise RuntimeError(f"typed cleanup executor rejected {action_type}")
+        return result if result is not True else "completed"
+
     async def _finalize_coordinator_run(
         self, *, winner: "Optional[str]", flag: "Optional[str]",
         goal_complete: bool, per_solver: "dict[str, SolveOutcome]",
@@ -1081,6 +905,15 @@ class Swarm(
             else:
                 reason = "runtime_failure"
         if self.shared_graph is not None:
+            # Pentest scope review runs after all workers have written their
+            # effective evidence and before graph events are bridged/closed.
+            # It is intentionally a no-op for CTF runs or missing scope.
+            try:
+                self._run_scope_audit()
+            except Exception:
+                # Scope review is an audit side effect; it must never hide the
+                # run outcome or prevent the append-only graph from finalizing.
+                pass
             try:
                 snap = self.shared_graph.snapshot()
                 self._record_flags(*getattr(snap, "flags", []))
@@ -1090,6 +923,13 @@ class Swarm(
                 reason if reason in {"solved", "operator_stop", "budget_exhausted", "runtime_failure"}
                 else ("solved" if solved else "runtime_failure"))
             fin: dict = {}
+            try:
+                # M9 typed cleanup runs before claims are released, while the run
+                # ownership context is still available. It is best-effort and has
+                # no raw-command or host-shell fallback.
+                await self._execute_registered_cleanups()
+            except Exception:
+                pass
             try:
                 await self._drain_graph_to_bus(emit_bb=self._emit_bb_bus)
             except Exception:
@@ -1894,9 +1734,19 @@ class Swarm(
                     self.shared_graph.pin_facts(
                         actor="reason", fact_seqs=list(pins),
                         reason="reason model selected durable retention facts")
-            except Exception:
-                pass
-            proposed = dispatch_intents(self.shared_graph, result, actor="reason")
+            except Exception as exc:
+                await self._note_reason_db_failure(
+                    "fact_db_write_failed", "pin_facts", exc)
+            try:
+                proposed = dispatch_intents(self.shared_graph, result, actor="reason")
+            except Exception as exc:
+                # The legacy/advisory Reason entry point is still exercised by
+                # callers and tests even though the live scheduler owns dispatch.
+                # Do not let a failed intent append disappear behind its outer
+                # best-effort return value.
+                await self._note_reason_db_failure(
+                    "intent_db_write_failed", "propose", exc)
+                return 0
             for it in proposed:
                 if self.bus is not None:
                     await self.bus.emit(Event(
@@ -1930,8 +1780,7 @@ class Swarm(
             pass
 
     async def _emit_coord_bb(self, kind: str, **fields) -> None:
-        """Coordinator-scoped blackboard delta (shared by the race-scout phase and
-        the main loop's local _emit_bb)."""
+        """Emit a coordinator-scoped blackboard delta for the scheduler loop."""
         if self.bus is None:
             return
         try:
@@ -1941,6 +1790,27 @@ class Swarm(
                 payload=blackboard_delta_payload(kind, actor="coordinator", **fields)))
         except Exception:
             pass
+
+    async def _note_reason_db_failure(
+            self, kind: str, op: str, exc: BaseException) -> None:
+        """Surface one bounded durable-write diagnostic from the advisory path.
+
+        This path must remain best-effort: the event is useful operator telemetry,
+        but neither a failed fact pin nor a failed intent append may alter worker
+        execution or provenance/flag acceptance.  Publish only the exception class;
+        filesystem/database messages can contain private paths or payload details.
+        """
+        key = f"{kind}:{op}"
+        if key in self._reason_db_failures_noted:
+            return
+        if len(self._reason_db_failures_noted) >= 32:
+            self._reason_db_failures_noted.clear()
+        self._reason_db_failures_noted.add(key)
+        await self._emit_coord_bb(
+            kind,
+            op=op,
+            reason=sanitize_public_text(type(exc).__name__, limit=160),
+        )
 
 
 
@@ -1987,13 +1857,30 @@ class Swarm(
             dest = self._graph_dir.parent / "winner.json"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-        except Exception:
-            pass
+        except Exception as exc:
+            if self._winner_persist_failure_noted:
+                return
+            self._winner_persist_failure_noted = True
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            try:
+                loop.create_task(self._emit_coord_bb(
+                    "winner_persist_failed",
+                    op="winner_json",
+                    # Filesystem exceptions often include an absolute host path;
+                    # publish only the stable exception class, never that path.
+                    reason=sanitize_public_text(type(exc).__name__, limit=160),
+                ))
+            except Exception:
+                # Diagnostics are strictly best-effort; never turn a solved run
+                # into a failure merely because its telemetry cannot be queued.
+                pass
 
 
 async def run_swarm(
     challenge: Challenge,
-    lineup: list[ModelSpec],
     *,
     llm: LLMClient,
     sandbox: SandboxManager,
@@ -2005,6 +1892,6 @@ async def run_swarm(
 ) -> SwarmOutcome:
     """Functional entry point mirroring §5.4's run_swarm signature."""
     return await Swarm(
-        challenge, lineup, llm=llm, sandbox=sandbox, bus=bus, cost=cost,
+        challenge, llm=llm, sandbox=sandbox, bus=bus, cost=cost,
         artifacts=artifacts, config=config, run_id=run_id,
     ).run()

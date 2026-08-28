@@ -31,7 +31,7 @@ async def blackboard_command(run_id: str, request: Request) -> Any:
         "read-deadends", "read-flags", "list-intents", "write-fact",
         "mark-deadend", "claim", "claim-activity", "list-activities",
         "claim-resource", "release-resource", "read-resource-locks",
-        "read-directives", "directive-status",
+        "read-directives", "directive-status", "register-cleanup", "read-cleanups",
     }
     if cmd not in allowed:
         raise HTTPException(status_code=400, detail=f"unsupported blackboard command: {cmd}")

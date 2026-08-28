@@ -1,4 +1,4 @@
-"""Coordinator-private, secret-free runtime pool diagnostics.
+"""Scheduler-private, secret-free runtime pool diagnostics.
 
 Runtime lifecycle is deliberately kept out of the evidence graph and canonical
 event stream.  This module only records an allowlisted projection of a pool
@@ -148,6 +148,8 @@ class RuntimeDiagnosticsStore:
     def _ensure_private_root(self) -> None:
         for directory in (self.run_root / ".runtime", self.root):
             directory.mkdir(parents=True, exist_ok=True)
+            # Native Windows cannot provide POSIX owner-only isolation; this is
+            # best-effort metadata, not a host-side security boundary.
             try:
                 os.chmod(directory, 0o700)
             except OSError:

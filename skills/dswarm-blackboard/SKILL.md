@@ -106,6 +106,19 @@ Run these at the RIGHT moments — not constantly, not never:
    python3 blackboard.py read-directives
    ```
 
+8. **Register cleanup work without executing it** after temporary resources are created:
+   ```
+   python3 blackboard.py register-cleanup remove_artifact:workers/<worker-id>/artifact.txt
+   python3 blackboard.py register-cleanup stop_listener:listener-<id>
+   python3 blackboard.py read-cleanups
+   ```
+   Cleanup registration accepts only the typed action allowlist (`remove_artifact`,
+   `stop_listener`, `close_session`, `revoke_credential`). It never accepts shell
+   commands, and the worker-side skill never executes a registered action. Targets
+   are retained privately for the run owner; readback exposes only digests and
+   lengths. Finalization executes registered actions in reverse order and records
+   failures without aborting the rest of wind-down.
+
 ## Rules
 
 - Query the board with intent, then get back to running real commands. Do **not**

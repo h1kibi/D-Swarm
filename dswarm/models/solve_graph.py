@@ -78,7 +78,7 @@ class Challenge(BaseModel):
     # flags are still SAVED + displayed, but a saved flag does NOT finish the run —
     # completion is `expected_flags` distinct flags (if >1) OR, when the count is
     # unknown (expected_flags<=1), never by count: the run ends on operator STOP or
-    # the coordinator's no-progress pause. Lets a ladder/collection challenge gather
+    # the scheduler's no-progress pause. Lets a ladder/collection challenge gather
     # every flag instead of stopping on the first. Set at dispatch time.
     multi_flag: bool = False
     # ── rate-limited verifier (submission gate) ───────────────────────────────

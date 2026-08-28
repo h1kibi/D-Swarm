@@ -1,5 +1,5 @@
 /**
- * Legacy + new event normalizer (docs/07 Phase 1).
+ * Historical + current event normalizer (docs/07 Phase 1).
  *
  * The UI never reads raw SSE payloads directly anymore: every event — live or
  * replayed from an old session JSONL — passes through here first. The raw
@@ -10,9 +10,8 @@
  *    explicitly; for legacy sessions the stage is DERIVED from event order
  *    (`stageDerived: true`) and must be rendered as approximate. Derived
  *    state is never written back to the event log.
- *  - a legacyActivity marker for retired paths (race / old coordinator /
- *    pre-pi worker engines). These render as generic "legacy execution
- *    activity" — the old run modes never reappear in nav, settings, or the
+ *  - a historicalActivity marker for retired paths and pre-pi worker engines.
+ *    These render as generic archive activity — the old run modes never reappear in nav, settings, or the
  *    formal status enums.
  */
 
@@ -40,8 +39,8 @@ export const STAGES: readonly Stage[] = [
   "finalize",
 ];
 
-export interface LegacyActivity {
-  kind: "race" | "coordinator" | "engine";
+export interface HistoricalActivity {
+  kind: "historical";
   /** i18n key — never render raw kernel vocabulary directly. */
   i18nKey: string;
   detail?: string;
@@ -51,27 +50,27 @@ export interface NormalizedEvent {
   raw: DSwarmEvent;
   stage?: Stage;
   stageDerived: boolean;
-  legacyActivity?: LegacyActivity;
+  historicalActivity?: HistoricalActivity;
 }
 
 const STAGE_SET = new Set<string>(STAGES);
 
-/** Retired-path blackboard kinds → generic legacy activity. */
-const LEGACY_BB_KINDS: Record<string, LegacyActivity> = {
-  race_started: { kind: "race", i18nKey: "legacy.raceStarted" },
-  race_concluded: { kind: "race", i18nKey: "legacy.raceConcluded" },
-  race_scout_spawned: { kind: "race", i18nKey: "legacy.raceStarted" },
+/** Historical blackboard kinds → archive activity. */
+const HISTORICAL_BB_KINDS: Record<string, HistoricalActivity> = {
+  race_started: { kind: "historical", i18nKey: "legacy.raceStarted" },
+  race_concluded: { kind: "historical", i18nKey: "legacy.raceConcluded" },
+  race_scout_spawned: { kind: "historical", i18nKey: "legacy.raceStarted" },
 };
 
-/** Legacy-activity lookup by blackboard delta kind — lets the Decision
+/** Historical-activity lookup by blackboard delta kind — lets the Decision
  *  Timeline render retired-path markers from the folded blackboard event log
  *  without re-normalizing the raw stream (docs/07 §7.3). */
-export function legacyBlackboardActivity(kind: string): LegacyActivity | undefined {
-  return LEGACY_BB_KINDS[kind];
+export function historicalBlackboardActivity(kind: string): HistoricalActivity | undefined {
+  return HISTORICAL_BB_KINDS[kind];
 }
 
-/** Pre-pi worker engines → generic worker identity (docs/07 §7.3). */
-const LEGACY_ENGINES = new Set(["claude", "codex", "cursor"]);
+/** Pre-pi worker engines → historical worker identity (docs/07 §7.3). */
+const HISTORICAL_ENGINES = new Set(["claude", "codex", "cursor"]);
 
 function bbStageHint(kind: string): Stage | undefined {
   if (kind === "intent_proposed") return "reason";
@@ -98,26 +97,26 @@ export function normalizeEvent(
     ? (p.stage as Stage)
     : undefined;
 
-  let legacyActivity: LegacyActivity | undefined;
+  let historicalActivity: HistoricalActivity | undefined;
   let derived: Stage | undefined;
 
   // 2. retired-path detection (payload-level; event names are unchanged).
   if (raw.event_type === EventType.BLACKBOARD_DELTA) {
     const kind = typeof p.kind === "string" ? p.kind : "";
-    legacyActivity = LEGACY_BB_KINDS[kind];
+    historicalActivity = HISTORICAL_BB_KINDS[kind];
     derived = bbStageHint(kind);
-    if (legacyActivity) derived = "legacy";
+    if (historicalActivity) derived = "legacy";
   } else if (raw.event_type === EventType.GUIDANCE_INJECTED) {
-    legacyActivity = { kind: "coordinator", i18nKey: "legacy.coordinatorPlan" };
+    historicalActivity = { kind: "historical", i18nKey: "legacy.coordinatorPlan" };
     derived = "legacy";
   } else if (
     raw.event_type === EventType.WORKER_STATUS ||
     raw.event_type === EventType.WORKER_LIFECYCLE
   ) {
     const engine = typeof p.engine === "string" ? p.engine.toLowerCase() : "";
-    if (LEGACY_ENGINES.has(engine)) {
-      legacyActivity = {
-        kind: "engine",
+    if (HISTORICAL_ENGINES.has(engine)) {
+      historicalActivity = {
+        kind: "historical",
         i18nKey: "legacy.engine",
         detail: engine,
       };
@@ -155,7 +154,7 @@ export function normalizeEvent(
     raw,
     stage,
     stageDerived: !explicit && stage !== undefined,
-    legacyActivity,
+    historicalActivity,
   };
 }
 
