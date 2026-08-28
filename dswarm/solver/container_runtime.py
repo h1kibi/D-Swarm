@@ -281,7 +281,11 @@ class DockerCliRuntimeAdapter:
 
     @staticmethod
     def _container_identity(container_id: str, flag: str) -> int:
-        result = docker_run("exec", container_id, "id", flag, "kali", timeout=10.0)
+        # Probe the container's EFFECTIVE identity (docker exec runs as the
+        # --user the pool created the container with). Asking for a named user
+        # ("kali") broke when the M9a image switched its worker user to "ctf":
+        # numeric proof works for any image user.
+        result = docker_run("exec", container_id, "id", flag, timeout=10.0)
         if result.returncode != 0:
             raise ContainerRuntimeError("container_identity_probe_failed")
         try:

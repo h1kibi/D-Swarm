@@ -117,7 +117,16 @@ class DockerCliImageBackend:
 
 
 class DockerImageInspector:
-    """Resolve each requested tag once and prove the image's ``kali`` identity."""
+    """Resolve each requested tag once and prove the image's worker identity.
+
+    The worker user is an image property, not a constant: the current
+    docker/worker-kali image creates ``ctf`` (uid 1000), while pre-M9a images
+    created ``kali``. Candidates are probed in order and the first that proves
+    wins; the numeric identity must then be consistent across the run's pools
+    (validated separately).
+    """
+
+    WORKER_USER_CANDIDATES = ("ctf", "kali")
 
     def __init__(
         self,
@@ -160,30 +169,36 @@ class DockerImageInspector:
                 "image_resolution_failed", "worker image is unavailable"
             )
 
-        try:
-            identity = self._backend.query_user(
-                image_id,
-                "kali",
-                network="none",
-                mounts=(),
-                env={},
-            )
-        except Exception as exc:
+        identity = None
+        for user in self.WORKER_USER_CANDIDATES:
+            try:
+                identity = self._backend.query_user(
+                    image_id,
+                    user,
+                    network="none",
+                    mounts=(),
+                    env={},
+                )
+            except Exception as exc:
+                raise RuntimeSnapshotBuildError(
+                    "worker_identity_mismatch", "worker identity could not be proven"
+                ) from exc
+            if (
+                identity is not None
+                and len(identity) == 2
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                    for value in identity
+                )
+            ):
+                break
+            identity = None
+        if identity is None:
             raise RuntimeSnapshotBuildError(
-                "worker_identity_mismatch", "worker identity could not be proven"
-            ) from exc
-        if (
-            identity is None
-            or len(identity) != 2
-            or not all(
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value > 0
-                for value in identity
-            )
-        ):
-            raise RuntimeSnapshotBuildError(
-                "worker_identity_mismatch", "worker identity could not be proven"
+                "worker_identity_mismatch",
+                "worker identity could not be proven for any known worker user",
             )
 
         result = ResolvedWorkerImage(
@@ -199,7 +214,7 @@ class DockerImageInspector:
 def validate_shared_worker_identity(
     images: Sequence[ResolvedWorkerImage],
 ) -> tuple[int, int]:
-    """Require every image in one run to expose the same numeric ``kali`` user."""
+    """Require every image in one run to expose the same numeric worker user."""
 
     if not images:
         raise RuntimeSnapshotBuildError(

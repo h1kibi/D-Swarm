@@ -310,3 +310,28 @@ A1 scope 接线 → A2 cleanup 落地/降级决策 → B1+B3（小而硬） → 
 - **验收**：`tests/test_web_launch_runtime.py` 5 项端到端（真实 HTTP 路由）：容器冻结
   +快照落盘+池组合+网络钳制 / 本地双门禁两态 / 镜像缺失 400 且 run 不再静默死亡 /
   重复派发幂等（同一快照对象）/ mock 跳过。全量 pytest exit=0。
+
+### F2. 身份模型仍 fabricated 已回收的 0.2.0 方向镜像（2026-08-28，✅ closed）
+
+- **现象**：新架构 seats/environments 不携带 image；`identity_model._seat_direction_image`
+  按 seat 方向从 `_DIRECTION_IMAGE_TAG` 硬编码拼出 `ctf-swarm-pi-<dir>:0.2.0`。
+  该镜像族已废弃回收后，任何新派工都会在镜像预检处 400。
+- **修复**：统一镜像教义落地——`DEFAULT_WORKER_IMAGE` = M9a tag
+  （`DSWARM_WORKER_IMAGE` env 可覆盖），`direction_image()` 一律解析到统一镜像；
+  `worker_config`/`worker_image` 钉死旧 tag 的测试更新为统一契约。全量 exit=0。
+
+### F3. 运行时身份链残留两处 `kali` 用户硬编码（2026-08-28，✅ closed）
+
+- **现象**：M9a 镜像的 worker 用户是 `ctf`（Dockerfile useradd 1000:1000，`Config.User="ctf"`），
+  但 ①快照预检 `DockerImageInspector.resolve` 只探测 `kali`（`id -u kali` 必败 →
+  `worker_identity_mismatch`，冻结阶段全灭）；②池容器身份证明
+  `container_runtime._container_identity` 执行 `docker exec id -u kali`（探针失败回退
+  uid=0 → `runtime_identity_mismatch`，池代际永不就绪）。二者的合流表象是冒烟
+  8/8 "completed without startup test ok marker"。
+- **修复**：①预检改为候选用户链 `("ctf", "kali")`，首个证明者胜，跨池数值一致性
+  校验不变；②容器身份探针改为 `docker exec id <flag>`（无用户名，证明容器**有效**
+  身份，与 `--user` 创建参数数值对账，任意镜像用户名通用）。
+- **验收**：`scripts/repro_pool_lease.py`（冻结→租约全链复现工具）实测预检/容器创建
+  通过；全量 pytest exit=0。遗留的最终失败为用户配置层模型/凭据不匹配（glm-5.3-flash
+  vs DeepSeek 端点），见冒烟面板指引。
+
