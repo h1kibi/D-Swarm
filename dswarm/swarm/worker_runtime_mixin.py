@@ -442,6 +442,19 @@ class WorkerRuntimeMixin:
                     env["HOME"] = str(home_host)
             else:
                 env["HOME"] = str(home_host)
+            if home_and_gateway_only and not str(env.get("HOME", "")).startswith(
+                "/home/kali/workspace"
+            ):
+                # Windows dev host: the executor mapper's prefix match fails on
+                # host path shapes, returning an absolute WINDOWS path, which
+                # the control-link env filter then refuses to forward -- pi ran
+                # with the supervisor default HOME=/home/kali (no provider
+                # config, Unknown provider). The pool container mounts
+                # <workspace> at CONTAINER_WORKSPACE, so the container path is
+                # statically derivable: force it.
+                from dswarm.solver.container_exec import CONTAINER_WORKSPACE
+
+                env["HOME"] = f"{CONTAINER_WORKSPACE}/homes/{label}"
             # pi 0.83+ documents PI_CODING_AGENT_DIR as the authoritative
             # config root. Do not rely on HOME expansion inside the container
             # supervisor: make the isolated run-local config explicit so the
