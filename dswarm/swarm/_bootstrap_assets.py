@@ -89,6 +89,27 @@ def _ensure_pi_config_links(
     for rel in _PI_CONFIG_LINKS:
         link = home / rel
         target = f"{config_target_root}/{link.name}"
+        # Windows dev hosts: a host-side symlink pointing at a Linux-style
+        # container path (/home/kali/...) does not resolve inside the container
+        # (NTFS symlink + bind mount). Prefer a real copy unconditionally there
+        # -- the workspace bind mount carries it in.
+        if os.name == "nt" and copy_source is not None:
+            src = copy_source / link.name
+            if src.exists():
+                try:
+                    if link.is_symlink() or link.exists():
+                        if link.is_dir() and not link.is_symlink():
+                            shutil.rmtree(link)
+                        else:
+                            link.unlink()
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    if src.is_dir():
+                        shutil.copytree(src, link, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, link)
+                    continue
+                except OSError:
+                    pass
         try:
             if link.is_symlink():
                 if os.readlink(link) == target:
@@ -123,6 +144,7 @@ def _ensure_pi_config_links(
 
 def _ensure_blackboard_skill_links(
     home: Path, *, skill_target: str = _CONTAINER_BLACKBOARD_SKILL,
+    copy_source: "Optional[Path]" = None,
 ) -> None:
     """Expose the current blackboard skill inside an isolated worker HOME.
 
@@ -130,9 +152,36 @@ def _ensure_blackboard_skill_links(
     so pi's skill auto-discovery follows the same source-versioned implementation
     as ``DSWARM_BLACKBOARD_SCRIPT``.  The image target remains a safe fallback for
     installed deployments without an adjacent source checkout.
+
+    Windows dev hosts cannot create the HOME symlinks (and an NTFS symlink with
+    a Linux target never resolves inside the container), so ``copy_source`` (the
+    HOST-side runtime skill dir) is copied into the HOME instead.
     """
+    import os as _os
+
     for rel in _BLACKBOARD_SKILL_LINKS:
         link = home / rel
+        if _os.name == "nt" and copy_source is not None:
+            src = copy_source / link.name
+            if not src.exists() and copy_source.is_dir():
+                # skill links: the link name IS the source dir itself
+                # (homes/<w>/.pi/agent/skills/dswarm-blackboard <- runtime dir)
+                src = copy_source
+            if src.exists():
+                try:
+                    if link.is_symlink() or link.exists():
+                        if link.is_dir() and not link.is_symlink():
+                            shutil.rmtree(link)
+                        else:
+                            link.unlink()
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    if src.is_dir():
+                        shutil.copytree(src, link, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, link)
+                    continue
+                except OSError:
+                    pass
         try:
             if link.is_symlink():
                 if os.readlink(link) == skill_target:

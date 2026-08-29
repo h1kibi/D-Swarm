@@ -382,9 +382,13 @@ class WorkerRuntimeMixin:
                 runtime_skill = materialize_runtime_blackboard_skill(base)
                 if runtime_skill is not None and callable(mapper):
                     skill_target = mapper(str(runtime_skill))
+                skill_copy_source = runtime_skill
             except Exception:
+                skill_copy_source = None
                 pass
-            _ensure_blackboard_skill_links(home_host, skill_target=skill_target)
+            _ensure_blackboard_skill_links(
+                home_host, skill_target=skill_target,
+                copy_source=skill_copy_source)
             _ensure_base_skill_links(home_host)
             pi_config_target = _CONTAINER_PI_CONFIG
             try:

@@ -18,6 +18,14 @@ from dswarm.models.solve_graph import Challenge
 from dswarm.sandbox.manager import SandboxManager
 from dswarm.solver.result import ArtifactStore
 from dswarm.swarm.insight_bus import InsightBus, InsightKind
+def _assert_config_link_or_copy(link, posix_target: str) -> None:
+    """Accept a symlink OR a real copy (Windows dev hosts copy instead)."""
+    import os as _os
+    assert link.exists(), link
+    if _os.name != "nt":
+        assert link.is_symlink()
+        assert str(link.readlink()).replace("\\", "/") == posix_target
+
 from dswarm.swarm.swarm import Swarm
 
 
@@ -2889,14 +2897,19 @@ def test_pi_config_links_replace_stale_copied_config(tmp_path):
     settings = home / ".pi" / "agent" / "settings.json"
     settings.write_text("{}", encoding="utf-8")
 
-    assets._ensure_pi_config_links(home, config_target_root="/fresh/pi-config")
+    # Windows dev hosts copy from this dir when symlinks are unavailable
+    copy_src = tmp_path / "fresh" / "pi-config"
+    (copy_src / "extensions").mkdir(parents=True)
+    (copy_src / "extensions" / "fresh.ts").write_text("// fresh", encoding="utf-8")
+    (copy_src / "settings.json").write_text("{\"fresh\": true}", encoding="utf-8")
 
-    assert (home / ".pi/agent/extensions").is_symlink()
-    assert str((home / ".pi/agent/extensions").readlink()).replace("\\", "/") == (
-        "/fresh/pi-config/extensions")
-    assert (home / ".pi/agent/settings.json").is_symlink()
-    assert str((home / ".pi/agent/settings.json").readlink()).replace("\\", "/") == (
-        "/fresh/pi-config/settings.json")
+    assets._ensure_pi_config_links(
+        home, config_target_root="/fresh/pi-config", copy_source=copy_src)
+
+    _assert_config_link_or_copy(
+        home / ".pi/agent/extensions", "/fresh/pi-config/extensions")
+    _assert_config_link_or_copy(
+        home / ".pi/agent/settings.json", "/fresh/pi-config/settings.json")
 
 
 def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, tmp_path, monkeypatch):
@@ -2943,10 +2956,7 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
         ".pi/agent/extensions": "/home/kali/workspace/.dswarm_runtime/pi-config/extensions",
     }
     for rel, target in expected_links.items():
-        link = home / rel
-        assert link.is_symlink()
-        # WindowsPath normalizes separators; the target is a POSIX container path
-        assert str(link.readlink()).replace("\\", "/") == target
+        _assert_config_link_or_copy(home / rel, target)
     runtime_provider = (tmp_path / "workspace" / ".dswarm_runtime" / "pi-config"
                         / "extensions" / "dswarm-worker-provider.ts")
     assert runtime_provider.is_file()
@@ -3160,8 +3170,17 @@ def test_container_runtime_endpoint_uses_secret_file_and_runtime_pi_config(
     home = workspace / "homes" / "cli-pi"
     assert (workspace / ".dswarm_runtime" / "pi-config" / "extensions"
             / "dswarm-worker-provider.ts").is_file()
-    assert str((home / ".pi/agent/extensions").readlink()).replace("\\", "/") == (
-        "/home/kali/workspace/.dswarm_runtime/pi-config/extensions")
+    ext_link = home / ".pi/agent/extensions"
+    assert ext_link.exists()
+    import os as _os
+    if _os.name != "nt":
+        assert str(ext_link.readlink()).replace("\\", "/") == (
+            "/home/kali/workspace/.dswarm_runtime/pi-config/extensions")
+    else:
+        # Windows dev hosts copy instead of symlinking (NTFS links with Linux
+        # targets never resolve inside the container)
+        assert (ext_link / "dswarm-worker-provider.ts").is_file()
+        assert (ext_link / "ctf-gateway-provider.ts").is_file()
 
 
 @pytest.mark.asyncio
