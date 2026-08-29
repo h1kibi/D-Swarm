@@ -289,8 +289,17 @@ class WorkerRuntimeMixin:
         container: "Optional[object]",
         profile: "Optional[dict]" = None,
         task_token: str | None = None,
+        home_and_gateway_only: bool = False,
     ) -> dict[str, str]:
-        """Per-worker runtime env: Credential Account plus isolated HOME."""
+        """Per-worker runtime env: Credential Account plus isolated HOME.
+
+        ``home_and_gateway_only`` (strict M9a lease path): skip the host
+        credential-account merge entirely (the lease owns credentials via its
+        gateway token) but STILL prepare the isolated HOME (provider config /
+        blackboard skill links) and emit HOME/PI_CODING_AGENT_DIR — without
+        this, lease workers ran with the image-default HOME and no provider
+        config (Unknown provider ctf-gateway).
+        """
 
         explicit_endpoint = bool(
             (profile or {}).get("base_url")
@@ -298,15 +307,18 @@ class WorkerRuntimeMixin:
             or (profile or {}).get("provider_ref")
         )
         source_env = None
-        if explicit_endpoint:
+        if explicit_endpoint and not home_and_gateway_only:
             source_env = {**os.environ, "DSWARM_PI_PROVIDER": "dswarm-worker"}
-        env = runtime_env_for_engine(
-            engine,
-            account_root=self.credential_accounts_root,
-            account_id=(profile.get("credential_account") if profile else None),
-            container=container is not None,
-            env=source_env,
-        ).env
+        if home_and_gateway_only:
+            env: dict[str, str] = {}
+        else:
+            env = runtime_env_for_engine(
+                engine,
+                account_root=self.credential_accounts_root,
+                account_id=(profile.get("credential_account") if profile else None),
+                container=container is not None,
+                env=source_env,
+            ).env
         if profile:
             provider_ref = str(profile.get("provider_ref") or "").strip()
             resolved_provider = None
@@ -717,11 +729,10 @@ class WorkerRuntimeMixin:
                 lifecycle_scope="worker",
                 # container backend (None → local host subprocess, default).
                 container=container,
-                worker_env=(
-                    None if strict_docker else self._runtime_env_for(
-                        transport, label, container=container, profile=profile,
-                        task_token=gateway_token,
-                    )
+                worker_env=self._runtime_env_for(
+                    transport, label, container=container, profile=profile,
+                    task_token=gateway_token,
+                    home_and_gateway_only=strict_docker,
                 ),
                 runtime_lease_factory=runtime_lease_factory,
                 runtime_policy=runtime_policy,

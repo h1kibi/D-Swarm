@@ -397,7 +397,14 @@ async def test_strict_docker_worker_injects_frozen_pool_lease_factory(
     assert len(seen) == 1
     assert worker.runtime_policy is policy
     assert worker.container is None
-    assert worker.worker_env in (None, {})
+    # Strict lease path: worker_env carries NO host credential material, but
+    # MUST carry the isolated-HOME/graph context (provider config discovery).
+    if worker.worker_env:
+        joined = str(worker.worker_env)
+        assert "OPENAI_API_KEY" not in joined
+        assert "DEEPSEEK_API_KEY" not in joined
+        # HOME/PI_CODING_AGENT_DIR appear when worker_root is configured
+        # (production dispatch always does; this fixture does not).
     assert callable(worker.runtime_lease_factory)
     assert seen[0]["task_kind"] == "web"
     assert seen[0]["runtime_operation_kind"] == "ordinary"
