@@ -42,7 +42,8 @@ EXPECTED_EXTENSIONS = {
     "dswarm-worker-provider.ts",
 }
 
-EXPECTED_GATEWAY_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+EXPECTED_GATEWAY_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro",
+                          "glm-5.3-flash"}
 
 IMPORT_RE = re.compile(
     r"^\s*import\s+(?P<kind>type\s+)?(?:[^'\"\n]*?\s+from\s+)?['\"](?P<spec>[^'\"]+)['\"]",
