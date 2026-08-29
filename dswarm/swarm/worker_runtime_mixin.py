@@ -377,7 +377,7 @@ class WorkerRuntimeMixin:
                         prompt = local / direction / "prompt.md"
                         if prompt.exists():
                             env["DSWARM_DIRECTION_PROMPT"] = str(prompt)
-        if self.worker_root is not None and container is not None:
+        if self.worker_root is not None and (container is not None or home_and_gateway_only):
             base = (self.workspace_root or self.worker_root.parent)
             home_host = base / "homes" / label
             try:
@@ -385,6 +385,18 @@ class WorkerRuntimeMixin:
             except OSError:
                 return env
             mapper = getattr(container, "to_container_path", None)
+            if mapper is None and home_and_gateway_only:
+                # strict lease path: the executor does not exist yet at env-build
+                # time. The pool container mounts <workspace> at
+                # CONTAINER_WORKSPACE, so the mapping is static.
+                from dswarm.solver.container_exec import CONTAINER_WORKSPACE
+
+                def mapper(host_path: str) -> str:
+                    rel = Path(host_path).resolve().as_posix()
+                    host_ws = Path(base).resolve().as_posix()
+                    if rel.startswith(host_ws):
+                        return CONTAINER_WORKSPACE + rel[len(host_ws):]
+                    return host_path
             # The image ships a fallback skill, but the source checkout may have
             # added CLI protocol support since that image was built.  Put a fresh,
             # run-local copy on the bind mount and link pi's auto-discovery to it.
