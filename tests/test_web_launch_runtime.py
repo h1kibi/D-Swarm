@@ -138,10 +138,11 @@ def test_container_launch_freezes_docker_policy_snapshot_and_pool(tmp_path):
     assert len(pool_calls) == 1
     assert pool_calls[0]["run_id"] == RUN_ID
     assert pool_calls[0]["snapshot"] is run.runtime_snapshot
-    # offline clamp baked into the frozen spec (default: no operator offline
-    # switch -> hard network isolation for container runtimes)
+    # network preserved from the runtime profile when the offline switch is
+    # absent (clamp must NOT fire by default: network:none pools can never
+    # pass the reverse-dial hello)
     assert run.runtime_snapshot.pools
-    assert all(pool.network.kind == "none" for pool in run.runtime_snapshot.pools)
+    assert all(pool.network.kind == "bridge" for pool in run.runtime_snapshot.pools)
     # the dispatch path (drivers.runtime_context_kwargs) now sees frozen objects
     assert run.runtime_snapshot is not None and run.pool_manager is not None
     assert launches and launches[0][0] == RUN_ID
@@ -209,3 +210,15 @@ def test_mock_driver_skips_runtime_freeze(tmp_path):
     assert resp.status_code == 200, resp.text
     assert mgr.get(RUN_ID).runtime_policy is None
     assert pool_calls == []
+
+
+def test_explicit_offline_clamps_container_network_to_none(tmp_path):
+    client, _mgr, _pool_calls, _launches = make_client(tmp_path)
+
+    resp = _start(client, RUN_ID + "-off", offline=True)
+
+    assert resp.status_code == 200, resp.text
+    mgr2 = _mgr
+    run = mgr2.get(RUN_ID + "-off")
+    assert run.runtime_snapshot is not None
+    assert all(pool.network.kind == "none" for pool in run.runtime_snapshot.pools)

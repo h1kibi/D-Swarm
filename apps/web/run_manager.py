@@ -1323,15 +1323,18 @@ class RunManager:
             body.get("runtime_profiles") or wc.get("runtime_profiles") or []
         )
         selected = _selected_roster(engines, worker_profiles)
-        # Same offline clamp as the dispatch path: the deck's "offline" switch
-        # means deny worker web tools, but a selected OpenAI-compatible endpoint
-        # still needs egress to its LLM gateway, so only then is hard network
-        # isolation relaxed. Default is network=none for container runtimes.
+        # Same offline clamp as the dispatch path (drivers._swarm_driver): the
+        # deck's "offline" switch opts INTO hard network isolation, softened
+        # only when a selected profile needs a custom LLM endpoint. With the
+        # flag absent, runtime profiles keep their configured network (bridge) —
+        # the reverse-dial control link is a hard requirement of the M9a
+        # runtime contract. (Do NOT invert this default: network:none pool
+        # containers can never pass hello.)
         offline = bool(body.get("offline", False))
         offline_endpoint_profiles = (
             [p for p in selected if profile_uses_endpoint(p)] if offline else []
         )
-        strict_offline_network = (not offline) or (not offline_endpoint_profiles)
+        strict_offline_network = offline and not offline_endpoint_profiles
         if strict_offline_network:
             runtime_profiles = [
                 {**r, "network": "none"}
