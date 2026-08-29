@@ -74,8 +74,18 @@ def _materialize_runtime_pi_config(workspace_root: str | Path) -> "Optional[Path
         return None
 
 
-def _ensure_pi_config_links(home: Path, *, config_target_root: str = _CONTAINER_PI_CONFIG) -> None:
-    """Expose pi provider config inside an isolated worker HOME."""
+def _ensure_pi_config_links(
+    home: Path, *, config_target_root: str = _CONTAINER_PI_CONFIG,
+    copy_source: "Optional[Path]" = None,
+) -> None:
+    """Expose pi provider config inside an isolated worker HOME.
+
+    Symlinks are the primary mechanism, but on Windows dev hosts (no symlink
+    privilege) ``os.symlink`` raises and the silent ``continue`` left worker
+    HOMEs without any provider config (``Unknown provider``). When
+    ``copy_source`` (the HOST-side config dir) is given, a failed link falls
+    back to a real copy so the bind-mounted HOME always carries a config.
+    """
     for rel in _PI_CONFIG_LINKS:
         link = home / rel
         target = f"{config_target_root}/{link.name}"
@@ -96,7 +106,19 @@ def _ensure_pi_config_links(home: Path, *, config_target_root: str = _CONTAINER_
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(target, target_is_directory=rel.endswith("extensions"))
         except OSError:
-            continue
+            # Windows dev host without symlink privilege: copy the host-side
+            # source instead so the isolated HOME still gets a working config.
+            src = (copy_source / link.name) if copy_source is not None else None
+            if src is None or not src.exists():
+                continue
+            try:
+                link.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, link, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, link)
+            except OSError:
+                continue
 
 
 def _ensure_blackboard_skill_links(

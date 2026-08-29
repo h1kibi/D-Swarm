@@ -391,9 +391,16 @@ class WorkerRuntimeMixin:
                 runtime_pi_config = _materialize_runtime_pi_config(base)
                 if runtime_pi_config is not None and callable(mapper):
                     pi_config_target = mapper(str(runtime_pi_config))
+                # Windows dev hosts cannot create the HOME symlinks; hand the
+                # host-side config dir to the link helper so it can fall back
+                # to a real copy inside the bind-mounted HOME.
+                pi_config_copy_source = runtime_pi_config
             except Exception:
+                pi_config_copy_source = None
                 pass
-            _ensure_pi_config_links(home_host, config_target_root=pi_config_target)
+            _ensure_pi_config_links(
+                home_host, config_target_root=pi_config_target,
+                copy_source=pi_config_copy_source)
             direction = _direction_from_profile_id(
                 (profile or {}).get("id", ""))
             if direction:

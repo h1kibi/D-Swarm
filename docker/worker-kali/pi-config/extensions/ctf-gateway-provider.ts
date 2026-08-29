@@ -22,11 +22,25 @@ export default function registerCtfGateway(pi: ExtensionAPI) {
       id: "deepseek-v4-flash",
       name: "DeepSeek V4 Flash (gateway)",
       reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: null,
+        medium: null,
+        high: "high",
+        max: "max",
+      },
     },
     {
       id: "deepseek-v4-pro",
       name: "DeepSeek V4 Pro (gateway)",
       reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: null,
+        medium: null,
+        high: "high",
+        max: "max",
+      },
     },
   ];
 

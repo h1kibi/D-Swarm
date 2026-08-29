@@ -181,6 +181,8 @@ declare module "@earendil-works/pi-coding-agent" {
     models?: ProviderModelConfig[];
     refreshModels?: unknown;
     oauth?: unknown;
+    // deepseek-family thinking/reasoning compat flags (ctf-gateway provider)
+    compat?: Record<string, unknown>;
   }
 
   // --------------------------------------------------------------- handlers
