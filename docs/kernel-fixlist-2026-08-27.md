@@ -335,3 +335,29 @@ A1 scope 接线 → A2 cleanup 落地/降级决策 → B1+B3（小而硬） → 
   通过；全量 pytest exit=0。遗留的最终失败为用户配置层模型/凭据不匹配（glm-5.3-flash
   vs DeepSeek 端点），见冒烟面板指引。
 
+---
+
+## 2026-08-29 追加：M9a web 全链接通战役（9 个提交，冒烟到达最后一层）
+
+修复序列（每层都有事件流/复现脚本证据，全量 pytest 绿）：
+1. `e51f860` web 派工冻结接线（F1，run-4408）
+2. `0296741` 统一镜像事实源（F2，fabricated 旧 tag）
+3. `a8a11d3` 身份链 kali 硬编码 ×2（预检候选链 ctf→kali + 容器 exec 数值自证）
+4. `b566293` 池容器 user=0:0(root) → PoolSpec.uid:gid；冒烟 harness remember_dispatch 接线
+5. `9ed1f8f` worker.status detail 字段 + 池容器死亡证据落盘（本战役的可观测性基建）
+6. `2bac39a` gateway 模式池探针自签任务令牌（LEASE OK 里程碑）
+7. `74b89d9` offline 钳制反转修复（默认不得 network:none）
+8. `dd0a604` 租约 worker 走 executor RCP run 路径（不再当 legacy ContainerHandle）
+9. `f9ddb5d` + `70f20fa` + `52ba2f4` runtime pi-config 补齐 gateway 扩展 + Windows 拷贝回退
+10. `bfec1b6` + `c9da3db` strict 租约路径保留隔离 HOME 准备（worker_env=None 跳过 HOME 块的断层）
+
+**已证明**：复现脚本 LEASE OK（冻结→池→容器→RCP→网关→真实探针调用→租约）；
+容器内隔离 HOME 配置完整（extensions/models.json 实测在位）。
+
+**剩余唯一症状**：worker pi 会话仍报 `Unknown provider "ctf-gateway"`（容器外取证显示其
+HOME/配置应完整）。**头号嫌疑**：`dswarm/solver/control_client.py:38` 的
+`_PI_ENV_KEYS = {"PI_CODING_AGENT_DIR"}` —— 会话 env 转发白名单可能丢弃了
+HOME/DSWARM_PI_PROVIDER 等（或 agent 侧另有一份白名单），导致 pi 实际读到的 HOME
+并非 mixin 准备的隔离 HOME。下一步：核对 control link 的会话 env 转发白名单与
+runtime-agent（cmd/runtime-agent）的 env 透传行为，让会话 env 与 create env 走同一契约。
+
