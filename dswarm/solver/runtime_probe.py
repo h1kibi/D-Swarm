@@ -293,6 +293,38 @@ class RuntimeProbe:
         driver = PiDriver()
         spec = driver.probe_spec(model=pool_spec.model, session_dir=session_dir)
         env = dict(getattr(credential_projection, "env", {}) or {})
+        if getattr(credential_projection, "credential_mode", "") == "gateway":
+            # The readiness probe runs BEFORE any worker spawn, so no task token
+            # exists yet — but its pi call goes through the ctf-gateway provider,
+            # which requires one. Mint a probe-scoped token and inject the same
+            # env block the worker spawn path uses (worker_runtime_mixin).
+            from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
+
+            gateway = ModelGateway.instance()
+            token = gateway.issue_worker(WorkerClaims(
+                run_id=str(getattr(executor, "run_id", "") or ""),
+                challenge_id=None,
+                worker_instance_id=worker_instance_id,
+                solver_id=None,
+                profile_id=str(pool_spec.profile_id or ""),
+                configured_account_id=(
+                    str(pool_spec.credential_binding_id or "").strip() or None
+                ),
+                token_scope="worker",
+            ))
+            import os as _os
+            gateway_url = _os.environ.get(
+                "DSWARM_GATEWAY_URL",
+                "http://host.docker.internal:"
+                f"{_os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
+            )
+            env.update({
+                "DEEPSEEK_API_KEY": token,
+                "DSWARM_TASK_TOKEN": token,
+                "DSWARM_GATEWAY_URL": gateway_url,
+                "DSWARM_PI_PROVIDER": "ctf-gateway",
+                "DSWARM_WORKER_MODEL": str(pool_spec.model or "deepseek-v4-flash"),
+            })
         return await asyncio.wait_for(
             executor.run(
                 driver,
