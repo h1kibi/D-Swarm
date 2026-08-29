@@ -523,9 +523,11 @@ class ContainerRuntimeExecutor:
                 worker_token_revoker=worker_token_revoker,
             )
         except ContainerRuntimeError as exc:
+            await _log_pool_container_death(adapter, container_id)
             await _cleanup_startup(adapter, receiver, container_id, pool_instance_id)
             raise ContainerRuntimeError(exc.code) from None
         except Exception:
+            await _log_pool_container_death(adapter, container_id)
             await _cleanup_startup(adapter, receiver, container_id, pool_instance_id)
             code = "runtime_hello_failed" if container_id else "runtime_start_failed"
             raise ContainerRuntimeError(code) from None
@@ -872,6 +874,36 @@ def _validate_link(link: Any, expected: ExpectedRuntimeIdentity) -> None:
     for name, expected_value in checks.items():
         if getattr(link, name, None) != expected_value:
             raise ContainerRuntimeError("runtime_hello_failed")
+
+
+async def _log_pool_container_death(
+    docker: DockerRuntimeAdapter, container_id: str,
+) -> None:
+    """Best-effort: a pool container that died during startup loses its agent
+    logs when _cleanup_startup removes it. Persist the terminal state + last
+    log lines to the backend log so hello/identity failures carry evidence
+    (run-4408-class failures were undiagnosable without this)."""
+    if not container_id:
+        return
+    try:
+        import logging
+        import subprocess
+
+        state = await asyncio.to_thread(
+            lambda: subprocess.run(
+                ["docker", "inspect", "--format",
+                 "{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}}",
+                 container_id], capture_output=True, text=True, timeout=10))
+        logs = await asyncio.to_thread(
+            lambda: subprocess.run(
+                ["docker", "logs", "--tail", "40", container_id],
+                capture_output=True, text=True, timeout=10))
+        logging.getLogger(__name__).warning(
+            "pool container %s startup failure: state=%s agent_logs=%s",
+            container_id[:12], state.stdout.strip() or state.stderr.strip(),
+            (logs.stdout + logs.stderr)[-1500:])
+    except Exception:
+        pass
 
 
 async def _cleanup_startup(

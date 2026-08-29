@@ -734,7 +734,14 @@ class StartupTestController:
                     "Do not inspect files, do not solve anything, and do not contact external services."
                 ),
             },
-            "offline": True,
+            # offline=False BY DESIGN: the M9a runtime contract is reverse-dial
+            # RCP — a network:none pool container cannot dial the control
+            # receiver, so hard offline isolation + container backend can never
+            # pass hello (runtime_hello_failed after the 40s wait). The smoke
+            # task only prints a marker and calls the LLM gateway; worker web
+            # tools stay denied via the kb/web_access flags, not network
+            # isolation. (offline+container coexistence needs an RFC.)
+            "offline": False,
             "kb": False,
             "engines": [str(smoke_profile.get("name") or smoke_profile.get("id"))],
             "max_workers": 1,

@@ -144,7 +144,7 @@ def cost_payload(scope: str, usd: float, tokens: int, **extra: Any) -> dict[str,
 def worker_status_payload(
     online: bool, *, status: str = "", reason: str = "", engine: str = "",
     session: str = "", runtime: Optional[dict[str, Any]] = None,
-    worker_role: str = "",
+    worker_role: str = "", detail: str = "",
 ) -> dict[str, Any]:
     """Live worker presence for the deck's interpreter cluster.
 
@@ -162,6 +162,8 @@ def worker_status_payload(
         payload["worker_role"] = worker_role
     if runtime:
         payload["runtime"] = runtime
+    if detail:
+        payload["detail"] = detail
     return payload
 
 

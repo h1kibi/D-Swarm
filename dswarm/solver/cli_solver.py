@@ -1000,6 +1000,7 @@ class CliSolver:
     async def _emit_worker_status(
         self, *, online: bool, reason: str, status: Optional[str] = None,
     ) -> None:
+        detail = "" if online else str(getattr(self, "_worker_error_detail", "") or "")
         await self._emit(
             EventType.WORKER_STATUS,
             **worker_status_payload(
@@ -1010,6 +1011,7 @@ class CliSolver:
                 session=self._cli_session or "",
                 runtime=self._last_runtime_status if not online else None,
                 worker_role=self.mode,
+                detail=detail,
             ))
 
     def _tokens_spent(self) -> int:
@@ -3261,8 +3263,12 @@ class CliSolver:
         except asyncio.CancelledError:
             self._note_worker_stop("cancelled")
             raise
-        except Exception:
+        except Exception as exc:
             self._note_worker_stop("error")
+            # Bounded operator-visible cause: the deck otherwise sees only
+            # "offline reason=error" with no trace of WHY (today's smoke loop).
+            self._worker_error_detail = sanitize_public_text(
+                f"{type(exc).__name__}: {exc}", limit=200)
             raise
         finally:
             # M9/M10: clean a mkdtemp scratch dir we own on EVERY exit path (the
