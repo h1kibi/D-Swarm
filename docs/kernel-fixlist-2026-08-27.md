@@ -361,3 +361,24 @@ HOME/DSWARM_PI_PROVIDER 等（或 agent 侧另有一份白名单），导致 pi 
 并非 mixin 准备的隔离 HOME。下一步：核对 control link 的会话 env 转发白名单与
 runtime-agent（cmd/runtime-agent）的 env 透传行为，让会话 env 与 create env 走同一契约。
 
+### F4.（2026-08-29 续）租约 worker 执行链七连修 + 当前唯一残留
+
+后续修复（全量 pytest 绿，均有活体取证）：
+- `74b89d9` offline 钳制反转（默认 network:none 导致 hello 必败）——整个冒烟循环的真凶
+- `dd0a604` 租约 worker 改走 executor.run/run_streaming（原先被当 legacy ContainerHandle）
+- `2bac39a` gateway 模式池探针自签任务令牌
+- `bfec1b6`+`c9da3db` strict 派工保留隔离 HOME 准备（worker_env=None 跳过 HOME 块）
+- `f9ddb5d` runtime pi-config 补齐 ctf-gateway-provider.ts + thinkingLevelMap + d.ts compat
+- `70f20fa` Windows 宿主 HOME 配置/技能链接拷贝回退（NTFS 符号链接容器内不可解析）
+- `7a3ca7f` lease 路径强制容器侧 HOME（Windows 路径形态下 mapper 前缀失配 → 过滤器拒发）
+- `a290e2d` 修复 container 赋值被合并编辑吞掉 + spawn→lease env 白名单合并
+
+**已证明**（活体）：容器内隔离 HOME 完整（extensions/models.json 实测）；worker pi 完整
+执行生命周期（delegating→claimed→agent_settled→fact_added→concluded，事件全流回）。
+
+**当前唯一残留（行为层，非管道）**：冒烟 worker 完成 pi 生命周期但未产生 `startup_test_ok`
+标记输出——模型收到 printf 任务后走了 recon 流程/无 stdout。候选方向：①模型能力
+（glm-5.3-flash 对该指令的服从性；可换 deepseek-v4-pro 对照——注意须同时还原 pi-main 凭据）；
+②冒烟任务提示与 recon 角色 preamble 的冲突；③lease 流式路径的输出捕获（TEXT delta 只有
+delegating/agent_settled 帧，无逐 token 流——对照 TUI/旧路径确认流式颗粒度）。
+
