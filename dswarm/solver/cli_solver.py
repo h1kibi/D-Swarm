@@ -3262,10 +3262,28 @@ class CliSolver:
                 runtime_lease = await self.runtime_lease_factory(
                     worker_instance_id, self.runtime_operation_kind
                 )
-                # The lease is the sole owner of Docker executor and credential
-                # projection state.  Never merge legacy host/account env into it.
                 self.container = runtime_lease.executor
-                self._extra_worker_env = dict(runtime_lease.worker_env)
+                # The lease is the sole owner of Docker executor and credential
+                # projection state: arbitrary spawn-env keys must NOT survive
+                # the acquire (host/account material, LEGACY junk). But a
+                # blanket clobber also dropped the spawn env's isolated-HOME
+                # block (HOME / PI_CODING_AGENT_DIR / provider selection) --
+                # lease workers then ran on the image-default HOME (Unknown
+                # provider; HOME=/home/kali in /proc evidence). Merge an
+                # ALLOWLIST of exactly the keys the mixin env block produces.
+                _MERGE_KEYS = (
+                    "HOME", "PI_CODING_AGENT_DIR",
+                    "DSWARM_PI_PROVIDER", "DSWARM_WORKER_MODEL",
+                    "DSWARM_TASK_TOKEN", "DSWARM_GATEWAY_URL",
+                    "DSWARM_BLACKBOARD_DB", "DSWARM_CHALLENGE_ID",
+                    "DSWARM_BLACKBOARD_URL", "DSWARM_DIRECTION_PROMPT",
+                )
+                merged_env = dict(runtime_lease.worker_env)
+                for _k in _MERGE_KEYS:
+                    _v = (self._extra_worker_env or {}).get(_k)
+                    if _v:
+                        merged_env[_k] = _v
+                self._extra_worker_env = merged_env
 
             await self._emit_worker_status(
                 online=True, reason="standby" if self.mode == "respond" else "started")
