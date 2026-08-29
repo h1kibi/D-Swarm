@@ -259,7 +259,8 @@ async def test_create_freezes_named_network_resources_and_numeric_uid_gid(tmp_pa
     assert create.pids_limit == 257
     assert create.tmpfs_bytes == 67_108_864
     assert (create.uid, create.gid) == (1001, 1002)
-    assert create.user == "0:0"
+    # worker runs as the proven snapshot identity, never root
+    assert create.user == "1001:1002"
     assert create.env["DSWARM_RUN_ID"] == "run-a"
     assert create.env["DSWARM_POOL_ID"] == spec.pool_id
     assert (

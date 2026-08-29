@@ -548,6 +548,9 @@ async def test_startup_test_default_worker_runner_does_not_pass_legacy_stage_pol
     mgr = RunManager(sessions_root=tmp_path)
     _enabled_worker_config(mgr)
     controller = StartupTestController(mgr, timeout_per_worker=5.0)
+    # runner-mechanics unit test: stub the freeze on the controller's OWN
+    # internal test_manager (start() dispatches through it, not mgr)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
     session = StartupTestSession("startup-test-unit", controller)
 
     captured: dict = {}
@@ -589,6 +592,9 @@ async def test_startup_test_default_worker_runner_returns_as_soon_as_marker_is_s
     mgr = RunManager(sessions_root=tmp_path)
     _enabled_worker_config(mgr)
     controller = StartupTestController(mgr, timeout_per_worker=5.0)
+    # runner-mechanics unit test: stub the freeze on the controller's OWN
+    # internal test_manager (start() dispatches through it, not mgr)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
     session = StartupTestSession("startup-test-marker-unit", controller)
     worker_run_ids: list[str] = []
 
@@ -637,6 +643,9 @@ async def test_startup_test_default_worker_runner_waits_for_cleanup_grace_and_re
     mgr = RunManager(sessions_root=tmp_path)
     _enabled_worker_config(mgr)
     controller = StartupTestController(mgr, timeout_per_worker=0.01)
+    # runner-mechanics unit test: stub the freeze on the controller's OWN
+    # internal test_manager (start() dispatches through it, not mgr)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
     session = StartupTestSession("startup-test-cleanup-grace-unit", controller)
     delete_completed = asyncio.Event()
 
@@ -685,6 +694,9 @@ async def test_startup_test_default_worker_runner_bounds_cleanup_after_timeout(t
     mgr = RunManager(sessions_root=tmp_path)
     _enabled_worker_config(mgr)
     controller = StartupTestController(mgr, timeout_per_worker=0.01)
+    # runner-mechanics unit test: stub the freeze on the controller's OWN
+    # internal test_manager (start() dispatches through it, not mgr)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
     session = StartupTestSession("startup-test-cleanup-timeout-unit", controller)
     delete_called = asyncio.Event()
 
@@ -724,6 +736,9 @@ async def test_startup_test_default_worker_runner_routes_smoke_category_to_profi
     mgr = RunManager(sessions_root=tmp_path)
     _enabled_worker_config(mgr)
     controller = StartupTestController(mgr, timeout_per_worker=5.0)
+    # runner-mechanics unit test: stub the freeze on the controller's OWN
+    # internal test_manager (start() dispatches through it, not mgr)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
     captured_bodies: list[dict] = []
 
     def fake_build_driver(body, mgr=None):

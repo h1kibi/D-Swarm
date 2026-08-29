@@ -487,7 +487,11 @@ class ContainerRuntimeExecutor:
                 tmpfs_bytes=pool_spec.resources.tmpfs_bytes,
                 uid=pool_spec.uid,
                 gid=pool_spec.gid,
-                user="0:0",
+                # Run as the exact worker identity the snapshot preflight proved
+                # (PoolSpec.uid/gid). Hardcoded "0:0" (root) contradicted the
+                # identity contract: post-create inspection proves uid/gid, and
+                # a root worker is exactly what the M9a model forbids.
+                user=f"{pool_spec.uid}:{pool_spec.gid}",
                 command=(
                     "--connect",
                     f"{control_host}:{port}",

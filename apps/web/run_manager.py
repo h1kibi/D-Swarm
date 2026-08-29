@@ -36,7 +36,10 @@ from dswarm.core.session_store import SessionStore
 from dswarm.core.usage_journal import UsageContext, UsageJournal, UsageRecord, UsageWriter
 from dswarm.core.usage_ledger import SpawnGuard, UsageLedger
 from dswarm.swarm.budget import ProfileBudgetGate
-from dswarm.solver.credential_accounts import ensure_pi_account_from_env
+from dswarm.solver.credential_accounts import (
+    account_store_root,
+    ensure_pi_account_from_env,
+)
 from dswarm.solver.container_pool import ContainerPoolManager
 from dswarm.solver.runtime_policy import (
     RuntimePolicy,
@@ -1291,6 +1294,25 @@ class RunManager:
         worker_profiles = [p for p in worker_profiles if isinstance(p, dict)]
         if not worker_profiles:
             return
+        # Credential-mode fix: the new-shape projection (seats/environments)
+        # carries no base_url, so every container profile would resolve to
+        # gateway mode with an unconfigured gateway and the worker would fall
+        # back to the default DeepSeek endpoint (model-not-found). A credential
+        # account that stores BASE_URL is a custom endpoint: re-attach it so
+        # the projection runs in direct mode (BASE_URL+API_KEY into the worker).
+        accounts_root = account_store_root(self.sessions_root)
+        for profile in worker_profiles:
+            label = str(profile.get("credential_account") or "").strip()
+            if not label or profile.get("base_url"):
+                continue
+            base_url_file = accounts_root / label / "BASE_URL"
+            if base_url_file.is_file():
+                try:
+                    url = base_url_file.read_text(encoding="utf-8").strip()
+                    if url:
+                        profile["base_url"] = url
+                except OSError:
+                    pass
         worker_backend = resolve_worker_backend(
             request_backend=body.get("worker_backend"),
             config_backend=wc.get("worker_backend"),

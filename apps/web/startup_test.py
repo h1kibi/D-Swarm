@@ -764,6 +764,10 @@ class StartupTestController:
 
         run.bus.add_sink(_sink)
         driver = build_driver(body, mgr=manager)
+        # F1 parity with the real launch route: remember the dispatch body so
+        # RunManager.start freezes the M9a runtime context for this smoke run
+        # (without it, container-profile spawns fail runtime_policy_required).
+        test_manager.remember_dispatch(run.run_id, body)
         await test_manager.start(run.run_id, driver)
         try:
             waitables: list[asyncio.Future | asyncio.Task] = [marker_seen]
