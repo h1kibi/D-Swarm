@@ -86,6 +86,7 @@ from dswarm.solver.result_codes import (
     RESULT_TIMED_OUT,
 )
 from dswarm.solver.types import SolverConfig, SolveOutcome
+from dswarm.solver.container_runtime import ContainerRuntimeExecutor
 from dswarm.swarm.poc_verification import (
     normalize_reproduction_indicator, sanitize_public_text,
 )
@@ -1418,6 +1419,18 @@ class CliSolver:
         pause/resume (SIGSTOP/SIGCONT) and a sibling's FLAG reach this live worker."""
         env = self._worker_env()
         argv = self._apply_runtime_argv(argv, env)
+        # M9a lease path: the executor is NOT a legacy ContainerHandle. Route
+        # through its RCP run (same machinery the readiness probe uses) instead
+        # of run_cli's legacy handle shim, which expects .container/.control_dir.
+        if isinstance(self.container, ContainerRuntimeExecutor):
+            res = await self.container.run(
+                self.driver, list(argv), host_cwd=cwd, timeout=timeout,
+                env=env, worker_instance_id=str(
+                    getattr(self, "worker_instance_id", "") or self.solver_id),
+                operation_kind=self.runtime_operation_kind or self.mode,
+            )
+            self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+            return res
         if self.bus is None:
             res = await asyncio.to_thread(
                 run_cli, self.driver, argv, cwd=cwd, timeout=timeout, env=env,
@@ -1490,6 +1503,17 @@ class CliSolver:
         self._turn_active = True
         self._current_workdir = Path(cwd).resolve()
         try:
+            if isinstance(self.container, ContainerRuntimeExecutor):
+                res = await self.container.run_streaming(
+                    self.driver, list(argv), host_cwd=cwd, timeout=timeout,
+                    on_step=on_step, env=env, cancel_event=self._cancel_event,
+                    on_proc=self._on_proc, steer_event=self._steer_event,
+                    worker_instance_id=str(
+                        getattr(self, "worker_instance_id", "") or self.solver_id),
+                    operation_kind=self.runtime_operation_kind or self.mode,
+                )
+                self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+                return res
             res = await asyncio.to_thread(
                 run_cli_streaming, self.driver, argv, cwd=cwd, timeout=timeout,
                 on_step=on_step, env=env, cancel_event=self._cancel_event,
