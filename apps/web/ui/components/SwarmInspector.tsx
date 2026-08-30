@@ -30,6 +30,7 @@ import { Icon } from "@/components/Icon";
 import { workerColor, workerInitial, workerShortLabel } from "@/lib/workers";
 import { BudgetStatus } from "@/components/BudgetStatusPanel";
 import { RuntimeStatus } from "@/components/RuntimeStatusPanel";
+import { formatDurationMs, reasonCycleRows, reasonLoopTone } from "@/lib/reason";
 import type { RuntimePoolsSnapshot } from "@/components/runtimeStatus";
 import type { BudgetSnapshot } from "@/components/budgetStatus";
 
@@ -642,6 +643,43 @@ export function SwarmInspector({
 
         {tab === "intents" && (
           <>
+            <section className="reason-strip" aria-label={t("reason.strip")}>
+              <div className="reason-strip-head">
+                <span className="budget-eyebrow">{t("reason.strip")}</span>
+                <span className={`budget-state ${reasonLoopTone(deck.reasonLoop)}`}>
+                  <span className="budget-state-dot" aria-hidden="true" />
+                  {deck.reasonLoop.solved
+                    ? t("reason.loopSolved")
+                    : deck.reasonLoop.paused
+                      ? t("reason.loopPaused")
+                      : deck.reasonLoop.stopReason
+                        ? t("reason.loopStopped", { reason: deck.reasonLoop.stopReason })
+                        : t("reason.loopRunning", { n: deck.reasonLoop.cycles.length })}
+                </span>
+              </div>
+              {deck.reasonLoop.recon && (
+                <div className="reason-recon">
+                  {t(deck.reasonLoop.recon.status === "completed" ? "reason.reconDone" : "reason.reconRunning")}
+                  {deck.reasonLoop.recon.durationMs != null && (
+                    <span> · {formatDurationMs(deck.reasonLoop.recon.durationMs)}</span>
+                  )}
+                  {deck.reasonLoop.recon.newFindings != null && (
+                    <span> · {t("reason.reconFindings", { n: deck.reasonLoop.recon.newFindings })}</span>
+                  )}
+                </div>
+              )}
+              {reasonCycleRows(deck.reasonLoop).map((row) => (
+                <div className="reason-cycle-row" key={row.id}>
+                  <span className="tl-intent-id">{row.id}</span>
+                  <span className={`tl-chip intent-${row.status}`}>{t(`intent.status.${row.status}`)}</span>
+                  <span className="reason-cycle-meta">
+                    g{row.generation} · {formatDurationMs(row.durationMs)}
+                    {row.trigger ? ` · ${row.trigger}` : ""}
+                    {row.auditCount > 0 ? ` · ${t("reason.auditShort", { n: row.auditCount })}` : ""}
+                  </span>
+                </div>
+              ))}
+            </section>
             <div className="swarm-count">{t("swarm.intentQueue")}</div>
             {queue.length === 0 && <div className="swarm-empty">{t("swarm.noIntents")}</div>}
             {queue.map((it) => (

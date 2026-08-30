@@ -347,3 +347,44 @@ export function foldReasonEvent(
       return loop;
   }
 }
+
+// ── presentation projections (P0-2: make the folded loop observable) ────────
+
+/** Traffic-light tone for the loop banner. */
+export function reasonLoopTone(loop: ReasonLoopView): "ok" | "warn" | "bad" | "muted" {
+  if (loop.solved) return "ok";
+  if (loop.paused) return "warn";
+  if (loop.stopReason) {
+    // an operator stop or a dry planner is a normal end; anything else is suspect
+    return loop.stopReason === "operator_stop" ? "muted" : "warn";
+  }
+  return "ok";
+}
+
+/** One line per cycle for the intents-tab strip: status + duration + trigger. */
+export function reasonCycleRows(
+  loop: ReasonLoopView,
+): { id: string; generation: number; status: ReasonCycleStatus; durationMs?: number; trigger?: string; auditCount: number; intentCount: number }[] {
+  return loop.cycles.map((cycle) => ({
+    id: cycle.id,
+    generation: cycle.generation,
+    status: cycle.status,
+    durationMs: cycle.durationMs ?? (
+      cycle.startedAt != null
+        ? Math.max(0, Math.round(((cycle.completedAt ?? Date.now() / 1000) - cycle.startedAt) * 1000))
+        : undefined
+    ),
+    trigger: cycle.trigger,
+    auditCount: cycle.audits.length,
+    intentCount: cycle.intents.length,
+  }));
+}
+
+export function formatDurationMs(ms?: number): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1).replace(/\.0$/, "")}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m${Math.round(s - m * 60)}s`;
+}

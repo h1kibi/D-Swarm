@@ -5684,6 +5684,12 @@ body.swarm-resizing * {
 
 .budget-error { margin-top: 7px; color: var(--amber); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.reason-strip { display: grid; gap: 5px; margin: 0 0 10px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--line) 78%, transparent); border-radius: 14px; background: linear-gradient(145deg, color-mix(in srgb, var(--panel) 90%, transparent), color-mix(in srgb, var(--panel2) 76%, transparent)); }
+.reason-strip-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.reason-recon { color: var(--muted); font-size: 11px; }
+.reason-cycle-row { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 5px 7px; border-radius: 8px; background: color-mix(in srgb, var(--panel2) 76%, transparent); }
+.reason-cycle-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+
 .runtime-pool-row { display: grid; gap: 3px; min-width: 0; padding: 6px 7px; border-radius: 8px; background: color-mix(in srgb, var(--panel2) 76%, transparent); }
 .runtime-pool-row.bad { background: color-mix(in srgb, var(--red) 8%, var(--panel2)); }
 .runtime-gen { color: var(--muted); font-size: 10px; }
