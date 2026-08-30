@@ -68,6 +68,14 @@ export function WorkerLanes({
   useEffect(() => {
     setExpandedLaneIds((prev) => new Set([...prev].filter((id) => allIds.includes(id))));
   }, [allIds]);
+  // A lone worker auto-expands: the drawer would otherwise be one collapsed row
+  // above a screen of dead space, and the interesting content (streams, facts)
+  // sits behind a click. Still user-collapsible afterwards.
+  useEffect(() => {
+    if (allIds.length === 1) {
+      setExpandedLaneIds((prev) => (prev.has(allIds[0]) ? prev : new Set([allIds[0]])));
+    }
+  }, [allIds]);
   const ids = shown.size === 0 ? allIds : allIds.filter((id) => shown.has(id));
   const filterSummary = shown.size === 0
     ? t("wlane.focusAll")

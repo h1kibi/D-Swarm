@@ -635,7 +635,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
    the inner content cleanly while the column grows so nothing reflow-janks mid-slide;
    the body fades in just after via .artifact-view so first paint reads as "settling
    in" rather than popping. easing = decelerate (fast start, soft landing). */
-.artifact { flex: none; position: relative; width: 0; min-width: 0; background: var(--bg); border-left: 1px solid var(--border);
+.artifact { flex: 0 1 auto; position: relative; width: 0; min-width: 280px; max-width: 100%; background: var(--bg); border-left: 1px solid var(--border);
   display: flex; flex-direction: column; overflow: visible;
   transition: width .22s cubic-bezier(.2, .8, .2, 1); }
 .artifact.resizing { transition: none; }
@@ -648,7 +648,10 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .artifact-resizer:focus-visible { border-radius: 6px; }
 body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important; user-select: none !important; }
 .artifact-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-.artifact-head .tabs { display: flex; gap: 4px; min-width: 0; max-width: 100%; overflow-x: auto; scrollbar-width: thin; }
+.artifact-head .tabs { display: flex; gap: 4px; min-width: 0; max-width: 100%; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
+.artifact-head .tabs::-webkit-scrollbar { height: 4px; }
+.artifact-head .tabs::-webkit-scrollbar-thumb { border-radius: 99px; background: var(--line2); }
+.artifact-head .tabs::-webkit-scrollbar-track { background: transparent; }
 .artifact-head .tabs button { background: transparent; color: var(--dim); border: 1px solid transparent;
   padding: 6px 12px; border-radius: 7px; white-space: nowrap; }
 .artifact-head .tabs button.on { color: var(--bright); background: var(--panel); border-color: var(--border); }
@@ -943,7 +946,7 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
 .btw-quick-btn:hover:not(:disabled) { color: var(--bright); border-color: var(--accent); }
 .btw-quick-btn:disabled { opacity: .5; cursor: not-allowed; }
 .btw-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
-.btw-empty { color: var(--dim); font-size: 12.5px; line-height: 1.5; padding: 24px 8px; text-align: center; }
+.btw-empty { color: var(--dim); font-size: 12.5px; line-height: 1.5; padding: 14px 8px; text-align: center; }
 .btw-msg { display: flex; flex-direction: column; gap: 4px; }
 .btw-msg-role { font-size: 10.5px; color: var(--dim); font-weight: 700; letter-spacing: .03em; }
 .btw-msg-body { font-size: 13px; line-height: 1.55; color: var(--bright); word-wrap: break-word; overflow-wrap: anywhere; }
@@ -3284,7 +3287,9 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .stage-approx { color: var(--amber); margin-left: 2px; }
 
 /* ---------- decision timeline (§5.4) ---------- */
-.dectl { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+/* the artifact drawer must never crush the Decision Timeline out of existence
+   (it previously collapsed to a 40px sliver) */
+.dectl { flex: 1 1 auto; min-width: 240px; display: flex; flex-direction: column; background: var(--bg); }
 .dectl-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 18px 20px; }
 .dectl-empty { color: var(--muted); text-align: center; margin-top: 18vh; max-width: 460px;
   margin-left: auto; margin-right: auto; line-height: 1.7; }
@@ -3380,9 +3385,10 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .sw-intent-top { display: flex; align-items: baseline; gap: 8px; }
 .sw-intent-goal { flex: 1; min-width: 0; color: var(--text); font-size: var(--fs-caption);
   overflow-wrap: anywhere; }
-.swarm-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.swarm-panels button { padding: 7px 8px; border-radius: var(--r-input); border: 1px solid var(--border2);
-  background: var(--panel); color: var(--text); font-size: var(--fs-caption); text-align: left; }
+.swarm-panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.swarm-panels button { padding: 5px 4px; border-radius: 8px; border: 1px solid var(--border2);
+  background: var(--panel); color: var(--text); font-size: 10px; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .swarm-panels button:hover { border-color: var(--brand); color: var(--brand-hi); }
 .swarm-attention { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 8px; }
@@ -4145,7 +4151,7 @@ body.wsw-resizing, body.wsw-resizing * { cursor: col-resize !important; user-sel
 .stage-node { transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease; }
 .stage-node:hover { background: color-mix(in srgb, var(--panel) 68%, transparent); transform: translateY(-1px); }
 .cc-body { gap: 12px; padding: 12px; min-width: 0; }
-.main, .dectl, .swarm, .artifact, .rail-body { min-width: 0; }
+.main, .swarm, .rail-body { min-width: 0; }
 .rail { border-right: 0; background: transparent; }
 
 
@@ -4326,7 +4332,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   max-width: min(560px, 42vw);
 }
 .cc-body.layout-refined .artifact {
-  flex: 0 0 auto;
+  /* shrink (not clip) when the timeline rail + drawer exceed the workspace */
+  flex: 0 1 auto;
 }
 
 .swarm-resizer {
@@ -5664,23 +5671,25 @@ body.swarm-resizing * {
 @keyframes budget-pulse { 50% { opacity: .45; transform: scaleX(.88); } }
 .budget-status-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .budget-eyebrow { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-.budget-usage { margin-top: 3px; color: var(--text); font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
+.budget-usage { margin-top: 4px; color: var(--text); font-size: 17px; font-weight: 700; letter-spacing: -.01em; line-height: 1.35; }
 .budget-state { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: 10px; white-space: nowrap; }
 .budget-state-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .budget-state.ok { color: var(--green); }
 .budget-state.warn { color: var(--amber); }
 .budget-state.bad { color: var(--red); }
 .budget-state.muted { color: var(--muted); }
-.budget-meta { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; color: var(--muted); font-size: 11px; }
+.budget-meta { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 6px; padding-bottom: 2px; color: var(--muted); font-size: 11px; }
 .budget-meta-warn { color: var(--amber); }
-.budget-alert { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 9px; padding: 7px 8px; color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); border-radius: 9px; background: color-mix(in srgb, var(--red) 8%, transparent); font-size: 11px; }
+.budget-alert { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; padding: 9px 10px; color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); border-radius: 9px; background: color-mix(in srgb, var(--red) 8%, transparent); font-size: 11px; }
 .budget-alert > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .budget-rebuild { flex: none; padding: 4px 7px; border: 1px solid currentColor; border-radius: 7px; color: inherit; background: transparent; font-size: 10px; cursor: pointer; }
 .budget-rebuild:hover:not(:disabled) { background: color-mix(in srgb, var(--red) 12%, transparent); }
 .budget-rebuild:disabled { opacity: .55; cursor: wait; }
 .budget-progress { margin-top: 8px; color: var(--amber); font-size: 11px; }
-.budget-scope-list { display: grid; gap: 4px; max-height: 154px; overflow-y: auto; margin-top: 10px; padding-right: 2px; }
-.budget-scope-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 6px 7px; border-radius: 8px; background: color-mix(in srgb, var(--panel2) 76%, transparent); }
+.budget-scope-group + .budget-scope-group { margin-top: 8px; }
+.budget-scope-title { color: var(--dim); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; margin: 2px 0 4px; }
+.budget-scope-list { display: grid; gap: 5px; max-height: 168px; overflow-y: auto; padding-right: 2px; }
+.budget-scope-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 8px 9px; border-radius: 9px; background: color-mix(in srgb, var(--panel2) 76%, transparent); }
 .budget-scope-row.blocked { background: color-mix(in srgb, var(--red) 8%, var(--panel2)); }
 .budget-scope-label, .budget-scope-value { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .budget-scope-label { overflow: hidden; }

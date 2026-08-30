@@ -1025,6 +1025,8 @@ export const STRINGS: Dict = {
   "budget.profile": { zh: "配置", en: "profile" },
   "budget.account": { zh: "计费账户", en: "account" },
   "budget.blocked": { zh: "已阻断", en: "blocked" },
+  "budget.groupProfile": { zh: "模型配置", en: "Profiles" },
+  "budget.groupAccount": { zh: "计费账户", en: "Billing accounts" },
   "budget.unavailable": { zh: "预算状态暂不可用", en: "Budget status unavailable" },
 
   // ---- pheromone (Phase 5, docs/07 §P0-4/§6.3) — scheduling heat ONLY,

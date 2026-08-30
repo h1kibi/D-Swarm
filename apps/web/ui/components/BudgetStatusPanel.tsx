@@ -44,6 +44,13 @@ export function BudgetStatus({ snapshot, loading = false, rebuilding = false, er
     ? ledgerConflictInfo(snapshot.ledger_error)
     : null;
   const rows = budgetRows(snapshot);
+  const scopeGroups: { labelKey: string; items: typeof rows }[] = (
+    ["profile", "account"] as const
+  ).map((scope) => ({
+    labelKey: scope === "profile" ? "budget.groupProfile" : "budget.groupAccount",
+    items: rows.filter((r) => r.scope === scope)
+      .sort((a, b) => b.tokens - a.tokens),
+  })).filter((g) => g.items.length > 0);
   const global = snapshot.ledger?.global;
   const unknown = Math.max(0, Math.round(global?.unknown_calls ?? 0));
   const estimated = Math.max(0, Math.round(global?.estimated_calls ?? 0));
@@ -88,12 +95,13 @@ export function BudgetStatus({ snapshot, loading = false, rebuilding = false, er
       {state === "rebuilding" && <div className="budget-progress">{t("budget.rebuilding")}</div>}
       {error && state !== "failed" && <div className="budget-error">{error}</div>}
 
-      {rows.length > 0 && (
-        <div className="budget-scope-list">
-          {rows.map((row) => (
+      {scopeGroups.map((group) => (
+        <div className="budget-scope-group" key={group.labelKey}>
+          <div className="budget-scope-title">{t(group.labelKey)}</div>
+          <div className="budget-scope-list">
+          {group.items.map((row) => (
             <div className={`budget-scope-row ${row.blocked ? "blocked" : ""}`} key={`${row.scope}:${row.key}`}>
               <div className="budget-scope-label">
-                <span className="budget-scope-kind">{t(`budget.${row.scope}`)}</span>
                 <span className="budget-scope-key" title={row.key}>{row.key}</span>
               </div>
               <div className="budget-scope-value">
@@ -102,8 +110,9 @@ export function BudgetStatus({ snapshot, loading = false, rebuilding = false, er
               </div>
             </div>
           ))}
+          </div>
         </div>
-      )}
+      ))}
     </section>
   );
 }
