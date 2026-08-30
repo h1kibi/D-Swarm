@@ -17,6 +17,8 @@ export interface BudgetScope {
   blocked: boolean;
 }
 
+export type LedgerErrorKind = "usage_conflict" | "invalid_event" | null;
+
 export interface BudgetSnapshot {
   run_id: string;
   ledger?: {
@@ -26,6 +28,8 @@ export interface BudgetSnapshot {
   };
   ledger_state: LedgerState;
   ledger_error?: string | null;
+  /** Machine-readable class of ledger_error (backend snapshot projection). */
+  ledger_error_kind?: LedgerErrorKind;
   budget?: {
     profile?: Record<string, BudgetScope>;
     account?: Record<string, BudgetScope>;
@@ -74,4 +78,23 @@ export function budgetUsageLabel(snapshot: BudgetSnapshot): string {
   const unknown = Math.max(0, Math.round(finiteNumber(global?.unknown_calls)));
   const suffix = `${unknown} unknown ${unknown === 1 ? "call" : "calls"}`;
   return `${tokens} tokens · ${suffix}`;
+}
+
+export interface LedgerConflictInfo {
+  /** Short call id for display (e.g. 6678bec9). */
+  callId: string;
+}
+
+/** A usage_conflict means one provider call was recorded with two different
+ *  outcomes in run history (pre-fix gateway double-record). The pair is baked
+ *  into the event log, so rebuild can never reconcile it — the UI explains
+ *  this instead of offering a dead button. */
+export function ledgerConflictInfo(error: string | null | undefined): LedgerConflictInfo | null {
+  const match = /conflicting usage_id: usage::[^:]*::[a-z]*::([0-9a-f-]+)/i.exec(str2(error || ""));
+  if (!match) return null;
+  return { callId: match[1].slice(0, 8) };
+}
+
+function str2(v: unknown): string {
+  return typeof v === "string" ? v : "";
 }

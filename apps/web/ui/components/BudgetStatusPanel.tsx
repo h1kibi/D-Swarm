@@ -5,6 +5,7 @@ import {
   budgetRows,
   budgetUsageLabel,
   formatBudgetTokens,
+  ledgerConflictInfo,
   type BudgetSnapshot,
   type LedgerState,
 } from "./budgetStatus";
@@ -37,6 +38,11 @@ export function BudgetStatus({ snapshot, loading = false, rebuilding = false, er
 
   const state = rebuilding ? "rebuilding" : snapshot.ledger_state;
   const tone = ledgerTone(state);
+  // A usage conflict is baked into run history: rebuild cannot fix it, so the
+  // panel explains the conflict instead of offering a button that always 503s.
+  const conflict = state === "failed" && snapshot.ledger_error_kind === "usage_conflict"
+    ? ledgerConflictInfo(snapshot.ledger_error)
+    : null;
   const rows = budgetRows(snapshot);
   const global = snapshot.ledger?.global;
   const unknown = Math.max(0, Math.round(global?.unknown_calls ?? 0));
@@ -61,7 +67,15 @@ export function BudgetStatus({ snapshot, loading = false, rebuilding = false, er
         {estimated > 0 && <span>{t("budget.estimatedCalls", { n: estimated })}</span>}
       </div>
 
-      {state === "failed" && (
+      {state === "failed" && conflict && (
+        <div className="budget-alert">
+          <span>
+            {t("budget.conflictTitle", { call: conflict.callId })}
+            <span className="budget-conflict-note">{t("budget.conflictNote")}</span>
+          </span>
+        </div>
+      )}
+      {state === "failed" && !conflict && (
         <div className="budget-alert">
           <span>{snapshot.ledger_error || t("budget.ledgerFailed")}</span>
           {onRebuild && (

@@ -429,3 +429,43 @@ def test_profile_budget_gate_rebuilds_projection_without_private_state_access() 
     assert snapshot["profile"]["p1"]["tokens"] == 10
     assert snapshot["profile"]["p1"]["cap_tokens"] == 20
     assert gate.authorize(profile_id="p1", account_id=None).allowed
+
+
+@pytest.mark.asyncio
+async def test_budget_snapshot_classifies_usage_conflict_error(tmp_path: Path) -> None:
+    """A run whose history holds two DIFFERENT records for one usage_id leaves
+    the ledger failed on every rebuild (the pre-fix gateway double-record).
+    The snapshot must classify that error so the UI can explain it and hide
+    the rebuild button that can never succeed."""
+    from httpx import ASGITransport, AsyncClient
+    from apps.web.run_manager import RunManager
+    from apps.web.server import create_app
+
+    manager = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = manager.create("budget-conflict")
+    app = create_app(manager)
+    uid = f"usage::{run.run_id}::gateway::call-1"
+    first = _record(usd=0.0, tokens=5, profile="p1", run_id=run.run_id, usage_id=uid)
+    second = _record(usd=0.0, tokens=5, profile="p1", run_id=run.run_id, usage_id=uid)
+    second = UsageRecord.from_call(
+        second, call_outcome="transport_error", usage_status="unknown",
+        input_tokens=None, output_tokens=None, usd=None,
+    )
+    await run.bus.emit(Event(
+        event_type=EventType.USAGE_RECORDED, run_id=run.run_id,
+        payload=first.__dict__.copy(),
+    ))
+    await run.bus.emit(Event(
+        event_type=EventType.USAGE_RECORDED, run_id=run.run_id,
+        payload=second.__dict__.copy(),
+    ))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        body = (await client.get(f"/api/runs/{run.run_id}/budget")).json()
+        assert body["ledger_state"] == "failed"
+        assert body["ledger_error_kind"] == "usage_conflict"
+        # the conflict is baked into history: rebuild fails again, same class
+        rebuild = await client.post(f"/api/runs/{run.run_id}/budget/rebuild")
+        assert rebuild.status_code == 503
+        assert "conflicting usage_id" in rebuild.json()["detail"]
+        after = (await client.get(f"/api/runs/{run.run_id}/budget")).json()
+    assert after["ledger_error_kind"] == "usage_conflict"

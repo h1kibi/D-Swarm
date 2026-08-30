@@ -5683,6 +5683,7 @@ body.swarm-resizing * {
 .budget-blocked { color: var(--red); font-size: 10px; }
 
 .budget-error { margin-top: 7px; color: var(--amber); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.budget-conflict-note { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; white-space: normal; }
 
 .reason-strip { display: grid; gap: 5px; margin: 0 0 10px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--line) 78%, transparent); border-radius: 14px; background: linear-gradient(145deg, color-mix(in srgb, var(--panel) 90%, transparent), color-mix(in srgb, var(--panel2) 76%, transparent)); }
 .reason-strip-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

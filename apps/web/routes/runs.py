@@ -26,6 +26,25 @@ async def list_runs(request: Request, archived: int = 0) -> Any:
     return {"runs": request.app.state.manager.list_runs(include_archived=bool(archived))}
 
 
+# Ledger error classifier for the deck: machine-readable kind so the UI can
+# branch on KNOWN, operator-actionable failure classes instead of string
+# matching raw messages. usage_conflict = the same provider call recorded with
+# two different outcomes in run history — replay can never reconcile it (the
+# gateway double-record defect fixed 2026-08-30; pre-fix runs keep the pair).
+_LEDGER_ERROR_KINDS = {
+    "conflicting usage_id:": "usage_conflict",
+    "invalid usage event:": "invalid_event",
+}
+
+
+def _ledger_error_kind(error: Any) -> str | None:
+    text = str(error or "")
+    for marker, kind in _LEDGER_ERROR_KINDS.items():
+        if marker in text:
+            return kind
+    return None
+
+
 @router.get("/{run_id}/budget")
 async def budget_snapshot(run_id: str, request: Request) -> Any:
     """Return the run-scoped ledger and profile/account budget projections."""
@@ -35,12 +54,14 @@ async def budget_snapshot(run_id: str, request: Request) -> Any:
     ledger = run.ledger.snapshot() if run.ledger is not None else {
         "run_id": run_id, "ledger_state": "unavailable", "ledger_error": "ledger_unavailable",
     }
+    ledger_error = getattr(run.spawn_guard, "ledger_error", ledger.get("ledger_error"))
     return {
         "run_id": run_id,
         "ledger": ledger,
         "budget": run.budget_gate.snapshot(),
         "ledger_state": getattr(run.spawn_guard, "ledger_state", ledger.get("ledger_state")),
-        "ledger_error": getattr(run.spawn_guard, "ledger_error", ledger.get("ledger_error")),
+        "ledger_error": ledger_error,
+        "ledger_error_kind": _ledger_error_kind(ledger_error),
     }
 
 

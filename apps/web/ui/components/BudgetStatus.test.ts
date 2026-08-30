@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { budgetRows, budgetUsageLabel, type BudgetSnapshot } from "./budgetStatus";
+import { budgetRows, budgetUsageLabel, ledgerConflictInfo, type BudgetSnapshot } from "./budgetStatus";
 
 const snapshot: BudgetSnapshot = {
   run_id: "run-1",
@@ -22,5 +22,18 @@ describe("BudgetStatus projections", () => {
 
   it("formats unknown calls without treating them as zero spend", () => {
     expect(budgetUsageLabel(snapshot)).toBe("1.2k tokens · 1 unknown call");
+  });
+});
+
+
+describe("usage-conflict attribution", () => {
+  it("extracts a short call id from the raw ledger error", () => {
+    const conflict = ledgerConflictInfo(
+      "conflicting usage_id: usage::run-6038::gateway::6678bec9f4574e4dac7fe3b06f7102e2",
+    );
+    expect(conflict).toEqual({ callId: "6678bec9" });
+    // other errors are not conflicts
+    expect(ledgerConflictInfo("canonical_append_failed")).toBeNull();
+    expect(ledgerConflictInfo(null)).toBeNull();
   });
 });

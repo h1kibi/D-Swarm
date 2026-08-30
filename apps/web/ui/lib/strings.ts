@@ -984,6 +984,8 @@ export const STRINGS: Dict = {
   "budget.rebuilding": { zh: "恢复中…", en: "Rebuilding…" },
   "budget.rebuildSuccess": { zh: "账本已恢复", en: "Ledger recovered" },
   "budget.rebuildFailed": { zh: "账本恢复失败", en: "Ledger recovery failed" },
+  "budget.conflictTitle": { zh: "调用 {call}… 被记录了两种结果（历史冲突）", en: "Call {call}… was recorded with two outcomes (historical conflict)" },
+  "budget.conflictNote": { zh: "旧版网关缺陷所致，已在 2026-08-30 修复；新运行不受影响，重建无法改写历史。", en: "Caused by a pre-fix gateway defect (fixed 2026-08-30). New runs are unaffected; rebuild cannot rewrite history." },
   "budget.tokens": { zh: "令牌", en: "tokens" },
   "budget.calls": { zh: "调用 {n}", en: "{n} calls" },
   "budget.unknownCalls": { zh: "未知用量 {n}", en: "{n} unknown" },
