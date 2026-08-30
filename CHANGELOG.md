@@ -2,6 +2,81 @@
 
 All notable public release changes are tracked here.
 
+## Unreleased
+
+### Added
+
+- **M9a Docker-first runtime pools (kernel).** Runs freeze an immutable
+  `RuntimePolicy` → `RuntimeSnapshot` (canonical pool identities, image-id
+  preflight, per-binding credential isolation) before any worker spawns; a
+  run-scoped `ContainerPoolManager` owns generations of pool containers that
+  reverse-dial the host over the RCP-v2 control link. Every real worker spawn
+  goes through runtime leases (the retired run-global single-container
+  ownership path is removed at the API boundary), with an accounted,
+  tool-disabled readiness probe, exact generation cleanup, private per-pool
+  diagnostics (`state.v1.json` + lifecycle JSONL), and a docker-first web/TUI
+  control plane. Contract audit tests pin the secrecy and identity invariants.
+- **M9 verified PoC gate (pentest track).** Reproduction commands with typed
+  indicators, a typed cleanup registry (4-action allowlist, run-scoped
+  targets), and a post-hoc scope audit that flags out-of-scope host
+  references in the provenance corpus.
+- **Authoritative documentation set.** `docs/00-architecture-spec.md` (root
+  principles, layered architecture, mechanism index, debt ledger); era drafts
+  archived under `docs/archive/`; kernel issue work-order
+  (`docs/kernel-fixlist-2026-08-27.md`); factual corrections across the
+  top-level guides; D-Swarm demarcated from upstream muteki (NOTICE, lineage
+  sections, legacy shims removed).
+- **GLM on the model gateway.** `glm-5.3-flash` registered in the worker
+  image's ctf-gateway provider (models.json + extension, both worker flavors);
+  the gateway normalizes the bigmodel effort dialect (code 1210: always-
+  thinking models reject `reasoning_effort` medium/minimal → snapped to low)
+  and dumps rejected upstream requests to the run dir for diagnosis.
+- **Deck observability batch.** Runtime card in the inspector panel (per-pool
+  lifecycle state, worker occupancy, failure codes, sanitized transition
+  history, frozen policy mode); Reason-loop strip on the intents tab (loop
+  status + stop reason, recon summary, per-cycle duration/audits); structured
+  run-status dimension beside the stage rail (active/waiting/paused/degraded/
+  failed/solved/completed, degradation wired to run-level events); budget
+  ledger conflicts render as readable attribution with the dead rebuild
+  button hidden for that class.
+
+### Fixed
+
+- **M9a web integration chain (end-to-end with GLM via bigmodel, 8/8 startup
+  smoke).** Web launches now freeze the runtime policy (run-4408); worker
+  identity is proved against the image's actual user instead of a hardcoded
+  name; pool containers run as the snapshot's uid:gid; the gateway-mode pool
+  probe mints its own task token; the offline network clamp no longer
+  inverts; lease workers route through the executor RCP path with isolated,
+  materialized HOMEs (Windows dev hosts get copy-first config prep); probe
+  hello gets the same HOME treatment. Failed probes persist their worker
+  output before pool teardown, pool-container deaths leave terminal state and
+  logs in the backend log, and `docker create` failures log stderr
+  (run-6964-class failures were previously undiagnosable).
+- **Provider bindings go through the gateway.** A `provider_ref` profile no
+  longer counts as a direct endpoint: snapshot binding falls back to the
+  provider ref, container workers authenticate with gateway task tokens, and
+  the provider's raw key never enters the lease env. Container-backend
+  profiles defer the host-local auth hello to the worker-container probe (the
+  host CLI resolves a different model/provider registry and false-failed GLM).
+- **Gateway ledger integrity.** A worker disconnecting after a successful
+  stream no longer double-finishes the usage call (the "conflicting usage_id"
+  class); streamed calls now measure real token usage (the SSE `data:` prefix
+  survived extraction, making every streamed call's usage unknown).
+- **Kernel correctness.** Graph flags reconcile into every completion verdict
+  (split-brain); swallowed shared-graph intent writes surface as bounded
+  `intent_db_write_failed` deltas; runtime degradation mixin covered by
+  deterministic tests; stage_policy/coordinator config rejected at the API
+  boundary (ReasonSwarm is the only dispatch path).
+
+### Changed
+
+- Worker image default: `ghcr.io/h1kibi/dswarm-worker-pi:0.3.0-rc.1` is the
+  single M9a image source of truth (per-direction image tags retired); the
+  entrypoint must come from the Dockerfile — patch builds via `docker commit`
+  of `--entrypoint`-overridden containers bake the override in and every pool
+  container exits at startup.
+
 ## 0.3.0-rc.1 - 2026-08-10
 
 ### Added

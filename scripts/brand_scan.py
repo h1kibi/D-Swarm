@@ -56,6 +56,7 @@ ALLOWLIST = {
     "README.md",  # upstream attribution note (fork lineage)
     "NOTICE",  # AGPL attribution note (fork lineage)
     "README_CN.md",  # upstream attribution note (fork lineage)
+    "CHANGELOG.md",  # demarcation work item (fork lineage)
     "docs/00-architecture-spec.md",  # blueprint §1 lineage note
     "apps/web/ui/lib/storage.ts",  # retired-shim historical note
     "apps/web/ui/test/storage.test.ts",  # retired-shim historical note
