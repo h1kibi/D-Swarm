@@ -21,7 +21,6 @@ router = APIRouter(prefix="/api/runs", tags=["btw"])
 @router.post("/{run_id}/btw")
 async def btw(run_id: str, request: Request) -> Any:
     from apps.web.drivers import (
-        _planner_llm_credentials,
         _standby_profile_for,
     )
     from apps.web.worker_config import backend_for_profile, resolve_worker_backend
@@ -29,7 +28,7 @@ async def btw(run_id: str, request: Request) -> Any:
     from dswarm.solver.btw import (
         BtwLimiter,
         BtwWorkerPaths,
-        BTW_MODEL,
+        btw_model_for,
         build_btw_evidence_pack_sync,
         build_btw_worker_prompt,
         btw_evidence_messages,
@@ -127,19 +126,28 @@ async def btw(run_id: str, request: Request) -> Any:
                     or os.environ.get("DSWARM_DEEPSEEK_BASE_URL")
                     or ""
                 ).strip()
-                account_key, account_base = _planner_llm_credentials(
+                # The observer follows the SAME credential resolution as the
+                # Reason planner (resolve_reason_llm_endpoint): credential_source
+                # decides env-vs-account, so a stale host DEEPSEEK_API_KEY no
+                # longer shadows a configured provider/account (that shadow sent
+                # BTW to api.deepseek.com with a dead key after the relay move).
+                from apps.web.reason_llm import resolve_reason_llm_endpoint
+                cfg = mgr.worker_config.get()
+                planner_profile = dict(
+                    (cfg.get("llm_profiles") or {}).get("planner") or {}
+                )
+                resolved_planner = resolve_reason_llm_endpoint(
                     sessions_root=mgr.sessions_root,
                     worker_profiles=worker_profiles,
-                    planner_base=configured_base,
+                    profile=planner_profile,
+                    llm_providers=cfg.get("llm_providers") or [],
                 )
                 api_key = (
                     os.environ.get("DSWARM_BTW_API_KEY")
-                    or os.environ.get("DSWARM_DEEPSEEK_API_KEY")
-                    or os.environ.get("DEEPSEEK_API_KEY")
-                    or account_key
+                    or str(resolved_planner.get("api_key") or "")
                     or ""
                 )
-                base_url = configured_base or account_base or "https://api.deepseek.com/v1"
+                base_url = configured_base or str(resolved_planner.get("base_url") or "")
                 if not api_key:
                     payload = {
                         "final": "观察员暂时无法回答：旁路总结服务未配置 API 凭据。请检查 BTW/DeepSeek provider 配置。",
@@ -176,7 +184,10 @@ async def btw(run_id: str, request: Request) -> Any:
                         usage_context=btw_usage_writer.context,
                     ) as client:
                         result = await client.chat(
-                            model=BTW_MODEL,
+                            model=btw_model_for(
+                                base_url,
+                                fallback_model=str(resolved_planner.get("model") or ""),
+                            ),
                             messages=messages,
                             temperature=0.2,
                             # Reasoning models spend the output budget on

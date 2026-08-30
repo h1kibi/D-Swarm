@@ -23,6 +23,7 @@ import re
 import threading
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+import os
 from typing import Any, Mapping, Optional
 
 # Cheap/fast tier — same as summarizer.py's SUMMARY_MODEL. Hardcoded (not read
@@ -30,6 +31,38 @@ from typing import Any, Mapping, Optional
 # pro model, btw stays on the cheap observation channel: predictable cost + no
 # surprise spend on what is fundamentally a summarization/Q&A task.
 BTW_MODEL = "deepseek-v4-flash"
+
+# The observation channel stays on each upstream's CHEAP tier (predictable
+# cost — see the comment above BTW_MODEL). bigmodel has no deepseek models;
+# its flash tier is glm-5.3-flash. DSWARM_BTW_MODEL overrides.
+_BTW_MODEL_BY_UPSTREAM_HOST = {
+    "api.deepseek.com": BTW_MODEL,
+    "open.bigmodel.cn": "glm-5.3-flash",
+}
+
+
+def btw_model_for(
+    base_url: str,
+    *,
+    fallback_model: str = "",
+    env: "Mapping[str, str] | None" = None,
+) -> str:
+    """The cheap observation model for one upstream.
+
+    Known hosts map to their cheap tier; an unknown relay falls back to the
+    planner's own model (it is proven available on that relay). DSWARM_BTW_MODEL
+    overrides everything.
+    """
+    from urllib.parse import urlparse
+    override = (os.environ if env is None else env).get("DSWARM_BTW_MODEL", "").strip()
+    if override:
+        return override
+    host = (urlparse(base_url or "").hostname or "").lower()
+    known = _BTW_MODEL_BY_UPSTREAM_HOST.get(host)
+    if known:
+        return known
+    # an unknown relay: the planner's own model is proven available there
+    return fallback_model.strip() or BTW_MODEL
 
 _BTW_SYSTEM = """你是 D-Swarm swarm 的只读观察员。操作员问了一个"顺嘴"问题,你要基于当前
 run 的真实状态回答。

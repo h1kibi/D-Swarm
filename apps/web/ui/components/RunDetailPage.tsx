@@ -28,6 +28,7 @@ import {
 } from "@/components/ArtifactPanel";
 import { PanelEmpty } from "@/components/PanelEmpty";
 import { NodeInspector } from "@/components/NodeInspector";
+import { BtwPage } from "@/components/BtwPage";
 
 const VIEW_TITLE_KEY: Record<DetailView, string> = {
   evidence: "panelbtn.evidence",
@@ -40,6 +41,7 @@ const VIEW_TITLE_KEY: Record<DetailView, string> = {
   pocs: "panelbtn.pocs",
   routes: "panelbtn.routes",
   directives: "panelbtn.directives",
+  btw: "btw.title",
 };
 
 export function RunDetailPage({ view }: { view: DetailView }) {
@@ -100,6 +102,8 @@ export function RunDetailPage({ view }: { view: DetailView }) {
         return <RoutesPanel deck={deck} />;
       case "directives":
         return <DirectivesPanel deck={deck} />;
+      case "btw":
+        return <BtwPage runId={runId} />;
     }
   }, [view, runId, deck, running]);
 

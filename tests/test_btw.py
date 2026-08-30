@@ -578,3 +578,19 @@ def test_parse_btw_structured_answer_degrades_invalid_json():
     assert result["answer_markdown"] == "不是 JSON"
     assert result["answer_type"] == "insufficient"
     assert result["evidence_refs"] == []
+
+
+def test_btw_model_for_chooses_cheap_tier_per_upstream():
+    from dswarm.solver.btw import btw_model_for
+
+    bigmodel = "https://open.bigmodel.cn/api/paas/v4"
+    deepseek = "https://api.deepseek.com/v1"
+    relay = "https://relay.example/v1"
+    # known hosts: cheap tier regardless of the planner model
+    assert btw_model_for(bigmodel, fallback_model="glm-5.3-pro") == "glm-5.3-flash"
+    assert btw_model_for(deepseek, fallback_model="deepseek-v4-pro") == "deepseek-v4-flash"
+    # an unknown relay: the planner's own model is proven available there
+    assert btw_model_for(relay, fallback_model="glm-5.3-flash") == "glm-5.3-flash"
+    assert btw_model_for(relay, fallback_model="") == "deepseek-v4-flash"
+    # explicit env override wins everywhere
+    assert btw_model_for(deepseek, fallback_model="x", env={"DSWARM_BTW_MODEL": "m"}) == "m"

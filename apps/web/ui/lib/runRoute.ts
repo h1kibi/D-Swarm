@@ -20,6 +20,7 @@ export const DETAIL_VIEWS = [
   "pocs",
   "routes",
   "directives",
+  "btw",
 ] as const;
 
 export type DetailView = (typeof DETAIL_VIEWS)[number];

@@ -596,7 +596,14 @@ function Deck() {
         onJumpStage={onJumpStage}
         onCommand={onCommand}
         onResolve={onResolve}
-        onOpenBtw={() => setBtwOpen(true)}
+        onOpenBtw={() => {
+          if (runId && !isDraft(runId)) {
+            // the dedicated BTW page is the primary surface now
+            window.location.href = detailUrlForRun(runId, "btw");
+          } else {
+            setBtwOpen(true);
+          }
+        }}
         theme={theme}
         onToggleTheme={toggleTheme}
       />

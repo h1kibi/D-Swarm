@@ -31,8 +31,8 @@ describe("run path parsing", () => {
   it("whitelist membership", () => {
     expect(isDetailView("evidence")).toBe(true);
     expect(isDetailView("nope")).toBe(false);
-    // btw joins the routes with its dedicated page (commit 2)
-    expect(DETAIL_VIEWS).not.toContain("btw");
+    // btw ships with its dedicated full-page chat
+    expect(DETAIL_VIEWS).toContain("btw");
   });
 });
 
@@ -44,6 +44,7 @@ describe("url builders", () => {
 
   it("builds detail urls and falls back for drafts", () => {
     expect(detailUrlForRun("run-1", "evidence")).toBe("/run/run-1/evidence");
+    expect(detailUrlForRun("run-1", "btw")).toBe("/run/run-1/btw");
     expect(detailUrlForRun("draft-abc", "evidence")).toBe("/");
   });
 });
