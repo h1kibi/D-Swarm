@@ -155,10 +155,9 @@ def test_auth_layer_pins_profile_model(tmp_path, monkeypatch):
 
 
 def test_auth_layer_env_is_always_container_false(tmp_path, monkeypatch):
-    """CRITICAL fix: the auth probe runs as a HOST-LOCAL subprocess even for a
-    container-backend profile, so the credential env MUST be resolved with
-    container=False (a container=True overlay points at in-container paths that
-    don't exist on the host)."""
+    """CRITICAL fix: the auth probe runs as a HOST-LOCAL subprocess, so the
+    credential env MUST be resolved with container=False (a container=True
+    overlay points at in-container paths that don't exist on the host)."""
     _register_pi(tmp_path)
     seen = {}
 
@@ -173,19 +172,42 @@ def test_auth_layer_env_is_always_container_false(tmp_path, monkeypatch):
         "dswarm.solver.cli_driver.driver_for",
         lambda profile: type("D", (), {"health_detail": lambda self, env=None: (True, "ok")})(),
     )
-    # plumbing must PASS so the auth layer is reached (container plumbing gates
-    # before auth — itself a correct ordering we rely on).
+    # backend=local (the host IS the worker env), and the auth env resolution
+    # must STILL be container=False.
+    evaluate_profile_health(
+        {"name": "pi-local", "engine": "pi",
+         "credential_account": "pi-main", "credential_mode": "api_key", "enabled": True},
+        backend="local", sessions_root=tmp_path, depth="auth",
+    )
+    assert seen["container"] is False
+
+
+def test_container_backend_defers_auth_hello_to_worker_container(tmp_path, monkeypatch):
+    """A container-backend profile must not be gated by a HOST-local pi hello:
+    the host CLI resolves a different model/provider registry, so a model the
+    container supports can false-fail preflight. The pool probe (real, paid
+    hello inside the worker environment) is the authoritative auth check."""
+    _register_pi(tmp_path)
+    ran_hello = []
+
+    def _boom(profile):
+        ran_hello.append(profile)
+        raise AssertionError("host hello must not run for container backend")
+
+    monkeypatch.setattr("dswarm.solver.cli_driver.driver_for", _boom)
     monkeypatch.setattr(
         "dswarm.solver.profile_health._probe_container_plumbing",
         lambda **kw: (True, None, "plumbing ok"),
     )
-    # backend=container, but the auth env resolution must STILL be container=False
-    evaluate_profile_health(
-        {"name": "pi-local", "engine": "pi",
-         "credential_account": "pi-main", "credential_mode": "api_key", "enabled": True},
+    h = evaluate_profile_health(
+        {"name": "pi-glm", "engine": "pi",
+         "credential_account": "pi-main", "model": "glm-5.3-flash",
+         "credential_mode": "api_key", "enabled": True},
         backend="container", sessions_root=tmp_path, depth="auth",
     )
-    assert seen["container"] is False
+    assert h.status == "ok"
+    assert "deferred" in (h.detail or "")
+    assert not ran_hello
 
 
 def test_auth_failure_reports_auth_layer(tmp_path, monkeypatch):

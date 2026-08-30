@@ -60,6 +60,23 @@ _UPSTREAM_BASE = os.environ.get(
 
 _UPSTREAM_PATH = "/chat/completions"
 
+# bigmodel (GLM open platform) rejects reasoning_effort values outside
+# low/high/max on always-thinking models (code 1210, "请使用 low、high 或 max").
+# pi's openai-completions path sends its default effort ("medium") regardless of
+# the model spec's thinkingLevelMap, so the gateway normalizes the dialect here
+# — it is the single controlled upstream funnel.
+_BIGMODEL_HOST = "open.bigmodel.cn"
+_VALID_EFFORT_LEVELS = {"low", "high", "max"}
+
+
+def normalize_upstream_request(req: dict, *, upstream_base: str = _UPSTREAM_BASE) -> dict:
+    """Adapt OpenAI-style request fields to the configured upstream's dialect."""
+    if _BIGMODEL_HOST in str(upstream_base or ""):
+        effort = req.get("reasoning_effort")
+        if isinstance(effort, str) and effort.strip().lower() not in _VALID_EFFORT_LEVELS:
+            req["reasoning_effort"] = "low"
+    return req
+
 
 _TOKEN_SCOPES = frozenset({"worker", "review", "recon", "btw"})
 
@@ -547,10 +564,15 @@ class ModelGateway:
         except Exception:
             pass
         upstream_url = f"{_UPSTREAM_BASE}{_UPSTREAM_PATH}"
+        req = normalize_upstream_request(req)
         headers = {
             "Authorization": f"Bearer {real_key}",
             "Content-Type": "application/json",
         }
+        try:
+            log.info("gateway request fields run=%s keys=%s", run_id, sorted(req.keys()))
+        except Exception:
+            pass
         t0 = time.time()
         try:
             with httpx.stream(
@@ -621,6 +643,19 @@ class ModelGateway:
                 break
         payload = "\n".join(usage_parts)
         outcome = "provider_error" if resp.status_code >= 400 else "succeeded"
+        if resp.status_code >= 400:
+            # The upstream rejected the request: persist WHICH field/shape it
+            # disliked (worker 400s were previously undiagnosable — the body is
+            # the only evidence and it died with the worker process).
+            try:
+                dump = Path(self.sessions_root or ".") / f"{call.run_id}-rejected-request.json"
+                dump.write_text(json.dumps(req, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception:
+                dump = None
+            log.warning(
+                "gateway upstream %d body run=%s: %s ; request keys=%s ; dump=%s",
+                resp.status_code, call.run_id, payload[:400], sorted(req.keys()), dump,
+            )
         self._finish_gateway_call(
             call, outcome=outcome, usage=self._extract_usage(payload),
             legacy_payload=payload,

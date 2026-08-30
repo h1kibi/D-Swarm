@@ -365,17 +365,32 @@ class RuntimeSnapshotBuilder:
                     "rcp-v2",
                     "tool-disabled-probe",
                 )
-                credential_binding_id = str(
-                    profile.get("credential_account")
-                    or profile.get("credential_binding_id")
-                    or ""
-                ).strip()
                 provider_binding_id = str(
                     profile.get("provider_ref")
                     or profile.get("provider_binding_id")
                     or profile.get("engine")
                     or ""
                 ).strip()
+                credential_binding_id = str(
+                    profile.get("credential_account")
+                    or profile.get("credential_binding_id")
+                    or ""
+                ).strip()
+                if not credential_binding_id:
+                    # A provider-bound profile keeps no credential_account (the
+                    # provider binding owns the secret); the pool key still needs
+                    # a stable non-secret binding identity, so an explicitly
+                    # configured provider doubles as the binding id. The engine
+                    # fallback above is an accounting label only — a profile with
+                    # neither an account nor a provider cannot authenticate a
+                    # worker, so fail at freeze time.
+                    credential_binding_id = str(
+                        profile.get("provider_ref")
+                        or profile.get("provider_binding_id")
+                        or ""
+                    ).strip()
+                if not credential_binding_id:
+                    raise RuntimePolicyError("invalid_credential_binding_id")
                 pool = PoolSpec.with_computed_id(
                     profile_id=profile_id,
                     runtime_kind=str(profile.get("engine") or "").strip(),

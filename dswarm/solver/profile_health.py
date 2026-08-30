@@ -300,6 +300,17 @@ def evaluate_profile_health(
         return mk("ok", detail="auth deferred to worker container",
                   binding_kind=bk, effective_credential_id=effective_account_id)
 
+    # A container-backend worker runs the WORKER image's own pi + config: the
+    # host CLI may resolve a different (smaller) model/provider registry, so a
+    # host-local hello can false-fail a model the container happily uses (and
+    # vice versa). The M9a pool probe is the authoritative auth check — a real,
+    # accounted one-turn hello inside the actual worker environment — so defer
+    # instead of gating dispatch on the wrong filesystem. Host backend still
+    # probes here: for local workers the host environment IS the worker env.
+    if backend == "container":
+        return mk("ok", detail="auth deferred to worker container probe",
+                  binding_kind=bk, effective_credential_id=effective_account_id)
+
     from dswarm.solver.cli_driver import driver_for  # lazy: avoid import cycle
 
     # container=False ALWAYS — see module docstring. The probe is a host

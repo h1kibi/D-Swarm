@@ -2963,6 +2963,49 @@ def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, 
     assert 'readSecret("OPENAI_API_KEY")' in runtime_provider.read_text(encoding="utf-8")
 
 
+def test_provider_bound_lease_worker_uses_gateway_token_not_raw_key(
+        challenge, tmp_path, monkeypatch):
+    """A provider_ref-only profile on the strict lease path must authenticate
+    with a gateway task token (ctf-gateway provider). The provider's raw API
+    key must never enter the worker env — the relay keeps it host-side."""
+    import dswarm.solver.container_exec as container_exec
+
+    wroot = tmp_path / "workspace" / "workers"
+    wroot.mkdir(parents=True, exist_ok=True)
+    sw = _reason_swarm(
+        challenge, tmp_path, worker_backend="container", worker_root=wroot,
+    )
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", lambda _path: None)
+
+    class _FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return (path.replace(str(tmp_path / "workspace"), "/home/kali/workspace")
+                    .replace("\\", "/"))
+
+    profile = {
+        "id": "seat_pi_glm",
+        "name": "seat_pi_glm",
+        "engine": "pi",
+        "credential_account": "",
+        "provider_ref": "zhipu",
+        "model": "glm-5.3-flash",
+    }
+    env = sw._runtime_env_for(
+        "pi", "cli-pi", container=_FakeContainer(), profile=profile,
+        task_token="task-token", home_and_gateway_only=True,
+    )
+
+    assert env["DSWARM_PI_PROVIDER"] == "ctf-gateway"
+    assert env["DSWARM_TASK_TOKEN"] == "task-token"
+    assert env["DEEPSEEK_API_KEY"] == "task-token"
+    assert env["DSWARM_WORKER_MODEL"] == "glm-5.3-flash"
+    # the provider relay's raw secret must stay host-side
+    assert "OPENAI_API_KEY" not in env
+    assert "DSWARM_WORKER_API_KEY" not in env
+    assert "OPENAI_BASE_URL" not in env
+    assert "DSWARM_WORKER_BASE_URL" not in env
+
+
 
 @pytest.mark.asyncio
 async def test_run_teardown_revokes_all_tokens_for_run(challenge, tmp_path, monkeypatch):

@@ -169,12 +169,13 @@ def build_docker_runtime_context(
 
 
 def _credential_mode(profile: Mapping[str, Any]) -> str:
-    explicit_endpoint = bool(
-        profile.get("base_url")
-        or profile.get("api_key_ref")
-        or profile.get("provider_ref")
-    )
-    return "direct" if explicit_endpoint else "gateway"
+    if profile.get("base_url") or profile.get("api_key_ref"):
+        return "direct"
+    # A provider_ref-only binding owns its secret on the relay side; container
+    # workers authenticate with gateway task tokens (never the upstream key).
+    # ("direct" would make the projector look for an accounts-store entry that
+    # provider bindings intentionally do not have.)
+    return "gateway"
 
 
 def _validate_snapshot_profiles(

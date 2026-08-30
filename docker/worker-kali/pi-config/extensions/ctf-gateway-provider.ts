@@ -46,10 +46,11 @@ export default function registerCtfGateway(pi: ExtensionAPI) {
       id: "glm-5.3-flash",
       name: "GLM 5.3 Flash (gateway)",
       reasoning: true,
+      // bigmodel rejects reasoning_effort "medium"/"minimal" (code 1210: use low/high/max)
       thinkingLevelMap: {
         minimal: null,
-        low: null,
-        medium: null,
+        low: "low",
+        medium: "low",
         high: "high",
         max: "max",
       },

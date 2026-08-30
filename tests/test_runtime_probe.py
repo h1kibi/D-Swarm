@@ -239,6 +239,36 @@ async def test_probe_has_independent_identity_and_private_probe_session():
 
 
 @pytest.mark.asyncio
+async def test_probe_prepares_materialized_home_inside_workspace(tmp_path):
+    """The probe hello runs in the pool container where the runtime agent's
+    baseEnv HOME has NO pi provider config. The probe must materialize a probe
+    HOME (same mechanism as worker spawn) and forward HOME/PI_CODING_AGENT_DIR,
+    or the hello fails with "Unknown provider" regardless of the credential."""
+    from dswarm.solver.runtime_probe import RuntimeProbe
+
+    calls = []
+    executor = FakeExecutor(calls)
+    executor.run_root = tmp_path
+    result = await RuntimeProbe(usage_writer=OrderedWriter(calls), budget_gate=AllowBudget()).run(
+        executor=executor,
+        pool_spec=pool_spec(),
+        credential_projection=projection(),
+        generation=1,
+        timeout=5,
+    )
+    assert result.ready
+    env = executor.last_request["kwargs"]["env"]
+    home = env["HOME"]
+    assert home.startswith("/home/kali/workspace/homes/probe-")
+    assert env["PI_CODING_AGENT_DIR"] == f"{home}/.pi/agent"
+    # the materialized config landed on the shared bind mount under the
+    # workspace (container-visible), not just an ephemeral host path
+    label = home.rsplit("/", 1)[-1]
+    materialized = tmp_path / "workspace" / "homes" / label
+    assert materialized.is_dir()
+
+
+@pytest.mark.asyncio
 async def test_probe_success_is_cached_and_identity_changes_invalidate_cache():
     from dswarm.solver.runtime_probe import RuntimeProbe
 

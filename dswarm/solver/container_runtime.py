@@ -232,6 +232,17 @@ class DockerCliRuntimeAdapter:
         args.extend(request.command)
         result = docker_run(*args, timeout=60.0)
         if result.returncode != 0:
+            # docker create failures were previously undiagnosable: the code
+            # alone said nothing about WHICH argument docker rejected.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "docker create failed rc=%s stderr=%s stdout=%s argv_tail=%s",
+                result.returncode,
+                (result.stderr or "")[-400:],
+                (result.stdout or "")[-200:],
+                args[-12:],
+            )
             raise ContainerRuntimeError("container_create_failed")
         container_id = result.stdout.strip()
         if not container_id:

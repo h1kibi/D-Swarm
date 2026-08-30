@@ -304,8 +304,11 @@ class WorkerRuntimeMixin:
         explicit_endpoint = bool(
             (profile or {}).get("base_url")
             or (profile or {}).get("api_key_ref")
-            or (profile or {}).get("provider_ref")
         )
+        # provider_ref is NOT an explicit endpoint for container workers: a
+        # provider binding owns its secret on the relay/gateway side, so the
+        # worker authenticates with a gateway task token (the ctf-gateway
+        # provider), never with the provider's raw key.
         source_env = None
         if explicit_endpoint and not home_and_gateway_only:
             source_env = {**os.environ, "DSWARM_PI_PROVIDER": "dswarm-worker"}
@@ -322,7 +325,12 @@ class WorkerRuntimeMixin:
         if profile:
             provider_ref = str(profile.get("provider_ref") or "").strip()
             resolved_provider = None
-            if provider_ref:
+            if provider_ref and not home_and_gateway_only:
+                # Direct-provider projection is a LOCAL-exec path only: it hands
+                # the provider's raw API key to the worker env. On the strict
+                # lease path (container workers) the secret must stay host-side;
+                # the worker authenticates to the model gateway with a task
+                # token instead (block below).
                 provider_store = None
                 if self.workspace_root is not None:
                     provider_store = LLMProviderSecretStore(provider_secret_root(self.workspace_root.parent))
@@ -691,8 +699,10 @@ class WorkerRuntimeMixin:
         explicit_endpoint = bool(
             (profile or {}).get("base_url")
             or (profile or {}).get("api_key_ref")
-            or (profile or {}).get("provider_ref")
         )
+        # provider_ref binds the profile to a relay whose secret stays host-side:
+        # container workers authenticate with a gateway task token, so a
+        # provider_ref alone must NOT suppress token minting.
         if (strict_docker or container is not None) and not explicit_endpoint:
             from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
             gateway_token = ModelGateway.instance().issue_worker(WorkerClaims(

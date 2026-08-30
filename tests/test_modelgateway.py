@@ -530,3 +530,30 @@ async def test_gateway_usage_bridge_unregister_does_not_fallback_to_stale_defaul
 
     assert seen_default == []
     assert seen_run == []
+
+
+def test_normalize_upstream_request_snaps_invalid_bigmodel_effort():
+    """bigmodel 1210: always-thinking models reject reasoning_effort medium/
+    minimal (only low/high/max). The gateway is the single upstream funnel, so
+    it normalizes the dialect for bigmodel upstreams only."""
+    from dswarm.solver.modelgateway import normalize_upstream_request
+
+    bigmodel = "https://open.bigmodel.cn/api/paas/v4"
+    req = normalize_upstream_request(
+        {"model": "glm-5.3-flash", "reasoning_effort": "medium"}, upstream_base=bigmodel)
+    assert req["reasoning_effort"] == "low"
+    req = normalize_upstream_request(
+        {"model": "glm-5.3-flash", "reasoning_effort": "minimal"}, upstream_base=bigmodel)
+    assert req["reasoning_effort"] == "low"
+    # valid values pass through untouched
+    req = normalize_upstream_request(
+        {"model": "glm-5.3-flash", "reasoning_effort": "high"}, upstream_base=bigmodel)
+    assert req["reasoning_effort"] == "high"
+    # absent effort stays absent
+    req = normalize_upstream_request({"model": "glm-5.3-flash"}, upstream_base=bigmodel)
+    assert "reasoning_effort" not in req
+    # other upstreams are not rewritten
+    req = normalize_upstream_request(
+        {"model": "glm-5.3-flash", "reasoning_effort": "medium"},
+        upstream_base="https://api.deepseek.com")
+    assert req["reasoning_effort"] == "medium"

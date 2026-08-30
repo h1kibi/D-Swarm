@@ -293,6 +293,38 @@ class RuntimeProbe:
         driver = PiDriver()
         spec = driver.probe_spec(model=pool_spec.model, session_dir=session_dir)
         env = dict(getattr(credential_projection, "env", {}) or {})
+        # The runtime agent's baseEnv HOME (/home/kali) has NO pi provider
+        # config — only the image's own user home and the run-materialized
+        # workspace homes do. Without an explicit HOME the probe hello ran the
+        # bare CLI (no ctf-gateway/dswarm-worker provider) and failed with the
+        # same "Unknown provider / model not found" symptom as a mis-bound
+        # credential. Materialize a probe HOME exactly like the worker spawn
+        # path does (worker_runtime_mixin), inside the bind-mounted workspace.
+        try:
+            from dswarm.solver.container_exec import (
+                CONTAINER_WORKSPACE,
+                _chown_tree_to_worker,
+            )
+            from dswarm.swarm._bootstrap_assets import (
+                _ensure_pi_config_links,
+                _materialize_runtime_pi_config,
+            )
+
+            probe_label = f"probe-{probe_id}"
+            workspace_root = root / "workspace"
+            probe_home = workspace_root / "homes" / probe_label
+            probe_home.mkdir(parents=True, exist_ok=True)
+            runtime_config = _materialize_runtime_pi_config(workspace_root)
+            _ensure_pi_config_links(
+                probe_home,
+                config_target_root=f"{CONTAINER_WORKSPACE}/.dswarm_runtime/pi-config",
+                copy_source=runtime_config,
+            )
+            _chown_tree_to_worker(str(probe_home))
+            env["HOME"] = f"{CONTAINER_WORKSPACE}/homes/{probe_label}"
+            env["PI_CODING_AGENT_DIR"] = f'{env["HOME"]}/.pi/agent'
+        except Exception:  # noqa: BLE001 - HOME prep is best-effort preflight
+            pass
         if getattr(credential_projection, "credential_mode", "") == "gateway":
             # The readiness probe runs BEFORE any worker spawn, so no task token
             # exists yet — but its pi call goes through the ctf-gateway provider,

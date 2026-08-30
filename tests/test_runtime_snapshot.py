@@ -194,6 +194,43 @@ def test_snapshot_freezes_image_id_pool_limit_and_binding_identity(tmp_path):
         assert forbidden not in serialized
 
 
+def test_provider_bound_profile_falls_back_to_provider_ref_as_binding_id():
+    profile = {
+        "id": "pi-glm",
+        "name": "pi-glm",
+        "engine": "pi",
+        "runtime": "docker-web",
+        "image": "worker:a",
+        # normalize_worker_profile clears credential_account whenever a
+        # provider_ref is set; the provider binding owns the secret.
+        "credential_account": "",
+        "provider_ref": "zhipu",
+        "model": "glm-5.3-flash",
+    }
+    snapshot = build_snapshot(
+        worker_profiles=[profile], run_max_workers=2,
+    )
+    assert len(snapshot.pools) == 1
+    pool = snapshot.pools[0]
+    assert pool.provider_binding_id == "zhipu"
+    assert pool.credential_binding_id == "zhipu"
+
+
+def test_profile_without_any_credential_identity_is_rejected():
+    profile = {
+        "id": "pi-orphan",
+        "name": "pi-orphan",
+        "engine": "pi",
+        "runtime": "docker-web",
+        "image": "worker:a",
+        "credential_account": "",
+        "model": "glm-5.3-flash",
+    }
+    with pytest.raises(RuntimeSnapshotBuildError) as exc:
+        build_snapshot(worker_profiles=[profile], run_max_workers=2)
+    assert exc.value.code == "invalid_credential_binding_id"
+
+
 def test_snapshot_is_create_once_and_tag_drift_does_not_rewrite_existing_run(tmp_path):
     store = RuntimeSnapshotStore(tmp_path)
     original = snapshot_builder(image_ids={"worker:a": "sha256:old"}).build(

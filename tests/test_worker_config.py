@@ -846,6 +846,42 @@ def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path
             "name": "pi-sub",
             "engine": "pi",
             "transport": "pi_cli",
+            "credential_mode": "api_key",
+            "credential_account": "pi-main",
+            "runtime": "local",
+            "enabled": True,
+        }],
+        runtime_profiles=[{"id": "local", "backend": "local"}],
+        sessions_root=tmp_path,
+    )
+
+    assert missing == []
+    assert seen["key"] == "deepseek-secret"
+    assert any("Reply with exactly: OK" in str(x) for x in seen["argv"])
+
+
+def test_container_backend_dispatch_precheck_defers_hello(tmp_path, monkeypatch):
+    """A container-backend profile must not run a HOST-local pi hello in the
+    dispatch precheck: the host CLI resolves a different model/provider
+    registry (a glm/gateway model false-fails there). The worker-container
+    pool probe is the authoritative auth check."""
+
+    seen_argv: list = []
+
+    def fake_run(argv, **kwargs):
+        seen_argv.append(argv)
+        # plumbing probe (docker run) may pass; a pi hello would too — asserted below.
+        return subprocess.CompletedProcess(argv, 0, "Docker version", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    account = tmp_path / "_secrets" / "accounts" / "pi-main"
+    account.mkdir(parents=True)
+    (account / "API_KEY").write_text("deepseek-secret\n")
+    missing = _missing_profile_accounts(
+        worker_profiles=[{
+            "id": "pi-glm",
+            "name": "pi-glm",
+            "engine": "pi",
             "credential_mode": "subscription",
             "credential_account": "pi-main",
             "runtime": "docker-web",
@@ -854,10 +890,8 @@ def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path
         runtime_profiles=[{"id": "docker-web", "backend": "container"}],
         sessions_root=tmp_path,
     )
-
     assert missing == []
-    assert seen["key"] == "deepseek-secret"
-    assert any("Reply with exactly: OK" in str(x) for x in seen["argv"])
+    assert not any("Reply with exactly: OK" in str(x) for x in seen_argv)
 
 
 def test_offline_custom_endpoint_auto_relaxes_strict_network(tmp_path, monkeypatch):

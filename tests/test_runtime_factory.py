@@ -16,7 +16,12 @@ from dswarm.solver.runtime_policy import (
     RuntimeSnapshot,
     build_runtime_policy,
 )
-from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuildError, RuntimeSnapshotStore
+from dswarm.solver.runtime_snapshot import (
+    DockerImageInspector,
+    RuntimeSnapshotBuilder,
+    RuntimeSnapshotBuildError,
+    RuntimeSnapshotStore,
+)
 from dswarm.swarm.budget import ProfileBudgetGate
 
 
@@ -58,6 +63,19 @@ def _snapshot(
         shared_gid=1000,
         pools=tuple(sorted(pools, key=lambda pool: (pool.profile_id, pool.pool_id))),
     )
+
+
+class FakeDocker:
+    def __init__(self):
+        self.images: dict[str, str] = {}
+        self.identity: tuple[int, int] = (1000, 1000)
+
+    def resolve_image(self, ref):
+        image_id = self.images.get(ref)
+        return {"image_id": image_id} if image_id else None
+
+    def query_user(self, image_id, user, *, network, mounts, env):
+        return self.identity
 
 
 class RecordingBuilder:
@@ -193,6 +211,60 @@ def test_runtime_context_passes_direct_and_gateway_credential_modes(tmp_path: Pa
     assert captured["credential_projector"] is not None
     assert captured["probe"] is not None
     assert callable(captured["executor_factory"])
+
+
+def test_provider_bound_profile_projects_gateway_mode(tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def manager_factory(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return type("Manager", (), {
+            "run_id": kwargs["run_id"],
+            "snapshot": kwargs["snapshot"],
+        })()
+
+    profile = {
+        "id": "pi-glm",
+        "name": "pi-glm",
+        "engine": "pi",
+        "runtime": "docker-web",
+        "image": "worker:web",
+        # normalize_worker_profile clears credential_account when a provider_ref
+        # is set; the provider relay owns the secret, workers get task tokens.
+        "credential_account": "",
+        "provider_ref": "zhipu",
+        "model": "glm-5.3-flash",
+        "enabled": True,
+    }
+    runtime = {
+        "id": "docker-web",
+        "backend": "container",
+        "network": "bridge",
+        "cpus": "2.0",
+        "memory": "2G",
+        "pids_limit": 256,
+        "tmpfs_bytes": 67108864,
+    }
+    docker = FakeDocker()
+    docker.images["worker:web"] = "sha256:" + "a" * 64
+    docker.identity = (1000, 1000)
+    context = build_docker_runtime_context(
+        run_id="tui-run",
+        sessions_root=tmp_path / "sessions",
+        bus=EventBus(),
+        budget_gate=ProfileBudgetGate(),
+        worker_profiles=[profile],
+        runtime_profiles=[runtime],
+        run_max_workers=2,
+        snapshot_builder=RuntimeSnapshotBuilder(
+            DockerImageInspector(docker, allow_pull=False),
+        ),
+        pool_manager_factory=manager_factory,
+    )
+
+    pool = context["runtime_snapshot"].pools[0]
+    assert pool.credential_binding_id == "zhipu"
+    assert captured["credential_modes"][pool.pool_id] == "gateway"
 
 
 def test_runtime_context_wires_transition_callback_to_private_diagnostics(
