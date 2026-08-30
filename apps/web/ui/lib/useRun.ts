@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, DSwarmEvent, emptyDeck, reduce } from "./events";
 import { readKey, writeKey, removeKey } from "./storage";
 import type { BudgetSnapshot } from "@/components/budgetStatus";
+import type { RuntimePoolsSnapshot } from "@/components/runtimeStatus";
 
 /**
  * API base. Empty string = same-origin: `run.sh web` serves the production
@@ -188,6 +189,62 @@ export function useBudgetSnapshot(runId: string, pollMs = 4000) {
   }, [runId, rebuilding]);
 
   return { snapshot, loading, error, rebuilding, refresh, rebuild };
+}
+
+export async function fetchRuntimePools(runId: string, signal?: AbortSignal): Promise<RuntimePoolsSnapshot> {
+  const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/runtime-pools`, { signal });
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) {
+    throw new Error(String(data?.detail || `runtime-pools request failed (${res.status})`));
+  }
+  return data as RuntimePoolsSnapshot;
+}
+
+export function useRuntimePools(runId: string, pollMs = 4000) {
+  const [snapshot, setSnapshot] = useState<RuntimePoolsSnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    if (!runId || isDraftRunId(runId)) return null;
+    setLoading(true);
+    try {
+      const next = await fetchRuntimePools(runId, signal);
+      if (!signal?.aborted) {
+        setSnapshot(next);
+        setError(null);
+      }
+      return next;
+    } catch (err) {
+      if (!signal?.aborted) setError(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, [runId]);
+
+  useEffect(() => {
+    if (!runId || isDraftRunId(runId)) {
+      setSnapshot(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    let alive = true;
+    const poll = async () => {
+      if (!alive) return;
+      await refresh(controller.signal);
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), Math.max(1000, pollMs));
+    return () => {
+      alive = false;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [runId, pollMs, refresh]);
+
+  return { snapshot, loading, error, refresh };
 }
 
 /** One run as the thread rail lists it (matches RunManager.Run.summary()). */

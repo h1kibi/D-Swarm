@@ -29,6 +29,8 @@ import { HitlCard } from "@/components/HitlCard";
 import { Icon } from "@/components/Icon";
 import { workerColor, workerInitial, workerShortLabel } from "@/lib/workers";
 import { BudgetStatus } from "@/components/BudgetStatusPanel";
+import { RuntimeStatus } from "@/components/RuntimeStatusPanel";
+import type { RuntimePoolsSnapshot } from "@/components/runtimeStatus";
 import type { BudgetSnapshot } from "@/components/budgetStatus";
 
 /**
@@ -388,6 +390,9 @@ export function SwarmInspector({
   maxWidth,
   defaultWidth,
   budgetSnapshot,
+  runtimeSnapshot,
+  runtimeLoading,
+  runtimeError,
   budgetLoading,
   budgetRebuilding,
   budgetError,
@@ -408,6 +413,9 @@ export function SwarmInspector({
   maxWidth: number;
   defaultWidth: number;
   budgetSnapshot?: BudgetSnapshot | null;
+  runtimeSnapshot?: RuntimePoolsSnapshot | null;
+  runtimeLoading?: boolean;
+  runtimeError?: string | null;
   budgetLoading?: boolean;
   budgetRebuilding?: boolean;
   budgetError?: string | null;
@@ -590,6 +598,11 @@ export function SwarmInspector({
           rebuilding={budgetRebuilding}
           error={budgetError}
           onRebuild={onRebuildBudget}
+        />
+        <RuntimeStatus
+          snapshot={runtimeSnapshot}
+          loading={runtimeLoading}
+          error={runtimeError}
         />
         {tab === "workers" && (
           <>

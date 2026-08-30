@@ -482,6 +482,10 @@ export interface DeckState {
   // set when the planner PAUSED waiting for operator input (a worker raised a
   // NEED_INPUT / env_down). Holds the outstanding ask(s). Cleared on resume.
   awaitingOperator?: string;
+  // M9a runtime observability: run-level degradation feed, folded from
+  // actor="coordinator" runtime_degraded deltas (arrival order, deduped by
+  // engine+reason). Observational only — never a flag/verdict source.
+  runtimeDegraded: { engine: string; reason: string; ts?: number }[];
 }
 
 export function emptyDeck(runId: string): DeckState {
@@ -517,6 +521,7 @@ export function emptyDeck(runId: string): DeckState {
     hitlRequests: [],
     operatorDirectives: [],
     resourceLocks: [],
+    runtimeDegraded: [],
     compactEpochs: 0,
     gauge: { zones: [], total: 0, limit: 0 },
     usd: 0,
@@ -1158,6 +1163,15 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
         case "runtime_degraded":
         case "worker_backend_degraded": {
           tlabel(`${actor} runtime degraded: ${p.reason ?? p.backend ?? "unknown"}`);
+          {
+            const engine = String(p.engine ?? p.solver_id ?? "");
+            const reason = String(p.reason ?? p.backend ?? "");
+            if (!s.runtimeDegraded.some(
+              (row) => row.engine === engine && row.reason === reason,
+            )) {
+              s.runtimeDegraded = [...s.runtimeDegraded, { engine, reason, ts: ev.ts }];
+            }
+          }
           const sid = p.solver_id ?? p.engine ?? actor;
           if (sid) {
             const l = lane(s, sid);

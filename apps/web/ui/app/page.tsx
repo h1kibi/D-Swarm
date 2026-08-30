@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRun, useRunList, useFolders, useBudgetSnapshot, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
+import { useRun, useRunList, useFolders, useBudgetSnapshot, useRuntimePools, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
 import { I18nProvider } from "@/lib/i18n";
@@ -135,6 +135,7 @@ function Deck() {
   }, [runId]);
   const { deck, connected, start, sendHitl, resolve } = useRun(runId);
   const budget = useBudgetSnapshot(runId);
+  const runtime = useRuntimePools(runId);
 
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [railWidth, setRailWidth] = useState(RAIL_WIDTH_DEFAULT);
@@ -739,6 +740,9 @@ function Deck() {
             maxWidth={inspectorWidthMax(winW)}
             defaultWidth={INSPECTOR_WIDTH_DEFAULT}
             budgetSnapshot={budget.snapshot}
+            runtimeSnapshot={runtime.snapshot}
+            runtimeLoading={runtime.loading}
+            runtimeError={runtime.error}
             budgetLoading={budget.loading}
             budgetRebuilding={budget.rebuilding}
             budgetError={budget.error}

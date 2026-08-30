@@ -5683,3 +5683,9 @@ body.swarm-resizing * {
 .budget-blocked { color: var(--red); font-size: 10px; }
 
 .budget-error { margin-top: 7px; color: var(--amber); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.runtime-pool-row { display: grid; gap: 3px; min-width: 0; padding: 6px 7px; border-radius: 8px; background: color-mix(in srgb, var(--panel2) 76%, transparent); }
+.runtime-pool-row.bad { background: color-mix(in srgb, var(--red) 8%, var(--panel2)); }
+.runtime-gen { color: var(--muted); font-size: 10px; }
+.runtime-problem { color: var(--red); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-history-hint { color: var(--muted); font-size: 10px; }

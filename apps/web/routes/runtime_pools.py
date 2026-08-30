@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from dswarm.solver.runtime_diagnostics import sanitize_pool_id
+from dswarm.solver.runtime_diagnostics import (
+    RuntimeDiagnosticsStore,
+    sanitize_pool_id,
+)
 
 _SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+# Per-pool lifecycle history surfaced to the deck: an allowlisted projection of
+# the already-sanitized diagnostics rows (codes only, no free-text reasons).
+_HISTORY_FIELDS = (
+    "state", "reason_code", "recovery_episode", "updated_at", "kind", "generation",
+)
+_HISTORY_LIMIT = 8
 
 
 def _safe_int(value: Any) -> int:
@@ -53,14 +64,49 @@ def _project_view(view: Any) -> dict[str, Any]:
     }
 
 
+def _project_history_row(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    out: dict[str, Any] = {field: row.get(field) for field in _HISTORY_FIELDS}
+    failure = row.get("failure")
+    out["failure"] = (
+        {
+            "category": str(failure.get("category") or "infrastructure"),
+            "code": str(failure.get("code") or "runtime_operation_failed"),
+        }
+        if isinstance(failure, dict)
+        else None
+    )
+    return out
+
+
 @router.get("/{run_id}/runtime-pools")
 async def get_runtime_pools(run_id: str, request: Request) -> dict[str, Any]:
-    run = request.app.state.manager.get(run_id)
+    manager = request.app.state.manager
+    run = manager.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run_not_found")
     pool_manager = run.pool_manager
     views = pool_manager.snapshot_view() if pool_manager is not None else ()
-    return {"run_id": run_id, "pools": [_project_view(view) for view in views]}
+    policy = getattr(run, "runtime_policy", None)
+    policy_mode = str(getattr(policy, "mode", "") or "")
+    store = RuntimeDiagnosticsStore(
+        run_root=Path(manager.sessions_root) / run_id, run_id=run_id,
+    )
+    pools: list[dict[str, Any]] = []
+    for view in views:
+        pool = _project_view(view)
+        try:
+            rows = store.read_lifecycle(pool["pool_id"])[- _HISTORY_LIMIT:]
+        except Exception:  # noqa: BLE001 - diagnostics are best-effort observability
+            rows = []
+        pool["history"] = [_project_history_row(row) for row in rows]
+        pools.append(pool)
+    return {
+        "run_id": run_id,
+        "policy_mode": policy_mode,
+        "pools": pools,
+    }
 
 
 __all__ = ["router"]

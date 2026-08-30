@@ -102,21 +102,24 @@ async def test_runtime_pools_get_is_read_only(tmp_path):
         response = await client.get("/api/runs/run-a/runtime-pools")
         missing = await client.get("/api/runs/missing/runtime-pools")
     assert response.status_code == 200
-    assert response.json() == {
-        "run_id": "run-a",
-        "pools": [
-            {
-                "pool_id": "pool-a",
-                "state": "ready",
-                "generation": 2,
-                "pool_instance_id": "instance-a",
-                "active_workers": 1,
-                "waiting_workers": 0,
-                "capacity": 2,
-                "failure": None,
-                "recovery_episode": 0,
-            }
-        ],
-    }
+    body = response.json()
+    # no runtime policy frozen for this bare run -> empty mode; each pool now
+    # also carries its (empty here) sanitized lifecycle history
+    assert body["run_id"] == "run-a"
+    assert body["policy_mode"] == ""
+    assert body["pools"] == [
+        {
+            "pool_id": "pool-a",
+            "state": "ready",
+            "generation": 2,
+            "pool_instance_id": "instance-a",
+            "active_workers": 1,
+            "waiting_workers": 0,
+            "capacity": 2,
+            "failure": None,
+            "recovery_episode": 0,
+            "history": [],
+        }
+    ]
     assert missing.status_code == 404
     assert run.pool_manager.transition_count == 7
