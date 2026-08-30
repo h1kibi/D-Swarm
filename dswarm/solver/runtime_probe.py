@@ -197,10 +197,17 @@ class RuntimeProbe:
                 raise
             except Exception as exc:  # noqa: BLE001 - classify sanitized exception text
                 failure = self._classify_exception(exc)
+                self._log_probe_evidence(probe_id, attempt, failure, exc_text=str(exc))
                 await self._finish(call, call_outcome=self._outcome_for(failure), usage_status="unknown")
                 last_failure = failure
             else:
                 failure, usage_status, usage = self._classify_result(result)
+                if failure is not None:
+                    self._log_probe_evidence(
+                        probe_id, attempt, failure,
+                        exc_text=str(getattr(result, "text", "") or ""),
+                        rc=getattr(result, "runtime_status", {}) or {},
+                    )
                 await self._finish(
                     call,
                     call_outcome="succeeded" if failure is None else self._outcome_for(failure),
@@ -368,6 +375,22 @@ class RuntimeProbe:
                 operation_kind="runtime_probe",
             ),
             timeout=timeout,
+        )
+
+    @staticmethod
+    def _log_probe_evidence(
+        probe_id: str, attempt: int, failure: RuntimeFailure, *,
+        exc_text: str, rc: Any = None,
+    ) -> None:
+        """A failed probe's worker output dies with the pool container; persist
+        the classified reason + output snippet so the failure is diagnosable
+        (run-6964-class transport errors had zero evidence)."""
+        import logging
+
+        snippet = " ".join(str(exc_text or "").split())[:400]
+        logging.getLogger(__name__).warning(
+            "probe failed probe_id=%s attempt=%d category=%s code=%s rc=%s output=%s",
+            probe_id, attempt, failure.category, failure.code, rc, snippet,
         )
 
     @staticmethod

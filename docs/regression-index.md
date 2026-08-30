@@ -53,6 +53,7 @@
 | `run-75378` | Blackboard skill materialization must refresh from the repository; stale user-scope copies are not trusted. | `dswarm/solver/blackboard_skill.py:28`; `dswarm/solver/blackboard_skill.py:108`; `dswarm/swarm/swarm.py:617` |
 | `run-4408` | Pool containers that die during startup must leave their terminal state and agent logs in the backend log before cleanup; silent hello/identity failures were undiagnosable. | `dswarm/solver/container_runtime.py` (`_log_pool_container_death`) |
 | `run-75379` | The accepted flag must trace to real command output; invalidation/reopen, streamed output, and multi-flag fuel must not split into contradictory states. | `dswarm/solver/cli_solver.py:1582`; `dswarm/solver/cli_solver.py:1689`; `dswarm/solver/cli_solver.py:1975`; `dswarm/swarm/swarm.py:540`; `dswarm/swarm/swarm.py:571` |
+| `run-6964` | A failed readiness probe must persist its classified reason and worker output snippet to the backend log before the pool container is torn down; transport-class probe failures otherwise vanish with the container. | `dswarm/solver/runtime_probe.py` (`_log_probe_evidence`) |
 
 ## Legacy labels
 
