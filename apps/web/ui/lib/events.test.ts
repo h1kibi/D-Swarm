@@ -223,3 +223,58 @@ describe("reduce", () => {
   });
 
 });
+
+describe("runtime observability", () => {
+  it("accumulates runtime_degraded deltas into a deduped run-level feed", () => {
+    const s0 = emptyDeck("run-test");
+    const s1 = reduce(
+      s0,
+      ev(EventType.BLACKBOARD_DELTA, {
+        kind: "runtime_degraded",
+        actor: "coordinator",
+        engine: "pi-web",
+        backend: "local",
+        reason: "probe timeout",
+      }),
+    );
+    const s2 = reduce(
+      s1,
+      ev(EventType.BLACKBOARD_DELTA, {
+        kind: "runtime_degraded",
+        actor: "coordinator",
+        engine: "pi-web",
+        backend: "local",
+        reason: "probe timeout",
+      }),
+    );
+    const s3 = reduce(
+      s2,
+      ev(EventType.BLACKBOARD_DELTA, {
+        kind: "runtime_degraded",
+        actor: "coordinator",
+        engine: "pi-pwn",
+        reason: "image pull failed",
+      }),
+    );
+    expect(s3.runtimeDegraded).toEqual([
+      { engine: "pi-web", reason: "probe timeout", ts: 1723000000 },
+      { engine: "pi-pwn", reason: "image pull failed", ts: 1723000000 },
+    ]);
+  });
+
+  it("keeps the accumulator observational: lanes still get the badge", () => {
+    const s1 = reduce(
+      emptyDeck("run-test"),
+      ev(EventType.BLACKBOARD_DELTA, {
+        kind: "runtime_degraded",
+        actor: "coordinator",
+        solver_id: "cli-pi",
+        engine: "pi",
+        backend: "local",
+        reason: "probe timeout",
+      }),
+    );
+    expect(s1.runtimeDegraded).toHaveLength(1);
+    expect(s1.lanes["cli-pi"].runtime).toEqual({ backend: "local", status: "degraded" });
+  });
+});
