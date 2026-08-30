@@ -38,7 +38,7 @@ function EmptyPanel({ label }: { label: string }) {
   return <div className="artifact-list-empty">{label}</div>;
 }
 
-function ReviewFindingsPanel({ deck }: { deck: DeckState }) {
+export function ReviewFindingsPanel({ deck }: { deck: DeckState }) {
   const t = useT();
   const rows = deck.blackboard.reviewFindings ?? [];
   const claims = deck.blackboard.unverifiedFlags ?? [];
@@ -73,7 +73,7 @@ function ReviewFindingsPanel({ deck }: { deck: DeckState }) {
   );
 }
 
-function PocsPanel({ deck }: { deck: DeckState }) {
+export function PocsPanel({ deck }: { deck: DeckState }) {
   const t = useT();
   const rows = deck.blackboard.pocs ?? [];
   if (!rows.length) return <EmptyPanel label={t("panel.empty")} />;
@@ -94,7 +94,7 @@ function PocsPanel({ deck }: { deck: DeckState }) {
   );
 }
 
-function RoutesPanel({ deck }: { deck: DeckState }) {
+export function RoutesPanel({ deck }: { deck: DeckState }) {
   const t = useT();
   const routes = deck.blackboard.suppressedRoutes ?? [];
   const branches = deck.blackboard.branches ?? [];
@@ -124,7 +124,7 @@ function RoutesPanel({ deck }: { deck: DeckState }) {
   );
 }
 
-function DirectivesPanel({ deck }: { deck: DeckState }) {
+export function DirectivesPanel({ deck }: { deck: DeckState }) {
   const t = useT();
   const rows = deck.blackboard.directives ?? [];
   const lifecycle = deck.operatorDirectives ?? [];
@@ -154,7 +154,7 @@ function DirectivesPanel({ deck }: { deck: DeckState }) {
   );
 }
 
-function CredentialsPanel({ runId }: { runId: string }) {
+export function CredentialsPanel({ runId }: { runId: string }) {
   const t = useT();
   const [rows, setRows] = useState<CredentialRow[]>([]);
   const [loading, setLoading] = useState(true);

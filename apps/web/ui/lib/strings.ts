@@ -1027,6 +1027,10 @@ export const STRINGS: Dict = {
   "budget.blocked": { zh: "已阻断", en: "blocked" },
   "budget.groupProfile": { zh: "模型配置", en: "Profiles" },
   "budget.groupAccount": { zh: "计费账户", en: "Billing accounts" },
+  "detail.navAria": { zh: "详情视图导航", en: "Detail view navigation" },
+  "detail.back": { zh: "← 返回解题", en: "← Back to run" },
+  "detail.loading": { zh: "正在载入运行…", en: "Loading run…" },
+  "detail.brand": { zh: "D-Swarm 详情", en: "D-Swarm detail" },
   "budget.unavailable": { zh: "预算状态暂不可用", en: "Budget status unavailable" },
 
   // ---- pheromone (Phase 5, docs/07 §P0-4/§6.3) — scheduling heat ONLY,

@@ -1199,20 +1199,26 @@ def test_settings_moved_to_rail_and_header_toggles_theme():
     assert ':root[data-theme="dark"]' in css
 
 
-def test_artifact_panel_has_resizable_width_handle():
+def test_detail_views_are_routes_not_a_drawer():
+    """The deck is timeline-first: the 10 detail views are real routes
+    (/run/<id>/<view>) opened from links — the in-page drawer that crammed a
+    fourth column into the deck is gone."""
     page = (UI_ROOT / "app" / "page.tsx").read_text()
-    panel = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
-    css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
+    detail = (UI_ROOT / "components" / "RunDetailPage.tsx").read_text()
+    route = (UI_ROOT / "app" / "run" / "[id]" / "[view]" / "page.tsx").read_text()
+    helper = (UI_ROOT / "lib" / "runRoute.ts").read_text()
+    inspector = (UI_ROOT / "components" / "SwarmInspector.tsx").read_text()
 
-    assert "dswarm.artifact.width" in page
-    assert "onArtifactResize" in page
-    assert "artifact-resizer" in panel
-    assert "aria-valuenow={width}" in panel
-    assert "onResize(defaultWidth)" in panel
-    assert ".artifact-resizer" in css
-    assert "body.artifact-resizing" in css
-    assert "art.resizeCanvas" in i18n
+    # the deck no longer hosts the drawer...
+    assert "ArtifactPanel" not in page
+    assert "detailUrlForRun" in page
+    # ...the panel chips are real links (middle/ctrl-click = new tab)
+    assert 'className="swarm-panels"' in inspector
+    assert "detailUrlForRun(runId, p.view)" in inspector
+    # ...and the route layer exists with a whitelisted view segment
+    assert "isDetailView" in route and "notFound" in route
+    assert '"evidence"' in helper and "DETAIL_VIEWS" in helper
+    assert "RunDetailPage" in detail
 
 
 def test_phase4_command_center_layout():

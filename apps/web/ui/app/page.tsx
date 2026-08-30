@@ -9,12 +9,11 @@ import { ThreadRail } from "@/components/ThreadRail";
 import { StartupTestPanel } from "@/components/StartupTestPanel";
 import { Conversation } from "@/components/Conversation";
 import type { DispatchOpts } from "@/components/Conversation";
-import { ArtifactPanel } from "@/components/ArtifactPanel";
 import { LoginGate } from "@/components/LoginGate";
 import { CommandPalette } from "@/components/CommandPalette";
 import { BtwPanel } from "@/components/BtwPanel";
 import { ToastLane, useToasts } from "@/components/Toast";
-import type { ArtifactView } from "@/components/ArtifactPanel";
+import { detailUrlForRun, type DetailView } from "@/lib/runRoute";
 import { TopBar } from "@/components/TopBar";
 import { DecisionTimeline } from "@/components/DecisionTimeline";
 import { SwarmInspector } from "@/components/SwarmInspector";
@@ -47,27 +46,10 @@ import { useDeckMotion } from "@/lib/useDeckMotion";
 const newDraftId = () => `draft-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 const isDraft = (id: string) => id.startsWith("draft-");
 type ThemeMode = "light" | "dark";
-const ARTIFACT_WIDTH_MIN = 360;
-const ARTIFACT_WIDTH_MAX = 960;
-const ARTIFACT_WIDTH_STORAGE_KEY = "dswarm.artifact.width";
 const INSPECTOR_WIDTH_MIN = 280;
 const INSPECTOR_WIDTH_MAX = 640;
 const INSPECTOR_WIDTH_DEFAULT = 340;
 const INSPECTOR_WIDTH_STORAGE_KEY = "dswarm.inspector.width";
-
-function artifactWidthMax(viewportWidth?: number): number {
-  if (!viewportWidth || viewportWidth <= 0) return ARTIFACT_WIDTH_MAX;
-  return Math.max(ARTIFACT_WIDTH_MIN, Math.min(ARTIFACT_WIDTH_MAX, Math.round(viewportWidth * 0.72)));
-}
-
-function artifactWidthDefault(viewportWidth?: number): number {
-  return clampArtifactWidth(Math.round((viewportWidth || 1280) * 0.56), viewportWidth);
-}
-
-function clampArtifactWidth(width: number, viewportWidth?: number): number {
-  const next = Number.isFinite(width) ? width : artifactWidthDefault(viewportWidth);
-  return Math.round(Math.min(artifactWidthMax(viewportWidth), Math.max(ARTIFACT_WIDTH_MIN, next)));
-}
 
 function inspectorWidthMax(viewportWidth?: number): number {
   if (!viewportWidth || viewportWidth <= 0) return INSPECTOR_WIDTH_MAX;
@@ -144,15 +126,9 @@ function Deck() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [btwOpen, setBtwOpen] = useState(false);
   const [startupTestOpen, setStartupTestOpen] = useState(false);
-  const [artifactOpen, setArtifactOpen] = useState(false);
-  const [artifactView, setArtifactView] = useState<ArtifactView>("graph");
-  const [artifactWidth, setArtifactWidth] = useState(() => artifactWidthDefault(typeof window !== "undefined" ? window.innerWidth : 1280));
-  const [artifactWidthReady, setArtifactWidthReady] = useState(false);
-  const [selected, setSelected] = useState<GraphNode | null>(null);
   // Roster-row → Worker 详情 focus seed. The nonce bumps on every click so
   // re-clicking the same worker re-focuses the lanes panel; WorkerLanes reacts
   // only to a new nonce, leaving the operator's manual chip filtering intact.
-  const [focusedWorker, setFocusedWorker] = useState<{ id: string; nonce: number } | null>(null);
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
   const [listBump, setListBump] = useState(0);
   // Unified toast/action-feedback lane: every operator mutation confirms here
@@ -227,27 +203,6 @@ function Deck() {
 
   useEffect(() => {
     try {
-      const raw = readKey(ARTIFACT_WIDTH_STORAGE_KEY);
-      const parsed = raw ? Number(raw) : NaN;
-      setArtifactWidth(clampArtifactWidth(Number.isFinite(parsed) ? parsed : artifactWidthDefault(window.innerWidth), window.innerWidth));
-    } catch {
-      setArtifactWidth(artifactWidthDefault(typeof window !== "undefined" ? window.innerWidth : 1280));
-    } finally {
-      setArtifactWidthReady(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!artifactWidthReady) return;
-    try {
-      writeKey(ARTIFACT_WIDTH_STORAGE_KEY, String(artifactWidth));
-    } catch {
-      // localStorage may be blocked; resizing should still work for this session.
-    }
-  }, [artifactWidth, artifactWidthReady]);
-
-  useEffect(() => {
-    try {
       const raw = readKey(RAIL_WIDTH_STORAGE_KEY);
       const parsed = raw ? Number(raw) : NaN;
       if (Number.isFinite(parsed)) setRailWidth(clampRailWidth(parsed, window.innerWidth));
@@ -292,10 +247,6 @@ function Deck() {
     const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
     setRailWidth(clampRailWidth(width, viewport));
   }, []);
-  const onArtifactResize = useCallback((width: number) => {
-    const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
-    setArtifactWidth(clampArtifactWidth(width, viewport));
-  }, []);
   const onInspectorResize = useCallback((width: number) => {
     const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
     setInspectorWidth(clampInspectorWidth(width, viewport));
@@ -335,22 +286,6 @@ function Deck() {
     return () => window.removeEventListener("keydown", onKey);
   }, [paletteOpen]);
 
-  // Escape closes the open artifact panel (graph / blackboard / timeline / …).
-  // Layering: modal drawers own Esc first. The rail's ⋯ menu Esc is
-  // an independent transient and doesn't conflict. Only bind while the panel is
-  // open and no modal is up. The palette is ALSO a modal layer: while it's open,
-  // its own Esc closes it (a React handler with stopPropagation can't stop this
-  // native window listener), so gate on !paletteOpen too — otherwise one Esc
-  // would close both the palette and the panel beneath it.
-  useEffect(() => {
-    if (!artifactOpen || paletteOpen || btwOpen || startupTestOpen) return;
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); setArtifactOpen(false); }
-    };
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [artifactOpen, paletteOpen, btwOpen, startupTestOpen]);
-
   // Single-key shortcuts to jump the secondary panels from the keyboard, so a
   // power operator watching a run never has to reach for the mouse. Mnemonic map:
   //   e=evidence  w=workers  g=graph  t=timeline  b=blackboard
@@ -362,7 +297,7 @@ function Deck() {
   // event.target AND document.activeElement so a steer like "go" typed into the
   // composer can never clobber a panel. Only armed once a run has started (panels
   // are meaningless on the welcome screen) and no modal is up.
-  const PANEL_KEYS: Record<string, ArtifactView> = {
+  const PANEL_KEYS: Record<string, DetailView> = {
     e: "evidence", w: "workers", g: "graph", t: "timeline", b: "blackboard",
     f: "findings", c: "credentials", p: "pocs", r: "routes", d: "directives",
   };
@@ -430,7 +365,6 @@ function Deck() {
   // pi CLI workers. The flag still only counts if it traces to real
   // execution output (provenance gate).
   const dispatch = async (prompt: string, opts?: DispatchOpts) => {
-    setSelected(null);
     // Promote a local draft to a real backend run id at send time, so the run
     // persists + orders as run-NNNN. Already-real ids (selected from the rail,
     // or promoted by addFiles when a file was attached) dispatch as-is. start()
@@ -495,16 +429,12 @@ function Deck() {
   const onNewSolve = () => {
     // Purely local: reset to a fresh empty draft. No backend run is created until
     // the operator dispatches, so "+ New solve" can't litter the rail with stubs.
-    setArtifactOpen(false);
-    setSelected(null);
     setAttachments([]);
     setRunId(newDraftId());
   };
 
   const onSelectRun = (id: string) => {
     if (id === runId) return;
-    setArtifactOpen(false);
-    setSelected(null);
     setAttachments([]);
     setOpTarget("global");
     setRunId(id);
@@ -571,7 +501,7 @@ function Deck() {
       if (!window.confirm(t("rail.confirmDelete"))) return;
       const ok = await deleteRun(a.runId);
       // if we just deleted the open conversation, fall back to a fresh draft
-      if (ok && a.runId === runId) { setArtifactOpen(false); setSelected(null); setAttachments([]); setRunId(newDraftId()); }
+      if (ok && a.runId === runId) { setAttachments([]); setRunId(newDraftId()); }
       bump();
       if (ok) pushToast({ msg: t("toast.deleted"), variant: "success" });
       else toastFail();
@@ -594,15 +524,16 @@ function Deck() {
     bump();
   };
 
-  const openArtifact = (view: ArtifactView) => {
-    setArtifactView(view);
-    setArtifactOpen(true);
+  // Detail views are real pages now (/run/<id>/<view>): navigate in-tab —
+  // links elsewhere keep native middle/ctrl-click new-tab semantics. The old
+  // in-page drawer is gone (it crammed a fourth column into the deck).
+  const openArtifact = (view: DetailView) => {
+    if (!runId || isDraft(runId)) return;
+    window.location.href = detailUrlForRun(runId, view);
   };
 
-  // Roster/inspector worker click → open the Worker 详情 panel focused on that
-  // worker. Bump the nonce so re-clicking the same row re-seeds the lanes filter.
-  const onOpenWorker = (id: string) => {
-    setFocusedWorker((prev) => ({ id, nonce: (prev?.nonce ?? 0) + 1 }));
+  // Roster/inspector worker click → the worker firehose page (same tab).
+  const onOpenWorker = (_id: string) => {
     openArtifact("workers");
   };
 
@@ -703,35 +634,15 @@ function Deck() {
               onRemoveFile={removeFile}
             />
           )}
-          <ArtifactPanel
-            open={artifactOpen}
-            width={artifactWidth}
-            view={artifactView}
-            deck={deck}
-            running={running}
-            loading={loading}
-            selected={selected}
-            onSelect={setSelected}
-            onView={setArtifactView}
-            onClose={() => setArtifactOpen(false)}
-            onResize={onArtifactResize}
-            minWidth={ARTIFACT_WIDTH_MIN}
-            maxWidth={artifactWidthMax(winW)}
-            defaultWidth={artifactWidthDefault(winW)}
-            onSpawnWorker={onSpawnWorker}
-            onKillWorker={onKillWorker}
-            focusWorker={focusedWorker}
-            onOpenWorker={onOpenWorker}
-          />
         </main>
         {deck.started && inspectorOpen && (
           <SwarmInspector
             deck={deck}
             running={running}
+            runId={runId}
             onOpenWorker={onOpenWorker}
             onRedirectWorker={onRedirectWorker}
             onKillWorker={onKillWorker}
-            onOpenArtifact={openArtifact}
             onCommand={onCommand}
             onHitlAnswered={() => pushToast({ msg: t("hitl.answered"), variant: "success" })}
             width={inspectorWidth}

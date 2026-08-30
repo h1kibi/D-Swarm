@@ -24,13 +24,13 @@ import {
   pheromoneStrength,
 } from "@/lib/pheromone";
 import { usePheromoneClock } from "@/lib/usePheromoneClock";
-import type { ArtifactView } from "@/components/ArtifactPanel";
 import { HitlCard } from "@/components/HitlCard";
 import { Icon } from "@/components/Icon";
 import { workerColor, workerInitial, workerShortLabel } from "@/lib/workers";
 import { BudgetStatus } from "@/components/BudgetStatusPanel";
 import { RuntimeStatus } from "@/components/RuntimeStatusPanel";
 import { formatDurationMs, reasonCycleRows, reasonLoopTone } from "@/lib/reason";
+import { detailUrlForRun, type DetailView } from "@/lib/runRoute";
 import type { RuntimePoolsSnapshot } from "@/components/runtimeStatus";
 import type { BudgetSnapshot } from "@/components/budgetStatus";
 
@@ -50,7 +50,7 @@ import type { BudgetSnapshot } from "@/components/budgetStatus";
  * Panels tab — no capability is removed.
  */
 
-const PANEL_VIEWS: { view: ArtifactView; key: string }[] = [
+const PANEL_VIEWS: { view: DetailView; key: string }[] = [
   { view: "evidence", key: "panelbtn.evidence" },
   { view: "workers", key: "panelbtn.workers" },
   { view: "graph", key: "rc.factGraph" },
@@ -382,7 +382,7 @@ export function SwarmInspector({
   onOpenWorker,
   onRedirectWorker,
   onKillWorker,
-  onOpenArtifact,
+  runId,
   onCommand,
   onHitlAnswered,
   width,
@@ -405,7 +405,8 @@ export function SwarmInspector({
   /** seed the Operator Command Bar with this worker as the redirect target. */
   onRedirectWorker: (id: string) => void;
   onKillWorker: (id: string) => void;
-  onOpenArtifact: (view: ArtifactView) => void;
+  /** active run id — panel chips deep-link to the detail routes (new-tab friendly). */
+  runId: string;
   onCommand: (target: string, action: string, text: string) => void;
   onHitlAnswered?: () => void;
   width: number;
@@ -634,7 +635,7 @@ export function SwarmInspector({
                 onInspect={onOpenWorker}
                 onRedirect={onRedirectWorker}
                 onKill={onKillWorker}
-                onOpenEvidence={() => onOpenArtifact("evidence")}
+                onOpenEvidence={() => { window.location.href = detailUrlForRun(runId, "evidence"); }}
                 onOpenIntent={openIntent}
               />
             ))}
@@ -732,9 +733,9 @@ export function SwarmInspector({
         {tab === "panels" && (
           <div className="swarm-panels">
             {PANEL_VIEWS.map((p) => (
-              <button key={p.view} type="button" onClick={() => onOpenArtifact(p.view)}>
+              <a key={p.view} href={detailUrlForRun(runId, p.view)}>
                 {t(p.key)}
-              </button>
+              </a>
             ))}
           </div>
         )}
