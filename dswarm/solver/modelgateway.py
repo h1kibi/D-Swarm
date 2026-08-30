@@ -574,6 +574,7 @@ class ModelGateway:
         except Exception:
             pass
         t0 = time.time()
+        finished = False
         try:
             with httpx.stream(
                 "POST", upstream_url, json=req, headers=headers,
@@ -592,14 +593,23 @@ class ModelGateway:
                     self._proxy_stream(run_id, handler, resp, req, call=call)
                 else:
                     self._proxy_json(run_id, handler, resp, call=call)
+                finished = True
         except Exception as exc:
             outcome = "timeout" if isinstance(exc, (TimeoutError, httpx.TimeoutException)) else "transport_error"
-            try:
-                self._finish_gateway_call(call, outcome=outcome, usage={})
-            except Exception as finish_exc:
-                log.error("gateway terminal usage write failed: %s", finish_exc)
+            if not finished:
+                # A successful proxy that only failed writing back to a
+                # disconnected client must keep its terminal "succeeded"
+                # outcome — double-finishing the same usage call id recorded
+                # contradictory ledgers (conflicting usage id).
+                try:
+                    self._finish_gateway_call(call, outcome=outcome, usage={})
+                except Exception as finish_exc:
+                    log.error("gateway terminal usage write failed: %s", finish_exc)
             log.warning("gateway upstream error (run %s): %s", run_id, exc)
-            self._write_json(handler, 502, {"error": {"message": f"upstream error: {exc}"}})
+            try:
+                self._write_json(handler, 502, {"error": {"message": f"upstream error: {exc}"}})
+            except Exception:
+                pass  # the worker client is already gone (broken pipe)
 
     def _proxy_json(self, run_id: str, handler: _Handler, resp, *, call: UsageCall) -> None:
         data = resp.read()
@@ -635,7 +645,10 @@ class ModelGateway:
                 if data == "[DONE]":
                     is_done = True
                 elif data:
-                    usage_parts.append(data)
+                    # keep the raw "data:" prefix: _extract_usage parses SSE
+                    # lines (stripping them here made every streamed call's
+                    # usage unknown even when the provider sent the tail chunk)
+                    usage_parts.append(line)
             handler._chunk((line + "\n").encode("utf-8", "replace"))
             n_chunks += 1
             n_chars += len(line) + 1

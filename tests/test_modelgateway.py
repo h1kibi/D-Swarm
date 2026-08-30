@@ -557,3 +557,59 @@ def test_normalize_upstream_request_snaps_invalid_bigmodel_effort():
         {"model": "glm-5.3-flash", "reasoning_effort": "medium"},
         upstream_base="https://api.deepseek.com")
     assert req["reasoning_effort"] == "medium"
+
+
+def test_gateway_streamed_usage_is_measured(upstream, tmp_path):
+    """The streamed proxy must keep the raw SSE "data:" prefix on collected
+    chunks: _extract_usage parses SSE lines, and stripping the prefix made
+    every streamed call's usage unknown even though the provider sent the
+    usage tail chunk."""
+    up, gw = upstream
+    gw.account_root = None
+    import os as _os
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-stream-usage"
+    try:
+        token = gw.issue("run-stream-usage")
+        status, _ = _post(gw, token, {"model": "deepseek-v4-flash", "messages": []}, stream=True)
+    finally:
+        _os.environ.pop("DEEPSEEK_API_KEY", None)
+    assert status == 200
+    rows = _journal_rows(tmp_path / "run-stream-usage-usage-journal.jsonl")
+    assert rows[-1]["call_outcome"] == "succeeded"
+    assert rows[-1]["usage_status"] == "measured"
+    assert rows[-1]["input_tokens"] == 11
+    assert rows[-1]["output_tokens"] == 7
+
+
+def test_gateway_client_disconnect_after_success_keeps_single_succeeded_record(
+        upstream, tmp_path):
+    """A worker disconnecting after the stream completed must NOT append a
+    second contradictory terminal record (conflicting usage id: the same call
+    was finished 'succeeded' and then again 'transport_error')."""
+    import http.client
+
+    up, gw = upstream
+    gw.account_root = None
+    import os as _os
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-disconnect"
+    try:
+        token = gw.issue("run-disconnect")
+        conn = http.client.HTTPConnection("127.0.0.1", gw._test_port, timeout=10)
+        conn.request(
+            "POST", "/v1/chat/completions",
+            body=json.dumps({"model": "deepseek-v4-flash", "messages": [], "stream": True}),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {token}"},
+        )
+        resp = conn.getresponse()
+        resp.read()  # full successful stream
+        # drop the connection abruptly, like a dying worker process
+        conn.close()
+        import time
+        time.sleep(0.5)  # let the handler's write-back failure surface
+    finally:
+        _os.environ.pop("DEEPSEEK_API_KEY", None)
+    rows = _journal_rows(tmp_path / "run-disconnect-usage-journal.jsonl")
+    finished = [r for r in rows if r.get("phase") == "finished"]
+    assert len(finished) == 1
+    assert finished[0]["call_outcome"] == "succeeded"
