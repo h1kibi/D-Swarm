@@ -26,15 +26,18 @@ export function StageRail({
         const cls = [
           "stage-node",
           `st-${state}`,
+          active && info.status === "degraded" ? "is-waiting" : "",
           active && info.waiting ? "is-waiting" : "",
           active && info.failed ? "is-failed" : "",
         ].filter(Boolean).join(" ");
         const approx = active && info.derived ? ` · ${t("stage.approx")}` : "";
         const stateNote = active && info.failed
           ? ` · ${t("stage.failed")}`
-          : active && info.waiting
-            ? ` · ${t("stage.waiting")}`
-            : "";
+          : active && info.status === "degraded"
+            ? ` · ${t("stage.degraded")}`
+            : active && info.waiting
+              ? ` · ${t("stage.waiting")}`
+              : "";
         return (
           <li key={stage} className="stage-cell">
             {i > 0 && (

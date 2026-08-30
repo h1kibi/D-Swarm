@@ -168,7 +168,7 @@ describe("isTimelineChat", () => {
 describe("deriveStage", () => {
   it("follows the reason loop when present (explicit, not derived)", () => {
     const deck = deckWithLoop();
-    expect(deriveStage(deck)).toEqual({ stage: "execute", derived: false, waiting: false, failed: false });
+    expect(deriveStage(deck)).toEqual({ stage: "execute", derived: false, waiting: false, failed: false, status: "active" });
 
     const reconning = deckWithLoop();
     reconning.reasonLoop.recon = { status: "running", startedAt: 100 };
@@ -187,9 +187,31 @@ describe("deriveStage", () => {
     const deck = deckWithLoop();
     deck.reasonLoop.paused = true;
     expect(deriveStage(deck).waiting).toBe(true);
+    expect(deriveStage(deck).status).toBe("paused");
     const failed = deckWithLoop();
     failed.outcomeReason = "runtime_failure";
     expect(deriveStage(failed).failed).toBe(true);
+    expect(deriveStage(failed).status).toBe("failed");
+  });
+
+  it("derives the status dimension (docs/07 P0-3 two-dim model)", () => {
+    // healthy run is active
+    expect(deriveStage(deckWithLoop()).status).toBe("active");
+    // awaiting operator is waiting (distinct from paused)
+    const awaiting = deckWithLoop();
+    awaiting.awaitingOperator = "needs env";
+    expect(deriveStage(awaiting).status).toBe("waiting");
+    // run-level runtime degradation paints degraded until the run finishes
+    const degraded = deckWithLoop();
+    degraded.runtimeDegraded = [{ engine: "pi-web", reason: "probe timeout" }];
+    expect(deriveStage(degraded).status).toBe("degraded");
+    degraded.finished = true;
+    expect(deriveStage(degraded).status).toBe("completed");
+    // solved beats completed
+    const solved = deckWithLoop();
+    solved.solved = true;
+    solved.finished = true;
+    expect(deriveStage(solved).status).toBe("solved");
   });
 
   it("falls back to an approximate stage for legacy sessions", () => {
@@ -204,7 +226,7 @@ describe("deriveStage", () => {
 
 describe("stage rail", () => {
   it("computes completed / active / pending around the current stage", () => {
-    const states = stageRailStates({ stage: "reason", derived: false, waiting: false, failed: false });
+    const states = stageRailStates({ stage: "reason", derived: false, waiting: false, failed: false, status: "active" });
     expect(states.map((s) => s.state)).toEqual([
       "completed", "completed", "completed", "active",
       "pending", "pending", "pending", "pending",

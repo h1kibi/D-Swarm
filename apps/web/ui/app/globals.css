@@ -3254,6 +3254,13 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 /* ---------- stage rail (§5.3) ---------- */
 .stage-rail { display: flex; align-items: center; gap: 0; margin: 0; padding: 0;
   list-style: none; white-space: nowrap; }
+
+.run-status-chip { display: inline-flex; align-items: center; margin-left: 8px; padding: 3px 8px; border: 1px solid currentColor; border-radius: 999px; font-size: 10px; white-space: nowrap; }
+.run-status-chip.rs-active { color: var(--green); }
+.run-status-chip.rs-waiting, .run-status-chip.rs-paused, .run-status-chip.rs-degraded { color: var(--amber); }
+.run-status-chip.rs-failed { color: var(--red); }
+.run-status-chip.rs-solved { color: var(--green); }
+.run-status-chip.rs-completed { color: var(--muted); }
 .stage-cell { display: flex; align-items: center; }
 .stage-link { width: 14px; height: 1px; background: var(--border2); margin: 0 2px; }
 .stage-link.done { background: var(--brand); }

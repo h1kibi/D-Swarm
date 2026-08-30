@@ -85,6 +85,8 @@ export function TopBar({
       {started && (
         <div className="topbar-stage">
           <StageRail info={stageInfo} onJump={onJumpStage} />
+          <span className={`run-status-chip rs-${stageInfo.status}`}
+            title={t("topbar.statusTitle")}>{t(`runStatus.${stageInfo.status}`)}</span>
         </div>
       )}
 

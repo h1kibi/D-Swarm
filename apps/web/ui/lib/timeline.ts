@@ -216,6 +216,11 @@ export function stageAnchors(items: TimelineItem[]): Partial<Record<Stage, strin
   return out;
 }
 
+/** Run-level status, orthogonal to stage (docs/07 §P0-3):
+ *  stage answers WHERE the run is, status answers HOW it is going. */
+export type RunStatus =
+  | "active" | "waiting" | "paused" | "degraded" | "failed" | "solved" | "completed";
+
 /** Two-dim run state for the Stage Rail + top bar (docs/07 §P0-3). */
 export interface StageInfo {
   stage: Stage;
@@ -225,6 +230,20 @@ export interface StageInfo {
   /** paused / waiting on operator / degraded — renders yellow on the rail. */
   waiting: boolean;
   failed: boolean;
+  /** structured status dimension; derivable from the flags + solved/finished. */
+  status: RunStatus;
+}
+
+/** Collapse the orthogonal flags into the single display status
+ *  (precedence: failure > pause > operator wait > degradation > outcome). */
+export function runStatusOf(deck: DeckState, waiting: boolean, failed: boolean): RunStatus {
+  if (failed) return "failed";
+  if (deck.reasonLoop.paused) return "paused";
+  if (waiting) return "waiting";
+  if (deck.runtimeDegraded.length > 0 && !deck.finished) return "degraded";
+  if (deck.solved) return "solved";
+  if (deck.finished) return "completed";
+  return "active";
 }
 
 /**
@@ -256,13 +275,13 @@ export function deriveStage(deck: DeckState): StageInfo {
       else if (loop.cycles.length > 0) stage = "reason"; // between cycles
       else stage = "prepare";
     }
-    return { stage, derived: false, waiting, failed };
+    return { stage, derived: false, waiting, failed, status: runStatusOf(deck, waiting, failed) };
   }
 
   // Legacy fallback — approximate, from the run's coarse lifecycle only.
-  if (!deck.started) return { stage: "queued", derived: true, waiting, failed };
-  if (deck.finished || deck.solved) return { stage: "finalize", derived: true, waiting, failed };
-  return { stage: "execute", derived: true, waiting, failed };
+  if (!deck.started) return { stage: "queued", derived: true, waiting, failed, status: runStatusOf(deck, waiting, failed) };
+  if (deck.finished || deck.solved) return { stage: "finalize", derived: true, waiting, failed, status: runStatusOf(deck, waiting, failed) };
+  return { stage: "execute", derived: true, waiting, failed, status: runStatusOf(deck, waiting, failed) };
 }
 
 /** Per-stage visual state for the Stage Rail (§5.3 conventions). */
