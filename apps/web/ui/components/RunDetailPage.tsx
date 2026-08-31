@@ -9,7 +9,9 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useT } from "@/lib/i18n";
+import { useT, useLang } from "@/lib/i18n";
+import { useTheme } from "@/lib/theme";
+import { Icon } from "@/components/Icon";
 import { useRun, spawnWorker, killWorker } from "@/lib/useRun";
 import { isRunActive, type GraphNode } from "@/lib/events";
 import { deriveStage } from "@/lib/timeline";
@@ -46,6 +48,8 @@ const VIEW_TITLE_KEY: Record<DetailView, string> = {
 
 export function RunDetailPage({ view }: { view: DetailView }) {
   const t = useT();
+  const { lang, setLang } = useLang();
+  const { theme, toggleTheme } = useTheme();
   const [runId, setRunId] = useState("");
   useEffect(() => {
     // /run/<id>/<view> deep link: the id lives in the second path segment
@@ -57,7 +61,13 @@ export function RunDetailPage({ view }: { view: DetailView }) {
   const [selected, setSelected] = useState<GraphNode | null>(null);
 
   const body = useMemo(() => {
+    // SSE replay in flight: show a loading state instead of a false "empty"
+    // flash (the fold populates deck.started within the first replay events).
     if (!runId) return null;
+    if (!deck.started && !deck.finished && !deck.reasonLoop.cycles.length
+        && !deck.blackboard.facts.length) {
+      return <PanelEmpty icon="clock" title={t("detail.loading")} />;
+    }
     switch (view) {
       case "evidence":
         return (
@@ -105,7 +115,7 @@ export function RunDetailPage({ view }: { view: DetailView }) {
       case "btw":
         return <BtwPage runId={runId} />;
     }
-  }, [view, runId, deck, running]);
+  }, [view, runId, deck, running, t]);
 
   return (
     <div className="shell detail-shell motion-root">
@@ -114,6 +124,16 @@ export function RunDetailPage({ view }: { view: DetailView }) {
         <span className="detail-brand">{t("detail.brand")}</span>
         <span className="detail-run" title={runId}>{deck.challengeName || runId}</span>
         {connected && <span className="detail-live">{t("topbar.live")}</span>}
+        <span className="detail-spacer" />
+        <button className="icon-btn" onClick={toggleTheme}
+          title={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}
+          aria-label={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}>
+          <Icon name={theme === "dark" ? "sun" : "moon"} />
+        </button>
+        <button className="lang-btn" onClick={() => setLang(lang === "zh" ? "en" : "zh")}
+          title={t("lang.toggleTitle")} aria-label={t("lang.toggleTitle")}>
+          {t("lang.toggle")}
+        </button>
         <span className="detail-tabs">
           {DETAIL_VIEWS.map((v) => (
             <a key={v} className={`detail-tab ${v === view ? "on" : ""}`}

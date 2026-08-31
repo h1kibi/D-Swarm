@@ -14,6 +14,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { BtwPanel } from "@/components/BtwPanel";
 import { ToastLane, useToasts } from "@/components/Toast";
 import { detailUrlForRun, type DetailView } from "@/lib/runRoute";
+import { useTheme } from "@/lib/theme";
 import { TopBar } from "@/components/TopBar";
 import { DecisionTimeline } from "@/components/DecisionTimeline";
 import { SwarmInspector } from "@/components/SwarmInspector";
@@ -45,7 +46,6 @@ import { useDeckMotion } from "@/lib/useDeckMotion";
 // until the operator sends a prompt — see dispatch() / onNewSolve().
 const newDraftId = () => `draft-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 const isDraft = (id: string) => id.startsWith("draft-");
-type ThemeMode = "light" | "dark";
 const INSPECTOR_WIDTH_MIN = 280;
 const INSPECTOR_WIDTH_MAX = 640;
 const INSPECTOR_WIDTH_DEFAULT = 340;
@@ -122,7 +122,6 @@ function Deck() {
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [railWidth, setRailWidth] = useState(RAIL_WIDTH_DEFAULT);
   const [railWidthReady, setRailWidthReady] = useState(false);
-  const [theme, setTheme] = useState<ThemeMode>("light");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [btwOpen, setBtwOpen] = useState(false);
   const [startupTestOpen, setStartupTestOpen] = useState(false);
@@ -157,29 +156,7 @@ function Deck() {
   // null/false (network / backend error), the biggest silent-failure gap today.
   const toastFail = () => pushToast({ msg: t("toast.actionFailed"), variant: "error" });
 
-  useEffect(() => {
-    try {
-      const saved = readKey("dswarm.theme");
-      if (saved === "dark" || saved === "light") {
-        setTheme(saved);
-        return;
-      }
-      if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) setTheme("dark");
-    } catch {
-      // keep the default light theme when storage/media is unavailable
-    }
-  }, []);
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    try {
-      writeKey("dswarm.theme", theme);
-    } catch {
-      // theming should still work for this session
-    }
-  }, [theme]);
-
-  const toggleTheme = () => setTheme((cur) => (cur === "dark" ? "light" : "dark"));
+  const { theme, toggleTheme } = useTheme();
 
   // Operator command → swarm. Wraps sendHitl so the otherwise-silent "生成复盘"
   // (writeup) command gives immediate feedback: the planner takes seconds to

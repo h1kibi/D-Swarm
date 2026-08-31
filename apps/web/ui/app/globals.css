@@ -3293,9 +3293,11 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 
 /* ---------- full-page run detail views (/run/<id>/<view>) ---------- */
 .detail-shell { display: flex; flex-direction: column; min-height: 100dvh; }
-.detail-nav { flex: none; display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+.detail-nav { position: sticky; top: 0; z-index: 5; flex: none; display: flex; align-items: center; gap: 10px; padding: 8px 14px;
   border-bottom: 1px solid var(--border); background: var(--bg2); overflow-x: auto;
   scrollbar-width: thin; }
+.detail-spacer { flex: 1 1 12px; }
+.detail-live { color: var(--brand-hi); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .detail-back { flex: none; color: var(--muted); font-size: 12px; text-decoration: none;
   padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border2); }
 .detail-back:hover { color: var(--brand-hi); border-color: var(--brand); }
