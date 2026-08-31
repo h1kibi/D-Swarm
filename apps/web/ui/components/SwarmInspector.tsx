@@ -63,7 +63,7 @@ const PANEL_VIEWS: { view: DetailView; key: string }[] = [
   { view: "directives", key: "panelbtn.directives" },
 ];
 
-type Tab = "workers" | "intents" | "panels";
+type Tab = "workers" | "intents" | "panels" | "ledger";
 
 function fmtTokens(n?: number): string {
   if (!n) return "0";
@@ -581,7 +581,7 @@ export function SwarmInspector({
         onDoubleClick={() => onResize(defaultWidth)}
       />
       <div className="swarm-tabs" role="tablist" aria-label={t("swarm.title")}>
-        {(["workers", "intents", "panels"] as Tab[]).map((k) => (
+        {(["workers", "intents", "panels", "ledger"] as Tab[]).map((k) => (
           <button
             key={k}
             type="button"
@@ -594,18 +594,22 @@ export function SwarmInspector({
       </div>
 
       <div className="swarm-body">
-        <BudgetStatus
-          snapshot={budgetSnapshot}
-          loading={budgetLoading}
-          rebuilding={budgetRebuilding}
-          error={budgetError}
-          onRebuild={onRebuildBudget}
-        />
-        <RuntimeStatus
-          snapshot={runtimeSnapshot}
-          loading={runtimeLoading}
-          error={runtimeError}
-        />
+        {tab === "ledger" && (
+          <BudgetStatus
+            snapshot={budgetSnapshot}
+            loading={budgetLoading}
+            rebuilding={budgetRebuilding}
+            error={budgetError}
+            onRebuild={onRebuildBudget}
+          />
+        )}
+        {tab === "panels" && (
+          <RuntimeStatus
+            snapshot={runtimeSnapshot}
+            loading={runtimeLoading}
+            error={runtimeError}
+          />
+        )}
         {tab === "workers" && (
           <>
             <div className="swarm-count">

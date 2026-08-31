@@ -3388,8 +3388,15 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 /* ---------- live swarm inspector (§5.5) ---------- */
 .swarm { flex: none; display: flex; flex-direction: column; min-height: 0;
   background: var(--bg2); border-left: 1px solid var(--border); }
-.swarm-tabs { flex: none; display: flex; gap: 4px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-.swarm-tabs .small.on { color: var(--brand-hi); border-color: var(--brand); }
+.swarm-tabs { flex: none; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px;
+  margin: 8px 10px 0; padding: 3px; border: 1px solid var(--border2); border-radius: 10px;
+  background: color-mix(in srgb, var(--panel2) 82%, transparent); }
+.swarm-tabs .small { border: 0; background: transparent; color: var(--muted); font-size: 12px;
+  padding: 6px 4px; border-radius: 8px; text-align: center; cursor: pointer;
+  transition: background .14s ease, color .14s ease; }
+.swarm-tabs .small:hover { color: var(--text); }
+.swarm-tabs .small.on { color: var(--bright); background: linear-gradient(135deg, var(--brand-deep), var(--brand));
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--brand) 32%, transparent); }
 .swarm-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; display: flex;
   flex-direction: column; gap: 8px; }
 .swarm-count { font-size: var(--fs-label); letter-spacing: var(--ls-label); text-transform: uppercase;

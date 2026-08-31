@@ -940,6 +940,7 @@ export const STRINGS: Dict = {
   "swarm.tab.workers": { zh: "Worker", en: "Workers" },
   "swarm.tab.intents": { zh: "意图", en: "Intents" },
   "swarm.tab.panels": { zh: "面板", en: "Panels" },
+  "swarm.tab.ledger": { zh: "账本", en: "Ledger" },
   "swarm.activeWorkers": { zh: "{active} 活跃 / 共 {total}", en: "{active} active / {total} total" },
   "swarm.intentQueue": { zh: "意图队列", en: "Intent queue" },
   "swarm.noIntents": { zh: "暂无待调度意图", en: "No pending intents" },
