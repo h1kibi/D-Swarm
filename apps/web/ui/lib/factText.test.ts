@@ -27,3 +27,20 @@ describe("prettyFact", () => {
     expect(prettyFact("")).toBe("");
   });
 });
+
+describe("prettyFact: truncated envelopes (arena-6826)", () => {
+  it("collapses a 200-char-truncated agent_end snapshot to an ellipsis", () => {
+    // the old closing-summary path truncated the envelope at 200 chars, so
+    // JSON.parse always failed and the raw JSON became the visible label
+    const truncated = '[pi] {"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"CONCLUDE: stop exploring NOW. Do n';
+    expect(prettyFact(truncated)).toBe("[pi] …");
+    expect(prettyFact(truncated.slice(5))).toBe("…");
+  });
+
+  it("isLowInfoFact flags truncated envelopes", async () => {
+    const { isLowInfoFact } = await import("./factText");
+    const truncated = '[pi] {"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"CONCLUDE: stop exploring NOW. Do n';
+    expect(isLowInfoFact(truncated)).toBe(true);
+    expect(isLowInfoFact("[pi] real worker words about the target")).toBe(false);
+  });
+});

@@ -942,6 +942,8 @@ export const STRINGS: Dict = {
   "swarm.tab.panels": { zh: "面板", en: "Panels" },
   "swarm.tab.ledger": { zh: "账本", en: "Ledger" },
   "swarm.panelsTitle": { zh: "详情视图 · 点击进入（可新标签打开）", en: "Detail views · click to open (new-tab friendly)" },
+  "graph.zeroInfoBtn": { zh: "零信息 ×{n}", en: "no-info ×{n}" },
+  "graph.zeroInfoToggle": { zh: "{n} 个零信息事实（纯快照无 worker 话语）— 点击切换显示", en: "{n} zero-info facts (raw snapshots, no worker words) — toggle display" },
   "swarm.activeWorkers": { zh: "{active} 活跃 / 共 {total}", en: "{active} active / {total} total" },
   "swarm.intentQueue": { zh: "意图队列", en: "Intent queue" },
   "swarm.noIntents": { zh: "暂无待调度意图", en: "No pending intents" },

@@ -6,6 +6,7 @@
 
 import { emptyReasonLoop, foldReasonEvent, type ReasonLoopView } from "./reason";
 import { foldFindingUpserted, type PheromoneFindingView } from "./pheromone";
+import { isLowInfoFact, prettyFact } from "./factText";
 
 export enum EventType {
   RUN_STARTED = "run.started",
@@ -596,14 +597,14 @@ function ensureSolverNode(m: GraphModel, sid: string): void {
 
 function addGraphNode(
   m: GraphModel, type: GraphNodeType, label: string,
-  opts: { id?: string; from?: string; fromMulti?: string[]; kind?: string; meta?: Record<string, any> } = {}
+  opts: { id?: string; from?: string; fromMulti?: string[]; kind?: string; raw?: string; meta?: Record<string, any> } = {}
 ): string {
   const id = opts.id || gid(type);
   const exists = m.nodes.some((n) => n.id === id);
   // keep the FULL raw text in meta.raw (for the <details>/tooltip) even though the
   // visible label is clipped — node.summarized later swaps label for a zh gist.
   if (!exists) {
-    m.nodes.push({ id, type, label: label.slice(0, 140), meta: { ...(opts.meta || {}), raw: label } });
+    m.nodes.push({ id, type, label: label.slice(0, 140), meta: { ...(opts.meta || {}), raw: opts.raw ?? label } });
     m.version += 1;
   }
   const sources = opts.fromMulti?.filter((s) => m.nodes.some((n) => n.id === s));
@@ -915,18 +916,22 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       // by id). Without this the fact appears twice (seq-id + gid).
       const sgSeq = typeof p.fact_seq === "number" && p.fact_seq > 0 ? p.fact_seq : undefined;
       const sgOwner = blackboardOwningIntent(s.blackboard, row.actor || sid, ev.ts, sgSeq);
-      addGraphNode(m, row.verified ? "fact" : "candidate", row.fact, {
+      addGraphNode(m, row.verified ? "fact" : "candidate", prettyFact(row.fact), {
         id: sgSeq ? `fact:${sgSeq}` : undefined,
         from: sgOwner ? `intent:${sgOwner.id}` : from,
         kind: sgOwner ? "produces" : (row.verified ? "verifies" : "claims"),
+        raw: row.fact,
         // actor = the worker that produced this fact. It drives the per-engine
         // colour ring in the radar view; the data was always on `row.actor` but
         // never made it into meta, so the graph couldn't colour facts by worker.
         // intentId = the owning intent (for the intent-centric radar grouping).
+        // zeroInfo = no worker-authored words (raw envelope snapshots) — the
+        // graph view hides these by default behind a toolbar toggle.
         meta: {
           confidence: row.confidence, verifier: row.verifier, verified: row.verified,
           actor: row.actor || undefined,
           intentId: sgOwner ? sgOwner.id : undefined,
+          zeroInfo: isLowInfoFact(row.fact) || undefined,
         },
       });
       break;
@@ -1061,16 +1066,19 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           const owner = explicitIntent
             ? bb.intents.find((i) => i.id === explicitIntent)
             : blackboardOwningIntent(bb, actor, ev.ts, factSeq);
-          addGraphNode(m, p.verified ? "fact" : "candidate", p.fact ?? "", {
+          addGraphNode(m, p.verified ? "fact" : "candidate", prettyFact(p.fact ?? ""), {
             id: factSeq ? `fact:${factSeq}` : undefined,
             from: owner ? `intent:${owner.id}` : factSolver,
             kind: owner ? "produces" : (p.verified ? "verifies" : "claims"),
+            raw: p.fact ?? "",
             // carry actor (producing worker → engine colour ring) + owning intent
             // id (radar grouping) into meta — see the SHARED_GRAPH_DELTA path above.
+            // zeroInfo = no worker-authored words — hidden by default in the graph.
             meta: {
               confidence: p.confidence, verifier: p.verifier, verified: p.verified,
               actor: actor || undefined,
               intentId: owner ? owner.id : undefined,
+              zeroInfo: isLowInfoFact(p.fact ?? "") || undefined,
             },
           });
           break;

@@ -10,20 +10,35 @@
  * prefix alone (the raw JSON stays available in the disclosure).
  */
 
+const ENVELOPE_TYPES = "agent_end|message_end|turn_end|message";
+const PREFIXED_ENVELOPE = new RegExp(
+  '^\\[([^\\]]+)\\]\\s*(\\{\\s*"type"\\s*:\\s*"(?:' + ENVELOPE_TYPES + '")[\\s\\S]*)$',
+);
+const BARE_ENVELOPE = new RegExp(
+  '^\\{\\s*"type"\\s*:\\s*"(?:' + ENVELOPE_TYPES + '")[\\s\\S]*$',
+);
+
 export function prettyFact(raw: string): string {
   const text = String(raw || "");
-  const m = text.match(/^\[([^\]]+)\]\s*(\{[\s\S]+\})$/);
-  if (!m) return text;
+  const m = text.match(PREFIXED_ENVELOPE);
+  if (!m) {
+    // a bare truncated envelope (no closing brace -> JSON.parse would fail)
+    if (BARE_ENVELOPE.test(text)) return "…";
+    return text;
+  }
   const actor = m[1];
   let ev: any;
   try {
     ev = JSON.parse(m[2]);
   } catch {
-    return text;
+    // truncated snapshot (facts are capped at 200 chars): JSON can never
+    // close. The assistant words are unrecoverable — say so instead of
+    // dumping the raw JSON.
+    return `[${actor}] …`;
   }
   if (!ev || typeof ev !== "object") return text;
   const type = String(ev.type || "");
-  if (!/^(agent_end|message_end|turn_end|message)$/.test(type)) return text;
+  if (!new RegExp(`^(${ENVELOPE_TYPES})$`).test(type)) return text;
   const prose = messageProse(ev);
   return prose ? `[${actor}] ${prose}` : `[${actor}]`;
 }
@@ -50,4 +65,17 @@ function messageProse(ev: any): string {
     if (found) break;
   }
   return found;
+}
+
+
+/** True when a fact carries no worker-authored words (a bare actor prefix,
+ *  a truncated-snapshot ellipsis / empty extraction): candidates for
+ *  display-suppression in dense views. */
+export function isLowInfoFact(raw: string): boolean {
+  const pretty = prettyFact(raw);
+  const stripped = pretty
+    .replace(/^\[[^\]]*\]\s*/, "")
+    .replace(/…/g, "")
+    .trim();
+  return stripped.length === 0;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import cytoscape, { type Core, type ElementDefinition } from "cytoscape";
 import cola from "cytoscape-cola";
 import { GraphModel, GraphNode } from "@/lib/events";
@@ -134,6 +134,11 @@ export function GraphView({
   onSelect?: (node: GraphNode | null) => void;
 }) {
   const t = useT();
+  const [showZeroInfo, setShowZeroInfo] = useState(false);
+  const zeroInfoCount = useMemo(
+    () => model.nodes.filter((n) => n.meta?.zeroInfo).length,
+    [model],
+  );
   const boxRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<Core | null>(null);
   const seenNodes = useRef<Set<string>>(new Set());
@@ -285,12 +290,14 @@ export function GraphView({
       });
       ro.observe(boxRef.current!);
     }
+    const nodesSeenByThisEffect = seenNodes.current;
+    const edgesSeenByThisEffect = seenEdges.current;
     return () => {
       ro?.disconnect();
       cyRef.current?.destroy();
       cyRef.current = null;
-      seenNodes.current.clear();
-      seenEdges.current.clear();
+      nodesSeenByThisEffect.clear();
+      edgesSeenByThisEffect.clear();
       lastVersion.current = -1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -344,6 +351,9 @@ export function GraphView({
     if (!cy || !ready) return;
     const toAdd: ElementDefinition[] = [];
     for (const n of model.nodes) {
+      // zero-info facts (raw envelope snapshots with no worker words) are
+      // hidden by default; the toolbar toggle remounts the graph with them.
+      if (n.meta?.zeroInfo && !showZeroInfo) continue;
       if (!seenNodes.current.has(n.id)) {
         seenNodes.current.add(n.id);
         // wc = the producing worker's per-engine colour, surfaced as a plain data
@@ -376,6 +386,9 @@ export function GraphView({
         const cc = e.kind === "plans" && srcType === "fact" ? 1 : undefined;
         toAdd.push({ data: { id: e.id, source: e.source, target: e.target, kind: e.kind, ...(cc ? { cc } : {}) } });
       } else if (!seenEdges.current.has(e.id) && (!seenNodes.current.has(e.source) || !seenNodes.current.has(e.target))) {
+        const srcNode = model.nodes.find((n) => n.id === e.source);
+        const dstNode = model.nodes.find((n) => n.id === e.target);
+        if (srcNode?.meta?.zeroInfo || dstNode?.meta?.zeroInfo) continue; // hidden by filter
         console.warn("[dswarm graph] cytoscape edge waiting for endpoint", {
           edge: e,
           nodes: Array.from(seenNodes.current),
@@ -481,6 +494,15 @@ export function GraphView({
             <button className="graph-tool-btn" onClick={() => setFocusId(null)} title={t("graph.clearFocus")} aria-label={t("graph.clearFocus")}>
               <Icon name="xCircle" size={14} />
             </button>
+          )}
+          {zeroInfoCount > 0 && (
+            <button
+              className={`graph-tool-btn ${showZeroInfo ? "on" : ""}`}
+              onClick={() => setShowZeroInfo((v) => !v)}
+              title={t("graph.zeroInfoToggle", { n: zeroInfoCount })}
+              aria-label={t("graph.zeroInfoToggle", { n: zeroInfoCount })}
+              aria-pressed={showZeroInfo}
+            >{t("graph.zeroInfoBtn", { n: zeroInfoCount })}</button>
           )}
         </div>
         <div className="graph-toolbar-meta">
