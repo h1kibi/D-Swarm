@@ -132,7 +132,10 @@ export function TopBar({
           aria-pressed={inspectorOpen}
         ><Icon name="panel" /></button>
       )}
-      {onOpenBtw && (
+      {/* BTW observes a RUN: hide on drafts so the button can never lead to
+          the legacy sidebar path (it now opens the dedicated /run/<id>/btw page
+          for real runs). */}
+      {onOpenBtw && deck.started && (
         <button className="btw-btn" onClick={onOpenBtw} title={t("btw.btnTitle")} aria-label={t("btw.btnTitle")}>
           {t("btw.btn")}
         </button>
