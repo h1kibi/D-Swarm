@@ -65,6 +65,16 @@ export function RuntimeStatus({ snapshot, loading = false, error }: RuntimeStatu
     </section>;
   }
   const pools = snapshot.pools;
+  // No pools yet: a slim one-liner (title + mode badge) instead of a full
+  // card squatting on the panel tab.
+  if (pools.length === 0) {
+    return (
+      <section className="budget-status budget-runtime-empty" aria-label={t("runtime.title")}>
+        <span>{t("runtime.title")} · {t("runtime.noPools")}</span>
+        {snapshot.policy_mode && <span className="budget-state muted">{snapshot.policy_mode}</span>}
+      </section>
+    );
+  }
   return (
     <section className="budget-status" aria-label={t("runtime.title")}>
       <div className="budget-status-head">
@@ -76,13 +86,9 @@ export function RuntimeStatus({ snapshot, loading = false, error }: RuntimeStatu
           <span className="budget-state muted">{snapshot.policy_mode}</span>
         )}
       </div>
-      {pools.length === 0 ? (
-        <div className="budget-meta"><span>{t("runtime.noPools")}</span></div>
-      ) : (
-        <div className="budget-scope-list">
-          {pools.map((pool) => <PoolRow key={pool.pool_id} pool={pool} t={t} />)}
-        </div>
-      )}
+      <div className="budget-scope-list">
+        {pools.map((pool) => <PoolRow key={pool.pool_id} pool={pool} t={t} />)}
+      </div>
       {error && <div className="budget-error">{error}</div>}
     </section>
   );

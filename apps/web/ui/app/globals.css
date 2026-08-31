@@ -3429,11 +3429,21 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .sw-intent-top { display: flex; align-items: baseline; gap: 8px; }
 .sw-intent-goal { flex: 1; min-width: 0; color: var(--text); font-size: var(--fs-caption);
   overflow-wrap: anywhere; }
-.swarm-panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
-.swarm-panels button { padding: 5px 4px; border-radius: 8px; border: 1px solid var(--border2);
-  background: var(--panel); color: var(--text); font-size: 10px; text-align: center;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.swarm-panels button:hover { border-color: var(--brand); color: var(--brand-hi); }
+.swarm-panels { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.swarm-panels a, .swarm-panels button { display: flex; align-items: center; gap: 7px;
+  padding: 9px 10px; border-radius: 10px; border: 1px solid var(--border2);
+  background: var(--panel); color: var(--text); font-size: 12px; text-align: left;
+  text-decoration: none; white-space: nowrap; overflow: hidden;
+  transition: border-color .14s ease, color .14s ease, transform .14s ease; }
+.swarm-panels a:hover, .swarm-panels button:hover { border-color: var(--brand);
+  color: var(--brand-hi); transform: translateY(-1px); }
+.swarm-panels a .icon, .swarm-panels button .icon { flex: none; color: var(--muted); }
+.swarm-panels a:hover .icon, .swarm-panels button:hover .icon { color: var(--brand-hi); }
+.swarm-panels-title { color: var(--muted); font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; margin: 2px 0 6px; }
+/* empty runtime: one slim line instead of a full card */
+.budget-status.budget-runtime-empty { padding: 9px 12px; display: flex; align-items: center;
+  justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; }
 .swarm-attention { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 8px; }
 .sw-degraded { display: flex; gap: 6px; align-items: baseline; color: var(--amber);
@@ -4212,7 +4222,7 @@ body.wsw-resizing, body.wsw-resizing * { cursor: col-resize !important; user-sel
 .rail-top, .swarm-tabs, .artifact-head { background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 68%, transparent), transparent); }
 .newsolve { border-radius: 12px; background: linear-gradient(135deg, var(--brand-deep), var(--accent)); box-shadow: var(--glow-accent); transition: transform .16s var(--ease-out-soft), box-shadow .16s ease, filter .16s ease; }
 .newsolve:hover { filter: brightness(1.04) saturate(1.05); transform: translateY(-1px); }
-.icon-btn, .topbar-ctl, .btw-btn, .opbar-send, .opbar-action, .opbar-target, .fleet-chip, .fleet-tool, .fleet-sort, .swarm-panels button, .sw-worker-ctl button, .tl-open { background: color-mix(in srgb, var(--panel) 72%, transparent); box-shadow: 0 1px 0 rgba(255, 255, 255, .42) inset; transition: transform .16s var(--ease-out-soft), border-color .16s ease, background .16s ease, box-shadow .16s ease, color .16s ease; }
+.icon-btn, .topbar-ctl, .btw-btn, .opbar-send, .opbar-action, .opbar-target, .fleet-chip, .fleet-tool, .fleet-sort, .swarm-panels a, .swarm-panels button, .sw-worker-ctl button, .tl-open { background: color-mix(in srgb, var(--panel) 72%, transparent); box-shadow: 0 1px 0 rgba(255, 255, 255, .42) inset; transition: transform .16s var(--ease-out-soft), border-color .16s ease, background .16s ease, box-shadow .16s ease, color .16s ease; }
 .icon-btn:hover, .topbar-ctl:hover, .btw-btn:hover, .opbar-send:hover:not(:disabled), .fleet-chip:hover, .fleet-tool:hover, .swarm-panels button:hover, .sw-worker-ctl button:hover, .tl-open:hover { transform: translateY(-1px); box-shadow: var(--glow-accent); }
 .opbar-send.primary { background: linear-gradient(135deg, var(--brand-deep), var(--brand)); box-shadow: 0 10px 24px color-mix(in srgb, var(--brand) 18%, transparent); }
 .rail-search-input, .opbar-input, input, textarea, select { border-radius: 11px; }
@@ -4227,7 +4237,7 @@ body.wsw-resizing, body.wsw-resizing * { cursor: col-resize !important; user-sel
 .tl-chip, .artifact-badge, .artifact-chip { border-radius: var(--r-pill); background: color-mix(in srgb, var(--panel) 68%, transparent); }
 .opbar { margin: 0 12px 12px; border: 1px solid color-mix(in srgb, var(--border) 78%, transparent); border-radius: 15px var(--radius-shell) var(--radius-shell) 15px; background: linear-gradient(180deg, var(--surface-glass-strong), var(--surface-glass)); -webkit-backdrop-filter: blur(18px) saturate(1.12); backdrop-filter: blur(18px) saturate(1.12); box-shadow: var(--shadow-md); }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent); outline-offset: 2px; box-shadow: var(--ring-focus); }
-@media (prefers-reduced-motion: reduce) { .stage-node, .newsolve, .thread-item, .icon-btn, .topbar-ctl, .btw-btn, .opbar-send, .fleet-chip, .fleet-tool, .swarm-panels button, .sw-worker-ctl button, .tl-open { transition-duration: .01ms !important; } }
+@media (prefers-reduced-motion: reduce) { .stage-node, .newsolve, .thread-item, .icon-btn, .topbar-ctl, .btw-btn, .opbar-send, .fleet-chip, .fleet-tool, .swarm-panels a, .swarm-panels button, .sw-worker-ctl button, .tl-open { transition-duration: .01ms !important; } }
 
 /* Elevated command-deck surfaces: premium polish for the main deck + settings workspace. */
 :root {

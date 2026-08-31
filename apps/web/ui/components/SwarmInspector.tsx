@@ -25,10 +25,10 @@ import {
 } from "@/lib/pheromone";
 import { usePheromoneClock } from "@/lib/usePheromoneClock";
 import { HitlCard } from "@/components/HitlCard";
-import { Icon } from "@/components/Icon";
 import { workerColor, workerInitial, workerShortLabel } from "@/lib/workers";
 import { BudgetStatus } from "@/components/BudgetStatusPanel";
 import { RuntimeStatus } from "@/components/RuntimeStatusPanel";
+import { Icon, type IconName } from "@/components/Icon";
 import { formatDurationMs, reasonCycleRows, reasonLoopTone } from "@/lib/reason";
 import { detailUrlForRun, type DetailView } from "@/lib/runRoute";
 import type { RuntimePoolsSnapshot } from "@/components/runtimeStatus";
@@ -50,17 +50,17 @@ import type { BudgetSnapshot } from "@/components/budgetStatus";
  * Panels tab — no capability is removed.
  */
 
-const PANEL_VIEWS: { view: DetailView; key: string }[] = [
-  { view: "evidence", key: "panelbtn.evidence" },
-  { view: "workers", key: "panelbtn.workers" },
-  { view: "graph", key: "rc.factGraph" },
-  { view: "timeline", key: "panelbtn.timeline" },
-  { view: "blackboard", key: "rc.blackboard" },
-  { view: "findings", key: "panelbtn.findings" },
-  { view: "credentials", key: "panelbtn.credentials" },
-  { view: "pocs", key: "panelbtn.pocs" },
-  { view: "routes", key: "panelbtn.routes" },
-  { view: "directives", key: "panelbtn.directives" },
+const PANEL_VIEWS: { view: DetailView; key: string; icon: IconName }[] = [
+  { view: "evidence", key: "panelbtn.evidence", icon: "layers" },
+  { view: "workers", key: "panelbtn.workers", icon: "terminal" },
+  { view: "graph", key: "rc.factGraph", icon: "grid" },
+  { view: "timeline", key: "panelbtn.timeline", icon: "clock" },
+  { view: "blackboard", key: "rc.blackboard", icon: "board" },
+  { view: "findings", key: "panelbtn.findings", icon: "alert" },
+  { view: "credentials", key: "panelbtn.credentials", icon: "lock" },
+  { view: "pocs", key: "panelbtn.pocs", icon: "target" },
+  { view: "routes", key: "panelbtn.routes", icon: "network" },
+  { view: "directives", key: "panelbtn.directives", icon: "list" },
 ];
 
 type Tab = "workers" | "intents" | "panels" | "ledger";
@@ -735,13 +735,17 @@ export function SwarmInspector({
         )}
 
         {tab === "panels" && (
-          <div className="swarm-panels">
-            {PANEL_VIEWS.map((p) => (
-              <a key={p.view} href={detailUrlForRun(runId, p.view)}>
-                {t(p.key)}
-              </a>
-            ))}
-          </div>
+          <>
+            <div className="swarm-panels-title">{t("swarm.panelsTitle")}</div>
+            <div className="swarm-panels">
+              {PANEL_VIEWS.map((p) => (
+                <a key={p.view} href={detailUrlForRun(runId, p.view)}>
+                  <span className="icon"><Icon name={p.icon} size={14} /></span>
+                  {t(p.key)}
+                </a>
+              ))}
+            </div>
+          </>
         )}
 
         <div className="swarm-attention">
