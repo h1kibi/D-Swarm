@@ -51,6 +51,7 @@ from dswarm.solver.cli_stream import (
     _clean_flag_token,
     _is_stream_delta,
     _json_event_has_prose,
+    extract_closing_prose,
     _looks_like_verifier_output,
     _normalize_need_kind,
     _parse_lockout_seconds,
@@ -3543,9 +3544,11 @@ class CliSolver:
         # deltas) that are NOT worker prose — the raw stream is parsed line-wise,
         # and a trailing `{"type":"message_update",...}` would otherwise become a
         # bogus "fact" (observed in run-3154, seq 83).
-        lines = [ln for ln in all_text.strip().splitlines() if ln.strip()]
-        lines = [ln for ln in lines if not _is_stream_delta(ln)]
-        summary = lines[-1][:200] if lines else "(no output)"
+        # The closing summary must be worker WORDS, not a raw pi envelope: an
+        # agent_end conversation snapshot used to become a JSON "fact"
+        # (run-75380). extract_closing_prose pulls the last assistant-authored
+        # line/text, skipping harness user directives entirely.
+        summary = extract_closing_prose(all_text, limit=200) or "(no output)"
         fact = f"[{self.driver.name}] {summary}"
         await self._record_fact(fact, verified=bool(accepted), artifact_id=aid)
         # a recon/explore worker often gets cut off before writing VERIFIED_FACT

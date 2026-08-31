@@ -1186,6 +1186,7 @@ def test_settings_moved_to_rail_and_header_toggles_theme():
     rail = (UI_ROOT / "components" / "ThreadRail.tsx").read_text()
     topbar = (UI_ROOT / "components" / "TopBar.tsx").read_text()
     page = (UI_ROOT / "app" / "page.tsx").read_text()
+    theme = (UI_ROOT / "lib" / "theme.ts").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
 
     assert "rail-settings-btn" in rail
@@ -1195,7 +1196,8 @@ def test_settings_moved_to_rail_and_header_toggles_theme():
     assert '<span>{t("settings.open")}</span>' not in rail
     assert "onToggleTheme" in topbar
     assert "theme.toDark" in topbar and "theme.toLight" in topbar
-    assert "dswarm.theme" in page
+    assert 'import { useTheme } from "@/lib/theme";' in page
+    assert 'readKey("dswarm.theme")' in theme
     assert ':root[data-theme="dark"]' in css
 
 
@@ -1273,7 +1275,7 @@ def test_phase4_command_center_layout():
     assert "runNeedsAttention" in lib_fleet and "batchTargets" in lib_fleet
 
     # inspector: workers / intents / panels tabs + HITL attention + kill control.
-    assert 'swarm.tab.${k}' in inspector and '["workers", "intents", "panels"]' in inspector
+    assert 'swarm.tab.${k}' in inspector and '["workers", "intents", "panels", "ledger"]' in inspector
     assert "HitlCard" in inspector and "swarm.killConfirm" in inspector
 
     # operator bar: hint/redirect/focus + pause/resume/stop, semantics caption,

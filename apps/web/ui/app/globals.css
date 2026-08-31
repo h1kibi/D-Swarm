@@ -2785,7 +2785,7 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
   overflow: hidden; }
 .evi-item.expanded .evi-head .evi-fact { -webkit-line-clamp: unset; }
 .evi-meta-inline { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 4px;
-  max-width: 210px; overflow: hidden; }
+  flex: none; max-width: 46%; overflow: hidden; }
 .evi-meta-inline span { flex: 0 0 auto; max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--muted); border: 1px solid var(--line2); border-radius: var(--r-pill); padding: 1px 6px;
   font-size: 10px; line-height: 1.45; background: color-mix(in srgb, var(--bg2) 70%, transparent); }

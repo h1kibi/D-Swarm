@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { DeckState, BlackboardFact, isFactRetired } from "@/lib/events";
+import { prettyFact } from "@/lib/factText";
 import { useT, useLang } from "@/lib/i18n";
 import { readKey, writeKey } from "@/lib/storage";
 import { useCopied } from "@/lib/useCopied";
@@ -121,7 +122,7 @@ function FactItem({ f, t, zh, expanded, onToggle, finding, nowSec, onOpenWorker 
   nowSec: number;
   onOpenWorker?: (id: string) => void;
 }) {
-  const gist = (f.summary || "").trim();
+  const gist = (f.summary || "").trim() || prettyFact(f.fact);
   const text = gist || f.fact;
   // When a gist is shown as the label, the FULL raw fact must stay one click away —
   // a gist can truncate/omit an anchor (flag/cred/port), so the operator needs the
@@ -292,7 +293,7 @@ export function EvidenceChain({ deck, onOpenWorker }: {
   // Facts arrive chronologically; newest-first = reverse. Keep source arrays
   // untouched (memo over a copy) so other panels reading deck stay stable.
   // Strength sort: linked-finding strength desc, N/A last, ts as the tiebreak.
-  const order = (arr: BlackboardFact[]): BlackboardFact[] => {
+  const order = useCallback((arr: BlackboardFact[]): BlackboardFact[] => {
     let out = arr;
     if (expOnly) out = out.filter((f) => findingForFactSeq(deck.findings, f.factSeq) != null);
     if (kindFilter) out = out.filter((f) => findingForFactSeq(deck.findings, f.factSeq)?.kind === kindFilter);
@@ -309,17 +310,17 @@ export function EvidenceChain({ deck, onOpenWorker }: {
       out = [...out].reverse();
     }
     return out;
-  };
+  }, [deck.findings, expOnly, kindFilter, nowSec, sortMode]);
 
   // A: review-retired facts (rejected/merged/superseded) are NOT evidence — they
   // failed review and must not appear in the proof chain.
   const verified = useMemo(
     () => order(deck.blackboard.facts.filter((f) => f.verified && !isFactRetired(f))),
-    [deck.blackboard.facts, deck.findings, sortMode, kindFilter, expOnly, nowSec],
+    [deck.blackboard.facts, order],
   );
   const candidates = useMemo(
     () => order(deck.blackboard.facts.filter((f) => !f.verified && !isFactRetired(f))),
-    [deck.blackboard.facts, deck.findings, sortMode, kindFilter, expOnly, nowSec],
+    [deck.blackboard.facts, order],
   );
   const deadEnds = useMemo(
     () => (sortMode === "oldest" ? deck.blackboard.deadEnds : [...deck.blackboard.deadEnds].reverse()),

@@ -169,3 +169,68 @@ def _looks_like_verifier_output(text: str) -> bool:
     if _DOC_READ_RE.search(t):
         return False
     return True
+
+
+def _message_prose(msg: dict) -> str:
+    """The last non-empty text inside one pi message dict (assistant preferred)."""
+    content = msg.get("content")
+    texts: list[str] = []
+    if isinstance(content, str) and content.strip():
+        texts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                v = item.get("text")
+                if isinstance(v, str) and v.strip():
+                    texts.append(v)
+            elif isinstance(item, str) and item.strip():
+                texts.append(item)
+    elif isinstance(msg.get("text"), str) and msg["text"].strip():
+        texts.append(msg["text"])
+    if not texts:
+        return ""
+    # the harness CONCLUDE/user directive is boilerplate, not worker words
+    if str(msg.get("role") or "").lower() != "assistant":
+        return ""
+    return texts[-1].strip()
+
+
+def extract_closing_prose(text: str, *, limit: int = 200) -> str:
+    """The worker's last meaningful line for a closing-summary fact.
+
+    Plain prose lines win (scanned bottom-up). pi json-mode ENVELOPES
+    (message_end / agent_end snapshots of the whole conversation) are not
+    worker output — a bare `{"type":"agent_end","messages":[...]}` line used
+    to become a raw-JSON "fact"; the assistant text inside it is extracted
+    instead. Returns "" when nothing assistant-authored exists.
+    """
+    for line in reversed((text or "").splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        if not s.startswith("{"):
+            return s[:limit]
+        try:
+            ev = json.loads(s)
+        except (ValueError, TypeError):
+            return s[:limit]
+        if not isinstance(ev, dict):
+            return s[:limit]
+        if ev.get("type") not in _STREAM_CONTENT_TYPES:
+            continue
+        msgs = ev.get("messages")
+        candidates: list[str] = []
+        if isinstance(msgs, list):
+            for m in reversed(msgs):
+                if isinstance(m, dict):
+                    prose = _message_prose(m)
+                    if prose:
+                        candidates.append(prose)
+        msg = ev.get("message")
+        if isinstance(msg, dict):
+            prose = _message_prose(msg)
+            if prose:
+                candidates.append(prose)
+        if candidates:
+            return candidates[0][:limit]
+    return ""

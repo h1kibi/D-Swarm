@@ -3281,3 +3281,30 @@ def test_intent_db_failure_degrades_to_silence_without_running_loop():
     solver._record_intent_db("solve the whole challenge")
     solver._conclude_intent_db(result="explored")
     assert solver._intent_db_failures_noted == {"I-sync"}
+
+
+def test_extract_closing_prose_prefers_assistant_words_over_envelopes():
+    """run-75380: the closing summary fact was a raw pi agent_end envelope —
+    the whole conversation snapshot passed the stream-delta filter because it
+    carries prose (the harness CONCLUDE directive). The extractor must return
+    assistant-authored words only."""
+    from dswarm.solver.cli_stream import extract_closing_prose
+
+    conclude_only = (
+        '{"type":"agent_end","messages":[{"role":"user","content":'
+        '[{"type":"text","text":"CONCLUDE: stop exploring NOW. Do not"}]}]}'
+    )
+    # harness directive is NOT worker words -> empty (caller writes "(no output)")
+    assert extract_closing_prose(conclude_only) == ""
+
+    with_assistant = (
+        '{"type":"agent_end","messages":['
+        '{"role":"user","content":[{"type":"text","text":"task"}]},'
+        '{"role":"assistant","content":[{"type":"text","text":"Found Werkzeug debugger on :8000"}]}]}'
+    )
+    assert extract_closing_prose(with_assistant) == "Found Werkzeug debugger on :8000"
+    # plain prose lines still win, bottom-up
+    assert extract_closing_prose(with_assistant + "\nplain output line") == "plain output line"
+    # unknown json / non-json handled as before
+    assert extract_closing_prose("") == ""
+    assert extract_closing_prose('{"type":"tool_execution_end","id":1}') == ""
