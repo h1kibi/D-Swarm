@@ -1605,11 +1605,13 @@ def test_explore_tail_stream_delta_not_recorded_as_fact(monkeypatch, tmp_path):
     facts = [e for e in s.bus.events
              if e.event_type is EventType.BLACKBOARD_DELTA
              and e.payload.get("kind") == "fact_added"]
-    assert facts, "the explore worker should still record a (fallback) fact"
     for e in facts:
         assert "agent_settled" not in str(e.payload.get("fact", "")), e.payload
-    # the fallback fact is the honest "(no output)" tail, not a protocol line.
-    assert any("(no output)" in str(e.payload.get("fact", "")) for e in facts)
+    # NO worker words in the output (settled envelope only): no fallback fact
+    # at all. Placeholder "(no output)" facts flooded churn loops with junk
+    # candidates (arena-6826: 240 identical envelope "facts"). Thinking-line
+    # backfill still provides board content separately.
+    assert not facts
 
 
 def test_thinking_findings_backfilled_as_candidate_facts(monkeypatch, tmp_path):

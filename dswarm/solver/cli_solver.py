@@ -3548,9 +3548,16 @@ class CliSolver:
         # agent_end conversation snapshot used to become a JSON "fact"
         # (run-75380). extract_closing_prose pulls the last assistant-authored
         # line/text, skipping harness user directives entirely.
-        summary = extract_closing_prose(all_text, limit=200) or "(no output)"
-        fact = f"[{self.driver.name}] {summary}"
-        await self._record_fact(fact, verified=bool(accepted), artifact_id=aid)
+        summary = extract_closing_prose(all_text, limit=200)
+        if not summary:
+            # No assistant-authored words in the whole output: the worker was
+            # cut off / concluded empty. Recording a placeholder fact here
+            # flooded runs with junk candidates during churn (arena-6826:
+            # 240 identical envelope "facts"). Record nothing.
+            pass
+        else:
+            fact = f"[{self.driver.name}] {summary}"
+            await self._record_fact(fact, verified=bool(accepted), artifact_id=aid)
         # a recon/explore worker often gets cut off before writing VERIFIED_FACT
         # markers — backfill its thinking-line findings as candidate facts so
         # Reason isn't planning from an empty board (run-3155..3158).
@@ -3747,14 +3754,16 @@ class CliSolver:
                                 workdir=str(wd), flags=partial_flags,
                                 provider_error=provider_error)
 
-        # if no structured output at all, record the transcript tail as a candidate fact
+        # if no structured output at all, record the worker's closing WORDS as a
+        # candidate fact. With no assistant-authored words (settled envelope
+        # only / harness directives) record NOTHING: placeholder facts from
+        # this path flooded churn loops with junk candidates (arena-6826).
         if not facts and not deadends and not accepted:
-            lines = [ln for ln in all_text.strip().splitlines() if ln.strip()]
-            lines = [ln for ln in lines if not _is_stream_delta(ln)]
-            summary = lines[-1][:200] if lines else "(no output)"
-            await self._record_fact(
-                f"[{self.driver.name}] {summary}",
-                verified=False, artifact_id=aid)
+            summary = extract_closing_prose(all_text, limit=200)
+            if summary:
+                await self._record_fact(
+                    f"[{self.driver.name}] {summary}",
+                    verified=False, artifact_id=aid)
         # backfill thinking-line findings as candidate facts when the worker
         # produced no structured markers (recon/explore fact drought).
         await self._backfill_thinking_findings(aid)
