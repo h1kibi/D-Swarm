@@ -73,6 +73,7 @@ from dswarm.solver.marker_parser import (
     is_bare_raw_flag as _parse_bare_raw_flag,
 )
 from dswarm.solver.gate import flag_ok as _gate_flag_ok, is_placeholder_flag
+from dswarm.solver import cli_prompts
 from dswarm.solver.container_pool import WorkerRuntimeLease
 from dswarm.solver.result import ArtifactStore
 from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError
@@ -350,17 +351,6 @@ _EXPLORE_PROMPT = (
     "You may output multiple VERIFIED_FACT lines. The flag is shaped like {fmt}."
 )
 
-_EXPLORE_CONCLUDE_PROMPT = (
-    "CONCLUDE: stop exploring NOW. Do not run any more commands.\n"
-    "Summarize ONLY what you have already confirmed in REAL output, using these "
-    "markers on their own lines:\n"
-    "  VERIFIED_FACT=<a confirmed finding from real output>\n"
-    "  DEADEND=<why this direction failed>\n"
-    "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
-    "  CLEANUP=<remove_artifact|stop_listener|close_session|revoke_credential>:<target>\n"
-    "  FOUND_FLAG=<the flag>  (only if seen in real output this session)\n"
-    "If you found nothing, output DEADEND=<reason>. Do not guess."
-)
 
 _REVIEW_PROMPT = (
     "You are the Review-Arbiter for a CTF/pentest-solving swarm. You do NOT solve "
@@ -494,34 +484,8 @@ _REVIEW_JSON_MARKERS = {
 #   ask        — a plain question / follow-up about the solve
 #   mark_false — the flag was a false positive; keep solving, avoid it
 #   writeup    — produce a concise solve writeup from confirmed facts
-_RESPOND_ASK_PROMPT = (
-    "The operator has a follow-up about the challenge you just worked. Answer it "
-    "directly and concretely, drawing on what you already confirmed this session. "
-    "If answering needs a quick check, you may run a command — but do not start a "
-    "long new investigation; this is a conversation, not a fresh solve.\n\n"
-    "Operator: {text}"
-)
 
-_RESPOND_MARK_FALSE_PROMPT = (
-    "IMPORTANT: the flag you reported — {flag} — is a FALSE POSITIVE (the operator "
-    "verified it does not work). Treat it as a dead-end: do NOT report it again. "
-    "Resume solving from the facts you already confirmed and find the REAL flag.\n"
-    "{note}\n"
-    "Actually RUN commands against the real target/files. When you recover the TRUE "
-    "flag from REAL output, print it on its own line exactly as:\n  FOUND_FLAG=<flag>\n"
-    "It must appear verbatim in your shell output. Also print VERIFIED_FACT=<...> / "
-    "DEADEND=<...> lines as you go so the team's board stays current."
-)
 
-_RESPOND_WRITEUP_PROMPT = (
-    "Write a concise CTF WRITEUP for the challenge you just solved, in Chinese. "
-    "Base it ONLY on what you actually confirmed this session — do not invent steps. "
-    "Structure it as:\n"
-    "  ## 漏洞点  (the root cause / vulnerability)\n"
-    "  ## 利用步骤  (numbered, reproducible — the real commands/requests you used)\n"
-    "  ## Flag  (the flag and where it came from)\n"
-    "Keep it tight and technical. Output ONLY the markdown writeup, nothing else."
-)
 
 
 class CliSolver:
@@ -3725,7 +3689,7 @@ class CliSolver:
                 await self._emit(EventType.REASONING_DELTA,
                                  text=f"[{self.driver.name}] explore → one conclude fallback.\n")
                 self._write_board_file(wd)
-                argv = self._resume_or_execute_argv(_EXPLORE_CONCLUDE_PROMPT, session)
+                argv = self._resume_or_execute_argv(cli_prompts.EXPLORE_CONCLUDE_PROMPT, session)
                 res = await self._run_streaming(
                     argv, cwd=str(wd), timeout=self.conclude_timeout)
                 session = res.session or session
@@ -3967,12 +3931,12 @@ class CliSolver:
         # build the prompt for this command
         if action == "mark_false":
             note = self._board_context() or ""
-            prompt = _RESPOND_MARK_FALSE_PROMPT.format(
+            prompt = cli_prompts.RESPOND_MARK_FALSE_PROMPT.format(
                 flag=self.hitl_cmd.get("flag") or "(the reported flag)", note=note)
         elif action == "writeup":
-            prompt = _RESPOND_WRITEUP_PROMPT
+            prompt = cli_prompts.RESPOND_WRITEUP_PROMPT
         else:  # ask / hint / anything conversational
-            prompt = _RESPOND_ASK_PROMPT.format(text=text or "(no question text)")
+            prompt = cli_prompts.RESPOND_ASK_PROMPT.format(text=text or "(no question text)")
 
         # RESUME the winner's session (full memory) when we have one; otherwise a
         # fresh session, with the prompt already carrying the board context.
