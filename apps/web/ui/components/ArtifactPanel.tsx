@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { DeckState, GraphNode } from "@/lib/events";
+import { DeckState, GraphNode, reasonStopZh } from "@/lib/events";
 import { useT } from "@/lib/i18n";
+import { formatDurationMs } from "@/lib/reason";
 import { GraphView } from "@/components/GraphView";
 import { NodeInspector } from "@/components/NodeInspector";
 import { Blackboard } from "@/components/Blackboard";
@@ -98,28 +99,127 @@ export function RoutesPanel({ deck }: { deck: DeckState }) {
   const t = useT();
   const routes = deck.blackboard.suppressedRoutes ?? [];
   const branches = deck.blackboard.branches ?? [];
-  if (!routes.length && !branches.length) return <EmptyPanel label={t("panel.empty")} />;
+  const loop = deck.reasonLoop;
+  const intentsById = new Map(deck.blackboard.intents.map((i) => [i.id, i]));
+  const hasExploration = !!loop.recon || loop.cycles.length > 0 || !!loop.stopReason;
+  if (!hasExploration && !routes.length && !branches.length) {
+    return (
+      <div className="explore-empty">
+        <span className="rail-noresult-ico" aria-hidden="true"><Icon name="crosshair" size={18} /></span>
+        <span className="rail-noresult-title">{t("explore.empty")}</span>
+        <span className="rail-noresult-hint">{t("explore.emptyHint")}</span>
+      </div>
+    );
+  }
   return (
-    <div className="artifact-list">
-      {routes.slice().reverse().map((r) => (
-        <div className="artifact-row" key={`route-${r.routeHash}`}>
-          <div className="artifact-row-top">
-            <span className={`artifact-badge ${r.reopened ? "ok" : "bad"}`}>{r.reopened ? t("panel.reopened") : t("panel.suppressed")}</span>
-            <span className="artifact-row-title">{r.label || r.routeHash}</span>
+    <div className="artifact-list explore">
+      {/* 结局 — the first thing an operator wants to know */}
+      {(loop.stopReason || loop.solved) && (
+        <div className="explore-outcome">
+          <span className={`artifact-badge ${loop.solved ? "ok" : "sev-warn"}`}>{t("explore.stop")}</span>
+          <span className="explore-outcome-text">
+            {loop.solved
+              ? t("reason.loopSolved")
+              : t("explore.loopDone", { reason: reasonStopZh(loop.stopReason) })}
+          </span>
+        </div>
+      )}
+
+      {/* 侦察段 */}
+      {loop.recon && (
+        <div className="explore-block">
+          <div className="explore-block-h">
+            {t("explore.recon")}
+            <span className={`artifact-chip ${loop.recon.status === "completed" ? "ok" : ""}`}>
+              {t(loop.recon.status === "completed" ? "reason.reconDone" : "reason.reconRunning")}
+            </span>
+            {loop.recon.durationMs != null && (
+              <span className="explore-meta">{formatDurationMs(loop.recon.durationMs)}</span>
+            )}
           </div>
-          <div className="artifact-row-body">{r.reason}</div>
-          <div className="artifact-row-meta">{r.routeHash}</div>
+          {loop.recon.newFindings != null && (
+            <div className="explore-note">{t("reason.reconFindings", { n: loop.recon.newFindings })}</div>
+          )}
+        </div>
+      )}
+
+      {/* 规划循环：每周期 = 规划意图 → 派工 → 执行结果 → 审计 */}
+      {loop.cycles.map((cycle, idx) => (
+        <div className="explore-block" key={cycle.id}>
+          <div className="explore-block-h">
+            {t("explore.cycle", { n: idx + 1 })}
+            <span className="artifact-chip">{t(`explore.cycleStatus.${cycle.status}`)}</span>
+            {cycle.durationMs != null && <span className="explore-meta">{formatDurationMs(cycle.durationMs)}</span>}
+            {cycle.planner && <span className="explore-meta">{cycle.planner}</span>}
+            {cycle.goalMet && <span className="artifact-chip ok">{t("reason.goalMet")}</span>}
+          </div>
+          {cycle.intents.length > 0 && (
+            <div className="explore-intents">
+              {cycle.intents.map((it) => {
+                const gist = intentsById.get(it.id)?.summary?.trim();
+                const title = gist || it.goal || it.id;
+                return (
+                  <div className="explore-intent" key={`${cycle.id}-${it.id}`}>
+                    <div className="explore-intent-top">
+                      <span className={`explore-status st-${it.status}`}>{t(`explore.intentStatus.${it.status}`)}</span>
+                      <span className="explore-intent-goal" title={it.goal || it.id}>{title}</span>
+                    </div>
+                    <div className="explore-intent-meta">
+                      {it.workerId && <span>{t("explore.dispatchTo", { worker: it.workerId })}</span>}
+                      {it.mode && <span>{t("explore.modePriority", { mode: it.mode, p: it.priority ?? "-" })}</span>}
+                      {it.profile && <span>{it.profile}</span>}
+                      {it.skipReason && <span className="explore-warn">{it.skipReason}</span>}
+                      {it.status === "failed" && it.flag === undefined && it.dispatchReason && (
+                        <span>{it.dispatchReason}</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {cycle.audits.length > 0 && (
+            <div className="explore-audits">
+              <div className="explore-note-h">{t("explore.audits", { n: cycle.audits.length })}</div>
+              {cycle.audits.map((a, i) => <div className="explore-note" key={i}>{a}</div>)}
+            </div>
+          )}
         </div>
       ))}
-      {branches.slice().reverse().map((b) => (
-        <div className="artifact-row" key={`branch-${b.branchId}`}>
-          <div className="artifact-row-top">
-            <span className={`artifact-badge ${b.status === "resolved" ? "ok" : ""}`}>{b.status || "open"}</span>
-            <span className="artifact-row-title">{b.title || b.branchId}</span>
-          </div>
-          <div className="artifact-row-meta">{b.branchId} · {b.actor}</div>
+
+      {/* 死路 / 分支 */}
+      {routes.length > 0 && (
+        <div className="explore-block">
+          <div className="explore-block-h">{t("explore.deadends")} <span className="artifact-chip">{routes.length}</span></div>
+          {routes.slice().reverse().map((r) => (
+            <div className="explore-intent" key={`route-${r.routeHash}`}>
+              <div className="explore-intent-top">
+                <span className={`explore-status ${r.reopened ? "st-completed" : "st-failed"}`}>
+                  {r.reopened ? t("panel.reopened") : t("panel.suppressed")}
+                </span>
+                <span className="explore-intent-goal" title={r.routeHash}>{r.label || r.routeHash}</span>
+              </div>
+              {r.reason && <div className="explore-intent-meta">{r.reason}</div>}
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+      {branches.length > 0 && (
+        <div className="explore-block">
+          <div className="explore-block-h">{t("explore.branches")} <span className="artifact-chip">{branches.length}</span></div>
+          {branches.slice().reverse().map((b) => (
+            <div className="explore-intent" key={`branch-${b.branchId}`}>
+              <div className="explore-intent-top">
+                <span className={`explore-status ${b.status === "resolved" ? "st-completed" : "st-proposed"}`}>
+                  {b.status === "resolved" ? t("explore.intentStatus.completed") : t("explore.intentStatus.proposed")}
+                </span>
+                <span className="explore-intent-goal">{b.title || b.branchId}</span>
+              </div>
+              <div className="explore-intent-meta">{[b.actor, b.branchId].filter(Boolean).join(" · ")}</div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

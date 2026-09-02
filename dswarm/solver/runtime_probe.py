@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -300,6 +300,11 @@ class RuntimeProbe:
         driver = PiDriver()
         spec = driver.probe_spec(model=pool_spec.model, session_dir=session_dir)
         env = dict(getattr(credential_projection, "env", {}) or {})
+        if getattr(credential_projection, "credential_mode", "") == "gateway":
+            argv = list(spec.argv)
+            prompt_index = len(argv) - 1
+            argv[prompt_index:prompt_index] = ["--provider", "ctf-gateway"]
+            spec = replace(spec, argv=tuple(argv))
         # The runtime agent's baseEnv HOME (/home/kali) has NO pi provider
         # config — only the image's own user home and the run-materialized
         # workspace homes do. Without an explicit HOME the probe hello ran the

@@ -34,7 +34,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -121,8 +121,18 @@ class TokenCapError(RuntimeError):
         }
 
 
-def _real_api_key(account_root: Optional[str], run_id: str) -> str:
-    """The REAL upstream key: the run's pi-main credential account, else the host env."""
+def resolve_upstream_key(
+    explicit: Optional[str], account_root: Optional[str], run_id: str,
+    environ: Optional[dict] = None,
+) -> str:
+    """The REAL upstream key, most-specific first: the caller-resolved key for
+    the provider the run's workers are actually bound to (run_manager injects
+    it per run), else the legacy pi-main credential account file, else the
+    host env. Order matters — a stale pi-main file must not shadow the bound
+    provider's key (that mismatch was every worker 401-ing at the upstream)."""
+    val = (explicit or "").strip()
+    if val:
+        return val
     if account_root:
         p = Path(account_root) / "pi-main" / "API_KEY"
         try:
@@ -131,11 +141,17 @@ def _real_api_key(account_root: Optional[str], run_id: str) -> str:
                 return val
         except OSError:
             pass
+    env = environ if environ is not None else os.environ
     for var in ("DEEPSEEK_API_KEY",):
-        val = os.environ.get(var, "").strip()
+        val = str(env.get(var, "") or "").strip()
         if val:
             return val
     return ""
+
+
+def _real_api_key(account_root: Optional[str], run_id: str) -> str:
+    """Back-compat shim: the legacy pi-main-account → env resolution."""
+    return resolve_upstream_key(None, account_root, run_id)
 
 
 class GatewayUsageBridge:
@@ -283,6 +299,16 @@ class _Handler(BaseHTTPRequestHandler):
 class ModelGateway:
     """Process-wide OpenAI-compatible gateway with independent worker tokens."""
 
+    # Class-level upstream-key resolver: installed at app startup WITHOUT
+    # instantiating the gateway (the server must only come up when a run/probe
+    # actually needs it). Re-read on every proxy request, so settings edits and
+    # separate managers (startup tests) resolve bindings fresh.
+    _class_upstream_key_resolver: Optional[Callable[[], str]] = None
+
+    @classmethod
+    def set_upstream_key_resolver(cls, resolver: Optional[Callable[[], str]]) -> None:
+        cls._class_upstream_key_resolver = resolver
+
     def __init__(
         self, host: Optional[str] = None, port: int = _GATEWAY_PORT,
         *, max_active_tokens: int = 1024,
@@ -299,6 +325,14 @@ class ModelGateway:
         self._started = False
         self._usage_log: Optional[Path] = None
         self.account_root: Optional[str] = None   # credential account store root (set by the caller)
+        # The upstream key for the provider the run's workers are BOUND to —
+        # resolved by run_manager from the enabled worker profiles' provider_ref.
+        # The RESOLVER is the primary wiring: it is re-read on every proxy call,
+        # so settings changes and startup-test managers (which never run the
+        # per-run bus wiring) resolve correctly too. `upstream_key` remains as
+        # an eager override set per run; both beat the legacy pi-main file.
+        self.upstream_key: Optional[str] = None
+        self.upstream_key_resolver: Optional[Callable[[], str]] = None
         self.sessions_root: Optional[str] = None  # per-run usage ledgers land here
         self.usage_bridge: GatewayUsageBridge | Any | None = None
 
@@ -523,7 +557,15 @@ class ModelGateway:
         self, run_id: str, body: bytes, handler: _Handler, *,
         claims: WorkerClaims | None = None,
     ) -> None:
-        real_key = _real_api_key(self.account_root, run_id)
+        explicit = self.upstream_key
+        if explicit is None:
+            resolver = self.upstream_key_resolver or type(self)._class_upstream_key_resolver
+            if resolver is not None:
+                try:
+                    explicit = resolver()
+                except Exception:
+                    explicit = None  # resolver failure → legacy resolution paths
+        real_key = resolve_upstream_key(explicit, self.account_root, run_id)
         if not real_key:
             self._write_json(handler, 502, {"error": {"message": "gateway has no upstream key configured"}})
             return

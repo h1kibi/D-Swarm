@@ -111,6 +111,12 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app = FastAPI(title="Project D-Swarm — Command Deck", lifespan=lifespan)
     app.state.manager = mgr
     app.state.startup_test = StartupTestController(mgr)
+    # The model gateway's upstream key must track the provider the workers are
+    # bound to (NOT the legacy pi-main account file). Install the lazy resolver
+    # once at startup: startup-test runs use a separate RunManager that never
+    # hits the per-run gateway wiring, so the resolver (re-read per request,
+    # shared sessions_root) is what keeps worker calls authenticated there too.
+    mgr.install_gateway_key_resolver()
     app.state.engine_cache = {"ts": 0.0, "data": None}
     app.state.engine_cache_ttl_s = 300.0
     app.state.engine_refresh_lock = asyncio.Lock()

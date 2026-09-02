@@ -43,7 +43,7 @@ EXPECTED_EXTENSIONS = {
 }
 
 EXPECTED_GATEWAY_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro",
-                          "glm-5.3-flash"}
+                          "glm-5.3-flash", "gpt-5.5", "gpt-5.4-mini"}
 
 IMPORT_RE = re.compile(
     r"^\s*import\s+(?P<kind>type\s+)?(?:[^'\"\n]*?\s+from\s+)?['\"](?P<spec>[^'\"]+)['\"]",

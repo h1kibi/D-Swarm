@@ -40,7 +40,7 @@ export const FLEET_FILTERS: readonly FleetFilter[] = [
   "archived",
 ];
 
-export type BatchAction = "pause" | "resume" | "stop";
+export type BatchAction = "pause" | "resume" | "stop" | "archive" | "unarchive";
 
 /**
  * Needs Attention (§5.2): an unfinished run with a pending HITL hand-raise
@@ -108,10 +108,13 @@ export function sortFleet(runs: RunSummary[], sort: FleetSort): RunSummary[] {
   }
 }
 
-/** Flag progress label data for a row: "1/3" — undefined when not started. */
+/** Flag progress label data for a row: "1/3" — undefined when not started.
+ *  Flag VALUES are redacted from unauthenticated list responses (containment,
+ *  run-6427) — the count travels in flag_count when that's active. */
 export function flagProgress(r: RunSummary): { got: number; need: number } | null {
   if (!r.started) return null;
-  return { got: r.flags?.length ?? (r.flag ? 1 : 0), need: Math.max(1, r.expected_flags ?? 1) };
+  const got = r.flag_count ?? r.flags?.length ?? (r.flag ? 1 : 0);
+  return { got, need: Math.max(1, r.expected_flags ?? 1) };
 }
 
 /** Toggle one id in a batch selection (immutable — the component keeps a Set). */
@@ -124,7 +127,8 @@ export function toggleSelection(selected: ReadonlySet<string>, runId: string): S
 
 /**
  * The runs a batch action actually applies to (§5.2): pause/resume only make
- * sense on live runs, stop on anything not terminal. Selection order is kept
+ * sense on live runs, stop on anything not terminal, archive/unarchive on the
+ * selection's not-yet / already-archived halves. Selection order is kept
  * stable (input order) so the fan-out is deterministic.
  */
 export function batchTargets(
@@ -140,5 +144,9 @@ export function batchTargets(
       return chosen.filter((r) => r.status === "paused").map((r) => r.run_id);
     case "stop":
       return chosen.filter((r) => !r.finished && r.status !== "cancelled" && r.started).map((r) => r.run_id);
+    case "archive":
+      return chosen.filter((r) => !r.archived).map((r) => r.run_id);
+    case "unarchive":
+      return chosen.filter((r) => r.archived).map((r) => r.run_id);
   }
 }

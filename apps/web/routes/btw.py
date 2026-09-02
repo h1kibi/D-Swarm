@@ -15,6 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from apps.web.http_utils import _btw_timeout_exception, _env_float, _env_int, _require_dict_body
 from apps.web.run_manager import RunManager
+from dswarm.core.storage import safe_run_storage_key
 
 router = APIRouter(prefix="/api/runs", tags=["btw"])
 
@@ -59,7 +60,7 @@ async def btw(run_id: str, request: Request) -> Any:
 
     # The worker needs a cwd, so /btw creates only a per-turn scratch dir under
     # the run workspace. It never opens the graph read-write or joins the swarm.
-    safe = run_id.replace("/", "_").replace("..", "_")
+    safe = safe_run_storage_key(run_id)
     root = mgr.workspace_dir(run_id).resolve()
     graph_db = root / "graph" / "shared_graph.db"
     jsonl_path = (mgr.sessions_root / f"{safe}.jsonl").resolve()

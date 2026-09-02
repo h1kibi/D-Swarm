@@ -15,6 +15,7 @@ export type IconName =
   | "radio" | "folder" | "folderPlus" | "pin" | "pause" | "paperclip"
   | "globe" | "lock" | "menu" | "panel" | "gear" | "send" | "more"
   | "terminal" | "cpu" | "dot" | "help" | "alert" | "clock" | "plug"
+  | "archive"
   | "target" | "play" | "network" | "list" | "board" | "layers"
   | "chevronDown" | "chevronRight" | "rows" | "upload" | "copy" | "search" | "refresh"
   | "sun" | "moon" | "eye" | "eyeOff";
@@ -49,6 +50,7 @@ const PATHS: Record<IconName, JSX.Element> = {
   alert: (<><path d="M12 3 2 20h20L12 3Z" /><path d="M12 9v5" /><circle cx="12" cy="17.5" r="0.6" fill="currentColor" stroke="none" /></>),
   clock: (<><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>),
   plug: (<><path d="M9 2v6M15 2v6" /><path d="M7 8h10v3a5 5 0 0 1-10 0Z" /><path d="M12 16v6" /></>),
+  archive: (<><rect x="3" y="3" width="18" height="5" rx="1" /><path d="M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" /><path d="M10 12h4" /></>),
   target: (<><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="4" /><circle cx="12" cy="12" r="0.6" fill="currentColor" stroke="none" /></>),
   play: <path d="M7 5l12 7-12 7Z" />,
   network: (<><circle cx="6" cy="6" r="2.4" /><circle cx="18" cy="6" r="2.4" /><circle cx="12" cy="18" r="2.4" /><path d="M7.7 7.7 10.7 16M16.3 7.7 13.3 16M8 6h8" /></>),

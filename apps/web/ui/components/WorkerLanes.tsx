@@ -108,6 +108,13 @@ export function WorkerLanes({
     }
     return m;
   }, [deck]);
+  // did ANY worker in this run record tool events? A finished run with zero
+  // tool lines anywhere predates live tool capture — say so instead of a
+  // misleading "no tool output yet".
+  const anyToolLines = useMemo(
+    () => [...byWorker.values()].some((c) => c.tools.length > 0),
+    [byWorker],
+  );
 
   // verified-fact count per actor (from the blackboard provenance facts)
   const verifiedByActor = useMemo(() => {
@@ -189,7 +196,10 @@ export function WorkerLanes({
         const engine = workerEngine(id, lane.engine);
         const color = workerColor(id, lane.engine);
         const chat = byWorker.get(id) || { reasoning: [], tools: [] };
-        const reasoning = (lane.reasoning || chat.reasoning.slice(-1)[0] || "").trim();
+        // live lane text wins; historical runs only carry the phase summaries
+        // (⮑ lines) — show ALL of them, not just the last, so an old run's lane
+        // still tells its story.
+        const reasoning = (lane.reasoning || chat.reasoning.slice(-8).join("\n") || "").trim();
         const tools = chat.tools.slice(-6);
         const session = lane.session;
         const resumeCmd = session ? resumeCommand(engine, session) : "";
@@ -279,12 +289,19 @@ export function WorkerLanes({
                 <div className="wlane-body">
                   <div>
                     <div className="wlane-block-h">{t("wlane.reasoning")}</div>
-                    <div className={`wlane-reason ${reasoning ? "" : "idle"}`}>{reasoning || t("wlane.idle")}</div>
+                    <div className={`wlane-reason ${reasoning ? "" : "idle"}`}>
+                      {reasoning
+                        || (running ? t("wlane.idle") : t("wlane.idleHistorical"))}
+                    </div>
                   </div>
                   <div>
                     <div className="wlane-block-h">{t("wlane.tools")}</div>
                     {tools.length === 0 ? (
-                      <div className="wlane-reason idle">{t("wlane.noTools")}</div>
+                      <div className="wlane-reason idle">
+                        {running || anyToolLines
+                          ? t("wlane.noTools")
+                          : t("wlane.noToolsHistorical")}
+                      </div>
                     ) : (
                       <div className="wlane-tools">
                         {tools.map((tl, i) => <div className="wlane-toolline" key={i}>{tl}</div>)}

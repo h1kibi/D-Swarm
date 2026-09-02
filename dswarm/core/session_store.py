@@ -9,13 +9,30 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 from typing import AsyncIterator
 
+from pydantic import ValidationError
+
 from dswarm.core.events import Event
+from dswarm.core.storage import safe_run_storage_key
 
 
 _REPLAY_YIELD_EVERY = 100
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _path_lock(path: Path) -> threading.Lock:
+    """Serialize appends from multiple SessionStore instances in one process."""
+    key = str(path.resolve())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 class SessionStore:
@@ -25,14 +42,35 @@ class SessionStore:
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _path(self, run_id: str) -> Path:
-        # run_id is trusted internal (challenge id / uuid), but guard separators.
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = safe_run_storage_key(run_id)
         return self.root / f"{safe}.jsonl"
 
     def _lock_for(self, run_id: str) -> asyncio.Lock:
-        if run_id not in self._locks:
-            self._locks[run_id] = asyncio.Lock()
-        return self._locks[run_id]
+        key = safe_run_storage_key(run_id)
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+
+    @staticmethod
+    def _iter_events(path: Path):
+        """Yield valid events, tolerating only a torn final JSONL record.
+
+        A process can terminate after writing part of the final line.  The
+        durable prefix remains useful and should still be replayable.  A
+        newline-terminated malformed record is different: it indicates
+        corruption and must remain visible to callers instead of being silently
+        discarded.
+        """
+        with path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                if not raw.strip():
+                    continue
+                try:
+                    yield Event.model_validate_json(raw)
+                except (json.JSONDecodeError, ValidationError):
+                    if not raw.endswith(("\n", "\r")):
+                        continue
+                    raise
 
     async def append(self, event: Event) -> None:
         path = self._path(event.run_id)
@@ -40,18 +78,20 @@ class SessionStore:
         async with self._lock_for(event.run_id):
             # Synchronous append under an async lock; writes are small and the
             # OS buffers them. Keeps ordering per run without a thread pool.
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
+            with _path_lock(path):
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line)
 
     async def append_checked(self, event: Event) -> None:
         """Append an event and force it to durable storage before returning."""
         path = self._path(event.run_id)
         line = event.model_dump_json() + "\n"
         async with self._lock_for(event.run_id):
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
-                f.flush()
-                os.fsync(f.fileno())
+            with _path_lock(path):
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                    f.flush()
+                    os.fsync(f.fileno())
 
     # EventBus sink signature
     async def sink(self, event: Event) -> None:
@@ -62,29 +102,20 @@ class SessionStore:
         path = self._path(run_id)
         if not path.exists():
             return []
-        events: list[Event] = []
-        with path.open("r", encoding="utf-8") as f:
-            for raw in f:
-                raw = raw.strip()
-                if raw:
-                    events.append(Event.model_validate_json(raw))
-        return events
+        return list(self._iter_events(path))
     async def replay(self, run_id: str) -> AsyncIterator[Event]:
         path = self._path(run_id)
         if not path.exists():
             return
-        with path.open("r", encoding="utf-8") as f:
-            n = 0
-            for raw in f:
-                raw = raw.strip()
-                if raw:
-                    n += 1
-                    yield Event.model_validate_json(raw)
-                    if n % _REPLAY_YIELD_EVERY == 0:
-                        # Historical SSE subscribers can replay tens of thousands
-                        # of JSONL events. Cooperate with the uvicorn loop so
-                        # unrelated API calls do not look globally frozen.
-                        await asyncio.sleep(0)
+        n = 0
+        for event in self._iter_events(path):
+            n += 1
+            yield event
+            if n % _REPLAY_YIELD_EVERY == 0:
+                # Historical SSE subscribers can replay tens of thousands
+                # of JSONL events. Cooperate with the uvicorn loop so
+                # unrelated API calls do not look globally frozen.
+                await asyncio.sleep(0)
 
     def last_stream_seq(self, run_id: str) -> int:
         """Return the monotonic SSE sequence after normalizing persisted history.

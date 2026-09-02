@@ -35,6 +35,12 @@ def _result(ok: bool, detail: str, layer: Optional[str] = None) -> dict[str, Any
 
 _docker = docker_run
 
+# Cold container starts on Windows/WSL2 with a full-Kali image can outrun a
+# fixed 60s wall (disk IO races when several profiles probe at once), which
+# surfaced as rotating "容器探测超时（>60s）" profile_unhealthy failures during
+# the startup smoke. Env-tunable so operators on slow disks can widen it.
+PROBE_TIMEOUT_S = float(os.environ.get("DSWARM_CONTAINER_PROBE_TIMEOUT", "60"))
+
 
 def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, Any]:
     """Real one-shot ``docker run --rm`` test of the container plumbing.
@@ -107,9 +113,9 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
             image, "-lc", script,
         ]
         try:
-            run = _docker(*run_cmd, timeout=60)
+            run = _docker(*run_cmd, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            return _result(False, "容器探测超时（>60s）", layer="cli")
+            return _result(False, f"容器探测超时（>{PROBE_TIMEOUT_S:.0f}s，可调 DSWARM_CONTAINER_PROBE_TIMEOUT）", layer="cli")
         out = (run.stdout or "") + (run.stderr or "")
         if "DSWARM_MOUNT_UNREADABLE" in out or run.returncode == 71:
             return _result(False, "容器内无法读取凭据（uid 不匹配或挂载失败）", layer="mount")

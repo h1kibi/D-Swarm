@@ -125,4 +125,12 @@ describe("batch selection", () => {
     // hitl "stop", not a delete)
     expect(batchTargets(ALL, new Set(["s"]), "stop")).toEqual([]);
   });
+
+  it("batchTargets archive/unarchive split the selection by archived state", () => {
+    const sel = new Set(["live", "a", "s"]);
+    expect(batchTargets(ALL, sel, "archive")).toEqual(["live", "s"]);
+    expect(batchTargets(ALL, sel, "unarchive")).toEqual(["a"]);
+    // a full-archived selection has nothing left to archive
+    expect(batchTargets(ALL, new Set(["a"]), "archive")).toEqual([]);
+  });
 });

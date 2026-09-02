@@ -243,3 +243,45 @@ describe("stage rail", () => {
     expect(anchors.finalize).toBeUndefined();
   });
 });
+
+describe("buildTimeline — flag announcement dedupe", () => {
+  it("collapses insight + worker capture + coordinator re-broadcasts to one row", () => {
+    // run-6203 shape: one discovery, narrated five times (two case wrappers,
+    // three actors). The flag CORE (text between braces) is what identifies it.
+    const deck = emptyDeck("run-flag");
+    deck.started = true;
+    deck.startedAt = 1000;
+    deck.chat = [
+      { id: "c1", role: "system", kind: "insight", content: "insight · FlagFound: afctf{c14ssic_cae5ar} (cli-pi)", ts: 1000 },
+      { id: "c2", role: "system", kind: "insight", content: "insight · FlagFound: NSSCTF{c14ssic_cae5ar} (cli-pi)", ts: 1010 },
+      { id: "c3", role: "system", kind: "insight", content: "insight · provider recovered for seat_pi (system)", ts: 1020 },
+    ];
+    deck.blackboard.events = [
+      { id: "e1", kind: "flag_found", actor: "cli-pi", ts: 1005, label: "cli-pi FLAG afctf{c14ssic_cae5ar}" },
+      { id: "e2", kind: "flag_found", actor: "cli-pi", ts: 1015, label: "cli-pi FLAG NSSCTF{c14ssic_cae5ar}" },
+      { id: "e3", kind: "flag_found", actor: "coordinator", ts: 1020, label: "coordinator FLAG afctf{c14ssic_cae5ar}" },
+      { id: "e4", kind: "flag_found", actor: "coordinator", ts: 1022, label: "coordinator FLAG NSSCTF{c14ssic_cae5ar}" },
+    ];
+    const items = buildTimeline(deck);
+    const flagRows = items.filter((i) => i.kind === "flag");
+    expect(flagRows).toHaveLength(1);
+    // the worker's own capture row is the canonical telling
+    expect(flagRows[0]).toMatchObject({ actor: "cli-pi", flag: expect.stringContaining("afctf") });
+    // the FlagFound insight duplicates are gone; unrelated insights stay
+    const insightChats = items.filter((i) => i.kind === "chat" && i.message.kind === "insight");
+    expect(insightChats).toHaveLength(1);
+    expect(insightChats[0]).toMatchObject({ message: expect.objectContaining({ id: "c3" }) });
+  });
+
+  it("keeps genuinely different flags separate", () => {
+    const deck = emptyDeck("run-2flags");
+    deck.started = true;
+    deck.startedAt = 1000;
+    deck.blackboard.events = [
+      { id: "f1", kind: "flag_found", actor: "cli-pi", ts: 1000, label: "cli-pi FLAG flag{one}" },
+      { id: "f2", kind: "flag_found", actor: "cli-pi", ts: 1010, label: "cli-pi FLAG flag{two}" },
+    ];
+    const items = buildTimeline(deck);
+    expect(items.filter((i) => i.kind === "flag")).toHaveLength(2);
+  });
+});

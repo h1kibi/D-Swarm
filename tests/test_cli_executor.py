@@ -17,11 +17,12 @@ from dswarm.models.solve_graph import Challenge
 from dswarm.solver import cli_solver
 from dswarm.solver import blackboard_skill
 from dswarm.solver.cli_driver import (
-    PiDriver, StreamStep, DRIVERS,
+    CliResult, PiDriver, StreamStep, DRIVERS,
     driver_for, get_driver, _kill_proc_tree,
 )
 from dswarm.solver.cli_solver import CliSolver
 from dswarm.solver.container_exec import CONTAINER_WORKSPACE, ContainerHandle
+from dswarm.solver.container_runtime import ContainerRuntimeExecutor
 
 
 def _CP(rc: int, out: str = "", err: str = "") -> "subprocess.CompletedProcess":
@@ -3310,3 +3311,93 @@ def test_extract_closing_prose_prefers_assistant_words_over_envelopes():
     # unknown json / non-json handled as before
     assert extract_closing_prose("") == ""
     assert extract_closing_prose('{"type":"tool_execution_end","id":1}') == ""
+
+
+# ── _run_streaming routing: pool workers must stream (reasoning/tool steps) ───
+# Regression for the M9a-era short-circuit: a leased pool executor went through
+# plain container.run() with NO on_step, so every pool-dispatched worker ran
+# with zero live reasoning/tool events (run-6038: 16 real minutes, 41 model
+# calls, 4 reasoning deltas, 0 tool events).
+
+class _FakePoolExecutor(ContainerRuntimeExecutor):
+    """Duck executor recording which run entrypoint _run_streaming chose."""
+
+    def __init__(self):  # skip the real pool wiring — the routing is what we test
+        self.calls = []
+
+    async def run(self, driver, argv, **kw):
+        self.calls.append(("plain_run", kw))
+        return CliResult(text="done")
+
+    async def run_streaming(self, driver, argv, **kw):
+        self.calls.append(("run_streaming", kw))
+        on_step = kw.get("on_step")
+        if on_step:
+            on_step(StreamStep("reasoning", text="live thought"))
+        return CliResult(text="done")
+
+
+def _stream_routing_solver(bus):
+    s = _cli_solver(Challenge(id="t", name="t", category="web"), bus=bus)
+    ex = _FakePoolExecutor()
+    s.container = ex
+    return s, ex
+
+
+@pytest.mark.parametrize("with_bus", [True, False])
+def test_run_streaming_executor_routes_by_bus(monkeypatch, with_bus):
+    """With a bus, a leased pool executor MUST take the streaming run (on_step +
+    cancel/steer wired) so the deck sees live reasoning/tool output; without a
+    bus there is nothing to stream to and the plain run stays."""
+    from dswarm.solver import cli_solver as cs_mod
+
+    s, ex = _stream_routing_solver(_CaptureBus() if with_bus else None)
+    monkeypatch.setattr(cs_mod, "_WORKER_HEARTBEAT_SECONDS", 0.0)
+    monkeypatch.setattr(type(s), "_worker_env", lambda self: {})
+    monkeypatch.setattr(type(s), "_apply_runtime_argv",
+                        lambda self, argv, env: list(argv))
+
+    res = asyncio.run(s._run_streaming(["pi"], cwd=".", timeout=5))
+
+    assert res.text == "done"
+    chosen = [name for name, _ in ex.calls]
+    if with_bus:
+        assert chosen == ["run_streaming"]
+        kw = ex.calls[0][1]
+        assert callable(kw["on_step"])
+        assert kw["cancel_event"] is s._cancel_event
+        assert kw["steer_event"] is s._steer_event
+    else:
+        assert chosen == ["plain_run"]
+        assert "on_step" not in ex.calls[0][1]
+
+
+# ── missing-attachment prompt guard (run-6427) ────────────────────────────────
+
+def test_missing_attachment_guard_warns_when_declared_but_absent():
+    """A brief that declares 附件 while none staged must tell the worker the
+    files are missing — the wander that followed is how a run scraped other
+    runs' flags off the control-plane API instead of solving."""
+    ch = Challenge(id="t", name="t", category="reverse",
+                   description="- 题目类型：Reverse\n- 附件：re1，大小约 87.5 KB")
+    s = _cli_solver(ch)
+    s._staged_files = []
+    prompt = s._build_prompt()
+    assert "NO attachment files were staged" in prompt
+    assert "Do NOT fabricate" in prompt
+
+
+def test_missing_attachment_guard_silent_when_files_staged():
+    ch = Challenge(id="t", name="t", category="reverse",
+                   description="- 附件：re1")
+    s = _cli_solver(ch)
+    s._staged_files = ["/home/kali/workspace/inputs/by-name/re1"]
+    assert "NO attachment files were staged" not in s._build_prompt()
+
+
+def test_missing_attachment_guard_silent_without_attachment_mention():
+    ch = Challenge(id="t", name="t", category="web",
+                   description="attack http://target/ and capture the flag")
+    s = _cli_solver(ch)
+    s._staged_files = []
+    assert "NO attachment files were staged" not in s._build_prompt()

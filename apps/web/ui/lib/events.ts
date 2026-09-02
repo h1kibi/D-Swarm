@@ -74,6 +74,94 @@ function isConsumedBlackboardKind(kind: unknown): kind is string {
   return typeof kind === "string" && BLACKBOARD_CONSUMED_KINDS.has(kind);
 }
 
+/** Compact zh duration for fold-time timeline labels ("12分20秒" / "45秒"). */
+function fmtMs(ms: unknown): string {
+  const n = Number(ms ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return "耗时未知";
+  const sec = Math.round(n / 1000);
+  if (sec < 60) return `${sec}秒`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分${sec % 60 ? `${sec % 60}秒` : ""}`;
+  const hr = Math.floor(min / 60);
+  return `${hr}时${min % 60}分`;
+}
+
+/** zh rendering for the reason loop's stop reasons (timeline + exploration view). */
+export const REASON_STOP_ZH: Record<string, string> = {
+  no_fresh_intents: "没有新的探索方向",
+  solved: "已解出",
+  goal_met: "目标达成",
+  operator_paused: "操作员暂停",
+  provider_fatal: "模型通道持续失败",
+  budget_exhausted: "预算用尽",
+  wall_clock: "时间预算用尽",
+};
+export function reasonStopZh(reason: unknown): string {
+  const key = String(reason ?? "");
+  return REASON_STOP_ZH[key] ?? key;
+}
+
+const VERDICT_ZH: Record<string, string> = {
+  course_correct: "方向漂移，需要纠正",
+  explore: "继续当前方向",
+  complete: "任务已完成",
+};
+
+function renderVerdict(d: any): string | null {
+  if (!d || typeof d !== "object" || typeof d.verdict !== "string") return null;
+  const verdict = VERDICT_ZH[d.verdict.trim().toLowerCase()] ?? d.verdict;
+  const bits = [`规划审计 · 判定：${verdict}`];
+  bits.push(d.goal_met ? "目标达成" : "目标未达成");
+  const drift = String(d.drift ?? "").trim();
+  if (drift) bits.push(`漂移与建议：${drift}`);
+  const audit = Array.isArray(d.audit) ? d.audit.filter((x: any) => typeof x === "string" && x.trim()) : [];
+  for (const a of audit.slice(0, 4)) bits.push(`审计：${a.trim()}`);
+  return bits.join("\n");
+}
+
+/**
+ * The reason planner narrates its audit as a raw JSON blob
+ * (`{"verdict":"course_correct","goal_met":false,"drift":"…", …}`) through
+ * text.delta — unreadable in the activity feed. Consecutive verdicts can also
+ * end up CONCATENATED inside one chat bubble and head-clipped by the bubble
+ * cap, so anchor on each `{"verdict"` start and brace-walk from there (a
+ * clipped first fragment simply has no start marker and is skipped).
+ * Returns null when the bubble holds no verdict JSON (show it as-is).
+ */
+export function formatReasonVerdict(text: string): string | null {
+  const raw = String(text ?? "");
+  if (!raw.includes('"verdict"')) return null;
+  const out: string[] = [];
+  const startRe = /\{\s*"verdict"/g;
+  let m: RegExpExecArray | null;
+  while ((m = startRe.exec(raw)) !== null) {
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = m.index; i < raw.length; i++) {
+      const ch = raw[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    startRe.lastIndex = end > 0 ? end : m.index + m[0].length;
+    if (end > 0) {
+      try {
+        const rendered = renderVerdict(JSON.parse(raw.slice(m.index, end)));
+        if (rendered) out.push(rendered);
+      } catch { /* not a verdict blob — skip */ }
+    }
+  }
+  return out.length ? out.join("\n\n") : null;
+}
+
 export function isRuntimeInfraFactText(x: unknown): boolean {
   const s = String(x ?? "").trim().toLowerCase();
   if (!s) return false;
@@ -1730,6 +1818,50 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           tlabel(`${w ?? actor} killed`);
           break;
         }
+        // ── reason-scheduler / projector narration (folded structurally into
+        // deck.reasonLoop / deck.findings below; these cases only give the
+        // timeline a readable zh line instead of "unrecognized blackboard event")
+        case "recon_started": {
+          tlabel(`侦察开始 · ${(p.goal ?? "").toString().slice(0, 56)}`);
+          break;
+        }
+        case "recon_completed": {
+          tlabel(`侦察完成 · 新发现 ${Number(p.new_findings ?? 0)} 条 · ${fmtMs(p.duration_ms)}`);
+          break;
+        }
+        case "reason_cycle_started": {
+          tlabel(`规划周期 ${p.reason_cycle_id ?? "?"} 开始（第 ${p.generation ?? "?"} 代）`);
+          break;
+        }
+        case "reason_cycle_completed": {
+          const audits = Array.isArray(p.audit_notes) ? p.audit_notes.length : 0;
+          tlabel(`规划周期 ${p.reason_cycle_id ?? "?"} 完成 · 审计 ${audits} 条${p.goal_met ? " · 目标达成" : ""} · ${fmtMs(p.duration_ms)}`);
+          break;
+        }
+        case "dispatch_decision": {
+          tlabel(`派工：${p.intent_id ?? "?"} → ${p.profile ?? "?"}${p.dispatch_reason ? `（${p.dispatch_reason}）` : ""}`);
+          break;
+        }
+        case "intent_failed": {
+          tlabel(`意图 ${p.intent_id ?? "?"} 执行失败${p.error ? `：${String(p.error).slice(0, 72)}` : ""}`);
+          break;
+        }
+        case "fallback_dispatch": {
+          tlabel(`兜底派工：${p.intent_id ?? "?"}${p.reason ? `（${p.reason}）` : ""}`);
+          break;
+        }
+        case "reason_loop_finished": {
+          tlabel(`规划循环结束：${reasonStopZh(p.stop_reason)}`);
+          break;
+        }
+        case "finding_upserted": {
+          tlabel(`候选发现更新 · ${String(p.target ?? p.payload?.fact ?? "").slice(0, 56)}`);
+          break;
+        }
+        case "worker_health_check": {
+          tlabel(`worker 健康检查${p.status ? ` · ${p.status}` : ""}`);
+          break;
+        }
         case "worker_spawn_rejected": {
           const why = p.reason === "max_workers"
             ? "at max workers" : p.reason === "unknown_engine"
@@ -2124,6 +2256,11 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           ts: ev.ts, i18nKey: "sys.runtimeFailure",
           i18nVars: { detail: s.outcomeDetail || "runtime failure" },
         });
+      } else if (s.solvedChatShown || s.flag || s.flags.length > 0 || p.solved) {
+        // The outcome is ALREADY narrated — a solved banner ran (worker.finish
+        // banners the solve first on multi-flag runs, setting solvedChatShown)
+        // or flags sit on the deck. A trailing RUN_FINISHED must not
+        // contradict that with "解题结束（无 flag）".
       } else {
         pushChat(s, {
           role: "system", kind: "status", content: "Run finished (no flag)",

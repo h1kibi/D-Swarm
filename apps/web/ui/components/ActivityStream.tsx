@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { ChatMessage, DeckState, isReviewWorkerLane, isWorkerLane, COORDINATOR_IDS } from "@/lib/events";
+import { ChatMessage, DeckState, formatReasonVerdict, isReviewWorkerLane, isWorkerLane, COORDINATOR_IDS } from "@/lib/events";
 import { useT, useLang } from "@/lib/i18n";
 import { readKey, writeKey } from "@/lib/storage";
 import { workerColor, workerEngine, workerInitial, workerShortLabel } from "@/lib/workers";
@@ -254,7 +254,10 @@ export function ActivityStream({ deck }: { deck: DeckState }) {
       ) : (
         <div className={`activity-feed ${compact ? "compact" : ""}`}>
           {visibleChat.map((m, i) => {
-            const text = m.i18nKey ? t(m.i18nKey, m.i18nVars) : m.content;
+            const isCoord = !!m.solverId && COORDINATOR_IDS.has(m.solverId);
+            const text = m.i18nKey
+              ? t(m.i18nKey, m.i18nVars)
+              : (isCoord ? formatReasonVerdict(m.content) : null) ?? m.content;
             const isWorker = !!m.solverId && isWorkerLane(m.solverId);
             const isReview = isWorker && isReviewWorkerLane(deck.lanes[m.solverId!]);
             const color = isWorker ? workerColor(m.solverId!, undefined) : undefined;

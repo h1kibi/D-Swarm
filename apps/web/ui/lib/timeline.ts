@@ -193,9 +193,65 @@ export function buildTimeline(deck: DeckState): TimelineItem[] {
     items.push({ kind: "chat", id: `chat:${m.id}`, ts: tsMs(m.ts), stage: "execute", message: m });
   }
 
-  return items.sort((a, b) =>
+  return dedupeFlagAnnouncements(items.sort((a, b) =>
     a.ts - b.ts || KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
-  );
+  ));
+}
+
+/** The flag CORE used to collapse repeated announcements: the text between
+ *  braces, case-insensitive — a platform wrapper (NSSCTF{afctf{…}}) and the
+ *  bare inner flag (afctf{…}) narrate ONE discovery. */
+export function flagCore(s: string): string {
+  const text = String(s ?? "");
+  const m = text.match(/\{([^{}]*)\}/);
+  return (m ? m[1] : text).trim().toLowerCase();
+}
+
+function flagAnnouncementCore(item: TimelineItem): string | null {
+  if (item.kind === "flag") return flagCore(item.flag);
+  if (item.kind === "chat" && item.message.kind === "insight") {
+    const m = item.message.content.match(/FlagFound:\s*(\S+)/i);
+    if (m) return flagCore(m[1]);
+  }
+  return null;
+}
+
+/** Rank repeated announcements of one flag: the worker's capture row is the
+ *  canonical telling, the insight broadcast is backup, the coordinator's
+ *  re-broadcast is pure noise. */
+function flagAnnouncementRank(item: TimelineItem): number {
+  if (item.kind === "flag") return item.actor === "coordinator" ? 2 : 0;
+  return 1;
+}
+
+/**
+ * One flag discovery used to render as up to FIVE rows (worker insight, the
+ * worker's flag_found capture, the coordinator re-broadcasting the same flag
+ * twice, sometimes in a second case wrapper). Collapse every announcement of
+ * the same flag CORE to its best-ranked row: worker capture > insight >
+ * coordinator re-broadcast, earliest wins ties.
+ */
+function dedupeFlagAnnouncements(items: TimelineItem[]): TimelineItem[] {
+  const best = new Map<string, { id: string; rank: number }>();
+  const dropped = new Set<string>();
+  for (const item of items) {
+    const core = flagAnnouncementCore(item);
+    if (core === null) continue;
+    const rank = flagAnnouncementRank(item);
+    const cur = best.get(core);
+    if (cur === undefined) {
+      best.set(core, { id: item.id, rank });
+      continue;
+    }
+    if (rank < cur.rank) {
+      dropped.add(cur.id);
+      best.set(core, { id: item.id, rank });
+    } else {
+      dropped.add(item.id);
+    }
+  }
+  if (dropped.size === 0) return items;
+  return items.filter((it) => !dropped.has(it.id));
 }
 
 /** DOM anchor id a Stage Rail click scrolls to (§5.3: click stage → jump). */

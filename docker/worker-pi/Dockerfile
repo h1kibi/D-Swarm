@@ -71,6 +71,37 @@ RUN apt-get update && \
     && (gem install --no-document zsteg one_gadget \
          || echo "[dswarm] WARN: gem extras (zsteg/one_gadget) failed - install at runtime")
 
+# ── dynamic-analysis + QoL supplements (image audit 2026-09-01) ──────────────
+# The kali-tools-* metapackages don't pull the pwn dynamic-analysis kit
+# (strace/ltrace/qemu-user/patchelf/seccomp-tools) nor ripgrep/jq/poppler; and
+# the ghidra package ships analyzeHeadless OUTSIDE PATH. Small layer so a
+# rebuild stays cheap; keep it after the big install above for cache locality.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get \
+      -o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 \
+      install -y --no-install-recommends \
+      strace ltrace patchelf qemu-user ripgrep jq poppler-utils sudo \
+    && rm -rf /var/lib/apt/lists/* && \
+    (gem install --no-document seccomp-tools \
+       || echo "[dswarm] WARN: gem seccomp-tools failed - install at runtime") && \
+    GHIDRA_HEADLESS="$(find /usr/share/ghidra /usr/lib/ghidra /opt -maxdepth 5 \
+      -name analyzeHeadless 2>/dev/null | head -1)" && \
+    if [ -n "$GHIDRA_HEADLESS" ]; then \
+      ln -sf "$GHIDRA_HEADLESS" /usr/local/bin/analyzeHeadless; \
+    else echo "[dswarm] WARN: analyzeHeadless not found - ghidra headless unlinked"; fi
+
+# ── runtime self-install channel (parity with docker/worker-kali) ────────────
+# Workers install missing tools on demand; the models type `apt-get` without
+# sudo, so the auto-sudo wrappers transparently retry through NOPASSWD sudo
+# when the caller is not root. Without this the ctf user cannot install
+# anything at runtime (the tool-on-demand design breaks).
+RUN echo "ctf ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ctf && chmod 440 /etc/sudoers.d/ctf && \
+    printf '#!/bin/sh\nname="$(basename "$0")"\nreal="/usr/bin/$name"\n[ "$(id -u)" = "0" ] && exec "$real"\nexec sudo -n "$real"\n' \
+      > /usr/local/sbin/dswarm-auto-sudo && chmod +x /usr/local/sbin/dswarm-auto-sudo && \
+    ln -sf /usr/local/sbin/dswarm-auto-sudo /usr/local/bin/apt-get && \
+    ln -sf /usr/local/sbin/dswarm-auto-sudo /usr/local/bin/apt && \
+    ln -sf /usr/local/sbin/dswarm-auto-sudo /usr/local/bin/dpkg
+
 # ----------------------------------------------------------------------
 # Vendored external skills: base skills for every worker (MIT).
 # ljagiello/ctf-skills: solve-challenge (triage/dispatcher) and ctf-writeup

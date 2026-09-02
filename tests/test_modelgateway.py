@@ -613,3 +613,88 @@ def test_gateway_client_disconnect_after_success_keeps_single_succeeded_record(
     finished = [r for r in rows if r.get("phase") == "finished"]
     assert len(finished) == 1
     assert finished[0]["call_outcome"] == "succeeded"
+
+
+# ── upstream key resolution order (run-6123+ regression) ─────────────────────
+# The gateway used to hardcode the pi-main credential account file. When the
+# operator re-binds workers to a provider (e.g. zhipu) whose key lives in the
+# provider secret store, workers 401-ed at the upstream while host-side probes
+# stayed green. The bound provider's key must win.
+
+def test_explicit_upstream_key_beats_account_file_and_env(upstream, tmp_path):
+    up, gw = upstream
+    acct = tmp_path / "accounts" / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("sk-stale-pi-main\n", encoding="utf-8")
+    gw.account_root = str(tmp_path / "accounts")
+    gw.upstream_key = "sk-bound-provider"
+    import os as _os
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-env-fallback"
+    try:
+        token = gw.issue("run-key-order")
+        status, data = _post(gw, token,
+                             {"model": "glm-5.3-flash",
+                              "messages": [{"role": "user", "content": "hi"}]},
+                             stream=False)
+        assert status == 200
+        assert up.received_auth == ["Bearer sk-bound-provider"]
+    finally:
+        _os.environ.pop("DEEPSEEK_API_KEY", None)
+
+
+def test_account_file_still_works_without_explicit_key(upstream, tmp_path):
+    up, gw = upstream
+    acct = tmp_path / "accounts" / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("sk-account-file\n", encoding="utf-8")
+    gw.account_root = str(tmp_path / "accounts")
+    gw.upstream_key = None
+    import os as _os
+    _os.environ.pop("DEEPSEEK_API_KEY", None)
+    token = gw.issue("run-key-file")
+    status, data = _post(gw, token,
+                         {"model": "deepseek-v4-flash",
+                          "messages": [{"role": "user", "content": "hi"}]},
+                         stream=False)
+    assert status == 200
+    assert up.received_auth == ["Bearer sk-account-file"]
+
+
+def test_upstream_key_resolver_is_consulted_per_request(upstream, tmp_path):
+    """The lazy resolver (installed at app startup) is what authenticates
+    startup-test runs — their separate RunManager never runs the per-run
+    gateway wiring. It must be re-read on every request and a failing resolver
+    must fall back to the legacy sources instead of raising."""
+    up, gw = upstream
+    acct = tmp_path / "accounts" / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("sk-from-account-file\n", encoding="utf-8")
+    gw.account_root = str(tmp_path / "accounts")
+    gw.upstream_key = None
+    calls = {"n": 0}
+
+    def resolver():
+        calls["n"] += 1
+        return f"sk-resolved-{calls['n']}"
+
+    gw.upstream_key_resolver = resolver
+    token = gw.issue("run-resolver")
+    status, data = _post(gw, token,
+                         {"model": "glm-5.3-flash",
+                          "messages": [{"role": "user", "content": "hi"}]},
+                         stream=False)
+    assert status == 200
+    assert up.received_auth == ["Bearer sk-resolved-1"]
+
+    # a raising resolver must not break the request — legacy file wins
+    def boom():
+        raise RuntimeError("config store unavailable")
+
+    gw.upstream_key_resolver = boom
+    token = gw.issue("run-resolver-boom")
+    status, data = _post(gw, token,
+                         {"model": "glm-5.3-flash",
+                          "messages": [{"role": "user", "content": "hi"}]},
+                         stream=False)
+    assert status == 200
+    assert up.received_auth[-1] == "Bearer sk-from-account-file"

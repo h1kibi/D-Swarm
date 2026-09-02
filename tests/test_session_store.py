@@ -6,7 +6,12 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
+from dswarm.core.events import Event, EventType
 from dswarm.core.session_store import SessionStore
+from dswarm.core.storage import safe_run_storage_key
 
 
 def _write(root: Path, run_id: str, events: list[dict]) -> None:
@@ -40,6 +45,69 @@ def test_summary_multi_flag_partial_not_solved(tmp_path: Path) -> None:
     assert s["flag"] == "flag{one}"
     assert s["expected_flags"] == 3
     assert s["multi_flag"] is True
+
+
+def test_storage_key_contains_windows_path_id_inside_root(tmp_path: Path) -> None:
+    store = SessionStore(root=tmp_path)
+    hostile = r"C:\Users\Public\..\outside"
+    path = store._path(hostile)
+
+    assert path.parent == tmp_path
+    assert path.name == f"{safe_run_storage_key(hostile)}.jsonl"
+    assert path.resolve().is_relative_to(tmp_path.resolve())
+
+
+async def test_multiple_store_instances_append_complete_jsonl_records(
+    tmp_path: Path,
+) -> None:
+    """Separate backend components must not interleave writes to one run log."""
+    stores = [SessionStore(root=tmp_path), SessionStore(root=tmp_path)]
+    events = [
+        Event(
+            event_type=EventType.TEXT_MESSAGE_DELTA,
+            run_id="shared-run",
+            seq=index,
+            payload={"index": index},
+        )
+        for index in range(100)
+    ]
+
+    await asyncio.gather(*[
+        stores[index % 2].append(event)
+        for index, event in enumerate(events)
+    ])
+
+    persisted = stores[0].read_events("shared-run")
+    assert len(persisted) == len(events)
+    assert {event.payload["index"] for event in persisted} == set(range(100))
+
+
+def test_replay_ignores_only_a_torn_final_record(tmp_path: Path) -> None:
+    store = SessionStore(root=tmp_path)
+    path = store._path("torn-run")
+    valid = Event(
+        event_type=EventType.RUN_STARTED,
+        run_id="torn-run",
+        payload={},
+    ).model_dump_json()
+    path.write_text(valid + '\n{"event_type":"run.finished"', encoding="utf-8")
+
+    assert [event.event_type for event in asyncio.run(
+        _collect_events(store.replay("torn-run"))
+    )] == [EventType.RUN_STARTED]
+
+
+async def _collect_events(events):
+    return [event async for event in events]
+
+
+def test_replay_rejects_newline_terminated_corruption(tmp_path: Path) -> None:
+    store = SessionStore(root=tmp_path)
+    path = store._path("corrupt-run")
+    path.write_text('{"not_an_event":true}\n', encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        asyncio.run(_collect_events(store.replay("corrupt-run")))
 
 
 def test_summary_multi_flag_complete_is_solved(tmp_path: Path) -> None:

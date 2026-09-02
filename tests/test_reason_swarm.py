@@ -61,6 +61,43 @@ async def test_reason_swarm_starts_with_single_recon():
     assert calls[0].profile == "pi-web"  # challenge category web → web direction
 
 
+async def test_reason_goal_met_without_flag_does_not_stop_the_run():
+    board = MemoryBoard("c-reason")
+    bus = _Bus()
+    calls: list[DispatchDecision] = []
+    reason_calls = 0
+
+    async def worker(decision: DispatchDecision, profile) -> SimpleNamespace:
+        calls.append(decision)
+        return _outcome()
+
+    async def reason_fn(summary: str, challenge_id: str) -> ReasonResult:
+        nonlocal reason_calls
+        reason_calls += 1
+        return ReasonResult(goal_met=True, intents=[], audit_notes=[])
+
+    swarm = ReasonSwarm(
+        _challenge(),
+        board=board,
+        bus=bus,
+        worker_factory=worker,
+        reason_fn=reason_fn,
+    )
+
+    result = await swarm.run()
+
+    assert result["solved"] is False
+    assert [decision.mode for decision in calls] == ["recon", "bootstrap"]
+    assert reason_calls == 2
+    finished = next(
+        event.payload
+        for event in reversed(bus.events)
+        if event.payload.get("delta_type") == "reason_loop_finished"
+    )
+    assert finished["stop_reason"] == "no_fresh_intents"
+    assert finished["solved"] is False
+
+
 async def test_reason_swarm_marks_initial_recon_as_resolve_when_requested():
     board = MemoryBoard("c-reason")
     calls: list[DispatchDecision] = []

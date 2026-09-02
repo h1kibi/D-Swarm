@@ -14,10 +14,33 @@ The bus is transport-agnostic. SSE / WS / TUI / SessionStore all hang off it.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from dswarm.core.events import Event
+
+
+logger = logging.getLogger(__name__)
+
+
+def _log_sink_failure(
+    sink: Callable[[Event], Awaitable[None]], event: Event, exc: Exception
+) -> None:
+    sink_name = (
+        getattr(sink, "__qualname__", None)
+        or getattr(sink, "__name__", None)
+        or type(sink).__name__
+    )
+    event_type = getattr(event.event_type, "value", event.event_type)
+    logger.warning(
+        "event sink failed: sink=%s event_type=%s run_id=%s seq=%s error_type=%s",
+        sink_name,
+        event_type,
+        event.run_id,
+        event.seq,
+        type(exc).__name__,
+    )
 
 
 class EventBus:
@@ -63,7 +86,8 @@ class EventBus:
             for sink in sinks:
                 try:
                     await sink(event)
-                except Exception:
+                except Exception as exc:
+                    _log_sink_failure(sink, event, exc)
                     pass
             for q in subs:
                 await q.put(event)
@@ -94,7 +118,8 @@ class EventBus:
                     continue
                 try:
                     await sink(event)
-                except Exception:
+                except Exception as exc:
+                    _log_sink_failure(sink, event, exc)
                     pass
             for q in subs:
                 await q.put(event)

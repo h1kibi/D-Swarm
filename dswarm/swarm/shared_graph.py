@@ -921,19 +921,11 @@ class SQLiteSharedGraph:
         cur.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
-        try:
-            self._conn.execute("ALTER TABLE intents ADD COLUMN to_fact_seq INTEGER")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        self._ensure_column("intents", "to_fact_seq INTEGER")
         # zh gist of the intent goal (deepseek-flash, written back once). Facts
         # carry their gist inside events.payload["summary"] instead (events is
         # append-only, so we patch the JSON in place — see record_fact_summary).
-        try:
-            self._conn.execute("ALTER TABLE intents ADD COLUMN summary TEXT")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        self._ensure_column("intents", "summary TEXT")
         for ddl in (
             "ALTER TABLE intents ADD COLUMN worker_class TEXT NOT NULL DEFAULT 'code'",
             "ALTER TABLE intents ADD COLUMN route_hash TEXT",
@@ -945,16 +937,8 @@ class SQLiteSharedGraph:
             "ALTER TABLE intents ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE intents ADD COLUMN priority_scale TEXT NOT NULL DEFAULT 'planner'",
         ):
-            try:
-                self._conn.execute(ddl)
-                self._conn.commit()
-            except sqlite3.OperationalError:
-                pass
-        try:
-            self._conn.execute("ALTER TABLE lane_locks ADD COLUMN released_worker TEXT")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+            self._ensure_column("intents", ddl.removeprefix("ALTER TABLE intents ADD COLUMN "))
+        self._ensure_column("lane_locks", "released_worker TEXT")
         # A/J: dispatch_state lifecycle columns on intents (idempotent for old DBs).
         for ddl in (
             "ALTER TABLE intents ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'active'",
@@ -972,20 +956,13 @@ class SQLiteSharedGraph:
             "ALTER TABLE intents ADD COLUMN direction_resolution TEXT",
             "ALTER TABLE intents ADD COLUMN direction_source TEXT",
         ):
-            try:
-                self._conn.execute(ddl)
-                self._conn.commit()
-            except sqlite3.OperationalError:
-                pass
-        try:
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_intents_dispatch_priority_v2 "
-                "ON intents(challenge_id, dispatch_state, status, priority_scale, "
-                "priority, created_seq)"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+            self._ensure_column("intents", ddl.removeprefix("ALTER TABLE intents ADD COLUMN "))
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_intents_dispatch_priority_v2 "
+            "ON intents(challenge_id, dispatch_state, status, priority_scale, "
+            "priority, created_seq)"
+        )
+        self._conn.commit()
         # Fresh databases start directly on the immutable event contract. Existing
         # pre-v2 databases require an explicit, snapshotted migrate_to_v2() call.
         if is_new_database or user_version(self._conn) == self.SUPPORTED_USER_VERSION:
@@ -1000,6 +977,18 @@ class SQLiteSharedGraph:
                 (name,),
             ).fetchone()
         return row is not None
+
+    def _ensure_column(self, table: str, definition: str) -> None:
+        """Add one known compatibility column without masking DB failures."""
+        column = definition.split(None, 1)[0]
+        with self._lock:
+            columns = {
+                str(row[1])
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+                self._conn.commit()
 
     def _view_exists(self, name: str) -> bool:
         with self._lock:

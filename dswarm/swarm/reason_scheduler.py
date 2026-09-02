@@ -829,7 +829,16 @@ class ReasonSwarm:
             result: Optional[ReasonResult] = None
             try:
                 result = await self._run_reason()
-                if getattr(result, "goal_met", False):
+                goal_claimed = bool(getattr(result, "goal_met", False))
+                goal_accepted = goal_claimed and self._flags_complete()
+                if goal_claimed and not goal_accepted:
+                    await self._emit(
+                        "reason_goal_claim_rejected",
+                        stage="reason",
+                        reason_cycle_id=cycle_id,
+                        reason="provenance_gated_flag_required",
+                    )
+                if goal_accepted:
                     break
                 override_start = len(self._direction_overrides)
                 decisions = self._decisions_from_reason(result)
@@ -1109,12 +1118,15 @@ class ReasonSwarm:
                     duration_ms=int((time.monotonic() - tc) * 1000),
                     audit_notes=list(getattr(result, "audit_notes", None) or []),
                     goal_met=bool(getattr(result, "goal_met", False)),
+                    goal_met_accepted=bool(
+                        getattr(result, "goal_met", False) and self._flags_complete()
+                    ),
                     planner=self.reason_model,
                 )
 
         if self.stop_event is not None and self.stop_event.is_set():
             stop_reason = "operator_stop"
-        elif self._flags_complete() or getattr(self._last_reason, "goal_met", False):
+        elif self._flags_complete():
             stop_reason = "goal_met"
         elif time.monotonic() - t0 > self.wall_clock_budget or self._budget_exceeded():
             stop_reason = "budget_exceeded"

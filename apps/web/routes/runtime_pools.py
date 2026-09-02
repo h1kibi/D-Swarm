@@ -12,6 +12,7 @@ from dswarm.solver.runtime_diagnostics import (
     RuntimeDiagnosticsStore,
     sanitize_pool_id,
 )
+from dswarm.core.storage import safe_run_storage_key
 
 _SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -91,7 +92,7 @@ async def get_runtime_pools(run_id: str, request: Request) -> dict[str, Any]:
     policy = getattr(run, "runtime_policy", None)
     policy_mode = str(getattr(policy, "mode", "") or "")
     store = RuntimeDiagnosticsStore(
-        run_root=Path(manager.sessions_root) / run_id, run_id=run_id,
+        run_root=Path(manager.sessions_root) / safe_run_storage_key(run_id), run_id=run_id,
     )
     pools: list[dict[str, Any]] = []
     for view in views:

@@ -30,14 +30,19 @@ import { readKey, writeKey } from "@/lib/storage";
  * confirms and never deletes history).
  *
  * Legacy behavior kept: search, folders (drag-and-drop), pin/archive/rename/
- * delete, and the Pinned / Recent / Archived sections. Clicking a row only
- * SELECTS it — it never reorders or hoists.
+ * delete, and the Pinned / Recent / Archived sections. Cleanup shortcuts:
+ * double-click a row to rename inline, a hover ⧈ button to archive/unarchive
+ * with one click, and a "reapply naming rule" menu item that re-derives
+ * `{方向}-{标识}` (题目名 → URL host[:port] → attachment) for sessions
+ * dispatched before the rule. Clicking a row only SELECTS it — it never
+ * reorders or hoists.
  */
 
 type RailAction =
   | { kind: "pin"; runId: string; pinned: boolean }
   | { kind: "archive"; runId: string; archived: boolean }
   | { kind: "rename"; runId: string; name: string }
+  | { kind: "retitle"; runId: string }
   | { kind: "delete"; runId: string }
   | { kind: "move"; runId: string; folderId: string | null }
   | { kind: "newFolder" }
@@ -227,6 +232,12 @@ export function ThreadRail({
   const matched = q ? runs.filter(matchesQuery) : runs;
   // Fleet filter (§5.2) narrows every section at once; chips show live counts.
   const counts = fleetCounts(matched);
+  // a bucket that empties out (runs finished/archived away) loses its chip —
+  // fall back to 全部 so the rail isn't stuck on an invisible filter.
+  useEffect(() => {
+    if (filter !== "all" && counts[filter] === 0) setFilter("all");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, counts.all, counts.active, counts.attention, counts.queued, counts.paused, counts.solved, counts.failed, counts.archived]);
   const scoped = filterFleet(matched, filter);
 
   const pinned = scoped
@@ -351,18 +362,24 @@ export function ThreadRail({
         </div>
 
         <div className="fleet-filters" role="group" aria-label={t("fleet.title")}>
-          {FLEET_FILTERS.map((f) => (
-            <button
-              key={f}
-              type="button"
-              className={`fleet-chip ${filter === f ? "on" : ""} ${f === "attention" && counts.attention > 0 ? "has-attn" : ""}`}
-              aria-pressed={filter === f}
-              onClick={() => setFilter(f)}
-            >
-              {t(`fleet.filter.${f}`)}
-              {counts[f] > 0 && <span className="fleet-chip-n">{counts[f]}</span>}
-            </button>
-          ))}
+          {FLEET_FILTERS.map((f) => {
+            // a filter that matches nothing is dead chrome (with 9 finished
+            // sessions the row was 6 zero chips deep) — show only live counts,
+            // "全部" always stays as the anchor.
+            if (f !== "all" && counts[f] === 0) return null;
+            return (
+              <button
+                key={f}
+                type="button"
+                className={`fleet-chip ${filter === f ? "on" : ""} ${f === "attention" && counts.attention > 0 ? "has-attn" : ""}`}
+                aria-pressed={filter === f}
+                onClick={() => setFilter(f)}
+              >
+                {t(`fleet.filter.${f}`)}
+                {counts[f] > 0 && <span className="fleet-chip-n">{counts[f]}</span>}
+              </button>
+            );
+          })}
         </div>
 
         <div className="fleet-tools">
@@ -413,6 +430,17 @@ export function ThreadRail({
             <button type="button" onClick={() => runBatch("resume")} disabled={batchable("resume").length === 0}>
               {t("fleet.batch.resume")}
             </button>
+            {/* archiving is the fleet's cleanup path: on the archived filter the
+              same slot flips to unarchive so the operator can batch-restore. */}
+            {filter === "archived" ? (
+              <button type="button" onClick={() => runBatch("unarchive")} disabled={batchable("unarchive").length === 0}>
+                {t("fleet.batch.unarchive")}
+              </button>
+            ) : (
+              <button type="button" onClick={() => runBatch("archive")} disabled={batchable("archive").length === 0}>
+                {t("fleet.batch.archive")}
+              </button>
+            )}
             <button
               type="button"
               className="danger"
@@ -684,8 +712,9 @@ function RailRow({
         onDragStart();
       }}
       onDragEnd={() => { suppressRowDragRef.current = false; onDragEnd(); }}
-      title={`${name} · ${run.category || "—"}`}
+      title={`${name} · ${run.category || "—"} · ${t("rail.rowHint")}`}
       onClick={() => !renaming && onSelect()}
+      onDoubleClick={() => { if (!renaming && !selectMode) onStartRename(); }}
       onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !renaming) { e.preventDefault(); onSelect(); } }}
     >
       <StatusIcon status={run.status} t={t} />
@@ -741,6 +770,17 @@ function RailRow({
           onMouseDown={(e) => e.stopPropagation()}
           onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
         >
+          {/* one-click archive/unarchive — the fleet's cleanup path shouldn't
+            need a menu dig. Same hover-reveal + drag suppression as the ⋯ menu
+            (it lives inside .row-menu for exactly that). Hidden mid-selection. */}
+          {!selectMode && (
+            <button
+              className="dots qact"
+              title={run.archived ? t("rail.menu.unarchive") : t("rail.menu.archive")}
+              aria-label={run.archived ? t("rail.menu.unarchive") : t("rail.menu.archive")}
+              onClick={(e) => { e.stopPropagation(); onAction({ kind: "archive", runId: run.run_id, archived: !run.archived }); }}
+            ><Icon name="archive" size={14} /></button>
+          )}
           <button
             className="dots"
             title={t("rail.menu.moreActions")}
@@ -798,6 +838,14 @@ function RowMenu({
   onAction: (a: RailAction) => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  // rows near the bottom of the rail can't fit the ~190px dropdown below the
+  // ⋯ button (the scroll edge shears it) — flip the panel above the row there.
+  const [up, setUp] = useState(false);
+  useEffect(() => {
+    const anchor = ref.current?.parentElement;
+    const r = anchor?.getBoundingClientRect();
+    if (r && window.innerHeight - r.bottom < 220) setUp(true);
+  }, []);
   useEffect(() => {
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(); };
     const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -813,16 +861,18 @@ function RowMenu({
 
   return (
     <div
-      className="menu"
+      className={`menu ${up ? "up" : ""}`}
       ref={ref}
       onPointerDown={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* Not yet wired (no backend) — shown disabled per scope decision */}
-      <button className="mi" disabled>{t("rail.menu.share")}</button>
-      <button className="mi" disabled>{t("rail.menu.collab")}</button>
       <button className="mi" onClick={onStartRename}>{t("rail.menu.rename")}</button>
+      <button
+        className="mi"
+        title={t("rail.menu.retitleHint")}
+        onClick={() => act({ kind: "retitle", runId: run.run_id })}
+      >{t("rail.menu.retitle")}</button>
       <div className="msep" />
       {run.pinned ? (
         <button className="mi" onClick={() => act({ kind: "pin", runId: run.run_id, pinned: false })}>{t("rail.menu.unpin")}</button>
@@ -848,6 +898,13 @@ function FolderMenu({
   onDelete: () => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  // same bottom-edge flip as RowMenu — folders can sit anywhere in the rail
+  const [up, setUp] = useState(false);
+  useEffect(() => {
+    const anchor = ref.current?.parentElement;
+    const r = anchor?.getBoundingClientRect();
+    if (r && window.innerHeight - r.bottom < 160) setUp(true);
+  }, []);
   useEffect(() => {
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(); };
     const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -859,7 +916,7 @@ function FolderMenu({
   useEffect(() => { ref.current?.querySelector<HTMLButtonElement>(".mi")?.focus(); }, []);
   return (
     <div
-      className="menu"
+      className={`menu ${up ? "up" : ""}`}
       ref={ref}
       onPointerDown={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}

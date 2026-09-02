@@ -81,6 +81,9 @@ def project_probe_result(
 
 MAX_UPLOAD_BYTES = max(1, _env_int("DSWARM_MAX_UPLOAD_MB", 25)) * 1024 * 1024
 MAX_UPLOAD_FILES = max(1, _env_int("DSWARM_MAX_UPLOAD_FILES", 20))
+MAX_UPLOAD_TOTAL_BYTES = max(
+    1, _env_int("DSWARM_MAX_UPLOAD_TOTAL_MB", 100)
+) * 1024 * 1024
 
 
 def _btw_timeout_exception(exc: BaseException) -> bool:

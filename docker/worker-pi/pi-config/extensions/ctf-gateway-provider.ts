@@ -58,6 +58,30 @@ export default function registerCtfGateway(pi: ExtensionAPI) {
         max: "max",
       },
     },
+    {
+      id: "gpt-5.5",
+      name: "GPT-5.5 (gateway)",
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: null,
+        medium: null,
+        high: "high",
+        max: "max",
+      },
+    },
+    {
+      id: "gpt-5.4-mini",
+      name: "GPT-5.4 Mini (gateway)",
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: null,
+        medium: null,
+        high: "high",
+        max: "max",
+      },
+    },
   ];
 
   pi.registerProvider("ctf-gateway", {

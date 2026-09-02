@@ -12,7 +12,12 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from apps.web.auth import AuthConfig, bearer_from_header, verify_token
-from apps.web.http_utils import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, _require_dict_body
+from apps.web.http_utils import (
+    MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_FILES,
+    MAX_UPLOAD_TOTAL_BYTES,
+    _require_dict_body,
+)
 from apps.web.run_manager import Run, RunManager
 from dswarm.core.events import Event, EventType
 from dswarm.solver.runtime_policy import RuntimePolicyError
@@ -23,7 +28,38 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 @router.get("")
 async def list_runs(request: Request, archived: int = 0) -> Any:
-    return {"runs": request.app.state.manager.list_runs(include_archived=bool(archived))}
+    summaries = request.app.state.manager.list_runs(include_archived=bool(archived))
+    authenticated = _request_authenticated(request)
+    if authenticated:
+        return {"runs": summaries}
+    # Containment (run-6427): worker containers can reach the host control
+    # plane (Docker Desktop loops host.docker.internal back to host services),
+    # and this deployment may run passwordless. A flag VALUE listable without
+    # authentication let one run scrape another challenge's accepted flags out
+    # of the rail API and "solve" without ever seeing the attachment. The rail
+    # only needs counts for its progress chips — values stay behind auth.
+    return {"runs": [_redact_summary(s) for s in summaries]}
+
+
+def _request_authenticated(request: Request) -> bool:
+    cfg: AuthConfig = request.app.state.auth
+    if not cfg.enabled:
+        return False  # passwordless: nothing proves an operator is asking
+    return verify_token(cfg, bearer_from_header(request.headers.get("Authorization")))
+
+
+def _redact_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(summary, dict):
+        return summary
+    out = dict(summary)
+    flags = out.pop("flags", None) or []
+    if out.get("flag"):
+        flags = list(flags) or [out["flag"]]
+    out["flag"] = None
+    out["flags"] = []
+    out["flag_count"] = len(flags)
+    out["flags_redacted"] = True
+    return out
 
 
 # Ledger error classifier for the deck: machine-readable kind so the UI can
@@ -107,7 +143,90 @@ async def update_run(run_id: str, request: Request) -> Any:
     if body.get("resume"):
         ok = await mgr.resume_queued(run_id) and ok
     run = mgr.get(run_id)
-    return {"ok": ok, "run": run.summary() if run else None}
+    if _request_authenticated(request):
+        return {"ok": ok, "run": run.summary() if run else None}
+    return {"ok": ok, "run": _redact_summary(run.summary()) if run else None}
+
+
+@router.post("/{run_id}/retitle")
+async def retitle_run(run_id: str, request: Request) -> Any:
+    """Re-apply the rail naming rule (`方向-标识`: the identifier is the 题目名
+    → URL host[:port] → attachment filename, whatever independently pins down
+    the challenge) to an EXISTING run, using its remembered dispatch body.
+
+    Sessions dispatched before the rule landed keep their old slug/LLM name
+    forever otherwise. Deterministic rule hits rename synchronously and return
+    the name; anything else (pwn with no stated 题目名) falls back to the
+    background titler LLM and reports `pending: true` —the rail's poll picks
+    the rename up when it lands. Derived titles go through the fleet-wide
+    uniqueness guard, so a re-solve of one target becomes `…-2` instead of a
+    second identical row. The result becomes the run's sticky custom name, so
+    a later RUN_TITLED / re-solve cannot clobber an explicit operator request.
+    """
+    mgr: RunManager = request.app.state.manager
+    run = mgr.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="no such run")
+    body = mgr.dispatch_for(run_id)
+    ch = body.get("challenge") or {}
+    prompt = str(body.get("prompt") or ch.get("description") or "")
+    if not prompt.strip():
+        raise HTTPException(status_code=409, detail="no remembered dispatch prompt to derive a name from")
+    from apps.web.drivers import _infer_challenge
+    from apps.web.titler import compose_title, generate_title, rule_name_part
+
+    # same derivation as /start's auto-titler: INFERRED category + attachment
+    # filenames (challenge.attachments are absolute saved paths). challenge.name
+    # stays the RAW operator-supplied 题目名 — the inferred slug from prompt
+    # words is not an identifier and must not win the ladder.
+    inferred_ch = (_infer_challenge(dict(body)).get("challenge") or {})
+    category = str(inferred_ch.get("category") or "")
+    challenge_name = str(ch.get("name") or "")
+    attachment_names = [
+        Path(a).name for a in (inferred_ch.get("attachments") or [])
+        if isinstance(a, str)
+    ]
+    name_part, deterministic = rule_name_part(
+        prompt, category, attachment_names, challenge_name,
+    )
+    if deterministic:
+        title = mgr.unique_title(run_id, compose_title(category, name_part))
+        if title:
+            mgr.rename(run_id, title)
+        return {"ok": bool(title), "name": title, "pending": False}
+
+    llm_profiles = mgr.worker_config.get().get("llm_profiles", {})
+    titler_profile = llm_profiles.get("titler") or {}
+    title_usage_writer = mgr.internal_usage_writer(
+        run,
+        solver_id="titler",
+        profile_id="titler",
+        configured_account_id=(
+            str(titler_profile.get("credential_account") or "").strip() or None
+        ),
+    )
+
+    async def _apply_llm_title() -> None:
+        # no bus event: RUN_TITLED only adopts over a slug, and this run already
+        # has a name — we rename directly when the (always-non-empty) title lands.
+        try:
+            title = await generate_title(
+                prompt,
+                model=titler_profile.get("model"),
+                base_url=titler_profile.get("base_url") or None,
+                usage_writer=title_usage_writer,
+                usage_context=title_usage_writer.context,
+                category=category,
+                attachment_names=attachment_names,
+                challenge_name=challenge_name or None,
+            )
+        except Exception:
+            return
+        if title:
+            mgr.rename(run_id, mgr.unique_title(run_id, title))
+
+    asyncio.create_task(_apply_llm_title())
+    return {"ok": True, "name": None, "pending": True}
 
 
 @router.delete("/{run_id}")
@@ -164,6 +283,11 @@ async def start_run(run_id: str, request: Request) -> Any:
     # (before run.started lands) — conversational dispatch infers the rest.
     run = request.app.state.manager.get(run_id) or request.app.state.manager.create(run_id)
     ch = (body.get("challenge") or {})
+    # operator-supplied names are sticky; derived slugs (from _infer_challenge
+    # inside build_driver) are preliminary and may be replaced by the rule/LLM
+    # title (RUN_TITLED) once it lands.
+    had_operator_name = bool(ch.get("name"))
+    run.name_is_slug = not had_operator_name
     if ch.get("name"):
         run.name = ch["name"]
     if ch.get("category"):
@@ -203,7 +327,16 @@ async def start_run(run_id: str, request: Request) -> Any:
         prompt = body.get("prompt") or ch.get("description") or ""
         if prompt.strip():
             from apps.web.titler import generate_title
+            from apps.web.drivers import _infer_challenge
 
+            # rule naming needs the INFERRED category and the attachment
+            # filenames (challenge.attachments are absolute saved paths).
+            inferred_ch = (_infer_challenge(dict(body)).get("challenge") or {})
+            category = str(inferred_ch.get("category") or "")
+            attachment_names = [
+                Path(a).name for a in (inferred_ch.get("attachments") or [])
+                if isinstance(a, str)
+            ]
             llm_profiles = request.app.state.manager.worker_config.get().get("llm_profiles", {})
             titler_profile = llm_profiles.get("titler") or {}
             title_model = titler_profile.get("model")
@@ -222,6 +355,8 @@ async def start_run(run_id: str, request: Request) -> Any:
                     model=title_model, base_url=title_base_url,
                     usage_writer=title_usage_writer,
                     usage_context=title_usage_writer.context,
+                    category=category,
+                    attachment_names=attachment_names,
                 )
             )
 
@@ -252,46 +387,66 @@ async def upload_files(
     mgr.get(run_id) or mgr.create(run_id)
     if len(files) > MAX_UPLOAD_FILES:
         raise HTTPException(status_code=413, detail="too many files")
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit():
+        # Multipart framing adds a small amount of overhead. The streaming
+        # counter below remains authoritative for the actual file bytes.
+        framing_allowance = max(1 << 20, len(files) * 4096)
+        if int(content_length) > MAX_UPLOAD_TOTAL_BYTES + framing_allowance:
+            raise HTTPException(status_code=413, detail="upload request too large")
 
     dest_dir = mgr.uploads_dir(run_id)
     saved: list[dict[str, Any]] = []
-    for uf in files:
-        # SANITIZE: strip any path the client put in the name. Path(name).name
-        # drops directories AND collapses "../x"/absolute paths to a basename,
-        # so an upload can never escape dest_dir.
-        name = Path(uf.filename or "file").name
-        if not name or name in (".", ".."):
-            name = "file"
-        # dedupe collisions within this run's folder: foo.txt, foo-1.txt, ...
-        target = dest_dir / name
-        if target.exists():
-            stem, suf = target.stem, target.suffix
-            i = 1
-            while (dest_dir / f"{stem}-{i}{suf}").exists():
-                i += 1
-            target = dest_dir / f"{stem}-{i}{suf}"
-        # stream to disk in chunks with a running size guard (never buffer a
-        # whole file in memory; abort + clean up if it blows the cap).
-        size = 0
-        try:
-            with target.open("wb") as out:
-                while True:
-                    chunk = await uf.read(1 << 20)  # 1 MB
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > MAX_UPLOAD_BYTES:
-                        out.close()
-                        target.unlink(missing_ok=True)
-                        raise HTTPException(
-                            status_code=413, detail=f"{name} too large"
-                        )
-                    out.write(chunk)
-        finally:
-            await uf.close()
-        saved.append(
-            {"name": target.name, "path": str(target.resolve()), "size": size}
-        )
+    total_size = 0
+    try:
+        for uf in files:
+            # SANITIZE: strip any path the client put in the name. Path(name).name
+            # drops directories AND collapses "../x"/absolute paths to a basename,
+            # so an upload can never escape dest_dir.
+            name = Path(uf.filename or "file").name
+            if not name or name in (".", ".."):
+                name = "file"
+            # dedupe collisions within this run's folder: foo.txt, foo-1.txt, ...
+            target = dest_dir / name
+            if target.exists():
+                stem, suf = target.stem, target.suffix
+                i = 1
+                while (dest_dir / f"{stem}-{i}{suf}").exists():
+                    i += 1
+                target = dest_dir / f"{stem}-{i}{suf}"
+            # stream to disk in chunks with a running size guard (never buffer a
+            # whole file in memory; abort + clean up if it blows the cap).
+            size = 0
+            try:
+                with target.open("wb") as out:
+                    while True:
+                        chunk = await uf.read(1 << 20)  # 1 MB
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        total_size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            out.close()
+                            target.unlink(missing_ok=True)
+                            raise HTTPException(
+                                status_code=413, detail=f"{name} too large"
+                            )
+                        if total_size > MAX_UPLOAD_TOTAL_BYTES:
+                            out.close()
+                            target.unlink(missing_ok=True)
+                            raise HTTPException(
+                                status_code=413, detail="upload request too large"
+                            )
+                        out.write(chunk)
+            finally:
+                await uf.close()
+            saved.append(
+                {"name": target.name, "path": str(target.resolve()), "size": size}
+            )
+    except HTTPException:
+        for entry in saved:
+            Path(entry["path"]).unlink(missing_ok=True)
+        raise
     return {"files": saved}
 
 @router.get("/{run_id}/events")

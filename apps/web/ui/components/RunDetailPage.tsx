@@ -115,7 +115,7 @@ export function RunDetailPage({ view }: { view: DetailView }) {
       case "btw":
         return <BtwPage runId={runId} />;
     }
-  }, [view, runId, deck, running, t]);
+  }, [view, runId, deck, running, selected, t]);
 
   return (
     <div className="shell detail-shell motion-root">

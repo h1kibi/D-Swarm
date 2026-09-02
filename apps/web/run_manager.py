@@ -33,6 +33,7 @@ from dswarm.core.event_bus import EventBus
 from dswarm.core.events import Event, EventType, hitl_response_payload
 from dswarm.core.runtime_env import is_web_container
 from dswarm.core.session_store import SessionStore
+from dswarm.core.storage import safe_run_storage_key
 from dswarm.core.usage_journal import UsageContext, UsageJournal, UsageRecord, UsageWriter
 from dswarm.core.usage_ledger import SpawnGuard, UsageLedger
 from dswarm.swarm.budget import ProfileBudgetGate
@@ -138,6 +139,9 @@ class Run:
     # outcome per run without replaying the whole event stream. We sniff these off
     # the bus as a sink (the run stays a dumb event source — no extra contract).
     name: str = ""
+    # True when `name` is a derived slug / auto title (replaceable by a better
+    # rule/LLM title); False once the operator names it themselves.
+    name_is_slug: bool = False
     category: str = ""
     started: bool = False
     solved: bool = False
@@ -448,6 +452,26 @@ class RunManager:
         run.custom_name = self.meta.set_name(run_id, name)["custom_name"]
         return True
 
+    def unique_title(self, run_id: str, title: str) -> str:
+        """Disambiguate an auto-derived rail label against the other runs.
+
+        The naming rule's whole point is telling challenges apart (`方向-标识`),
+        so two runs deriving the same identifier (a re-solve of one target, two
+        arena instances behind one hostname) must not render as identical rows:
+        the later one becomes `…-2`, `…-3`, … Operator renames are NOT funneled
+        through here — typing an exact duplicate by hand is the operator's call.
+        """
+        taken = {
+            (r.custom_name or r.name or "")
+            for rid, r in self.runs.items() if rid != run_id
+        } - {""}
+        if title not in taken:
+            return title
+        n = 2
+        while f"{title}-{n}" in taken:
+            n += 1
+        return f"{title}-{n}"
+
     def set_folder(self, run_id: str, folder_id: Optional[str]) -> bool:
         run = self.runs.get(run_id)
         if run is None:
@@ -527,7 +551,7 @@ class RunManager:
 
     def _delete_artifacts(self, run_id: str) -> None:
         self.meta.forget(run_id)
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = safe_run_storage_key(run_id)
         jsonl = self.sessions_root / f"{safe}.jsonl"
         try:
             jsonl.unlink(missing_ok=True)
@@ -643,7 +667,7 @@ class RunManager:
         run = self.runs.get(run_id)
         if run is not None and run.dispatch_body:
             return dict(run.dispatch_body)
-        path = self.sessions_root / run_id.replace("/", "_").replace("..", "_") / "workspace" / ".dswarm_dispatch.json"
+        path = self.sessions_root / safe_run_storage_key(run_id) / "workspace" / ".dswarm_dispatch.json"
         try:
             import json
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -651,13 +675,18 @@ class RunManager:
         except (OSError, ValueError, TypeError):
             return {}
 
+    def dispatch_for(self, run_id: str) -> dict[str, Any]:
+        """Public read of a run's remembered (redacted) dispatch body — the
+        non-secret prompt/challenge settings retitle needs to re-derive a name."""
+        return self._load_dispatch(run_id)
+
     def workspace_dir(self, run_id: str) -> Path:
         """Per-run persistent workspace: sessions/{id}/workspace/.
 
         Replaces the old tempfile.mkdtemp root so sandbox, artifacts, and
         shared_graph.db survive process restarts. Same id-sanitization as
         uploads_dir / _delete_artifacts."""
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = safe_run_storage_key(run_id)
         d = self.sessions_root / safe / "workspace"
         d.mkdir(parents=True, exist_ok=True)
         return d
@@ -693,7 +722,7 @@ class RunManager:
         is a sibling of the run's {id}.jsonl log — SessionStore only globs
         *.jsonl, so a directory of the same stem never collides with rehydration.
         """
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = safe_run_storage_key(run_id)
         d = self.sessions_root / safe / "uploads"
         d.mkdir(parents=True, exist_ok=True)
         return d
@@ -868,7 +897,9 @@ class RunManager:
         self._sync_bus_seq(bus, store=store, run_id=run_id)
         bus.add_critical_sink(store.sink, store.append_checked)
         self._seq += 1
-        journal = UsageJournal(self.sessions_root / f"{run_id}-usage-journal.jsonl")
+        journal = UsageJournal(
+            self.sessions_root / f"{safe_run_storage_key(run_id)}-usage-journal.jsonl"
+        )
         ledger = UsageLedger(run_id=run_id)
         # Startup projection rebuild is synchronous and happens before a handle is
         # exposed to any spawn path. A failed replay leaves the guard failed so
@@ -918,10 +949,10 @@ class RunManager:
             if ev.event_type is EventType.RUN_STARTED:
                 ch = ev.payload.get("challenge", {}) or {}
                 run.started = True
-                # Keep name EMPTY when the operator gave none — the rail renders a
-                # "new conversation" placeholder, and the background summarizer fills
-                # in a ChatGPT-style title via RUN_TITLED. Don't pin it to the run_id.
-                if ch.get("name"):
+                # The derived slug is a PRELIMINARY display name (marked
+                # name_is_slug at /start): the rule/LLM title (RUN_TITLED)
+                # replaces it. An operator-supplied name is sticky.
+                if ch.get("name") and not run.name:
                     run.name = ch["name"]
                 run.category = ch.get("category", run.category) or run.category
                 if ch.get("expected_flags"):
@@ -929,11 +960,15 @@ class RunManager:
                 if "multi_flag" in ch:
                     run.multi_flag = bool(ch["multi_flag"])
             elif ev.event_type is EventType.RUN_TITLED:
-                # auto-title landed from the background summarizer; only adopt it
-                # if the operator hasn't supplied a real name (don't clobber).
+                # auto-title landed from the background summarizer; adopt over a
+                # derived slug (name_is_slug) but never over an operator name or
+                # an operator rename (custom_name wins at display anyway). The
+                # title is disambiguated against the fleet so two runs on the
+                # same target don't collapse into identical rows.
                 title = ev.payload.get("title") or ""
-                if title and not run.name:
-                    run.name = title
+                if title and (not run.name or run.name_is_slug):
+                    run.name = self.unique_title(run.run_id, title)
+                    run.name_is_slug = False
             elif ev.event_type is EventType.HITL_RESPONSE:
                 # reflect pause/resume into the rail status icon. The driver still
                 # owns the real halt; this is just the displayed state.
@@ -1030,7 +1065,49 @@ class RunManager:
         gateway = ModelGateway.instance()
         gateway.account_root = str(account_store_root(self.sessions_root))
         gateway.sessions_root = str(self.sessions_root)
+        gateway.upstream_key = self._resolve_worker_provider_key()
         gateway.configure_usage_bridge(bus=run.bus, loop=loop, run_id=run.run_id)
+
+    def install_gateway_key_resolver(self) -> None:
+        """Register THIS manager's provider-key resolution on the gateway CLASS
+        — without instantiating the gateway (starting the server at app boot
+        broke the BTW lease guards and changed lazy-start behavior). The class
+        resolver is re-read on every gateway request, covering the startup-test
+        manager (which never runs the per-run wiring) and settings edits."""
+        from dswarm.solver.modelgateway import ModelGateway
+
+        ModelGateway.set_upstream_key_resolver(self._resolve_worker_provider_key)
+
+    def _resolve_worker_provider_key(self) -> str:
+        """The gateway's upstream key: the secret of the provider the ENABLED
+        worker profiles actually bind to (first present wins).
+
+        Workers authenticate to the gateway with task tokens; the gateway must
+        forward with the SAME provider key those bindings resolve to. It used
+        to hardcode the pi-main credential account file — when the operator
+        re-binds workers to a provider (e.g. zhipu) whose key lives in the
+        provider secret store, every worker call 401-ed at the upstream while
+        host-side probes (which resolve bindings correctly) stayed green."""
+        try:
+            cfg = self.worker_config.get()
+        except Exception:
+            return ""
+        refs: list[str] = []
+        for p in cfg.get("worker_profiles", []) or []:
+            if not isinstance(p, dict) or not p.get("enabled"):
+                continue
+            ref = str(p.get("provider_ref") or "").strip()
+            if ref and ref not in refs:
+                refs.append(ref)
+        if not refs:
+            return ""
+        from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root
+        store = LLMProviderSecretStore(provider_secret_root(self.sessions_root))
+        for ref in refs:
+            val = store.read_secret(ref)
+            if val:
+                return val
+        return ""
 
     def internal_usage_writer(
         self,
@@ -1043,7 +1120,8 @@ class RunManager:
     ) -> UsageWriter:
         """Create an internal-producer writer sharing this run's journal."""
         journal = getattr(run, "usage_journal", None) or UsageJournal(
-            self.sessions_root / f"{run.run_id}-usage-journal.jsonl"
+            self.sessions_root
+            / f"{safe_run_storage_key(run.run_id)}-usage-journal.jsonl"
         )
         run.usage_journal = journal
         return UsageWriter(
@@ -1071,7 +1149,8 @@ class RunManager:
     ) -> UsageWriter:
         """Create the non-gateway CLI invocation-aggregate writer."""
         journal = getattr(run, "usage_journal", None) or UsageJournal(
-            self.sessions_root / f"{run.run_id}-usage-journal.jsonl"
+            self.sessions_root
+            / f"{safe_run_storage_key(run.run_id)}-usage-journal.jsonl"
         )
         run.usage_journal = journal
         return UsageWriter(

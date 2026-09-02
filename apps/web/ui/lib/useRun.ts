@@ -262,7 +262,9 @@ export interface RunSummary {
   cancelled?: boolean;
   flag?: string | null;
   // multi-flag progress (backend summary already sends these; the Run Fleet
-  // rows render "flags x/y" from them).
+  // rows render "flags x/y" from them). Unauthenticated list responses REDACT
+  // the values (containment) — flag_count carries the count instead.
+  flag_count?: number;
   flags?: string[];
   expected_flags?: number;
   multi_flag?: boolean;
@@ -642,6 +644,24 @@ export async function deleteRun(runId: string): Promise<boolean> {
     return r.ok;
   } catch {
     return false;
+  }
+}
+
+/** Re-apply the rail naming rule ({category}-{url|attachment|题目}) to an
+ *  EXISTING run from its remembered dispatch. Deterministic rule hits (web→URL
+ *  host, rev/crypto/forensics/misc→attachment) return the new name immediately;
+ *  anything else (pwn → 题目名) is named by the background titler LLM and comes
+ *  back pending —the rail poll picks the rename up when it lands. */
+export async function retitleRun(
+  runId: string,
+): Promise<{ ok: boolean; name: string | null; pending: boolean; detail?: string }> {
+  try {
+    const r = await apiFetch(`/api/runs/${runId}/retitle`, { method: "POST" });
+    const j = await r.json().catch(() => ({} as any));
+    if (!r.ok) return { ok: false, name: null, pending: false, detail: String(j?.detail ?? "") };
+    return { ok: Boolean(j?.ok), name: j?.name ?? null, pending: Boolean(j?.pending) };
+  } catch (e) {
+    return { ok: false, name: null, pending: false, detail: String(e) };
   }
 }
 

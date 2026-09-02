@@ -55,6 +55,7 @@
 | `run-75379` | The accepted flag must trace to real command output; invalidation/reopen, streamed output, and multi-flag fuel must not split into contradictory states. | `dswarm/solver/cli_solver.py:1582`; `dswarm/solver/cli_solver.py:1689`; `dswarm/solver/cli_solver.py:1975`; `dswarm/swarm/swarm.py:540`; `dswarm/swarm/swarm.py:571` |
 | `run-6964` | A failed readiness probe must persist its classified reason and worker output snippet to the backend log before the pool container is torn down; transport-class probe failures otherwise vanish with the container. | `dswarm/solver/runtime_probe.py` (`_log_probe_evidence`) |
 | `run-75380` | The worker closing-summary fact must be worker WORDS: pi `agent_end` conversation snapshots pass the prose filter and used to become raw-JSON facts. | `dswarm/solver/cli_stream.py` (`extract_closing_prose`); `dswarm/solver/cli_solver.py` (closing summary) |
+| `run-6427` | Flag VALUES must not be listable from the control plane without authentication: worker containers can reach the host API (Docker Desktop loopback proxy), and unauthenticated run summaries exposing `flags` let a run "solve" by scraping other runs' accepted flags. List responses redact values to counts unless a valid token is presented; a brief declaring attachments with none staged warns the worker not to scavenge. | `apps/web/routes/runs.py` (`_redact_summary`); `dswarm/solver/cli_solver.py` (`_missing_attachment_block`); `apps/web/ui/lib/fleet.ts` (`flagProgress`) |
 
 ## Legacy labels
 

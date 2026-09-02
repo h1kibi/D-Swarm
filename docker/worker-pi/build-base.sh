@@ -12,6 +12,10 @@
 set -uo pipefail
 
 PI_VERSION="${PI_VERSION:-0.84.1}"
+# Debian apt mirrors for the BTFly stage images — TUNA 403s some hosts, so the
+# mirror is overridable here instead of editing the vendored Dockerfiles.
+APT_MIRROR="${APT_MIRROR:-https://mirrors.aliyun.com/debian}"
+APT_SECURITY_MIRROR="${APT_SECURITY_MIRROR:-https://mirrors.aliyun.com/debian-security}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BTFLY="$(cd "$HERE/../../references/btfly" && pwd)"
 cd "$BTFLY"
@@ -21,6 +25,8 @@ failed=()
 build_one() {
   local name="$1" dockerfile="$2" extra=()
   if [ -n "${3:-}" ]; then extra=("--build-arg" "$3"); fi
+  extra+=("--build-arg" "APT_MIRROR=$APT_MIRROR"
+          "--build-arg" "APT_SECURITY_MIRROR=$APT_SECURITY_MIRROR")
   echo ">> [$name] ..."
   if ! docker build --platform linux/amd64 --load \
     "${extra[@]}" -t "$name" -f "$dockerfile" .; then

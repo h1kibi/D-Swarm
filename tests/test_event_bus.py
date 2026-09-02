@@ -1,6 +1,7 @@
 """Sprint 0.2 acceptance: bus fan-out ordering, Last-Event-ID resume, JSONL replay."""
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -134,6 +135,28 @@ async def test_sink_exception_does_not_block_fanout() -> None:
 
     assert seen == [1, 2, 3], "fan-out must survive a raising sink"
     assert delivered == [1, 2, 3], "a healthy sink after a raising one must still run"
+
+
+async def test_sink_exception_is_logged_without_event_payload(caplog) -> None:
+    bus = EventBus()
+    secret = "flag{must-not-appear-in-logs}"
+
+    async def boom(_ev: Event) -> None:
+        raise RuntimeError("sink blew up")
+
+    bus.add_sink(boom)
+    caplog.set_level(logging.WARNING, logger="dswarm.core.event_bus")
+
+    await bus.emit(Event(
+        event_type=EventType.TEXT_MESSAGE_DELTA,
+        run_id="run-log",
+        payload={"secret": secret},
+    ))
+
+    assert "event sink failed" in caplog.text
+    assert "boom" in caplog.text
+    assert "run-log" in caplog.text
+    assert secret not in caplog.text
 
 
 async def test_last_event_id_resume_replays_backlog() -> None:

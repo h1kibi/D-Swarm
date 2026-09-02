@@ -1420,19 +1420,22 @@ class CliSolver:
         pause/resume (SIGSTOP/SIGCONT) and a sibling's FLAG reach this live worker."""
         env = self._worker_env()
         argv = self._apply_runtime_argv(argv, env)
-        # M9a lease path: the executor is NOT a legacy ContainerHandle. Route
-        # through its RCP run (same machinery the readiness probe uses) instead
-        # of run_cli's legacy handle shim, which expects .container/.control_dir.
-        if isinstance(self.container, ContainerRuntimeExecutor):
-            res = await self.container.run(
-                self.driver, list(argv), host_cwd=cwd, timeout=timeout,
-                env=env, worker_instance_id=str(
-                    getattr(self, "worker_instance_id", "") or self.solver_id),
-                operation_kind=self.runtime_operation_kind or self.mode,
-            )
-            self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
-            return res
+        # No bus → nothing to stream to: plain runs. The lease executor gets its
+        # non-streaming RCP run here, the legacy handle the run_cli shim. (The
+        # streaming path below is the one that carries on_step — reasoning/tool
+        # bubbles, live tool provenance, steer/pause. It used to be short-
+        # circuited for the executor too, which is why pool-dispatched workers
+        # showed no live worker detail at all.)
         if self.bus is None:
+            if isinstance(self.container, ContainerRuntimeExecutor):
+                res = await self.container.run(
+                    self.driver, list(argv), host_cwd=cwd, timeout=timeout,
+                    env=env, worker_instance_id=str(
+                        getattr(self, "worker_instance_id", "") or self.solver_id),
+                    operation_kind=self.runtime_operation_kind or self.mode,
+                )
+                self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+                return res
             res = await asyncio.to_thread(
                 run_cli, self.driver, argv, cwd=cwd, timeout=timeout, env=env,
                 container=self.container)
@@ -2447,6 +2450,25 @@ class CliSolver:
     def _web_ctf_focus_block(self) -> str:
         return _WEB_CTF_FOCUS_BLOCK if self._is_ctf_web_challenge() else ""
 
+    def _missing_attachment_block(self) -> str:
+        """run-6427 guard: a brief that DECLARES attachments (附件/attachment)
+        while none staged means the dispatch lost its files. Say so plainly —
+        the worker must report the gap and ask the operator instead of
+        fabricating evidence or scavenging the environment (that wander is
+        exactly how it found the control-plane API and scraped other runs'
+        flags)."""
+        if getattr(self, "_staged_files", None):
+            return ""
+        if not re.search(r"附件|attachment", self.challenge.description or "", re.IGNORECASE):
+            return ""
+        return (
+            "WARNING: the brief mentions attachments, but NO attachment files were "
+            "staged into this run's workspace. Do NOT fabricate, guess, or scavenge "
+            "flags from the surrounding environment — the only valid flag is one "
+            "recovered from THIS challenge's own evidence. Write a fact to the "
+            "blackboard reporting the missing attachment and ask the operator to "
+            "re-dispatch with the file.")
+
     def _build_prompt(self) -> str:
         c = self.challenge
         ctx_lines = [f"Challenge: {c.name} [{c.category}]"]
@@ -2459,6 +2481,9 @@ class CliSolver:
                 "FIRST): " + ", ".join(self._staged_files))
         if c.description:
             ctx_lines.append(f"Brief: {c.description.strip()[:600]}")
+        missing_att = self._missing_attachment_block()
+        if missing_att:
+            ctx_lines.append(missing_att)
         web_focus = self._web_ctf_focus_block()
         if web_focus:
             ctx_lines.append(web_focus)
@@ -3070,6 +3095,9 @@ class CliSolver:
                 "FIRST): " + ", ".join(self._staged_files))
         if c.description:
             ctx_lines.append(f"Brief: {c.description.strip()[:600]}")
+        missing_att = self._missing_attachment_block()
+        if missing_att:
+            ctx_lines.append(missing_att)
         web_focus = self._web_ctf_focus_block()
         if web_focus:
             ctx_lines.append(web_focus)

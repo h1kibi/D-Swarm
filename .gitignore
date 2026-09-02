@@ -100,3 +100,7 @@ docs/wechat/
 docs/assets/wechat-promo/
 
 .worktrees/
+
+# Codex/pi local agent state and generated worker homes; never publish runtime data.
+/.zcode/
+/workspace/

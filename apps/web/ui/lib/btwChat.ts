@@ -217,7 +217,7 @@ export function useBtwChat(runId: string) {
         if (abortRef.current === ctrl) abortRef.current = null;
       }
     },
-    [runId, streaming, turns],
+    [runId, turns],
   );
 
   const clear = useCallback(() => {

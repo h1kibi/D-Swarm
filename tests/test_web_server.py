@@ -1023,6 +1023,28 @@ async def test_upload_sanitizes_path_traversal_filename(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_upload_rejects_request_over_total_size_limit(tmp_path, monkeypatch) -> None:
+    import apps.web.routes.runs as runs_routes
+
+    monkeypatch.setattr(runs_routes, "MAX_UPLOAD_TOTAL_BYTES", 8)
+    sessions = tmp_path / "sessions"
+    app = create_app(RunManager(sessions_root=str(sessions)))
+    with _Server(app) as srv:
+        async with httpx.AsyncClient(base_url=srv.base, timeout=15, trust_env=False) as client:
+            files = [
+                ("files", ("one.txt", b"12345", "text/plain")),
+                ("files", ("two.txt", b"67890", "text/plain")),
+            ]
+            response = await client.post(
+                "/api/runs/run-total-limit/uploads", files=files
+            )
+
+    assert response.status_code == 413
+    assert not (sessions / "run-total-limit" / "uploads" / "one.txt").exists()
+    assert not (sessions / "run-total-limit" / "uploads" / "two.txt").exists()
+
+
+@pytest.mark.asyncio
 async def test_resolve_uses_scheduler_launch_and_finishes_mock(tmp_path) -> None:
     """Continue must use the same scheduler/launch lifecycle as /start.
 
@@ -1199,6 +1221,173 @@ async def test_dispatch_settings_survive_resolve_and_redact_secrets(tmp_path) ->
     restored = mgr2.create(run.run_id)
     assert restored.dispatch_body["worker_backend"] == "container"
     assert "api_key" not in restored.dispatch_body
+
+
+# ── retitle: re-apply the rail naming rule to an EXISTING run ────────────────
+
+@pytest.mark.asyncio
+async def test_retitle_applies_web_url_rule_to_existing_run(tmp_path) -> None:
+    """A session dispatched before the naming rule keeps its old slug; retitle
+    recomputes `{category}-{url-host:port}` from the remembered dispatch (no
+    LLM). The port is part of the identifier — arena instances differ by it."""
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("retitle-web")
+    run.name = "nssctf-arena-6826"  # the old pre-rule name a retitle must replace
+    mgr.remember_dispatch(run.run_id, {
+        "kind": "idle",
+        "prompt": "打 http://node4.anna.nssctf.cn:22966/ 这道题",
+    })
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r = await client.post("/api/runs/retitle-web/retitle")
+    assert r.status_code == 200
+    data = r.json()
+    assert data == {"ok": True, "name": "web-node4.anna.nssctf.cn:22966", "pending": False}
+    assert mgr.get("retitle-web").custom_name == "web-node4.anna.nssctf.cn:22966"
+
+
+@pytest.mark.asyncio
+async def test_retitle_applies_attachment_rule_for_rev(tmp_path) -> None:
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("retitle-rev")
+    mgr.remember_dispatch(run.run_id, {
+        "kind": "idle",
+        "prompt": "逆向它",
+        "challenge": {
+            "category": "rev",
+            "attachments": [str(tmp_path / "uploads" / "crackme.elf")],
+        },
+    })
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r = await client.post("/api/runs/retitle-rev/retitle")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "name": "rev-crackme.elf", "pending": False}
+    assert mgr.get("retitle-rev").custom_name == "rev-crackme.elf"
+
+
+@pytest.mark.asyncio
+async def test_retitle_without_dispatch_prompt_conflicts(tmp_path) -> None:
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    mgr.create("retitle-empty")
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r = await client.post("/api/runs/retitle-empty/retitle")
+    assert r.status_code == 409
+    assert "no remembered dispatch" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_retitle_pwn_defers_to_background_llm_title(tmp_path, monkeypatch) -> None:
+    """No deterministic identifier for a bare pwn prompt (no stated 题目名, no
+    http URL, no attachment) → pending:true, the background titler LLM lands
+    the rename on the rail poll; result is sticky custom_name."""
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("retitle-pwn")
+    mgr.remember_dispatch(run.run_id, {
+        "kind": "idle",
+        "prompt": "pwn 掉远程 1.2.3.4:9999",
+        "challenge": {"category": "pwn"},
+    })
+
+    async def fake_generate_title(prompt, **kwargs):
+        assert kwargs["category"] == "pwn"
+        return "pwn-ret2libc 变体"
+
+    monkeypatch.setattr("apps.web.titler.generate_title", fake_generate_title)
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r = await client.post("/api/runs/retitle-pwn/retitle")
+            assert r.status_code == 200
+            assert r.json() == {"ok": True, "name": None, "pending": True}
+            for _ in range(100):
+                if mgr.get("retitle-pwn").custom_name == "pwn-ret2libc 变体":
+                    break
+                await asyncio.sleep(0.05)
+    assert mgr.get("retitle-pwn").custom_name == "pwn-ret2libc 变体"
+
+
+@pytest.mark.asyncio
+async def test_retitle_stated_challenge_name_beats_url(tmp_path) -> None:
+    """`题目：X` in the dispatch prompt is the identifier — it outranks the URL
+    and applies to any category."""
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    run = mgr.create("retitle-stated")
+    mgr.remember_dispatch(run.run_id, {
+        "kind": "idle",
+        "prompt": "题目：flexcheck，打 http://target.cn:8000/ 这道题",
+    })
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r = await client.post("/api/runs/retitle-stated/retitle")
+    assert r.status_code == 200
+    # category inferred from the URL → web, identifier is the stated 题目名
+    assert r.json() == {"ok": True, "name": "web-flexcheck", "pending": False}
+    assert mgr.get("retitle-stated").custom_name == "web-flexcheck"
+
+
+@pytest.mark.asyncio
+async def test_retitle_same_target_twice_gets_unique_names(tmp_path) -> None:
+    """The whole point of `方向-标识` is telling challenges apart: retitling two
+    runs dispatched against the SAME target must not yield two identical rows —
+    the second one is disambiguated with a `-2` suffix."""
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    for rid in ("re-solve-1", "re-solve-2"):
+        run = mgr.create(rid)
+        run.name = "old-slug"
+        mgr.remember_dispatch(rid, {
+            "kind": "idle",
+            "prompt": "打 http://node4.anna.nssctf.cn:22966/ 这道题",
+        })
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r1 = await client.post("/api/runs/re-solve-1/retitle")
+            r2 = await client.post("/api/runs/re-solve-2/retitle")
+    assert r1.json()["name"] == "web-node4.anna.nssctf.cn:22966"
+    assert r2.json()["name"] == "web-node4.anna.nssctf.cn:22966-2"
+    assert mgr.get("re-solve-1").custom_name == "web-node4.anna.nssctf.cn:22966"
+    assert mgr.get("re-solve-2").custom_name == "web-node4.anna.nssctf.cn:22966-2"
+
+
+# ── gateway upstream key: bound provider secret wins over stale pi-main file ─
+
+def test_resolve_worker_provider_key_uses_bound_provider_secret(tmp_path) -> None:
+    """Workers bind provider_ref (e.g. zhipu); the gateway must forward with
+    THAT provider's secret — not the legacy pi-main account file, which may
+    hold an unrelated/stale key (the startup-test 401 wave)."""
+    from types import SimpleNamespace
+
+    from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    store = LLMProviderSecretStore(provider_secret_root(mgr.sessions_root))
+    store.upsert_secret("zhipu", "sk-zhipu-valid")
+    acct = Path(mgr.sessions_root) / "_secrets" / "accounts" / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("sk-stale-pi-main\n", encoding="utf-8")
+    mgr.worker_config = SimpleNamespace(get=lambda: {"worker_profiles": [
+        {"id": "seat-a", "enabled": True, "provider_ref": "zhipu"},
+        {"id": "seat-b", "enabled": True, "provider_ref": "zhipu"},
+        {"id": "off", "enabled": False, "provider_ref": "deepseek"},
+    ]})
+    assert mgr._resolve_worker_provider_key() == "sk-zhipu-valid"
+
+
+def test_resolve_worker_provider_key_empty_without_binding_or_secret(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root
+
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    LLMProviderSecretStore(provider_secret_root(mgr.sessions_root))
+    # no enabled profiles at all → empty (gateway falls back to legacy sources)
+    mgr.worker_config = SimpleNamespace(get=lambda: {"worker_profiles": []})
+    assert mgr._resolve_worker_provider_key() == ""
+    # bound provider whose secret was never stored → empty as well
+    mgr.worker_config = SimpleNamespace(get=lambda: {"worker_profiles": [
+        {"id": "seat", "enabled": True, "provider_ref": "zhipu"},
+    ]})
+    assert mgr._resolve_worker_provider_key() == ""
 
 
 # 👻👻 ghost-running guard: a run whose durable history ENDS on run.started with no
@@ -1441,3 +1630,53 @@ def test_compose_web_auth_bind_tracks_published_host() -> None:
         'DSWARM_WEB_BIND: "${DSWARM_WEB_PUBLISH_HOST:-127.0.0.1}"'
     ) in compose
     assert 'DSWARM_WEB_PASSWORD: "${DSWARM_WEB_PASSWORD:-}"' in compose
+
+
+# ── containment: flag VALUES must not be listable without authentication ─────
+
+def _seed_flagged_run(mgr, run_id: str) -> None:
+    run = mgr.create(run_id)
+    run.name = "reverse-test"
+    run.category = "reverse"
+    run.started = True
+    run.solved = True
+    run.flag = "afctf{c14ssic_cae5ar}"
+    run.flags = ["afctf{c14ssic_cae5ar}", "NSSCTF{c14ssic_cae5ar}"]
+
+
+@pytest.mark.asyncio
+async def test_run_list_redacts_flag_values_when_unauthenticated(tmp_path) -> None:
+    """run-6427 containment: worker containers can reach the passwordless
+    control-plane API, so flag VALUES must not travel in unauthenticated list
+    responses — only counts (the rail's progress chips need nothing more)."""
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    _seed_flagged_run(mgr, "leaky-run")
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            r = await client.get("/api/runs?archived=1")
+    row = next(x for x in r.json()["runs"] if x["run_id"] == "leaky-run")
+    assert row["flag"] is None and row["flags"] == []
+    assert row["flag_count"] == 2 and row["flags_redacted"] is True
+    # solved-ness is not a secret — the rail keeps its 已解出 badge
+    assert row["solved"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_list_keeps_flag_values_with_valid_token(tmp_path, monkeypatch) -> None:
+    import os
+
+    monkeypatch.setenv("DSWARM_WEB_PASSWORD", "op-secret")
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    _seed_flagged_run(mgr, "authed-run")
+    with _Server(create_app(mgr)) as s:
+        async with httpx.AsyncClient(base_url=s.base, timeout=10, trust_env=False) as client:
+            login = await client.post("/api/auth/login", json={"password": "op-secret"})
+            token = login.json()["token"]
+            r = await client.get("/api/runs?archived=1",
+                                 headers={"Authorization": f"Bearer {token}"})
+            unauth = await client.get("/api/runs?archived=1")
+    row = next(x for x in r.json()["runs"] if x["run_id"] == "authed-run")
+    assert row["flags"] == ["afctf{c14ssic_cae5ar}", "NSSCTF{c14ssic_cae5ar}"]
+    assert row.get("flags_redacted") is not True
+    # with auth ON the middleware 401s unauthenticated readers outright
+    assert unauth.status_code == 401

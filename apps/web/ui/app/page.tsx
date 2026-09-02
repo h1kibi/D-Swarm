@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRun, useRunList, useFolders, useBudgetSnapshot, useRuntimePools, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
+import { useRun, useRunList, useFolders, useBudgetSnapshot, useRuntimePools, newRun, patchRun, deleteRun, retitleRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
 import { I18nProvider } from "@/lib/i18n";
@@ -424,6 +424,7 @@ function Deck() {
     | { kind: "pin"; runId: string; pinned: boolean }
     | { kind: "archive"; runId: string; archived: boolean }
     | { kind: "rename"; runId: string; name: string }
+    | { kind: "retitle"; runId: string }
     | { kind: "delete"; runId: string }
     | { kind: "move"; runId: string; folderId: string | null }
     | { kind: "newFolder" }
@@ -462,6 +463,19 @@ function Deck() {
       bump();
       if (ok) pushToast({ msg: t("toast.renamed"), variant: "success" });
       else toastFail();
+    } else if (a.kind === "retitle") {
+      // Re-derive the naming rule ({category}-{url|attachment|题目}) from the
+      // run's remembered dispatch. Deterministic rule hits come back with the
+      // name; pwn (题目名) is named by the background titler LLM → pending.
+      const res = await retitleRun(a.runId);
+      bump();
+      if (!res.ok) {
+        pushToast({ msg: res.detail ? `${t("toast.retitleFailed")}：${res.detail}` : t("toast.retitleFailed"), variant: "error" });
+      } else if (res.pending) {
+        pushToast({ msg: t("toast.retitlePending"), variant: "info" });
+      } else {
+        pushToast({ msg: t("toast.retitled", { name: res.name || "" }), variant: "success" });
+      }
     } else if (a.kind === "archive") {
       const ok = await patchRun(a.runId, { archived: a.archived });
       bump();
@@ -486,9 +500,23 @@ function Deck() {
   };
 
   // Fleet batch control (§5.2): the rail already confirmed (for stop) and
-  // filtered eligibility; here we fan out the existing single-run HITL API —
-  // no batch endpoint, no history deletion.
+  // filtered eligibility. pause/resume/stop fan out the single-run HITL API;
+  // archive/unarchive fan out the run-metadata PATCH (no history is touched).
   const onBatch = async (action: BatchAction, runIds: string[]) => {
+    if (action === "archive" || action === "unarchive") {
+      const archived = action === "archive";
+      const results = await Promise.all(runIds.map((id) => patchRun(id, { archived })));
+      const okCount = results.filter(Boolean).length;
+      if (okCount > 0) {
+        pushToast({
+          msg: t(archived ? "toast.batchArchived" : "toast.batchUnarchived", { n: okCount }),
+          variant: okCount === runIds.length ? "success" : "info",
+        });
+      }
+      if (okCount < runIds.length) toastFail();
+      bump();
+      return;
+    }
     const results = await Promise.all(runIds.map((id) => sendRunHitl(id, action)));
     const okCount = results.filter(Boolean).length;
     if (okCount > 0) {

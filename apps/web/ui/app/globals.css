@@ -219,6 +219,14 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .thread-item.dragging { opacity: .4; }
 .thread-item[draggable="true"] { cursor: grab; }
 .thread-item.menu-open, .rail-folder.menu-open { position: relative; z-index: 90; }
+/* the ⋯ dropdown is absolutely positioned INSIDE the row — the row's own
+   overflow:hidden (layout-refined theme) would shear the menu down to its
+   first item. Open the clip while the menu is showing (z-index above keeps
+   the row painting over its siblings). */
+.thread-item.menu-open, .rail-folder.menu-open { overflow: visible; }
+/* near the bottom of the rail the menu flips above the ⋯ button instead of
+   running past the scroll edge */
+.menu.up { top: auto; bottom: 22px; }
 
 .thread-item { position: relative; display: flex; align-items: center; gap: 8px; padding: 7px 8px 7px 9px;
   border-radius: 7px; color: var(--text); cursor: pointer; border: 1px solid transparent;
@@ -258,8 +266,10 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .thread-item .sub .ct { text-transform: uppercase; }
 .thread-item .sub .st { text-transform: none; background: color-mix(in srgb, var(--panel) 72%, transparent); }
 .thread-item .sub .when { font-variant-numeric: tabular-nums; color: var(--dim); border-color: transparent; padding-left: 0; }
-.rename-input { width: 100%; background: var(--bg); border: 1px solid var(--accent); border-radius: 5px;
-  color: var(--text); font: inherit; font-size: 12px; padding: 2px 6px; outline: none; }
+.thread-item .rename-input { width: 100%; background: var(--bg2); border: 1px solid var(--brand);
+  border-radius: 7px; color: var(--text); font: inherit; font-size: 12px;
+  padding: 4px 8px; outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 18%, transparent); }
+.thread-item .rename-input:not(.thread-item .rename-input):focus { border-color: var(--brand-hi); box-shadow: none; }
 
 /* row ⋯menu: hidden until hover/focus/active or when the menu is open */
 .row-menu { flex: none; position: relative; }
@@ -2500,6 +2510,41 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .panel-scroll { flex: 1; min-height: 0; overflow: auto; padding: 14px 16px; }
 .artifact-list { flex: 1; min-height: 0; overflow: auto; padding: 12px; display: grid; align-content: start; gap: 8px; }
 .artifact-list-empty { flex: 1; display: grid; place-items: center; color: var(--dim); font-size: 13px; }
+
+/* ── 探索过程 (routes/branches page): recon → reason cycles → outcome ── */
+.explore-empty { flex: 1; display: grid; place-content: center; justify-items: center; gap: 6px;
+  color: var(--dim); padding: 24px; text-align: center; }
+.explore-empty .rail-noresult-title { font-weight: 700; color: var(--text); }
+.explore-empty .rail-noresult-hint { max-width: 420px; line-height: 1.6; }
+.explore { gap: 10px; }
+.explore-outcome { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border: 1px solid var(--border2); border-radius: 10px; background: var(--panel); }
+.explore-outcome-text { font-weight: 700; color: var(--text); }
+.explore-block { border: 1px solid var(--border2); border-radius: 10px; padding: 10px 12px;
+  display: grid; gap: 8px; background: color-mix(in srgb, var(--panel) 55%, transparent); }
+.explore-block-h { display: flex; align-items: center; gap: 8px; font-weight: 800;
+  font-size: 12px; color: var(--bright); }
+.explore-meta { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+.explore-note-h { color: var(--muted); font-size: 11px; font-weight: 700;
+  letter-spacing: .04em; }
+.explore-note { color: var(--text); font-size: 12px; line-height: 1.55;
+  background: var(--bg2); border-radius: 7px; padding: 6px 8px; }
+.explore-intents { display: grid; gap: 6px; }
+.explore-intent { border: 1px solid var(--border2); border-radius: 8px; padding: 7px 9px;
+  display: grid; gap: 4px; background: var(--bg2); }
+.explore-intent-top { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.explore-intent-goal { font-size: 12.5px; color: var(--text); line-height: 1.5; min-width: 0; }
+.explore-intent-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--dim);
+  font-size: 11px; font-variant-numeric: tabular-nums; }
+.explore-warn { color: var(--red); }
+.explore-status { flex: none; font-size: 10px; font-weight: 800; letter-spacing: .05em;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border2); color: var(--muted); }
+.explore-status.st-completed { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+.explore-status.st-failed { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
+.explore-status.st-claimed, .explore-status.st-running { color: var(--brand-hi);
+  border-color: color-mix(in srgb, var(--brand) 55%, transparent); }
+.explore-status.st-skipped { color: var(--dim); }
+.explore-audits { display: grid; gap: 5px; }
 .artifact-row { border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 9px 10px; display: grid; gap: 7px; min-width: 0; }
 .artifact-row-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .artifact-row-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--bright); font-size: 12px; font-weight: 650; }
@@ -2928,7 +2973,7 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .composer2 .collect-count,
 .composer2 .flag-wrapper-input,
 .ws-field input,
-.rename-input {
+.rename-input:not(.thread-item .rename-input) {
   background: transparent; border: 0; border-bottom: 1px solid var(--border2);
   border-radius: 0; box-shadow: none; padding: 4px 2px;
   color: var(--text); font: inherit; outline: none;
@@ -2940,7 +2985,7 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .composer2 .collect-count:focus,
 .composer2 .flag-wrapper-input:focus,
 .ws-field input:focus,
-.rename-input:focus {
+.rename-input:not(.thread-item .rename-input):focus {
   outline: none; border-bottom-color: var(--accent); box-shadow: 0 1px 0 0 var(--accent);
 }
 .composer2 .collect-count { width: 70px; font-size: 12px; font-variant-numeric: tabular-nums; }

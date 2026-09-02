@@ -51,3 +51,25 @@ describe("blackboard event contract", () => {
     });
   });
 });
+
+describe("run finish messaging", () => {
+  const ev = (seq: number, event_type: EventType, payload: Record<string, unknown>, solver_id?: string) =>
+    ({ event_type, seq, ts: seq, run_id: "run-f", solver_id, payload } as DSwarmEvent);
+
+  it("does not claim 'no flag' after a solved banner already ran", () => {
+    // multi-flag shape (run-6203): worker.finish banners the solve first, then
+    // the trailing run.finished folded into the no-flag else branch.
+    let s = emptyDeck("run-f");
+    s = reduce(s, ev(1, EventType.WORKER_FINISHED, { flag: "afctf{c14ssic_cae5ar}", solved: true }, "cli-pi"));
+    s = reduce(s, ev(2, EventType.RUN_FINISHED, { solved: true, flag: "NSSCTF{c14ssic_cae5ar}" }));
+    const keys = s.chat.map((m) => m.i18nKey);
+    expect(keys).toContain("sys.solved");
+    expect(keys).not.toContain("sys.finishedNoFlag");
+  });
+
+  it("still reports a no-flag finish for genuinely flagless runs", () => {
+    let s = emptyDeck("run-g");
+    s = reduce(s, ev(1, EventType.RUN_FINISHED, { solved: false }));
+    expect(s.chat.map((m) => m.i18nKey)).toContain("sys.finishedNoFlag");
+  });
+});

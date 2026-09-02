@@ -10,7 +10,7 @@
 FROM node:20-slim AS build
 WORKDIR /ui
 COPY package.json package-lock.json* /ui/
-RUN npm ci || npm install
+RUN npm ci
 COPY . /ui
 # next.config.mjs rewrites() reads process.env.DSWARM_BACKEND when the module is
 # evaluated, and `output: "standalone"` FREEZES that value into the bundled
