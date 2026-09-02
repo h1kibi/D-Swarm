@@ -1,4 +1,17 @@
-﻿"""Isolated paired planner runner for the offline M8 Advisor experiment."""
+﻿"""⚠️ EXPERIMENTAL OFFLINE RESEARCH FRAMEWORK ONLY ⚠️
+
+Isolated paired planner runner for the offline M8 Advisor experiment.
+
+WARNING: This module is NOT wired into production. Production Advisor remains
+permanently No-Go per docs/00-architecture-spec.md §4.6 (contamination risk).
+
+FOR RESEARCH USE ONLY. See docs/10 §M8 for experiment protocol.
+
+---
+
+Provides deterministic runner for M8 Advisor experiments. Given frozen fixture,
+executes baseline and Advisor arms and compares structured planning outputs (no
+actual dispatch)."""
 
 from __future__ import annotations
 

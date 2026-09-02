@@ -1,7 +1,16 @@
-﻿"""Operator-local harness for the offline-only M8 Advisor experiment.
+﻿"""⚠️ EXPERIMENTAL OFFLINE RESEARCH FRAMEWORK ONLY ⚠️
+
+Operator-local harness for the offline-only M8 Advisor experiment.
+
+WARNING: This module is NOT wired into production. Production Advisor remains
+permanently No-Go per docs/00-architecture-spec.md §4.6 (contamination risk).
+
+FOR RESEARCH USE ONLY. See docs/10 §M8 for experiment protocol.
+
+---
 
 The harness validates every path and fixture identity before creating local
-artifacts.  It never loads production graph/session state and never serializes
+artifacts. It never loads production graph/session state and never serializes
 fixtures, planner requests, planner output, hidden references, or exceptions.
 """
 

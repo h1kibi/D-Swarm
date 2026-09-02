@@ -1,4 +1,16 @@
-﻿"""Append-only, offline-only sidecar for the M8 Advisor experiment."""
+﻿"""⚠️ EXPERIMENTAL OFFLINE RESEARCH FRAMEWORK ONLY ⚠️
+
+Append-only, offline-only sidecar for the M8 Advisor experiment.
+
+WARNING: This module is NOT wired into production. Production Advisor remains
+permanently No-Go per docs/00-architecture-spec.md §4.6 (contamination risk).
+
+FOR RESEARCH USE ONLY. See docs/10 §M8 for experiment protocol.
+
+---
+
+Orchestrates offline Advisor experiments. Hooks scheduler decision boundaries to
+capture baseline and Advisor arms, then persists safe traces for evaluation."""
 
 from __future__ import annotations
 
