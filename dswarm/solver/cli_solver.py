@@ -143,46 +143,6 @@ def _stable_worker_path(current: str, *, sep: "Optional[str]" = None) -> str:
 
 # A focused, black-box prompt. No domain how-to — just "become an expert";
 # only the contract: probe the real target, read output fully, prove the flag.
-_EXEC_PROMPT = (
-    "You are an expert CTF solver working a BLACK-BOX challenge with a FULL shell "
-    "(curl, python3, nc, jq, common tooling). Become an expert in whatever this "
-    "challenge's domain is.\n\n"
-    "{ctx}\n"
-    "{kb}\n"
-    "Actually RUN commands and probe the real target/files — do not just plan. Read "
-    "every response/output end-to-end (follow redirects, keep session/cookies across "
-    "requests, inspect full bodies, not just the first lines). Drive ONE promising "
-    "direction to a conclusion before switching.\n\n"
-    "## Share findings with your team (a swarm is solving this with you)\n"
-    "As you confirm things, print them on their own lines so teammates benefit and "
-    "nobody repeats your work:\n"
-    "  VERIFIED_FACT=<a confirmed, objective finding from REAL output>\n"
-    "  DEADEND=<a direction you ruled out — so nobody retries it>\n"
-    "You may print several of each, as you go.\n"
-    "Print VERIFIED_FACT only for NEW findings not already on the team board. Do NOT "
-    "re-state facts, passwords, or unlocks a teammate already recorded — reuse them. "
-    "Put long data blobs in a file and reference the path in the fact, not the blob. "
-    "(For the freshest teammate state before a long re-derivation, check the live board "
-    "via the blackboard skill, not just the snapshot file.)\n\n"
-    "## If you are BLOCKED on something only the operator can give you\n"
-    "Some blockers are NOT solvable by trying harder or a different angle — you are "
-    "missing an external RESOURCE (a public VPS / reverse-shell host, a credential, "
-    "a tool) or the challenge ENVIRONMENT is objectively unusable (the target is "
-    "unreachable / the instance looks expired). When that is the case, do NOT keep "
-    "blindly retrying or scanning — state exactly what you need on its own line:\n"
-    "  NEED_INPUT=<the ONE specific thing the operator must supply, concretely>\n"
-    "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
-    "e.g. NEED_INPUT=a public VPS I can SSH to for a reverse-shell catcher (I'm behind NAT), "
-    "or NEED_INPUT=the target is returning connection-refused, the instance may have expired. "
-    "Print NEED_INPUT only for a genuine external blocker, not for a hard puzzle.\n\n"
-    "The flag is shaped like {fmt}. When you recover it FROM REAL output (not a "
-    "guess), write it on its own line IN YOUR REPLY (your assistant message — NOT "
-    "only inside an `echo`/shell command, and NOT only in your private reasoning) "
-    "exactly as:\n  FOUND_FLAG=<the flag>\n"
-    "The flag value must also appear verbatim in your real shell output. If a "
-    "verifier or command already printed the flag, restate it as a FOUND_FLAG= line "
-    "in your final reply — do not assume the tool echo alone counts."
-)
 
 # Pentest mode (BE-pentest-mode, Origin/Goal/Hints framing): the SAME swarm,
 # but the objective is operator-defined (find + prove vulnerabilities in scope)
@@ -286,23 +246,7 @@ _WEB_CTF_FOCUS_BLOCK = (
     "contains the flag.\n"
 )
 
-_KB_PROMPT = (
-    f"\nYou ALSO have a `{KB_MCP_NAME}` knowledge-base tool (a searchable security "
-    "knowledge base — e.g. tools, CVEs/PoCs, repos, payload helpers). "
-    "Use it like an expert teammate — call it when, and only when, it shortcuts the "
-    "solve:\n"
-    "  • a service/version/tech fingerprint → search the KB for known CVEs + PoCs;\n"
-    "  • need a specific tool/technique → look it up instead of reinventing;\n"
-    "  • need an obfuscated/WAF-bypass payload → look for a generator/helper.\n"
-    "Don't browse the KB aimlessly or paste large dumps; query it with a sharp term, "
-    "take the one useful hit, and get back to running commands on the real target.\n"
-) if KB_MCP_NAME else ""
 
-_RESUME_PROMPT = (
-    "CONCLUDE: stop exploring now. If you already saw a correctly-formatted flag in "
-    "REAL output this session, print it once more as FOUND_FLAG=<flag>. If not, print "
-    "FOUND_FLAG=NONE and one line on the furthest confirmed fact. Do not guess."
-)
 
 # P3: a resume turn that KEEPS WORKING (not conclude), used when teammates reported
 # new facts/dead-ends during the last turn. The worker continues from where it was,
@@ -2509,7 +2453,7 @@ class CliSolver:
                 )
             return _RECON_PROMPT.format(
                 ctx="\n".join(ctx_lines),
-                kb=_KB_PROMPT if self.kb else "",
+                kb=cli_prompts.KB_PROMPT(KB_MCP_NAME) if self.kb else "",
                 scope=recon_scope,
                 recon_goal=self.intent_goal or (
                     f"Recon the challenge {c.name} [{c.category}] and map the "
@@ -2521,14 +2465,14 @@ class CliSolver:
         if getattr(c, "mode", "ctf") == "pentest":
             return _PENTEST_EXEC_PROMPT.format(
                 ctx="\n".join(ctx_lines),
-                kb=_KB_PROMPT if self.kb else "",
+                kb=cli_prompts.KB_PROMPT(KB_MCP_NAME) if self.kb else "",
                 goal=(c.goal.strip() if c.goal else
                       f"Find and prove exploitable vulnerabilities in {c.name}."),
                 scope=(c.scope.strip() if c.scope else
                        "Only the target/files provided above. Ask if unsure."))
-        return _EXEC_PROMPT.format(
+        return cli_prompts.EXEC_PROMPT.format(
             ctx="\n".join(ctx_lines),
-            kb=_KB_PROMPT if self.kb else "",
+            kb=cli_prompts.KB_PROMPT(KB_MCP_NAME) if self.kb else "",
             fmt=self._flag_hint())
 
     def _extract_flag(self, text: str) -> Optional[str]:
@@ -3091,7 +3035,7 @@ class CliSolver:
             ctx_lines.append(rejected)
         return _EXPLORE_PROMPT.format(
             ctx="\n".join(ctx_lines),
-            kb=_KB_PROMPT if self.kb else "",
+            kb=cli_prompts.KB_PROMPT(KB_MCP_NAME) if self.kb else "",
             intent_goal=self.intent_goal or "general exploration",
             fmt=self._flag_hint())
 
@@ -3114,7 +3058,7 @@ class CliSolver:
                 review_board = self._board_markdown()
         return _REVIEW_PROMPT.format(
             ctx="\n".join(ctx_lines),
-            kb=_KB_PROMPT if self.kb else "",
+            kb=cli_prompts.KB_PROMPT(KB_MCP_NAME) if self.kb else "",
             intent_goal=self.intent_goal or "Audit the current swarm trajectory.",
             review_board=review_board or "(no shared graph available)")
 
@@ -3470,7 +3414,7 @@ class CliSolver:
             await self._emit(EventType.REASONING_DELTA,
                              text=f"[{self.driver.name}] timed out → one conclude turn.\n")
             self._write_board_file(wd)
-            argv = self._resume_or_execute_argv(_RESUME_PROMPT, session)
+            argv = self._resume_or_execute_argv(cli_prompts.RESUME_PROMPT, session)
             res = await self._run_streaming(
                 argv, cwd=str(wd), timeout=min(self.timeout, 600))
             session = res.session or session
