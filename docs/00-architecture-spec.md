@@ -69,6 +69,8 @@ D-Swarm 是**自主多模型 CTF / 授权渗透测试解题智能体集群**：
 │  SharedGraph(dswarm/swarm/shared_graph.py) append-only      │─┘
 │    权威 events 流；facts/intents/pocs/poc_reproductions/… 投影 │
 │    workers 经 skills/dswarm-blackboard 直读写（lead≠真相）    │
+│  Board (可选物化视图层)：MemoryBoard(本地) / PostgresBoard(生产) │
+│    finding/pheromone 持久化 · pgvector 相似度搜索 · 独立 schema │
 └────────┬─────────────────────────────────▲──────────────────┘
          │ spawn（租约 · gateway token · 凭据投影）│ stdout/stderr/工件
          ▼                                        │
@@ -101,6 +103,17 @@ flag 候选必经 gate.py：占位符/洗白路径/不在 provenance corpus 中�
 - 多 flag：`Challenge.expected_flags`（默认 1）；`=1` 字节级等同首血即停，仅 `>1` 进入多
   flag 路径；完成判定以图快照为最终事实源（内存 `_found_flags` 只是缓存，由
   `Swarm._sync_flags_from_graph` 对账吸收，operator-invalidated flag 永不入计数）。
+
+**Board 层（可选物化视图）**：
+
+SharedGraph 是权威事件源；Board 是可选的物化 finding/pheromone 层，用于 Reason 相位的
+相似度搜索和信息素衰减计算。实现：
+- `MemoryBoard`（`dswarm/swarm/board.py`）— 内存字典，本地开发/测试默认
+- `PostgresBoard`（`dswarm/swarm/postgres_board.py`）— PostgreSQL + pgvector，生产部署
+
+选择逻辑：Swarm 启动时检查 `DSWARM_BOARD_DSN`，有值则用 `PostgresBoard`，否则降级到 `MemoryBoard`。
+每个 run 独立 schema（`run_{challenge_id}`），删除 run 时自动清理。Board 写入是 best-effort
+投影，失败不影响事件追加或 flag acceptance（SharedGraph 仍是唯一事实源）。
 
 ### 4.3 预算体系（M5）
 run 级 UsageJournal/UsageLedger 记账先于消费；ProfileBudgetGate + SpawnGuard 在生成前拦截；
@@ -155,18 +168,16 @@ Advisor 建议（M8）仅限离线实验收集，生产永久 No-Go（污染风�
 
 以下为已识别、未处置的技术债（处置须走 RFC/专项，见 ROADMAP）：
 
-1. **超大文件**：`shared_graph.py`(≈5.2k 行) 与 `cli_solver.py`(≈4.3k 行) 远超维护阈值；
-   拆分建议：图生命周期域（poc/budget/energy 各自独立模块）与 marker 解析器外置。
-2. **mixin 解环**：`worker_runtime_mixin ↔ swarm` 经函数内延迟 import 维持循环；
-   应把被搬运的私有 helper 下沉为叶子模块。
-3. **normalize/sanitize helper 繁殖**：`direction_rules` 与 web 层各持一套 operator 方向归一
-   化；`worker_profiles/shared_graph` 各自繁殖同类 helper —— 收敛到公共叶子模块。
-4. **吞异常观测性**：core 内仍有大量 best-effort `except Exception: pass`（杀进程/清理类属合
-   理）；共享图写路径已加观测点，其余高频位点应逐步补事件或计数。
-5. **事故知识文本化**：~54 条 BUG①②③/run-ID 注释承载回归知识，应沉淀为本文件的附录或测试
-   名义，避免随重命名失联。
+1. **超大文件**：`shared_graph.py`(≈4.7k 行) 与 `cli_solver.py`(≈4.3k 行) 远超维护阈值；
+   已外置：POC lifecycle (528行)、review lifecycle (302行)、event reader (110行)、
+   marker parser、normalization helpers。剩余：核心事实/意图物化与 SQLite 事务。
+2. ~~**mixin 解环**~~ ✅ 已收口（2026-08-28）：下沉到 `_bootstrap_assets.py` 叶子模块。
+3. ~~**normalize/sanitize helper 繁殖**~~ ✅ 已收口（2026-08-28）：统一到 `core/normalization.py`。
+4. ~~**吞异常观测性**~~ ✅ 已文档化（2026-09-02）：120 处分类为 K/R/T/D，durable 写入已加观测点，
+   见 `docs/exception-handling.md`。
+5. ~~**事故知识文本化**~~ ✅ 已收口（2026-08-28）：沉淀进 `docs/regression-index.md`。
 6. **Windows dev-host 隔离弱化**：token/key 文件 `chmod 0o600` 在 Windows 上组位无效；生产目
-   标是 Linux 容器侧，dev host 上应显式知晓该差异。
+   标是 Linux 容器侧，dev host 上应显式知晓该差异（已在 `SECURITY.md` / `runtime-pools.md` 注明）。
 7. **ROADMAP 早期迭代项**仍含已删除 SDK 的过时内容（I2/I3 已标注 OBSOLETE），跟随下一轮
    roadmap 修订清理。
 

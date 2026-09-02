@@ -135,6 +135,7 @@ EV_GRAPH_COMPACTED = "graph_compacted"
 
 from dswarm.swarm.event_reader import GraphEventReader
 from dswarm.swarm.poc_lifecycle import PocLifecycle
+from dswarm.swarm.review_lifecycle import ReviewLifecycle
 
 
 # A: fact lifecycle states. unresolved/challenged/revalidated keep the legacy
@@ -899,6 +900,7 @@ class SQLiteSharedGraph:
         # M6 telemetry is a best-effort sidecar, never an evidence source.
         self._metrics_sink = metrics_sink
         self._poc_lifecycle = PocLifecycle(self)
+        self._review_lifecycle = ReviewLifecycle(self)
         self._event_reader = GraphEventReader(self)
         db_file = Path(self.db_path)
         is_new_database = not db_file.exists() or db_file.stat().st_size == 0
@@ -1489,6 +1491,7 @@ class SQLiteSharedGraph:
         inst.challenge = challenge
         inst.artifacts = None
         inst._poc_lifecycle = PocLifecycle(inst)
+        inst._review_lifecycle = ReviewLifecycle(inst)
         inst._event_reader = GraphEventReader(inst)
         inst._lock = threading.Lock()
         # URI mode=ro: open the file read-only at the SQLite VFS layer.
@@ -1801,222 +1804,89 @@ class SQLiteSharedGraph:
     def normalize_lane_key(lane_key: str) -> str:
         return _normalize_lane_key(lane_key)
 
-    @staticmethod
-    def _safe_review_severity(value: str) -> str:
-        v = (value or "info").strip().lower()
-        return v if v in {"info", "warn", "blocker"} else "warn"
-
-    def add_review_finding(self, *, actor: str, kind: str, severity: str,
-                           summary: str, evidence_seqs: Optional[list[int]] = None,
-                           intent_ids: Optional[list[str]] = None,
-                           route_hash: str = "", branch_id: str = "",
-                           recommended_actions: Optional[list[str]] = None,
-                           poc_id: str = "",
-                           poc_ids: Optional[list[str]] = None) -> int:
-        route = self.normalize_route_hash(route_hash) if route_hash else ""
-        fid_seed = f"{kind}:{summary}:{route}:{time.time()}"
-        payload = {
-            "finding_id": f"rvw-{hashlib.sha1(fid_seed.encode()).hexdigest()[:10]}",
-            "kind": (kind or "no_action").strip() or "no_action",
-            "severity": self._safe_review_severity(severity),
-            "summary": (summary or "").strip()[:1000],
-            "evidence_seqs": [int(x) for x in (evidence_seqs or []) if isinstance(x, int)],
-            "intent_ids": [str(x) for x in (intent_ids or []) if x],
-            "route_hash": route,
-            "branch_id": (branch_id or "").strip(),
-            "recommended_actions": [str(x) for x in (recommended_actions or []) if x],
-        }
-        explicit_pocs = []
-        for raw in ([poc_id] if poc_id else []) + list(poc_ids or []):
-            clean = str(raw or "").strip()
-            if clean and clean not in explicit_pocs:
-                explicit_pocs.append(clean)
-        if explicit_pocs:
-            payload["poc_ids"] = explicit_pocs
-            if len(explicit_pocs) == 1:
-                payload["poc_id"] = explicit_pocs[0]
-        return self._append(EV_REVIEW_FINDING, actor, payload,
-                            dedupe_key=f"review::{payload['kind']}::{payload['summary']}::{route}")
-
-    @staticmethod
-    def _review_proposal_tier(marker: str) -> str:
-        m = (marker or "").strip().upper()
-        if m in {"ROUTE_SUPPRESS", "COORDINATOR_DIRECTIVE", "LANE_LOCK", "LANE_UNLOCK"}:
-            return "tier2"
-        return "tier1"
-
-    def add_review_proposal(self, *, actor: str, marker: str, payload: dict,
-                            tier: str = "tier1") -> int:
-        marker = (marker or "").strip().upper()
-        clean_payload = dict(payload or {})
-        route_hash = str(clean_payload.get("route_hash") or "").strip()
-        if route_hash:
-            clean_payload["route_hash"] = self.normalize_route_hash(route_hash)
-        lane_key = str(clean_payload.get("lane_key") or "").strip()
-        if lane_key:
-            clean_payload["lane_key"] = self.normalize_lane_key(lane_key)
-        confidence = clean_payload.get("confidence", 1.0)
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = 1.0
-        clean_payload["confidence"] = max(0.0, min(1.0, confidence))
-        clean_tier = tier if tier in {"tier1", "tier2"} else self._review_proposal_tier(marker)
-        payload_out = {
-            "marker": marker,
-            "tier": clean_tier,
-            "payload": clean_payload,
-            "status": "pending",
-        }
-        fp = json.dumps(clean_payload, sort_keys=True, ensure_ascii=False, default=str)
-        return self._append(EV_REVIEW_PROPOSAL, actor, payload_out,
-                            dedupe_key=f"review-proposal::{marker}::{hashlib.sha1(fp.encode()).hexdigest()}")
-
-    def decide_review_proposal(self, *, actor: str, proposal_seq: int,
-                               decision: str, reason: str = "",
-                               applied_seq: Optional[int] = None) -> int:
-        clean_decision = (decision or "deferred").strip().lower()
-        if clean_decision not in {"accepted", "deferred", "rejected"}:
-            clean_decision = "deferred"
-        payload = {
-            "proposal_seq": int(proposal_seq),
-            "decision": clean_decision,
-            "reason": (reason or "").strip()[:1000],
-        }
-        if applied_seq is not None:
-            payload["applied_seq"] = int(applied_seq)
-        return self._append(
-            EV_REVIEW_PROPOSAL_DECISION, actor, payload,
-            dedupe_key=f"review-proposal-decision::{proposal_seq}::{clean_decision}",
+    def add_review_finding(
+        self, *, actor: str, kind: str, severity: str,
+        summary: str, evidence_seqs: Optional[list[int]] = None,
+        intent_ids: Optional[list[str]] = None,
+        route_hash: str = "", branch_id: str = "",
+        recommended_actions: Optional[list[str]] = None,
+        poc_id: str = "",
+        poc_ids: Optional[list[str]] = None,
+    ) -> int:
+        return self._review_lifecycle.add_review_finding(
+            actor=actor, kind=kind, severity=severity, summary=summary,
+            evidence_seqs=evidence_seqs, intent_ids=intent_ids,
+            route_hash=route_hash, branch_id=branch_id,
+            recommended_actions=recommended_actions,
+            poc_id=poc_id, poc_ids=poc_ids,
         )
 
-    def challenge_fact(self, *, actor: str, fact_seq: int, reason: str,
-                       verification_goal: str) -> dict:
-        fact_seq = int(fact_seq)
-        self._require_fact_target(fact_seq)
-        goal = (verification_goal or f"Verify fact #{fact_seq}: {reason}").strip()
-        h = hashlib.sha1(f"{fact_seq}:{goal}".encode("utf-8", "ignore")).hexdigest()[:8]
-        intent_id = f"I-verify-{fact_seq}-{h}"
-        payload = {
-            "fact_seq": fact_seq,
-            "status": "challenged",
-            "reason": (reason or "").strip()[:1000],
-            "challenged_by": actor,
-            "verification_intent_id": intent_id,
-        }
-        seq = self._append(EV_FACT_CHALLENGED, actor, payload,
-                           dedupe_key=f"fact-challenged::{fact_seq}::{payload['reason']}")
-        if seq <= 0:
-            return {"fact_seq": fact_seq, "verification_intent_id": intent_id,
-                    "seq": seq, "reason": payload["reason"]}
-        self.propose_intent(
-            actor=actor, intent_id=intent_id, goal=goal,
-            payload={"worker_class": "verifier", "depends_on": [str(fact_seq)],
-                     "rationale": f"Review challenged fact #{fact_seq}: {reason}"},
-            from_fact_seqs=[fact_seq],
+    def add_review_proposal(
+        self, *, actor: str, marker: str, payload: dict, tier: str = "tier1"
+    ) -> int:
+        return self._review_lifecycle.add_review_proposal(
+            actor=actor, marker=marker, payload=payload, tier=tier,
         )
-        return {"fact_seq": fact_seq, "verification_intent_id": intent_id,
-                "seq": seq, "reason": payload["reason"]}
+
+    def decide_review_proposal(
+        self, *, actor: str, proposal_seq: int,
+        decision: str, reason: str = "",
+        applied_seq: Optional[int] = None,
+    ) -> int:
+        return self._review_lifecycle.decide_review_proposal(
+            actor=actor, proposal_seq=proposal_seq, decision=decision,
+            reason=reason, applied_seq=applied_seq,
+        )
+
+    def challenge_fact(
+        self, *, actor: str, fact_seq: int, reason: str, verification_goal: str
+    ) -> dict:
+        return self._review_lifecycle.challenge_fact(
+            actor=actor, fact_seq=fact_seq, reason=reason,
+            verification_goal=verification_goal,
+        )
 
     def revalidate_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int:
-        fact_seq = int(fact_seq)
-        self._require_fact_target(fact_seq)
-        payload = {
-            "fact_seq": fact_seq,
-            "status": "revalidated",
-            "reason": (reason or "").strip()[:1000],
-            "revalidated_by": actor,
-        }
-        seq = self._append(EV_FACT_REVALIDATED, actor, payload,
-                           dedupe_key=f"fact-revalidated::{fact_seq}::{payload['reason']}")
-        if seq <= 0:
-            return seq
-        return seq
-
-    # ── A: fact lifecycle (reject / merge / supersede) ──────────────────
-    def _fact_base_verdict(self, fact_seq: int) -> tuple[bool, float]:
-        """The immutable genesis verdict folded with any promotion event."""
-        item = self.effective_fact(int(fact_seq))
-        if item is None:
-            return (False, 0.0)
-        return (bool(item["base_verified"]), float(item.get("base_confidence") or 0.0))
+        return self._review_lifecycle.revalidate_fact(
+            actor=actor, fact_seq=fact_seq, reason=reason,
+        )
 
     def reject_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int:
-        """Mark a fact REJECTED — review proved it false. It is retired from the
-        active candidate set and excluded from snapshots / Reason summaries, but the
-        originating event stays (audit trail)."""
-        fact_seq = int(fact_seq)
-        self._require_fact_target(fact_seq)
-        payload = {"fact_seq": fact_seq, "status": FACT_STATE_REJECTED,
-                   "reason": (reason or "").strip()[:1000], "rejected_by": actor}
-        seq = self._append(EV_FACT_REJECTED, actor, payload,
-                           dedupe_key=f"fact-rejected::{fact_seq}::{payload['reason']}")
-        if seq <= 0:
-            return seq
-        return seq
+        return self._review_lifecycle.reject_fact(
+            actor=actor, fact_seq=fact_seq, reason=reason,
+        )
 
-    def merge_fact(self, *, actor: str, from_fact_seq: int, to_fact_seq: int,
-                   reason: str = "") -> int:
-        """Fold `from_fact_seq` into `to_fact_seq` — they describe the same finding.
-        The from-fact is retired (merged) and the merge edge recorded."""
-        from_seq, to_seq = int(from_fact_seq), int(to_fact_seq)
-        if from_seq == to_seq:
-            return -1
-        self._require_fact_target(from_seq)
-        self._require_fact_target(to_seq)
-        payload = {"from_fact_seq": from_seq, "to_fact_seq": to_seq,
-                   "status": FACT_STATE_MERGED, "reason": (reason or "").strip()[:1000],
-                   "merged_by": actor}
-        seq = self._append(EV_FACT_MERGED, actor, payload,
-                           dedupe_key=f"fact-merged::{from_seq}::{to_seq}")
-        if seq <= 0:
-            return seq
-        return seq
+    def merge_fact(
+        self, *, actor: str, from_fact_seq: int, to_fact_seq: int, reason: str = ""
+    ) -> int:
+        return self._review_lifecycle.merge_fact(
+            actor=actor, from_fact_seq=from_fact_seq,
+            to_fact_seq=to_fact_seq, reason=reason,
+        )
 
-    def supersede_fact(self, *, actor: str, fact_seq: int, reason: str = "",
-                       by_fact_seq: Optional[int] = None) -> int:
-        """Mark a fact SUPERSEDED — a newer fact replaces it. Retired from the
-        active set; kept for audit."""
-        fact_seq = int(fact_seq)
-        self._require_fact_target(fact_seq)
-        if by_fact_seq is not None:
-            self._require_fact_target(int(by_fact_seq))
-        payload = {"fact_seq": fact_seq, "status": FACT_STATE_SUPERSEDED,
-                   "reason": (reason or "").strip()[:1000], "superseded_by": actor}
-        if by_fact_seq is not None:
-            payload["by_fact_seq"] = int(by_fact_seq)
-        seq = self._append(EV_FACT_SUPERSEDED, actor, payload,
-                           dedupe_key=f"fact-superseded::{fact_seq}::{payload['reason']}")
-        if seq <= 0:
-            return seq
-        return seq
+    def supersede_fact(
+        self, *, actor: str, fact_seq: int, reason: str = "",
+        by_fact_seq: Optional[int] = None,
+    ) -> int:
+        return self._review_lifecycle.supersede_fact(
+            actor=actor, fact_seq=fact_seq, reason=reason, by_fact_seq=by_fact_seq,
+        )
 
-    def review_fact(self, *, actor: str, fact_seq: int, action: str,
-                    reason: str = "", verification_goal: str = "",
-                    to_fact_seq: Optional[int] = None) -> dict:
-        """Unified fact review dispatcher (challenge/revalidate/reject/merge/supersede).
-        Returns {action, fact_seq, seq}."""
-        act = (action or "").strip().lower()
-        if act in ("challenge", "challenged"):
-            res = self.challenge_fact(actor=actor, fact_seq=fact_seq, reason=reason,
-                                      verification_goal=verification_goal)
-            return {"action": "challenge", "fact_seq": int(fact_seq),
-                    "seq": int(res.get("seq") or 0)}
-        if act in ("revalidate", "revalidated"):
-            seq = self.revalidate_fact(actor=actor, fact_seq=fact_seq, reason=reason)
-            return {"action": "revalidate", "fact_seq": int(fact_seq), "seq": seq}
-        if act in ("reject", "rejected"):
-            seq = self.reject_fact(actor=actor, fact_seq=fact_seq, reason=reason)
-            return {"action": "reject", "fact_seq": int(fact_seq), "seq": seq}
-        if act in ("merge", "merged"):
-            seq = self.merge_fact(actor=actor, from_fact_seq=fact_seq,
-                                  to_fact_seq=int(to_fact_seq or 0), reason=reason)
-            return {"action": "merge", "fact_seq": int(fact_seq), "seq": seq}
-        if act in ("supersede", "superseded"):
-            seq = self.supersede_fact(actor=actor, fact_seq=fact_seq, reason=reason,
-                                      by_fact_seq=to_fact_seq)
-            return {"action": "supersede", "fact_seq": int(fact_seq), "seq": seq}
-        return {"action": act, "fact_seq": int(fact_seq), "seq": -1}
+    def verify_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int:
+        return self._review_lifecycle.verify_fact(
+            actor=actor, fact_seq=fact_seq, reason=reason,
+        )
+
+    def review_fact(
+        self, *, actor: str, fact_seq: int, action: str,
+        reason: str = "", verification_goal: str = "",
+        to_fact_seq: Optional[int] = None,
+    ) -> dict:
+        return self._review_lifecycle.review_fact(
+            actor=actor, fact_seq=fact_seq, action=action,
+            reason=reason, verification_goal=verification_goal,
+            to_fact_seq=to_fact_seq,
+        )
 
     def _fact_state_map(self) -> dict[int, dict]:
         """Effective lifecycle state folded solely from immutable event rows."""
