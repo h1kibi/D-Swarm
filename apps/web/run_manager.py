@@ -51,6 +51,7 @@ from dswarm.solver.runtime_policy import (
 from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuilder, RuntimeSnapshotStore
 from dswarm.solver.runtime_cleanup import RuntimeCleanupInspector, RuntimeCleanupResult
 from dswarm.solver.worker_profiles import normalize_profile_roster, profile_uses_endpoint
+from dswarm.swarm.poc_verification import sanitize_public_text
 
 LOG = logging.getLogger(__name__)
 
@@ -1439,6 +1440,72 @@ class RunManager:
             run_max_workers=run_max_workers,
         )
 
+    async def _settle_start_failure(self, run: Run, exc: BaseException) -> None:
+        """Terminate a dispatch that failed before the scheduler took ownership.
+
+        The web route creates the run handle and remembers dispatch settings before
+        runtime preflight. If that preflight raises, no driver task exists to run
+        the normal terminal-event fallback in ``_launch``. Always publish a
+        terminal event and close the bus here so SSE clients and the rail cannot
+        mistake the failed attempt for a live run.
+        """
+        run.started = False
+        run.finished = True
+        run.solved = False
+        run.paused = False
+        run.queued = False
+        run.queue_position = None
+        run.cancelled = False
+        run.awaiting_help = False
+        run.help_text = ""
+        # Preflight exceptions happen on the host and may contain URLs, headers,
+        # account material, or an SDK's repr of its request.  Only structured
+        # runtime errors have an operator-safe detail contract; all other errors
+        # expose the exception type, never the raw message.
+        code = getattr(exc, "code", None)
+        safe_detail = getattr(exc, "safe_detail", None)
+        if isinstance(code, str) and isinstance(safe_detail, str):
+            detail = sanitize_public_text(f"{code}: {safe_detail}", limit=500)
+        elif isinstance(exc, RuntimePolicyError):
+            # RuntimePolicyError messages are stable machine-readable policy
+            # codes. Keep them useful, but reject an unexpected non-code value.
+            raw = str(exc).strip()
+            detail = (sanitize_public_text(raw, limit=500)
+                      if re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", raw)
+                      else "runtime_policy_error")
+        else:
+            detail = f"{type(exc).__name__}: startup preflight failed"
+        try:
+            # A failed POST must still leave a durable terminal marker.  The bus
+            # has a critical SessionStore sink, so use the checked path instead of
+            # the best-effort publish used by ordinary progress events.
+            await run.bus.emit_checked(Event(
+                event_type=EventType.RUN_FINISHED,
+                run_id=run.run_id,
+                payload={
+                    "flag": run.flag,
+                    "flags": list(run.flags),
+                    "expected_flags": run.expected_flags,
+                    "multi_flag": run.multi_flag,
+                    "solved": False,
+                    "reason": "runtime_failure",
+                    "detail": detail,
+                },
+            ))
+        except Exception:
+            LOG.debug("failed to publish dispatch failure for %s", run.run_id,
+                      exc_info=True)
+        finally:
+            if run.pool_manager is not None:
+                try:
+                    await run.pool_manager.close()
+                except Exception:
+                    LOG.warning("runtime pool close failed after dispatch failure for %s",
+                                run.run_id, exc_info=True)
+                run.pool_manager = None
+            await run.bus.close()
+            self._unregister_gateway_bridge(run.run_id)
+
     async def start(self, run_id: str, driver: Driver) -> Run:
         """Dispatch a run through the P4 scheduler: below the concurrency cap it
         launches immediately (today's behavior); at the cap it enters the FIFO
@@ -1450,17 +1517,23 @@ class RunManager:
         run = self.create(run_id)
         if run.task is not None and not run.task.done():
             return run  # already live — never stack a second driver on one run
-        await self._reconcile_ledger(run)
-        if run.runtime_snapshot is not None and run.finished:
-            await self._cleanup_before_reopen(run)
-        # M9a: freeze the runtime context BEFORE dispatch so a misconfigured
-        # launch fails here (operator-visible) instead of as a silently dead
-        # run whose every spawn raised runtime_policy_required.
-        if getattr(driver, "dispatch_kind", "swarm") == "swarm":
-            self._freeze_dispatch_runtime(run)
-        self._ensure_runtime_pool_manager(run)
-        if run.spawn_guard is not None:
-            await run.spawn_guard.ensure_ready(run_id)
+        try:
+            await self._reconcile_ledger(run)
+            if run.runtime_snapshot is not None and run.finished:
+                await self._cleanup_before_reopen(run)
+            # M9a: freeze the runtime context BEFORE dispatch so a misconfigured
+            # launch fails here (operator-visible) instead of as a silently dead
+            # run whose every spawn raised runtime_policy_required.
+            if getattr(driver, "dispatch_kind", "swarm") == "swarm":
+                self._freeze_dispatch_runtime(run)
+            self._ensure_runtime_pool_manager(run)
+            if run.spawn_guard is not None:
+                await run.spawn_guard.ensure_ready(run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._settle_start_failure(run, exc)
+            raise
         run.started = True  # the operator dispatched it; rail shows queued/running
         position = self.scheduler.submit(run_id, driver)
         if position is None:

@@ -11,7 +11,7 @@ tests pin the wiring through the real HTTP route:
   clamp baked into the frozen spec;
 - local profiles -> dual-gate honored (deny without DSWARM_ALLOW_LOCAL_WORKERS,
   local_dev policy with no snapshot when allowed);
-- image-preflight failure fails the POST, not the run;
+- image-preflight failure fails the POST and settles the attempted run;
 - freeze is idempotent across re-dispatch; mock drivers skip it entirely.
 """
 
@@ -181,8 +181,56 @@ def test_image_preflight_failure_fails_launch_not_the_run(tmp_path):
     assert resp.status_code == 400
     assert "image_resolution_failed" in resp.json()["detail"]
     run = mgr.get(RUN_ID)
+    assert run is not None
     assert run.runtime_policy is None
+    assert run.started is False
+    assert run.finished is True
+    assert run.status() == "draft"
     assert pool_calls == []
+    events = mgr.get(RUN_ID).store.load_all(RUN_ID)
+    assert events[-1]["event_type"] == "run.finished"
+    assert events[-1]["payload"]["reason"] == "runtime_failure"
+
+
+def test_preflight_failure_redacts_exception_and_closes_pool(tmp_path, monkeypatch):
+    client, mgr, _pool_calls, _ = make_client(tmp_path)
+    pools = []
+
+    class _Pool:
+        def __init__(self, **kwargs):
+            self.run_id = kwargs["run_id"]
+            self.snapshot = kwargs["snapshot"]
+            self.closed = False
+            pools.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    def pool_factory(**kwargs):
+        return _Pool(**kwargs)
+
+    mgr.runtime_pool_manager_factory = pool_factory
+
+    async def fail_ready(self, run_id):
+        raise RuntimeError("provider api_key=super-secret-token https://example.test/?token=secret")
+
+    monkeypatch.setattr("dswarm.core.usage_ledger.SpawnGuard.ensure_ready", fail_ready)
+
+    resp = _start(client, RUN_ID + "-redacted")
+
+    assert resp.status_code == 400
+    assert "super-secret-token" not in resp.text
+    assert "https://example.test" not in resp.text
+    run = mgr.get(RUN_ID + "-redacted")
+    assert run is not None
+    assert run.started is False and run.finished is True
+    assert pools and pools[0].closed is True
+    events = run.store.load_all(run.run_id)
+    terminal = events[-1]["payload"]
+    assert terminal["reason"] == "runtime_failure"
+    assert terminal["detail"] == "RuntimeError: startup preflight failed"
+    assert "super-secret-token" not in str(terminal)
+
 
 
 def test_freeze_is_idempotent_across_redispatch(tmp_path):

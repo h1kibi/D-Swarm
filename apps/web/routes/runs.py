@@ -317,7 +317,15 @@ async def start_run(run_id: str, request: Request) -> Any:
         raise HTTPException(status_code=400, detail=f"runtime_policy: {exc}") from exc
     except RuntimeSnapshotBuildError as exc:
         raise HTTPException(
-            status_code=400, detail=f"runtime_snapshot: {exc.code}: {exc}"
+            status_code=400,
+            detail=f"runtime_snapshot: {exc.code}: {exc.safe_detail}",
+        ) from exc
+    except Exception as exc:
+        # ``RunManager.start`` settles preflight failures before re-raising. Do
+        # not reflect raw host/SDK exception text: it can contain credentials or
+        # request URLs. The terminal event carries the same safe classification.
+        raise HTTPException(
+            status_code=400, detail=f"dispatch: {type(exc).__name__}: startup preflight failed"
         ) from exc
 
     # ChatGPT-style auto-title: if the operator gave no explicit name, kick off
