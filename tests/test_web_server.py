@@ -1532,12 +1532,50 @@ def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
         run = await mgr.start("failed-run", driver)
         await run.task
         assert run.finished is True
+        assert run.status() == "failed"
 
     asyncio.run(go())
     assert seen
     assert seen[-1]["reason"] == "runtime_failure"
     assert "pi-api-local:pi-main" in seen[-1]["detail"]
 
+
+
+def test_runtime_failure_detail_is_redacted_before_sse_and_persistence(tmp_path) -> None:
+    mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
+    seen: list[dict] = []
+
+    async def go() -> None:
+        async def sink(ev) -> None:
+            if ev.event_type is EventType.RUN_FINISHED:
+                seen.append(ev.payload)
+
+        async def driver(run) -> None:
+            run.bus.add_sink(sink)
+            raise RuntimeError(
+                "provider api_key=super-secret-token "
+                "sk-1234567890abcdef1234567890 "
+                "https://example.test/v1/chat?access_token=url-secret "
+                "at C:\\Users\\operator\\private\\run.json"
+            )
+
+        run = await mgr.start("runtime-redacted-run", driver)
+        await run.task
+        assert run.status() == "failed"
+
+    asyncio.run(go())
+    assert seen
+    payload = seen[-1]
+    text = str(payload)
+    assert "super-secret-token" not in text
+    assert "sk-1234567890abcdef1234567890" not in text
+    assert "url-secret" not in text
+    assert "example.test" not in text
+    assert "C:\\Users\\operator" not in text
+    assert "api_key=<redacted>" in payload["detail"]
+
+    stored = mgr.get("runtime-redacted-run").store.load_all("runtime-redacted-run")
+    assert "super-secret-token" not in str(stored)
 
 
 def test_run_manager_emits_provider_diagnostics_for_runtime_failures(tmp_path) -> None:

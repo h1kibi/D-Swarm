@@ -17,6 +17,7 @@ tests pin the wiring through the real HTTP route:
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -185,7 +186,8 @@ def test_image_preflight_failure_fails_launch_not_the_run(tmp_path):
     assert run.runtime_policy is None
     assert run.started is False
     assert run.finished is True
-    assert run.status() == "draft"
+    assert run.status() == "failed"
+    assert run.failure_reason == "runtime_failure"
     assert pool_calls == []
     events = mgr.get(RUN_ID).store.load_all(RUN_ID)
     assert events[-1]["event_type"] == "run.finished"
@@ -231,6 +233,88 @@ def test_preflight_failure_redacts_exception_and_closes_pool(tmp_path, monkeypat
     assert terminal["detail"] == "RuntimeError: startup preflight failed"
     assert "super-secret-token" not in str(terminal)
 
+
+
+def test_retry_after_preflight_failure_reopens_closed_event_bus(tmp_path):
+    client, mgr, _pool_calls, launches = make_client(tmp_path)
+    attempts = 0
+    barrier_calls: list[tuple[str, object]] = []
+
+    def pool_factory(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("pool construction failed")
+        return SimpleNamespace(run_id=kwargs["run_id"], snapshot=kwargs["snapshot"])
+
+    class _Barrier:
+        def cleanup_run_before_reopen(self, run_id, run_root):
+            barrier_calls.append((run_id, run_root))
+            return SimpleNamespace(proven=True)
+
+    mgr.runtime_pool_manager_factory = pool_factory
+    mgr.runtime_cleanup_inspector = _Barrier()
+
+    first = _start(client, RUN_ID + "-retry")
+    assert first.status_code == 400
+    run = mgr.get(RUN_ID + "-retry")
+    assert run is not None and getattr(run.bus, "_closed", False)
+
+    second = _start(client, RUN_ID + "-retry")
+    assert second.status_code == 200, second.text
+    run = mgr.get(RUN_ID + "-retry")
+    assert run is not None
+    assert not getattr(run.bus, "_closed", False)
+    assert run.pool_manager is not None
+    assert barrier_calls and barrier_calls[0][0] == RUN_ID + "-retry"
+    assert launches and launches[-1][0] == RUN_ID + "-retry"
+
+
+def test_resolve_error_does_not_reflect_secret_exception_text(tmp_path, monkeypatch):
+    client, mgr, _pool_calls, _launches = make_client(tmp_path)
+
+    async def fail_resolve(_run_id, _body):
+        raise RuntimeError("provider api_key=resolve-secret https://example.test/?token=secret")
+
+    monkeypatch.setattr(mgr, "resolve", fail_resolve)
+
+    resp = client.post(f"/api/runs/{RUN_ID}-resolve/resolve", json={})
+
+    assert resp.status_code == 503
+    assert "resolve-secret" not in resp.text
+    assert "example.test" not in resp.text
+    assert resp.json()["detail"] == "dispatch: RuntimeError: startup preflight failed"
+
+
+def test_resolve_preflight_failure_disposes_pool_and_bus(tmp_path):
+    client, mgr, _pool_calls, _launches = make_client(tmp_path)
+    run = mgr.create(RUN_ID + "-resolve-cleanup")
+    run.started = True
+    run.finished = True
+    run.spawn_guard.mark_failed("provider api_key=resolve-secret")
+    asyncio.run(run.bus.close())
+
+    class _Pool:
+        def __init__(self, **kwargs):
+            self.run_id = kwargs["run_id"]
+            self.snapshot = kwargs["snapshot"]
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    pool = _Pool(run_id=run.run_id, snapshot=object())
+    # Resolve composes a fresh pool after reopening the bus; inject it through the
+    # factory and let the failed readiness guard exercise the cleanup barrier.
+    mgr.runtime_pool_manager_factory = lambda **_kwargs: pool
+    run.runtime_snapshot = SimpleNamespace(run_id=run.run_id)
+
+    resp = client.post(f"/api/runs/{run.run_id}/resolve", json={"kind": "mock"})
+
+    assert resp.status_code == 503
+    assert pool.closed is True
+    assert run.pool_manager is None
+    assert getattr(run.bus, "_closed", False)
 
 
 def test_freeze_is_idempotent_across_redispatch(tmp_path):

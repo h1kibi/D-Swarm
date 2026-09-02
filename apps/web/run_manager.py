@@ -56,6 +56,38 @@ from dswarm.swarm.poc_verification import sanitize_public_text
 LOG = logging.getLogger(__name__)
 
 
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|auth(?:orization)?|"
+    r"bearer|secret|password)\s*['\"]?\s*[:=]\s*['\"]?([^\s,;}'\"]+)"
+)
+_SECRET_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,})(?![A-Za-z0-9_-])"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_URL_RE = re.compile(r"(?i)\bhttps?://[^\s<>\"']+")
+_ABSOLUTE_PATH_RE = re.compile(r"(?:(?:[A-Za-z]:[\\/])|(?:^|\s)/)[^\s,;]+")
+
+
+def _safe_runtime_detail(value: Any, *, limit: int = 500) -> str:
+    """Bound and redact worker/provider diagnostics before public emission.
+
+    Worker exceptions frequently include SDK request URLs, authorization headers,
+    or host paths.  The event bus is also an SSE/public persistence boundary, so
+    truncating the exception is not sufficient: remove those fields first while
+    retaining useful non-secret context such as provider error codes and account
+    identifiers.
+    """
+    text = sanitize_public_text(value, limit=max(int(limit) * 2, 500))
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1=<redacted>", text)
+    text = _SECRET_TOKEN_RE.sub("<redacted>", text)
+    text = _BEARER_RE.sub("Bearer <redacted>", text)
+    text = _URL_RE.sub("<url>", text)
+    text = _ABSOLUTE_PATH_RE.sub("<path>", text)
+    return sanitize_public_text(text, limit=limit)
+
+
 def _selected_roster(engines: Any, worker_profiles: list[dict]) -> list[dict]:
     """Mirror drivers._selected_profiles: normalize the roster to profile dicts."""
     names = normalize_profile_roster(engines or [], worker_profiles)
@@ -146,6 +178,9 @@ class Run:
     category: str = ""
     started: bool = False
     solved: bool = False
+    # Terminal runtime failures remain visible in the fleet rail as `failed`;
+    # ordinary non-solved completion remains `finished`.
+    failure_reason: Optional[str] = None
     paused: bool = False
     # a worker raised its hand (HITL_REQUEST: NEED_INPUT / target crashed / instance
     # expired / missing credential). True until the operator answers (HITL_RESPONSE)
@@ -203,14 +238,19 @@ class Run:
         if self.cancelled:
             return "cancelled"
         if not self.started:
-            return "draft"
+            # A preflight failure is terminal even though no worker was started;
+            # keep it visible to the fleet's `failed` filter instead of relabeling
+            # it as a draft.
+            return "failed" if self.finished and self.failure_reason == "runtime_failure" else "draft"
         if self.queued:
             return "paused" if self.paused else "queued"
         if not self.finished:
             return "paused" if self.paused else "running"
         if self.solved:
             return "solved"
-        return "finished"  # ended, no flag (we don't distinguish "failed" yet)
+        if self.failure_reason == "runtime_failure":
+            return "failed"
+        return "finished"
 
     def summary(self) -> dict[str, Any]:
         """The shape the deck's thread rail consumes (one row per run)."""
@@ -224,6 +264,7 @@ class Run:
             "started": self.started,
             "finished": self.finished,
             "solved": self.solved,
+            "failure_reason": self.failure_reason,
             "paused": self.paused,
             "awaiting_help": self.awaiting_help,
             "help_text": self.help_text,
@@ -376,6 +417,11 @@ class RunManager:
             # spin forever with no terminal event to settle it). Force-settle here.
             run.finished = bool(s.get("finished")) or run.started
             run.solved = bool(s.get("solved"))
+            run.failure_reason = (
+                str(s.get("reason"))
+                if s.get("reason") == "runtime_failure"
+                else None
+            )
             run.flag = s.get("flag")
             run.flags = list(s.get("flags") or ([run.flag] if run.flag else []))
             run.expected_flags = int(s.get("expected_flags") or 1)
@@ -950,6 +996,7 @@ class RunManager:
             if ev.event_type is EventType.RUN_STARTED:
                 ch = ev.payload.get("challenge", {}) or {}
                 run.started = True
+                run.failure_reason = None
                 # The derived slug is a PRELIMINARY display name (marked
                 # name_is_slug at /start): the rule/LLM title (RUN_TITLED)
                 # replaces it. An operator-supplied name is sticky.
@@ -989,6 +1036,7 @@ class RunManager:
                 # visible; false-positive payloads carry the one invalid flag to
                 # drop. Legacy false-positive payloads with no flag still clear all.
                 run.finished = False
+                run.failure_reason = None
                 run.solved = False
                 run.paused = False
                 if ev.payload.get("reason") == "resolve":
@@ -1011,6 +1059,11 @@ class RunManager:
                                      or (ev.payload or {}).get("text") or "")[:300]
             elif ev.event_type is EventType.RUN_FINISHED:
                 run.finished = True
+                run.failure_reason = (
+                    "runtime_failure"
+                    if ev.payload.get("reason") == "runtime_failure"
+                    else None
+                )
                 run.paused = False  # a finished run is never "paused"
                 run.awaiting_help = False  # finished → no outstanding ask
                 run.help_text = ""
@@ -1452,6 +1505,7 @@ class RunManager:
         run.started = False
         run.finished = True
         run.solved = False
+        run.failure_reason = "runtime_failure"
         run.paused = False
         run.queued = False
         run.queue_position = None
@@ -1492,16 +1546,16 @@ class RunManager:
                     "detail": detail,
                 },
             ))
-        except Exception:
-            LOG.debug("failed to publish dispatch failure for %s", run.run_id,
-                      exc_info=True)
+        except Exception as publish_exc:
+            LOG.debug("failed to publish dispatch failure for %s (%s)",
+                      run.run_id, type(publish_exc).__name__)
         finally:
             if run.pool_manager is not None:
                 try:
                     await run.pool_manager.close()
-                except Exception:
-                    LOG.warning("runtime pool close failed after dispatch failure for %s",
-                                run.run_id, exc_info=True)
+                except Exception as close_exc:
+                    LOG.warning("runtime pool close failed after dispatch failure for %s (%s)",
+                                run.run_id, type(close_exc).__name__)
                 run.pool_manager = None
             await run.bus.close()
             self._unregister_gateway_bridge(run.run_id)
@@ -1518,8 +1572,18 @@ class RunManager:
         if run.task is not None and not run.task.done():
             return run  # already live — never stack a second driver on one run
         try:
+            # A previous failed/finished dispatch closes its EventBus. Reusing
+            # that run id must rebuild the bus before any new events are emitted;
+            # otherwise the retry can appear successful while SSE subscribers
+            # remain attached to a permanently closed bus. Keep the observation
+            # because the route resets ``run.finished`` before calling start.
+            bus_was_closed = bool(getattr(run.bus, "_closed", False))
+            if bus_was_closed:
+                self._fresh_bus(run)
             await self._reconcile_ledger(run)
-            if run.runtime_snapshot is not None and run.finished:
+            if run.runtime_snapshot is not None and (run.finished or bus_was_closed):
+                # The closed-bus marker is also the reliable previous-cycle
+                # signal: /start clears the in-memory finished bit up front.
                 await self._cleanup_before_reopen(run)
             # M9a: freeze the runtime context BEFORE dispatch so a misconfigured
             # launch fails here (operator-visible) instead of as a silently dead
@@ -1562,12 +1626,14 @@ class RunManager:
         produce ``provider.batch_alert`` so the operator knows dispatch should be
         paused or reconfigured.
         """
-        raw = str(detail or "").strip()
+        raw = _safe_runtime_detail(detail)
         if not raw:
             return
         diag = classify_provider_error(
-            raw, provider=provider, account_id=account_id,
-            worker_id=worker_id or run.run_id,
+            raw,
+            provider=_safe_runtime_detail(provider, limit=160),
+            account_id=_safe_runtime_detail(account_id, limit=160),
+            worker_id=_safe_runtime_detail(worker_id or run.run_id, limit=160),
         )
         try:
             await run.bus.emit(Event(
@@ -1576,8 +1642,9 @@ class RunManager:
                 solver_id=worker_id or None,
                 payload=diag.to_event(),
             ))
-        except Exception:
-            LOG.exception("failed to emit provider diagnostic for run %s", run.run_id)
+        except Exception as emit_exc:
+            LOG.warning("failed to emit provider diagnostic for run %s (%s)",
+                        run.run_id, type(emit_exc).__name__)
             return
         try:
             active = active_workers
@@ -1592,8 +1659,9 @@ class RunManager:
                     run_id=run.run_id,
                     payload=alert,
                 ))
-        except Exception:
-            LOG.exception("failed to aggregate provider diagnostic for run %s", run.run_id)
+        except Exception as aggregate_exc:
+            LOG.warning("failed to aggregate provider diagnostic for run %s (%s)",
+                        run.run_id, type(aggregate_exc).__name__)
 
     def _launch(self, run: "Run", driver: Driver) -> None:
         """Create the run's driver task (slot already held by the scheduler).
@@ -1607,8 +1675,8 @@ class RunManager:
             try:
                 await driver(run)
             except Exception as exc:
-                LOG.exception("driver crashed for run %s", run_id)
-                failure_detail = str(exc)[:500]
+                LOG.error("driver crashed for run %s (%s)", run_id, type(exc).__name__)
+                failure_detail = _safe_runtime_detail(exc)
                 await self._emit_provider_diagnostics(run, failure_detail)
             finally:
                 # If the driver exited WITHOUT emitting RUN_FINISHED (cancelled
@@ -1618,6 +1686,9 @@ class RunManager:
                 # so a still-False flag here means none was emitted — synthesize one
                 # before closing the bus so every run reaches a settled state.
                 if not run.finished:
+                    # Set the projection before emitting so a sink failure cannot
+                    # leave a crashed run looking like an ordinary unfinished run.
+                    run.failure_reason = "runtime_failure"
                     try:
                         await run.bus.emit(Event(
                             event_type=EventType.RUN_FINISHED, run_id=run_id,
@@ -1898,6 +1969,16 @@ class RunManager:
         if self.scheduler.is_active(run_id) or self.scheduler.is_queued(run_id):
             return False
 
+        # A finished run may still have a post-solve standby worker serving a
+        # previous HITL command. Do not reopen the same run concurrently: both
+        # tasks would write to the same evidence graph and race the lifecycle
+        # projection. The UI can retry once the standby task settles.
+        if run.standby_task is not None and not run.standby_task.done():
+            return False
+
+        # Rehydrated/finished runs normally have a closed bus. Rebuild it before
+        # ledger reconciliation and pool composition so usage writers and runtime
+        # diagnostics bind to the live bus rather than a permanently closed one.
         # Reconstruct the challenge from the durable winner/event history, then
         # layer the saved dispatch body underneath it. Historical worker events
         # are evidence for replay only; they are never a source of live roster or
@@ -1939,29 +2020,56 @@ class RunManager:
 
         # Continue directly in the Reason scheduler on the existing evidence graph.
         # Recovery reuses the existing graph context and passes the current
-        # dispatch contract directly to the Reason scheduler.
-        await self._reconcile_ledger(run)
-        if run.runtime_snapshot is not None:
-            await self._cleanup_before_reopen(run)
-        self._ensure_runtime_pool_manager(run)
-        if run.spawn_guard is not None:
-            await run.spawn_guard.ensure_ready(run_id)
+        # dispatch contract directly to the Reason scheduler. This whole block is
+        # preflight: if it fails, no RUN_REOPENED marker has been emitted and the
+        # old terminal state remains authoritative.
+        try:
+            # Reopen only after all read-only reconstruction and validation that
+            # can fail without touching runtime state. If this preflight fails,
+            # the old closed bus remains intact and the retry path can rebuild it.
+            self._fresh_bus(run)
+            await self._reconcile_ledger(run)
+            if run.runtime_snapshot is not None:
+                await self._cleanup_before_reopen(run)
+            self._ensure_runtime_pool_manager(run)
+            if run.spawn_guard is not None:
+                await run.spawn_guard.ensure_ready(run_id)
 
-        self.configure_budget(run_id, merged)
-        # Build synchronously before changing lifecycle state. Configuration errors
-        # should be returned by /resolve, not recorded as a misleading reopen.
-        from apps.web.drivers import build_driver
-        driver = build_driver(
-            merged,
-            mgr=self,
-            runtime_operation_kind="resolve",
-        )
-        self.remember_dispatch(run_id, merged)
+            self.configure_budget(run_id, merged)
+            # Build synchronously before changing lifecycle state. Configuration
+            # errors should be returned by /resolve, not recorded as a misleading
+            # reopen.
+            from apps.web.drivers import build_driver
+            driver = build_driver(
+                merged,
+                mgr=self,
+                runtime_operation_kind="resolve",
+            )
+            self.remember_dispatch(run_id, merged)
+        except BaseException:
+            # A failed recovery may have composed a fresh pool manager and bus
+            # before readiness/build validation completed. Tear both down so the
+            # next retry cannot reuse a half-initialized manager or a closed-bus
+            # usage writer. Do not replace the original exception.
+            pool = run.pool_manager
+            run.pool_manager = None
+            if pool is not None:
+                try:
+                    await pool.close()
+                except Exception as close_exc:
+                    LOG.warning("runtime pool close failed after resolve preflight failure for %s (%s)",
+                                run_id, type(close_exc).__name__)
+            try:
+                await run.bus.close()
+            except Exception as close_exc:
+                LOG.debug("event bus close failed after resolve preflight failure for %s (%s)",
+                          run_id, type(close_exc).__name__)
+            self._unregister_gateway_bridge(run_id)
+            raise
 
-        # Reopen the bus and reset every lifecycle bit that can make the rail show a
-        # stale terminal/queued/cancelled state. Keep old flags as deliberate
-        # evidence carried into the continuation.
-        self._fresh_bus(run)
+        # Reset every lifecycle bit that can make the rail show a stale
+        # terminal/queued/cancelled state. Keep old flags as deliberate evidence
+        # carried into the continuation.
         run.started = True
         run.finished = False
         run.solved = False
@@ -2050,9 +2158,9 @@ class RunManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                detail = str(exc)[:500]
-                LOG.exception("standby worker failed for %s action=%s",
-                              run_id, cmd.get("action"))
+                detail = _safe_runtime_detail(exc)
+                LOG.error("standby worker failed for %s action=%s (%s)",
+                           run_id, cmd.get("action"), type(exc).__name__)
                 try:
                     await run.bus.emit(Event(
                         event_type=EventType.HITL_REQUEST,
@@ -2090,6 +2198,7 @@ class RunManager:
                     run.spawn_guard.mark_failed(str(exc))
             if ev.event_type is EventType.RUN_REOPENED:
                 run.finished = False
+                run.failure_reason = None
                 run.solved = False
                 run.paused = False
                 if ev.payload.get("reason") == "resolve":
@@ -2118,6 +2227,11 @@ class RunManager:
                 run.help_text = ""
             elif ev.event_type is EventType.RUN_FINISHED:
                 run.finished = True
+                run.failure_reason = (
+                    "runtime_failure"
+                    if ev.payload.get("reason") == "runtime_failure"
+                    else None
+                )
                 run.paused = False
                 run.awaiting_help = False
                 run.help_text = ""

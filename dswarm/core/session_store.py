@@ -202,7 +202,7 @@ class SessionStore:
         summary = {
             "run_id": run_id, "name": run_id, "category": "",
             "started": False, "finished": False, "solved": False, "flag": None,
-            "flags": [], "expected_flags": 1, "multi_flag": False,
+            "reason": None, "flags": [], "expected_flags": 1, "multi_flag": False,
             "events": 0, "ts": 0.0,
         }
         if not path.exists():
@@ -244,6 +244,7 @@ class SessionStore:
                     summary["name"] = p.get("title") or summary["name"]
                 elif et == "run.finished":
                     summary["finished"] = True
+                    summary["reason"] = p.get("reason")
                     finished_solved = bool(p.get("solved"))
                     _add_flag(p.get("flags") or p.get("flag"))
                     # run.finished may carry the authoritative mode (the single-solver
@@ -254,6 +255,7 @@ class SessionStore:
                         summary["multi_flag"] = bool(p["multi_flag"])
                 elif et == "run.reopened":
                     summary["finished"] = False
+                    summary["reason"] = None
                     finished_solved = False
                     if p.get("reason") == "resolve":
                         continue

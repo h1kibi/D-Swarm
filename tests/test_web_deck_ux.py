@@ -1414,8 +1414,13 @@ def test_run_status_state_machine(tmp_path):
     r.paused = False
     r.finished = True
     assert r.status() == "finished"
+    r.failure_reason = "runtime_failure"
+    assert r.status() == "failed"
     r.solved = True
-    assert r.status() == "solved"
+    assert r.status() == "solved"  # a verified solve outranks a stale failure marker
+    r.solved = False
+    r.failure_reason = None
+    assert r.status() == "finished"
 
 
 # ---- RunManager mutations + listing ----------------------------------------
@@ -1553,6 +1558,19 @@ def test_rehydrate_adopts_run_titled(tmp_path):
     row = next(r for r in mgr.list_runs() if r["run_id"] == "run-0003")
     assert row["name"] == "Auto Title"
     assert row["updated_at"] == 2.0
+
+
+def test_rehydrate_preserves_runtime_failure_status(tmp_path):
+    (tmp_path / "run-failed.jsonl").write_text(
+        json.dumps({"event_type": "run.started", "seq": 1, "ts": 1.0, "run_id": "run-failed",
+                    "payload": {"challenge": {"name": "broken"}}}) + "\n"
+        + json.dumps({"event_type": "run.finished", "seq": 2, "ts": 2.0, "run_id": "run-failed",
+                      "payload": {"solved": False, "reason": "runtime_failure"}}) + "\n"
+    )
+    mgr = RunManager(sessions_root=tmp_path)
+    row = next(r for r in mgr.list_runs() if r["run_id"] == "run-failed")
+    assert row["status"] == "failed"
+    assert row["failure_reason"] == "runtime_failure"
 
 
 async def test_meta_sink_tracks_pause_resume(tmp_path):

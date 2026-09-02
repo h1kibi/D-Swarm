@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,26 @@ from apps.web.run_manager import Run, RunManager
 from dswarm.core.events import Event, EventType
 from dswarm.solver.runtime_policy import RuntimePolicyError
 from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuildError
+from dswarm.swarm.poc_verification import sanitize_public_text
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
+
+
+def _safe_dispatch_detail(exc: BaseException) -> str:
+    """Return an operator-useful dispatch error without exposing host details."""
+    if isinstance(exc, RuntimeSnapshotBuildError):
+        code = sanitize_public_text(exc.code, limit=160)
+        safe_detail = sanitize_public_text(exc.safe_detail, limit=500)
+        return f"runtime_snapshot: {code}: {safe_detail}"
+    if isinstance(exc, RuntimePolicyError):
+        raw_code = str(exc).strip()
+        code = (
+            raw_code
+            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", raw_code)
+            else "runtime_policy_error"
+        )
+        return f"runtime_policy: {code}"
+    return f"dispatch: {type(exc).__name__}: startup preflight failed"
 
 
 @router.get("")
@@ -299,6 +318,7 @@ async def start_run(run_id: str, request: Request) -> Any:
     # (it would otherwise display the stale solved flag the whole time it runs).
     run.finished = False
     run.solved = False
+    run.failure_reason = None
     run.flag = None
     run.flags = []
     run.paused = False
@@ -310,16 +330,11 @@ async def start_run(run_id: str, request: Request) -> Any:
     request.app.state.manager.configure_budget(run_id, body)
     try:
         await request.app.state.manager.start(run_id, driver)
-    except RuntimePolicyError as exc:
+    except (RuntimePolicyError, RuntimeSnapshotBuildError) as exc:
         # M9a fail-closed: a misconfigured runtime (container profiles without a
         # freezable docker context, local workers without the dual gate) must
         # surface as an operator-visible launch error, not a silently dead run.
-        raise HTTPException(status_code=400, detail=f"runtime_policy: {exc}") from exc
-    except RuntimeSnapshotBuildError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"runtime_snapshot: {exc.code}: {exc.safe_detail}",
-        ) from exc
+        raise HTTPException(status_code=400, detail=_safe_dispatch_detail(exc)) from exc
     except Exception as exc:
         # ``RunManager.start`` settles preflight failures before re-raising. Do
         # not reflect raw host/SDK exception text: it can contain credentials or
@@ -598,12 +613,14 @@ async def resolve_run(run_id: str, request: Request) -> Any:
     body = await _require_dict_body(request, allow_empty=True)
     try:
         ok = await request.app.state.manager.resolve(run_id, body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (RuntimePolicyError, RuntimeSnapshotBuildError, ValueError) as exc:
+        # Configuration/preflight failures happen before the run is reopened;
+        # expose only structured policy/snapshot codes or a generic safe detail.
+        raise HTTPException(status_code=400, detail=_safe_dispatch_detail(exc)) from exc
     except Exception as exc:
         # Configuration/preflight failures happen before the run is reopened;
-        # never return 200/ok=true for a recovery that cannot be launched.
-        raise HTTPException(status_code=503, detail=str(exc)[:500]) from exc
+        # never return 200/ok=true or reflect raw host/SDK text.
+        raise HTTPException(status_code=503, detail=_safe_dispatch_detail(exc)) from exc
     if not ok:
         return JSONResponse(
             status_code=409,
