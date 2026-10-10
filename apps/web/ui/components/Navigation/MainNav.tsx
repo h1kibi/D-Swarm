@@ -44,6 +44,11 @@ export function MainNav() {
               Runs
             </Link>
           </li>
+          <li>
+            <Link href="/analytics" className={isActive("/analytics") ? styles.active : ""}>
+              Analytics
+            </Link>
+          </li>
           {isAdmin && (
             <>
               <li>
