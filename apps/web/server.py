@@ -42,6 +42,7 @@ from apps.web.run_manager import RunManager
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
 from apps.web.routes.auth_direct import router as accounts_auth_router
+from apps.web.routes.mock import router as mock_router
 from apps.web.routes.accounts import accounts_router
 from apps.web.routes.audit import router as audit_router
 from apps.web.routes.events import router as events_router
@@ -133,6 +134,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.state.engine_cache_ttl_s = 300.0
     app.state.engine_refresh_lock = asyncio.Lock()
     app.include_router(accounts_auth_router)
+    app.include_router(mock_router)
     app.include_router(accounts_router)
     app.include_router(events_router)
     app.include_router(runs_ctf_router)

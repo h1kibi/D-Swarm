@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>D-Swarm Login Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #0f0; }
+        .log { margin: 10px 0; padding: 10px; background: #222; border-left: 3px solid #0f0; }
+        .error { border-left-color: #f00; color: #f00; }
+        .success { border-left-color: #0f0; }
+        button { padding: 10px 20px; margin: 10px 5px 0 0; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>D-Swarm 登录测试</h2>
+    <div id="logs"></div>
+    <button onclick="testLogin()">测试登录</button>
+    <button onclick="testViaProxy()">测试通过前端代理</button>
+    <button onclick="clearLogs()">清除日志</button>
+    
+    <script>
+    const logs = document.getElementById('logs');
+    
+    function log(msg, isError = false) {
+        const div = document.createElement('div');
+        div.className = 'log' + (isError ? ' error' : ' success');
+        div.textContent = new Date().toLocaleTimeString() + ': ' + msg;
+        logs.appendChild(div);
+        logs.scrollTop = logs.scrollHeight;
+    }
+    
+    function clearLogs() {
+        logs.innerHTML = '';
+    }
+    
+    async function testLogin() {
+        log('开始测试直接后端登录...');
+        try {
+            const resp = await fetch('http://127.0.0.1:8000/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: 'TestPass123!' })
+            });
+            
+            log(`状态码: ${resp.status} (${resp.ok ? 'OK' : 'FAILED'})`);
+            
+            if (!resp.ok) {
+                log(`错误: ${resp.statusText}`, true);
+                return;
+            }
+            
+            const data = await resp.json();
+            log(`响应字段: ${Object.keys(data).join(', ')}`);
+            log(`Token: ${data.token ? '✓ 存在' : '✗ 缺失'}`, !data.token);
+            log(`OK: ${data.ok}`);
+            log(`Auth Required: ${data.auth_required}`);
+            
+            if (data.token) {
+                localStorage.setItem('dswarm_auth_token', data.token);
+                log('✓ Token 已保存到 localStorage');
+            }
+        } catch (err) {
+            log(`异常: ${err.message}`, true);
+        }
+    }
+    
+    async function testViaProxy() {
+        log('开始测试通过前端代理登录...');
+        try {
+            const resp = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: 'TestPass123!' })
+            });
+            
+            log(`状态码: ${resp.status}`);
+            
+            if (!resp.ok) {
+                log(`错误: ${resp.statusText}`, true);
+                return;
+            }
+            
+            const data = await resp.json();
+            log(`Token: ${data.token ? '✓' : '✗'}`, !data.token);
+            log(`✓ 登录成功! (通过代理)`);
+            
+            if (data.token) {
+                localStorage.setItem('dswarm_auth_token', data.token);
+                log('Token 已保存');
+            }
+        } catch (err) {
+            log(`异常: ${err.message}`, true);
+        }
+    }
+    </script>
+</body>
+</html>

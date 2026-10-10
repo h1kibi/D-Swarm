@@ -126,3 +126,19 @@ async def logout():
 async def get_me():
     """Get current user info"""
     return {"authenticated": True, "auth_required": True}
+
+# Mock endpoints for frontend - return empty lists to allow app to load
+@router.get("/api/runs")
+async def get_runs():
+    """Mock runs endpoint"""
+    return {"runs": []}
+
+@router.get("/api/targets")  
+async def get_targets():
+    """Mock targets endpoint"""
+    return {"targets": []}
+
+@router.get("/api/folders")
+async def get_folders():
+    """Mock folders endpoint"""
+    return {"folders": []}
