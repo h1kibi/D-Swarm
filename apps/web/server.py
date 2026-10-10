@@ -1,17 +1,18 @@
-"""FastAPI backend for the web command deck (§14.1 / Sprint 1.1).
+﻿"""FastAPI backend for the web command deck (搂14.1 / Sprint 1.1).
 
 Endpoints:
   GET  /api/runs                      list known runs
+  GET  /api/runs/{run_id}/observability read-only binding / usage / health view
   POST /api/runs/{run_id}/start       launch a run (mock driver, or swarm if a
-                                       challenge spec is posted) — see drivers.py
+                                       challenge spec is posted) 鈥?see drivers.py
   GET  /api/runs/{run_id}/events      SSE: the typed event stream (Last-Event-ID
                                        resume via the standard header)
   WS   /api/runs/{run_id}/terminal    sandbox terminal: TERMINAL_OUTPUT bytes
   POST /api/runs/{run_id}/hitl        human command into the run (hint/pause/etc.)
   GET  /                              the single-page UI (static)
 
-The server holds NO solving logic — it only brokers the event bus + HITL. Event
-schema is the only contract (§3).
+The server holds NO solving logic 鈥?it only brokers the event bus + HITL. Event
+schema is the only contract (搂3).
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from apps.web.auth import (
 from apps.web.run_manager import RunManager
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
-from apps.web.routes.auth import router as auth_router
+from apps.web.routes.accounts import router as accounts_auth_router, accounts_router
 from apps.web.routes.blackboard import router as blackboard_router
 from apps.web.routes.btw import router as btw_router
 from apps.web.routes.credentials import router as credentials_router
@@ -50,7 +51,9 @@ from apps.web.routes.llm_settings import router as llm_settings_router
 from apps.web.routes.profile_health import router as profile_health_router
 from apps.web.routes.runtime_environment import router as runtime_environment_router
 from apps.web.routes.runtime_pools import router as runtime_pools_router
+from apps.web.routes.observability import router as observability_router
 from apps.web.routes.runs import router as runs_router
+from apps.web.routes.targets import router as targets_router
 from apps.web.routes.scheduler import router as scheduler_router
 from apps.web.routes.settings_identity import router as settings_identity_router
 from apps.web.routes.settings_workers import router as settings_workers_router
@@ -79,13 +82,13 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Start the reverse-connect control receiver: the in-container supervisors
-        # DIAL this (host.docker.internal:<port>) — so the host must be listening
+        # DIAL this (host.docker.internal:<port>) 鈥?so the host must be listening
         # before any container starts. Lazy-starts on first use too, but starting it
         # here makes "control port already in use" surface at boot, not mid-run.
         try:
             from dswarm.solver.control_receiver import ControlReceiver
             ControlReceiver.instance()
-        except OSError as exc:  # port already bound (another backend?) — log, continue
+        except OSError as exc:  # port already bound (another backend?) 鈥?log, continue
             print(f"[control-receiver] could not bind control port: {exc}", flush=True)
         task: Optional[asyncio.Task] = None
         enabled = os.environ.get("DSWARM_RETENTION_ENABLED", "1").lower() not in (
@@ -105,11 +108,12 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             await app.state.startup_test.shutdown()
             # Tear down every live swarm/standby task (and its shelled CLI subprocess
             # group) so a server restart doesn't leave budget-eating zombies. This was
-            # never wired up before — shutdown() existed but nothing called it.
+            # never wired up before 鈥?shutdown() existed but nothing called it.
             await mgr.shutdown()
 
-    app = FastAPI(title="Project D-Swarm — Command Deck", lifespan=lifespan)
+    app = FastAPI(title="Project D-Swarm 鈥?Command Deck", lifespan=lifespan)
     app.state.manager = mgr
+    app.state.target_store = mgr.target_store
     app.state.startup_test = StartupTestController(mgr)
     # The model gateway's upstream key must track the provider the workers are
     # bound to (NOT the legacy pi-main account file). Install the lazy resolver
@@ -120,6 +124,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.state.engine_cache = {"ts": 0.0, "data": None}
     app.state.engine_cache_ttl_s = 300.0
     app.state.engine_refresh_lock = asyncio.Lock()
+    app.include_router(accounts_auth_router)
+    app.include_router(accounts_router)
     app.include_router(auth_router)
     app.include_router(blackboard_router)
     app.include_router(btw_router)
@@ -130,7 +136,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.include_router(profile_health_router)
     app.include_router(runtime_environment_router)
     app.include_router(runtime_pools_router)
+    app.include_router(observability_router)
     app.include_router(runs_router)
+    app.include_router(targets_router)
     app.include_router(scheduler_router)
     app.include_router(settings_identity_router)
     app.include_router(settings_workers_router)
@@ -139,7 +147,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.include_router(worker_models_router)
 
     # Auth (P3): a single-password gate in front of /api. fail_fast_check refuses
-    # to start if bound to a non-loopback host with no password — see auth.py and
+    # to start if bound to a non-loopback host with no password 鈥?see auth.py and
     # docs/_local/plan_p3_auth.md. When no password is set AND the bind is
     # loopback, auth is disabled and the deck behaves exactly as before.
     auth = AuthConfig.from_env()
@@ -150,7 +158,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # Dev convenience: the Next dev server (:3001) can talk to this backend
     # directly. Connecting the browser's EventSource straight here (instead of
     # through Next's dev rewrite proxy) avoids the proxy BUFFERING the SSE stream
-    # — the proxy holds events until the connection closes, which makes a live
+    # 鈥?the proxy holds events until the connection closes, which makes a live
     # run look frozen until it finishes. In prod the static UI is served same-
     # origin by this app, so CORS is a no-op there. Allowlist localhost only.
     app.add_middleware(
@@ -160,19 +168,19 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Auth gate. Added AFTER CORS, so CORS wraps it (outermost) — preflight
+    # Auth gate. Added AFTER CORS, so CORS wraps it (outermost) 鈥?preflight
     # OPTIONS are answered by CORS and never reach here. We still bypass OPTIONS
     # defensively (a same-origin request via the Next proxy often omits Origin,
     # so CORS does not short-circuit it). Only /api is gated; the Next server
     # (:3001) owns the UI/login page and must be secured separately when exposed
-    # (reverse proxy / loopback bind) — see docs/_local/plan_p3_auth.md.
+    # (reverse proxy / loopback bind) 鈥?see docs/_local/plan_p3_auth.md.
     #
     # @app.middleware("http") does NOT see websocket scope; the /terminal WS and
     # the SSE /events stream do their own ticket/token check in-handler.
     #
     # IMPORTANT (CORS): a middleware that SHORT-CIRCUITS with its own Response
     # bypasses CORSMiddleware's response path, so a cross-origin 401 would arrive
-    # at the browser WITHOUT Access-Control-Allow-Origin — the browser then
+    # at the browser WITHOUT Access-Control-Allow-Origin 鈥?the browser then
     # reports a network error instead of a 401, and the frontend can't tell "needs
     # login" from "backend down". The Next dev UI (:3001) talks to this backend
     # (:8000) cross-origin, so we must mirror the CORS allow-origin header onto the
@@ -219,7 +227,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
 
 
-    # ── P4 run scheduler (FIFO queue + global concurrency cap) ───────────────
+    # 鈹€鈹€ P4 run scheduler (FIFO queue + global concurrency cap) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     # The queue is in-memory and transient: a server restart drops pending
     # entries (their runs rehydrate as ghost-finished like any killed run).
 
@@ -231,7 +239,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # no bus.emit, no CostController, no CliSolver, no scheduler/max_worker slot.
     # Normal turns use a bounded read-only evidence package plus one fixed model
     # call. Explicit deep-audit turns retain the isolated CLI worker path below.
-    # static UI: the deck is the Next.js app (run `./run.sh web` → :3001, which
+    # static UI: the deck is the Next.js app (run `./run.sh web` 鈫?:3001, which
     # talks to this backend's /api). If a Next.js static export ever drops an
     # index.html into ui/, serve it at / too; otherwise / is unused (the bare
     # backend is API-only).
