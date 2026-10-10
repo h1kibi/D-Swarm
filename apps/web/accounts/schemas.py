@@ -48,7 +48,7 @@ class CreateAccountRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=255)
     display_name: str = Field(..., min_length=1, max_length=255)
     password: str = Field(..., min_length=8)  # Minimum 8 chars
-    role: str = Field(default="member", regex="^(admin|member)$")
+    role: str = Field(default="member", pattern="^(admin|member)$")
 
 
 class CreateAccountResponse(BaseModel):

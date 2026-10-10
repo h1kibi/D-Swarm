@@ -114,7 +114,7 @@ class TargetModel(Base):
     
     # Relationships
     event = relationship("EventModel", back_populates="targets")
-    created_by_account = relationship("AccountModel", back_populates="targets")
+    # created_by_account removed - use created_by_id instead (fixes relationship ambiguity)
     runs = relationship("RunModel", back_populates="target", cascade="all, delete-orphan")
     snapshots = relationship("TargetSnapshotModel", back_populates="target", cascade="all, delete-orphan")
     

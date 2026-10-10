@@ -41,7 +41,11 @@ from apps.web.auth import (
 from apps.web.run_manager import RunManager
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
+from apps.web.routes.auth_direct import router as accounts_auth_router
+from apps.web.routes.accounts import accounts_router
 from apps.web.routes.audit import router as audit_router
+from apps.web.routes.events import router as events_router
+from apps.web.routes.runs_ctf import router as runs_ctf_router
 from apps.web.routes.blackboard import router as blackboard_router
 from apps.web.routes.btw import router as btw_router
 from apps.web.routes.credentials import router as credentials_router
