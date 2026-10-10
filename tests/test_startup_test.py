@@ -631,6 +631,100 @@ async def test_startup_test_default_worker_runner_returns_as_soon_as_marker_is_s
     assert controller._test_manager.get(worker_run_ids[0]) is None
 
 
+@pytest.mark.asyncio
+async def test_startup_test_worker_uses_private_run_namespace_without_touching_target_draft(
+    tmp_path, monkeypatch,
+):
+    """Startup checks share storage but never claim an operator Run id."""
+    from dswarm.core.events import Event, EventType, shared_graph_delta_payload
+
+    mgr = RunManager(sessions_root=tmp_path)
+    _enabled_worker_config(mgr)
+    target = mgr.target_store.create({"name": "Target draft", "category": "web"})
+    draft = mgr.create("run-6428")
+    draft.target_id = target["id"]
+    mgr.target_store.attach_run(target["id"], draft.run_id)
+    mgr.remember_dispatch(draft.run_id, {
+        "kind": "swarm",
+        "challenge": {"name": "real-target", "category": "web"},
+    })
+    original_sidecar = (mgr.workspace_dir(draft.run_id) / ".dswarm_dispatch.json").read_text()
+
+    controller = StartupTestController(mgr, timeout_per_worker=5.0)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
+    session = StartupTestSession("startup-test-private-namespace", controller)
+    worker_run_ids: list[str] = []
+
+    def fake_build_driver(body, mgr=None):
+        async def driver(run):
+            worker_run_ids.append(run.run_id)
+            await run.bus.emit(Event(
+                event_type=EventType.SHARED_GRAPH_DELTA,
+                run_id=run.run_id,
+                payload=shared_graph_delta_payload(
+                    "startup_test_ok", verified=True, confidence=1.0, actor="test",
+                ),
+            ))
+            await asyncio.Event().wait()
+
+        return driver
+
+    monkeypatch.setattr("apps.web.drivers.build_driver", fake_build_driver)
+    result = await asyncio.wait_for(
+        StartupTestController.default_run_worker_test(
+            mgr.worker_config.get()["worker_profiles"][0],
+            timeout=5.0,
+            session=session,
+        ),
+        timeout=1.0,
+    )
+
+    assert result == {"ok": True, "detail": "startup_test_ok", "phase": "done"}
+    assert worker_run_ids and worker_run_ids[0].startswith("startup-test-")
+    assert worker_run_ids[0] != draft.run_id
+    assert mgr.get(draft.run_id) is draft
+    assert (mgr.workspace_dir(draft.run_id) / ".dswarm_dispatch.json").read_text() == original_sidecar
+    assert target["id"] in {item["id"] for item in mgr.target_store.list(include_archived=True)}
+    assert controller._test_manager.get(worker_run_ids[0]) is None
+
+@pytest.mark.asyncio
+async def test_startup_test_default_worker_runner_accepts_nested_tool_result_marker(tmp_path, monkeypatch):
+    from dswarm.core.events import Event, EventType, tool_result_payload
+
+    mgr = RunManager(sessions_root=tmp_path)
+    _enabled_worker_config(mgr)
+    controller = StartupTestController(mgr, timeout_per_worker=5.0)
+    controller._test_manager._freeze_dispatch_runtime = lambda run: None
+    session = StartupTestSession("startup-test-tool-result-marker-unit", controller)
+
+    def fake_build_driver(body, mgr=None):
+        async def driver(run):
+            await run.bus.emit(Event(
+                event_type=EventType.TOOL_CALL_RESULT,
+                run_id=run.run_id,
+                payload=tool_result_payload(
+                    "bash",
+                    {"condensed": "startup_test_ok\nVERIFIED_FACT=startup_test_ok\n"},
+                ),
+            ))
+            await asyncio.Event().wait()
+
+        return driver
+
+    monkeypatch.setattr("apps.web.drivers.build_driver", fake_build_driver)
+
+    result = await asyncio.wait_for(
+        StartupTestController.default_run_worker_test(
+            mgr.worker_config.get()["worker_profiles"][0],
+            timeout=5.0,
+            session=session,
+        ),
+        timeout=1.0,
+    )
+
+    assert result == {"ok": True, "detail": "startup_test_ok", "phase": "done"}
+
+
 
 def test_startup_test_worker_cleanup_timeout_allows_real_container_teardown():
     assert StartupTestController._cleanup_timeout(12.0) >= 20.0

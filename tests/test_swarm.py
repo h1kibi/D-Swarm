@@ -1681,6 +1681,17 @@ async def test_coordinator_multiflag_waits_for_all(challenge, tmp_path: Path, mo
     sw = _reason_swarm(challenge, tmp_path, )
     monkeypatch.setattr(sw, "_healthy_engines", lambda: ["pi", "pi"])
 
+    # Production wires an approving Reviewer whenever a review/Reason LLM is
+    # configured; this fixture has none. Continuing to collect flags requires
+    # dispatching the next Intent, which the gate fail-closes without a Reviewer —
+    # so model the wired reviewer here instead of weakening the gate.
+    sw.review_llm = object()
+
+    async def approve(decision, reason_cycle_id):
+        return {"decision": "approved"}
+
+    monkeypatch.setattr(sw, "_review_intent_quality", approve)
+
     flag_pool = ["flag{a}", "flag{b}"]
     spawn = {"n": 0}
 
@@ -3512,3 +3523,145 @@ def test_container_backend_without_frozen_policy_fails_closed(
     assert swarm._backend_for_engine("pi") == "container"
     with pytest.raises(RuntimePolicyError, match="runtime_policy_required"):
         swarm._make_cli_worker("pi", mode="bootstrap")
+
+def test_role_binding_overlay_changes_llm_without_mutating_worker_profile(challenge, tmp_path):
+    """Run role bindings affect the existing CLI substrate at its final profile boundary."""
+    from dswarm.solver.worker_profiles import normalize_worker_profiles
+
+    profiles = normalize_worker_profiles([
+        {
+            "id": "pi-worker-seat",
+            "name": "pi-worker-seat",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "runtime": "local",
+            "roles": ["bootstrap", "explore", "respond"],
+            "provider_ref": "profile-worker-relay",
+            "model": "profile-worker-model",
+            "image": "worker-image",
+            "max_running": 2,
+        },
+        {
+            "id": "pi-review-seat",
+            "name": "pi-review-seat",
+            "engine": "pi",
+            "transport": "pi_cli",
+            "runtime": "local",
+            "roles": ["review"],
+            "provider_ref": "profile-review-relay",
+            "model": "profile-review-model",
+            "image": "review-image",
+            "max_running": 3,
+        },
+    ])
+    original_worker_model = profiles[0]["model"]
+    sw = _reason_swarm(
+        challenge,
+        tmp_path,
+        worker_profiles=profiles,
+        engines=["pi-worker-seat", "pi-review-seat"],
+        binding_snapshot={
+            "version": 1,
+            "roles": {
+                "worker": {
+                    "provider_ref": "run-worker-relay",
+                    "model": "run-worker-model",
+                    "base_url": "https://worker.example/v1",
+                    "wire_api": "openai",
+                    "auth_mode": "header",
+                    "auth_header": "X-Worker-Key",
+                    "auth_prefix": "Token",
+                    "effort": "high",
+                    "credential_source": "account",
+                    "credential_account": "worker-account",
+                },
+                "review": {
+                    "provider_ref": "run-review-relay",
+                    "model": "run-review-model",
+                },
+            },
+        },
+    )
+
+    worker = sw._profile_for_engine("pi", role="bootstrap")
+    assert worker is not None
+    assert worker["id"] == "pi-worker-seat"
+    assert worker["runtime"] == "local"
+    assert worker["image"] == "worker-image"
+    assert worker["max_running"] == 2
+    assert worker["provider_ref"] == "run-worker-relay"
+    assert worker["model"] == "run-worker-model"
+    assert worker["base_url"] == "https://worker.example/v1"
+    assert worker["wire_api"] == "openai"
+    assert worker["auth_mode"] == "header"
+    assert worker["auth_header"] == "X-Worker-Key"
+    assert worker["auth_prefix"] == "Token"
+    assert worker["effort"] == "high"
+    assert worker["credential_account"] == "worker-account"
+
+    review = sw._profile_for_engine("pi", role="review")
+    assert review is not None
+    assert review["id"] == "pi-review-seat"
+    assert review["runtime"] == "local"
+    assert review["image"] == "review-image"
+    assert review["max_running"] == 3
+    assert review["provider_ref"] == "run-review-relay"
+    assert review["model"] == "run-review-model"
+
+    # The canonical configured profile remains untouched; the overlay is a
+    # per-resolution copy and therefore safe for other roles/runs.
+    assert profiles[0]["model"] == original_worker_model
+    assert profiles[0]["provider_ref"] == "profile-worker-relay"
+
+
+def test_role_binding_overlay_preserves_legacy_behavior_without_snapshot(challenge, tmp_path):
+    from dswarm.solver.worker_profiles import normalize_worker_profiles
+
+    profiles = normalize_worker_profiles([{
+        "id": "pi-worker-seat",
+        "name": "pi-worker-seat",
+        "engine": "pi",
+        "transport": "pi_cli",
+        "runtime": "local",
+        "roles": ["bootstrap"],
+        "provider_ref": "profile-relay",
+        "model": "profile-model",
+    }])
+    sw = _reason_swarm(
+        challenge, tmp_path, worker_profiles=profiles, engines=["pi-worker-seat"]
+    )
+    resolved = sw._profile_for_engine("pi", role="bootstrap")
+    assert resolved is not None
+    assert resolved["provider_ref"] == "profile-relay"
+    assert resolved["model"] == "profile-model"
+
+
+def test_container_gateway_binding_resolves_native_anthropic_host_side_only(challenge, tmp_path: Path):
+    from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root
+
+    sw = _reason_swarm(challenge, tmp_path)
+    sw.workspace_root = tmp_path / "workspace"
+    sw.llm_providers = [{
+        "id": "anthropic",
+        "label": "Anthropic",
+        "base_url": "https://api.anthropic.com/v1",
+        "wire_api": "anthropic",
+        "auth_mode": "x-api-key",
+        "auth_header": "x-api-key",
+        "auth_prefix": "",
+        "models": ["claude-sonnet-4-5"],
+    }]
+    LLMProviderSecretStore(provider_secret_root(tmp_path)).upsert_secret(
+        "anthropic", "sk-host-private-anthropic-key",
+    )
+
+    binding = sw._gateway_upstream_binding_for_profile({"provider_ref": "anthropic"})
+
+    assert binding is not None
+    assert binding.wire_api == "anthropic"
+    assert binding.base_url == "https://api.anthropic.com/v1"
+    assert binding.headers()["x-api-key"] == "sk-host-private-anthropic-key"
+    assert "sk-host-private-anthropic-key" not in repr(binding)
+
+    with pytest.raises(Exception, match="gateway_provider_binding_unavailable"):
+        sw._gateway_upstream_binding_for_profile({"provider_ref": "missing-provider"})

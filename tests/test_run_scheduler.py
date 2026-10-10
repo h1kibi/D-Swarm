@@ -339,7 +339,7 @@ def _free_port() -> int:
 class _Server:
     def __init__(self, app) -> None:
         self.port = _free_port()
-        cfg = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning")
+        cfg = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning", ws="websockets-sansio")
         self.server = uvicorn.Server(cfg)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 

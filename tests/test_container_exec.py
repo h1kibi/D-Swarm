@@ -13,6 +13,8 @@ surface relies on (rcp Signal op + legacy pkill).
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
 
 import signal
 
@@ -332,16 +334,19 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
     ws = tmp_path / "run" / "workspace"
     accounts = tmp_path / "_secrets" / "accounts"
-    acct = accounts / "codex-main"
-    (acct / "codex-home").mkdir(parents=True)
-    (acct / "API_KEY").write_text("sk-secret\n")
-    (acct / "codex-home" / "auth.json").write_text('{"tok":"x"}\n')
-    os.chmod(acct / "API_KEY", 0o600)
-    os.chmod(acct / "codex-home" / "auth.json", 0o600)
+    account = accounts / "pi-main"
+    sibling = accounts / "pi-other"
+    account.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (account / "API_KEY").write_text("selected-secret\n")
+    (sibling / "API_KEY").write_text("sibling-secret\n")
+    os.chmod(account / "API_KEY", 0o600)
 
     handle = ensure_container_legacy_for_tests(
-        "run-x", str(ws), policy=_legacy_policy(), account_root=str(accounts), image="img",
-        network="bridge", memory="12g", cpus="4", pids_limit=2048)
+        "run-x", str(ws), policy=_legacy_policy(), account_root=str(accounts),
+        credential_account_id="pi-main", credential_sessions_root=str(tmp_path),
+        image="img", network="bridge", memory="12g", cpus="4", pids_limit=2048,
+    )
 
     run_call = next(a for a in calls if a and a[0] == "run")
     joined = " ".join(run_call)
@@ -358,18 +363,19 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     assert (control_dir / "token").stat().st_mode & 0o777 == 0o600
     assert "--connect" in run_call and "--run-id" in run_call and "run-x" in run_call
     assert "host.docker.internal:host-gateway" in joined  # Linux dial-back
-    # workspace + account projection mounts (unchanged from before).
-    projection = ws / ".dswarm_accounts"
-    assert handle.account_root == str(projection)
+    # The mount is an operation-scoped projection containing one binding only.
+    projection = Path(handle.account_root)
+    assert sorted(path.name for path in projection.iterdir()) == ["pi-main"]
     assert f"source={projection},target=/run/dswarm/accounts" in joined
     assert f"source={ws},target={CONTAINER_WORKSPACE}" in joined
+    assert "sibling-secret" not in "".join(
+        path.read_text(encoding="utf-8")
+        for path in projection.rglob("*") if path.is_file()
+    )
     assert "--tmpfs" in run_call and "/tmp:rw,exec,size=2g" in run_call
     assert "--network bridge" in joined
     assert "--memory 12g" in joined
-    # the host store is untouched (still 0600), the projection is container-readable
-    assert (acct / "API_KEY").stat().st_mode & 0o777 == 0o600
-    proj_auth = projection / "codex-main" / "codex-home" / "auth.json"
-    assert proj_auth.stat().st_mode & 0o002, "#14: codex auth.json writable in projection"
+    assert (account / "API_KEY").stat().st_mode & 0o777 == 0o600
 
 
 # ── shared workspace is made kali-writable (blackboard readonly regression) ───

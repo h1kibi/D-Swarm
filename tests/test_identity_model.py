@@ -123,13 +123,15 @@ def test_migration_preserves_seat_fields():
             "id": "pi-local", "name": "pi-local", "engine": "pi",
             "credential_account": "pi-main", "runtime": "docker-web",
             "model": "deepseek-v4-pro", "roles": ["race", "review"], "race": False,
-            "max_running": 3, "priority": 10, "enabled": True,
+            "image": "ctf-swarm-pi:0.3.0-rc.1", "max_running": 3, "priority": 10, "enabled": True,
         }],
         runtime_profiles=[{"id": "docker-web", "backend": "container"}],
         account_modes={"pi-main": "api_key"},
     )
     seat = res.seats[0]
     assert seat.model == "deepseek-v4-pro"
+    assert seat.image == "ctf-swarm-pi:0.3.0-rc.1"
+    assert seat.to_dict()["image"] == "ctf-swarm-pi:0.3.0-rc.1"
     # Retired Race workers normalize into the current explore role; the
     # retired boolean must never reappear in the canonical seat contract.
     assert seat.roles == ["explore", "review"]
@@ -165,7 +167,7 @@ def test_adapter_round_trip_preserves_scheduler_fields():
         "credential_mode": "subscription", "credential_account": "pi-main",
         "runtime": "docker-web", "model": "deepseek-v4-pro",
         "roles": ["race", "review"], "race": True,
-        "max_running": 3, "max_review_running": 0, "priority": 10, "enabled": True,
+        "image": "ctf-swarm-pi:0.3.0-rc.1", "max_running": 3, "max_review_running": 0, "priority": 10, "enabled": True,
     }
     res = migrate_legacy_config(
         worker_profiles=[legacy],
@@ -179,6 +181,7 @@ def test_adapter_round_trip_preserves_scheduler_fields():
     )[0]
     assert back["engine"] == "pi"
     assert back["model"] == "deepseek-v4-pro"
+    assert back["image"] == "ctf-swarm-pi:0.3.0-rc.1"
     assert back["credential_account"] == "pi-main"
     assert back["runtime"] == "docker-web"
     assert back["roles"] == ["explore", "review"]

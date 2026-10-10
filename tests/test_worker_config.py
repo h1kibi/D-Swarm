@@ -1043,6 +1043,25 @@ def test_llm_profiles_base_url_accepted_and_normalized(tmp_path):
     assert "key" not in cfg["llm_profiles"]["planner"]
 
 
+def test_llm_profiles_persist_role_bindings_and_reason_alias(tmp_path):
+    store = WorkerConfigStore(root=tmp_path)
+    store.set(llm_profiles={
+        "reason": {"provider": "openai", "model": "reason-new", "base_url": "https://reason.example/v1"},
+        "worker": {"provider": "anthropic", "model": "worker-new", "base_url": "https://worker.example/v1"},
+        "review": {"provider": "openai", "model": "review-new", "base_url": "https://review.example/v1"},
+        "titler": {"provider": "openai", "model": "title-new"},
+    })
+    cfg = WorkerConfigStore(root=tmp_path).get()
+    assert cfg["llm_profiles"]["reason"]["model"] == "reason-new"
+    # The current Reason runtime reads planner; the alias keeps the selected
+    # product role effective without requiring a solver-core migration yet.
+    assert cfg["llm_profiles"]["planner"]["model"] == "reason-new"
+    assert cfg["llm_profiles"]["worker"]["model"] == "worker-new"
+    assert cfg["llm_profiles"]["review"]["model"] == "review-new"
+    assert cfg["llm_profiles"]["titler"]["model"] == "title-new"
+    assert "api_key" not in cfg["llm_profiles"]["worker"]
+
+
 def test_llm_profiles_base_url_defaults_deepseek(tmp_path):
     cfg = WorkerConfigStore(root=tmp_path).get()
     assert cfg["llm_profiles"]["planner"]["base_url"] == DEFAULT_DEEPSEEK_BASE_URL

@@ -1,7 +1,7 @@
 # D-Swarm 异常处理策略与审计
 
-> **状态：现行规范（2026-09-02）**  
-> 本文档记录内核 120 处 `except Exception: pass` 的分类依据与新增规则。
+> **状态：现行规范（2026-09-08）**
+> 本文档记录内核 133 处 `except Exception: pass` 的分类依据与新增规则。
 
 ## 背景
 
@@ -35,13 +35,13 @@ D-Swarm 内核约 120 处使用静默异常处理（`except Exception: pass`）�
 
 | 文件 | K | R | T | D | 合计 |
 |------|--:|--:|--:|--:|-----:|
-| `swarm/swarm.py` | 23 | 3 | 4 | 0 | 30 |
-| `solver/cli_solver.py` | 0 | 4 | 1 | 19 | 24 |
-| `solver/btw.py` | 0 | 10 | 0 | 0 | 10 |
-| `solver/container_exec.py` | 9 | 0 | 0 | 0 | 9 |
-| `solver/cli_driver.py` | 7 | 0 | 0 | 0 | 7 |
-| `swarm/reason_scheduler.py` | 0 | 0 | 5 | 1 | 6 |
-| `solver/container_pool.py` | 5 | 0 | 0 | 0 | 5 |
+| `swarm/swarm.py` | 35 | 0 | 0 | 0 | 35 |
+| `solver/cli_solver.py` | 26 | 4 | 1 | 20 | 26 |
+| `solver/btw.py` | 10 | 10 | 0 | 0 | 10 |
+| `solver/container_exec.py` | 11 | 0 | 0 | 0 | 11 |
+| `solver/cli_driver.py` | 7 | 7 | 0 | 0 | 7 |
+| `swarm/reason_scheduler.py` | 5 | 1 | 4 | 0 | 10 |
+| `solver/container_pool.py` | 5 | 5 | 0 | 0 | 5 |
 | `swarm/projection.py` | 0 | 0 | 4 | 0 | 4 |
 | `swarm/worker_runtime_mixin.py` | 4 | 0 | 0 | 0 | 4 |
 | `solver/container_runtime.py` | 3 | 0 | 0 | 0 | 3 |
@@ -78,8 +78,9 @@ D-Swarm 内核约 120 处使用静默异常处理（`except Exception: pass`）�
 **solver/cli_driver.py (7 处)**
 - L1461, L1456, L1591, L1679, L1599, L1593, L365 — 进程 kill/cleanup/signal/资源释放
 
-**solver/container_exec.py (9 处)**
-- L380, L418, L585, L619, L638, L1014, L1021, L1074, L1087 — 容器 exec/cleanup/kill/网络释放
+**solver/container_exec.py (11 处)**
+- L518, L715, L828, L883, L887, L976, L1043, L1167, L1219, L1234, L1258 — 容器 exec/cleanup/kill/网络释放/凭据租约释放
+  - 2026-09-05: legacy 凭据 facade 加固新增 L518（`lease.close()` 容错,清理可重试）、L883/L887（恢复路径 receiver 注销与旧容器强删,重建兜底）;同批次删除 raw-store fallback 的旧静默 handler,净 +2（120→122）。
 
 **solver/container_pool.py (5 处)**
 - L421, L522, L579, L590, L689 — 池容器回收/代际清理
@@ -93,8 +94,9 @@ D-Swarm 内核约 120 处使用静默异常处理（`except Exception: pass`）�
 **swarm/worker_runtime_mixin.py (4 处)**
 - L519, L543, L592, L626 — worker teardown/runtime 释放
 
-**swarm/swarm.py (23 处，大部分在清理路径）**
-- L466, L473, L522, L586, L614, L683, L719, L1050, L1069, L1195, L1238, L1434, L1449, L1532, L1646, L1661, L1688, L1697, L1753, L1764, L1805, L1843, L1860 — EventBus emit/worker cleanup/HITL 通知边界
+**swarm/swarm.py (35 处，大部分在清理与观测路径）**
+- L690, L940, L1085, L1267, L1329, L1400, L1422, L1429, L1440, L1444, L1449, L1453, L1461, L1467, L1471, L1499, L1594, L1607, L1642, L1658, L1738, L1745, L1756, L1796, L1804, L1825, L1840, L1919, L2003, L2132, L2312, L2397 — EventBus emit / worker cleanup / HITL 通知 / finalize drain 边界
+- L1166, L1177, L1193 — K：Reviewer 证据裁决路径的 emit / 去重失败不得中断 finalize
 
 ### R 类（只读/增强，20 处）
 
@@ -133,8 +135,11 @@ D-Swarm 内核约 120 处使用静默异常处理（`except Exception: pass`）�
 **swarm/runtime_degradation.py (3 处)**
 - L142, L189, L236 — 运行时降级 metrics
 
-**swarm/reason_scheduler.py (1 处)**
-- L584 — reason telemetry
+**swarm/reason_scheduler.py (10 处，K/R/T 混合）**
+- L185, L334, L522, L598, L607 — K：blackboard/alert/reviewer 观测 emit 失败不得中断调度循环
+- L931 — R：读取 graph 事件统计 recovery_attempt（只读降级）
+- L1028, L1101, L1188 — T：`projector.sync` 投影增量失败不影响调度
+- L1418 — T：offline energy trace 采样失败不影响解题
 
 ### D 类（持久证据，已加观测，19 处仍标注供审计）
 

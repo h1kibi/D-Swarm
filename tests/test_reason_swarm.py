@@ -6,7 +6,6 @@ import asyncio
 from types import SimpleNamespace
 
 from dswarm.core.events import EventType
-from dswarm.core.llm import ModelSpec
 from dswarm.models.solve_graph import Challenge
 from dswarm.sandbox.manager import SandboxManager
 from dswarm.solver.result import ArtifactStore
@@ -159,6 +158,272 @@ async def test_planner_unavailable_retries_and_does_not_collapse(monkeypatch):
     # the in-cycle retry + consecutive-cycle budget both fired.
     assert reason_calls >= 3
     assert swarm._planner_failures >= 2
+
+async def test_reason_health_emits_once_per_distinct_projection(monkeypatch):
+    """The health projection is deduped on its payload, and a pre-run launch
+    diagnostic reports a single honest `degraded` (no request was attempted) —
+    it must not escalate to `retrying` until the circuit threshold is reached."""
+    import dswarm.swarm.reason_scheduler as rs
+
+    async def no_sleep(_: float) -> None:
+        return None
+    monkeypatch.setattr(rs.asyncio, "sleep", no_sleep)
+    bus = _Bus()
+    swarm = ReasonSwarm(
+        _challenge(), bus=bus,
+        planner_diagnostic={"code": "timeout", "detail": "planner endpoint timed out."},
+    )
+    swarm._max_planner_failures = 4
+
+    result = await swarm._run_reason(reason_cycle_id="reason-1")
+
+    assert result.audit_notes == ["reason planner unavailable"]
+    events = [e.payload for e in bus.events
+              if e.payload.get("delta_type") == "reason_health_changed"]
+    assert [row["health_state"] for row in events] == ["degraded"]
+    assert events[0]["request_failures"] == 0   # no request was attempted
+    assert events[0]["failures"] == 1
+    assert events[0]["request_limit"] == 3
+    assert events[0]["max_failures"] == 4
+    assert events[0]["operator_attention"] is False
+
+    # An identical projection for the same cycle must not add a second event.
+    await swarm._set_reason_health(
+        "degraded", reason_cycle_id="reason-1", request_failures=0)
+    assert len([e for e in bus.events
+                if e.payload.get("delta_type") == "reason_health_changed"]) == 1
+
+    # A real state transition still publishes.
+    await swarm._set_reason_health(
+        "circuit_open", reason_cycle_id="reason-1",
+        request_failures=0, operator_attention=True, immediate=False)
+    states = [e.payload["health_state"] for e in bus.events
+              if e.payload.get("delta_type") == "reason_health_changed"]
+    assert states == ["degraded", "circuit_open"]
+
+
+async def test_reason_health_projection_tracks_degraded_retrying_and_circuit_open(monkeypatch):
+    """docs/17 §5.4 contract: one failed request degrades; the third failed
+    request inside the SAME cycle warns retrying; six unavailable planner
+    cycles open the circuit. Empty-intent planning results are not failures."""
+    import dswarm.swarm.reason_scheduler as rs
+
+    async def no_sleep(_: float) -> None:
+        return None
+    monkeypatch.setattr(rs.asyncio, "sleep", no_sleep)
+    bus = _Bus()
+    calls = 0
+
+    async def planner(_summary: str, _challenge_id: str) -> ReasonResult:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider timeout")
+
+    swarm = ReasonSwarm(_challenge(), bus=bus, reason_fn=planner)
+    swarm._max_planner_failures = 2
+    first = await swarm._run_reason(reason_cycle_id="reason-1")
+    second = await swarm._run_reason(reason_cycle_id="reason-2")
+    assert first.audit_notes == ["reason planner unavailable"]
+    assert second.audit_notes == ["reason planner unavailable"]
+    assert swarm._reason_health_state == "circuit_open"
+    assert swarm._reason_circuit_open is True
+    health = [
+        event.payload for event in bus.events
+        if event.payload.get("delta_type") == "reason_health_changed"
+    ]
+    states = [row["health_state"] for row in health]
+    # Request-level: the first failed request degrades, the third retries.
+    assert states[0] == "degraded"
+    assert states[1] == "retrying"
+    assert [row["request_failures"] for row in health[:2]] == [1, 3]
+    # Cycle-level: consecutive unavailable cycles end in circuit_open.
+    assert states[-1] == "circuit_open"
+    assert "circuit_open" not in states[:-1]
+    assert all(row["max_failures"] == 2 for row in health)
+    assert all(row["request_limit"] == 3 for row in health)
+    assert calls == 6  # three bounded requests in each of two cycles
+
+
+async def test_reason_empty_intents_are_not_provider_failures(monkeypatch):
+    """docs/17 §5.4: a legal JSON plan with intents=[] is Reason's planning
+    result, not a provider failure — it must never degrade the health state."""
+    import dswarm.swarm.reason_scheduler as rs
+
+    async def no_sleep(_: float) -> None:
+        return None
+    monkeypatch.setattr(rs.asyncio, "sleep", no_sleep)
+    bus = _Bus()
+
+    async def planner(_summary: str, _challenge_id: str) -> ReasonResult:
+        return ReasonResult(goal_met=False, intents=[], audit_notes=[])
+
+    swarm = ReasonSwarm(_challenge(), bus=bus, reason_fn=planner)
+    result = await swarm._run_reason(reason_cycle_id="reason-1")
+    assert result.intents == []
+    assert swarm._reason_health_state == "healthy"
+    assert swarm._reason_cycle_failures == 0
+    assert not [
+        event for event in bus.events
+        if event.payload.get("delta_type") == "reason_health_changed"
+    ]
+
+
+async def test_reason_auth_failure_opens_circuit_on_first_cycle(monkeypatch):
+    """docs/17 §5.4: insufficient_quota/auth_invalid/model_not_found open the
+    override's circuit immediately instead of waiting for the cycle budget."""
+    import dswarm.swarm.reason_scheduler as rs
+
+    async def no_sleep(_: float) -> None:
+        return None
+    monkeypatch.setattr(rs.asyncio, "sleep", no_sleep)
+    bus = _Bus()
+
+    async def planner(_summary: str, _challenge_id: str) -> ReasonResult:
+        raise RuntimeError("401 unauthorized: invalid api key")
+
+    swarm = ReasonSwarm(_challenge(), bus=bus, reason_fn=planner)
+    swarm._max_planner_failures = 6
+    await swarm._run_reason(reason_cycle_id="reason-1")
+    assert swarm._reason_health_state == "circuit_open"
+    assert swarm._reason_circuit_open is True
+    assert swarm._reason_cycle_failures == 1
+    final = [
+        event.payload for event in bus.events
+        if event.payload.get("delta_type") == "reason_health_changed"
+    ][-1]
+    assert final["health_state"] == "circuit_open"
+    assert final["immediate"] is True
+
+
+async def test_planner_diagnostic_keeps_specific_provider_failure_code():
+    """A launch-time provider classification must survive the generic
+    "planner unavailable" classification so §5.4's fatal path stays accurate."""
+    swarm = ReasonSwarm(
+        _challenge(),
+        planner_diagnostic={
+            "code": "missing_api_key",
+            "detail": "Planner API key is missing.",
+            "planner": "deepseek-v4-pro",
+        },
+    )
+    assert swarm._planner_exception_diag(RuntimeError("planner unavailable")) == {
+        "code": "missing_api_key",
+        "detail": "Planner API key is missing.",
+        "planner": "deepseek-v4-pro",
+    }
+    # A genuinely specific new classification still wins.
+    assert swarm._planner_exception_diag(RuntimeError("request timed out"))["code"] == "timeout"
+
+
+async def test_reason_default_probe_failure_blocks_and_waits_for_operator(monkeypatch):
+    """docs/17 §5.4: circuit_open + a FAILED settings-default probe means the
+    Run reports reason_blocked/waiting_for_operator and asks for an operator —
+    never a solved or ordinary challenge failure."""
+    import dswarm.swarm.reason_scheduler as rs
+
+    async def no_sleep(_: float) -> None:
+        return None
+    monkeypatch.setattr(rs.asyncio, "sleep", no_sleep)
+    bus = _Bus()
+
+    class Owner:
+        llm = None
+        _role_fallback_blocked = {"reason": "default_probe_failed"}
+
+        async def trigger_role_fallback(self, role, **kwargs):
+            return False
+
+    async def worker(decision, profile) -> SimpleNamespace:
+        return _outcome()
+
+    async def planner(_summary: str, _challenge_id: str) -> ReasonResult:
+        raise RuntimeError("missing api key")
+
+    swarm = ReasonSwarm(
+        _challenge(), bus=bus, worker_factory=worker, reason_fn=planner,
+        owner_swarm=Owner(),
+    )
+    swarm._max_planner_failures = 1
+    result = await swarm.run()
+
+    assert result["solved"] is False
+    health = [
+        event.payload for event in bus.events
+        if event.payload.get("delta_type") == "reason_health_changed"
+    ]
+    states = [row["health_state"] for row in health]
+    # The failed default probe is reported as an operator-waiting block, and the
+    # exhausted cycle budget then terminates the loop with reason_blocked.
+    assert "waiting_for_operator" in states
+    assert states[-1] == "reason_blocked"
+    waiting = health[states.index("waiting_for_operator")]
+    assert waiting["operator_attention"] is True
+    assert waiting["blocked_reason"] == "default_provider_probe_failed"
+    blocked = [
+        event.payload for event in bus.events
+        if event.payload.get("delta_type") == "reason_blocked"
+    ]
+    assert [row["reason"] for row in blocked] == [
+        "default_provider_probe_failed", "planner_unavailable",
+    ]
+    finished = [
+        event.payload for event in bus.events
+        if event.payload.get("delta_type") == "reason_loop_finished"
+    ]
+    assert finished[-1]["stop_reason"] == "planner_unavailable"
+    assert finished[-1]["solved"] is False
+
+
+async def test_reason_default_probe_success_recovers_health_via_settings_default(monkeypatch):
+    """A successful settings-default probe activates the fallback and the Reason
+    role returns to healthy with fallback_active recorded (docs/17 §5.4)."""
+    import dswarm.swarm.reason_scheduler as rs
+
+    async def no_sleep(_: float) -> None:
+        return None
+    monkeypatch.setattr(rs.asyncio, "sleep", no_sleep)
+    bus = _Bus()
+
+    class Owner:
+        llm = None
+        _role_fallback_blocked: dict = {}
+
+        def __init__(self) -> None:
+            self.activations = 0
+
+        async def trigger_role_fallback(self, role, **kwargs):
+            # A real host activates the settings default at most once per role/run.
+            self.activations += 1
+            return self.activations == 1
+
+    async def worker(decision, profile) -> SimpleNamespace:
+        return _outcome()
+
+    async def planner(_summary: str, _challenge_id: str) -> ReasonResult:
+        raise RuntimeError("provider timeout")
+
+    swarm = ReasonSwarm(
+        _challenge(), bus=bus, worker_factory=worker, reason_fn=planner,
+        owner_swarm=Owner(),
+    )
+    swarm._max_planner_failures = 1
+    await swarm.run()
+
+    health = [
+        event.payload for event in bus.events
+        if event.payload.get("delta_type") == "reason_health_changed"
+    ]
+    recovered = [i for i, row in enumerate(health)
+                 if row["health_state"] == "healthy" and row.get("fallback_active")]
+    assert recovered, "activating the settings default must report a healthy role"
+    # The recovery precedes any later block (the stub planner keeps failing, so
+    # the settings default is eventually blocked too — honestly reported).
+    first_block = next(
+        (i for i, row in enumerate(health)
+         if row["health_state"] in {"reason_blocked", "waiting_for_operator"}),
+        None,
+    )
+    assert first_block is None or first_block > recovered[0]
 
 
 def test_reason_decisions_route_direction_to_profile():
@@ -1457,3 +1722,116 @@ def test_swarm_preserves_zero_review_lane_capacity(tmp_path):
     assert swarm.review_policy["max_concurrent"] == 0
     assert swarm._worker_lane_gate.review_limit == 0
     assert swarm._review_capacity_available() is False
+
+
+async def test_reason_cycle_parks_abandoned_claims_before_recovery(tmp_path):
+    """docs/17 §9.2: the reason cycle must first convert an expired-lease claim into
+    a parked interruption, then recover it. Without the reaper the abandoned intent
+    was re-dispatched as if nothing had happened."""
+    import time as _time
+
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    graph = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_challenge())
+    graph.propose_intent(actor="reason", intent_id="I-abandoned", goal="probe /admin",
+                         payload={"worker_class": "code", "route_hash": "web:admin:probe"})
+    graph.claim_intent(worker="cli-ghost", intent_id="I-abandoned", lease_s=0.01)
+    _time.sleep(0.05)
+
+    dispatched: list[DispatchDecision] = []
+
+    async def worker(decision: DispatchDecision, profile) -> SimpleNamespace:
+        # Never solve: completing on the first flag would skip the planning cycle
+        # (and therefore the reaper) entirely.
+        dispatched.append(decision)
+        return _outcome(None)
+
+    swarm = ReasonSwarm(
+        _challenge(),
+        board=MemoryBoard("c-reason"),
+        graph=graph,
+        worker_factory=worker,
+    )
+
+    await swarm.run()
+
+    parked = graph.awaiting_validation_intents()
+    assert parked == [], "the parked interruption was consumed by recovery, not left behind"
+    recovered = [d for d in dispatched if d.intent_id.startswith("I-abandoned:recovery:")]
+    assert recovered, "the abandoned claim must come back as a bounded recovery decision"
+    assert recovered[0].intent_id == "I-abandoned:recovery:1"
+    # The original stays a tombstone; recovery never silently reuses the old owner.
+    assert recovered[0].dedupe_key == "recovery:I-abandoned:recovery:1"
+    graph.close()
+
+
+async def test_reason_recovery_runs_before_new_business_intents(tmp_path):
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    graph = SQLiteSharedGraph.open(db_path=tmp_path / "priority.db", challenge=_challenge())
+    graph.propose_intent(actor="reason", intent_id="I-parked", goal="recover old route",
+                         payload={"worker_class": "code", "direction": "web", "priority": 0.1})
+    graph.claim_intent(worker="old-worker", intent_id="I-parked", lease_s=300)
+    graph.mark_intent_awaiting_validation(
+        actor="worker", intent_id="I-parked", worker_id="old-worker",
+        reason="oom", recovery_attempt=0,
+    )
+    calls: list[DispatchDecision] = []
+
+    async def worker(decision, profile):
+        calls.append(decision)
+        return _outcome()
+
+    async def reason_fn(summary, challenge_id):
+        return ReasonResult(
+            goal_met=False,
+            intents=[Intent(intent_id="I-new", goal="new route", direction="web", priority=99, mode="explore")],
+            audit_notes=[],
+        )
+
+    swarm = ReasonSwarm(
+        _challenge(), graph=graph, board=MemoryBoard("c-reason"),
+        worker_factory=worker, reason_fn=reason_fn, max_intents_per_reason=2,
+    )
+    await swarm.run()
+    assert calls
+    non_recon = [call for call in calls if call.intent_id != "recon-initial"]
+    assert non_recon
+    assert non_recon[0].intent_id == "I-parked:recovery:1"
+    assert any(call.intent_id == "I-new" for call in non_recon)
+    graph.close()
+
+
+async def test_reason_recovery_exhaustion_uses_configured_attempt_limit(tmp_path, monkeypatch):
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    monkeypatch.setenv("DSWARM_WORKER_PROVIDER_RECOVERY_ATTEMPTS", "1")
+    graph = SQLiteSharedGraph.open(db_path=tmp_path / "exhaustion.db", challenge=_challenge())
+    graph.propose_intent(actor="reason", intent_id="I-exhaust", goal="recover route",
+                         payload={"worker_class": "code", "direction": "web", "priority": 1})
+    graph.claim_intent(worker="old-worker", intent_id="I-exhaust", lease_s=300)
+    graph.mark_intent_awaiting_validation(
+        actor="worker", intent_id="I-exhaust", worker_id="old-worker",
+        reason="stalled", recovery_attempt=1,
+    )
+    bus = _Bus()
+
+    async def empty_reason(summary, challenge_id):
+        return _empty_reason_result()
+
+    swarm = ReasonSwarm(
+        _challenge(), graph=graph, bus=bus, board=MemoryBoard("c-reason"),
+        worker_factory=lambda decision, profile: _outcome(),
+        reason_fn=empty_reason,
+    )
+    await swarm.run()
+    exhausted = [e.payload for e in bus.events
+                 if e.payload.get("delta_type") == "intent_recovery_exhausted"]
+    assert exhausted and exhausted[0]["recovery_attempt"] == 1
+    assert not any(e.payload.get("delta_type") == "intent_recovery_required"
+                   and e.payload.get("recovery_intent_id") for e in bus.events)
+    graph.close()
+
+
+def _empty_reason_result() -> ReasonResult:
+    return ReasonResult(goal_met=False, intents=[], audit_notes=[])

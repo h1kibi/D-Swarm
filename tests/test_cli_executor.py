@@ -1445,6 +1445,43 @@ def test_cli_streaming_emits_busy_heartbeat_during_silent_turn(monkeypatch, tmp_
     )
 
 
+def test_cli_solver_final_status_carries_bounded_worker_diagnostics(monkeypatch):
+    """The Worker detail view needs identity + Intent + runtime health + raw
+    output. The terminal WORKER_STATUS must carry a bounded, artifact-linked
+    runtime snapshot built from real tool output — never the unbounded corpus."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult, StreamStep
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False,
+                  mode="explore", intent_goal="try /admin", intent_id="I-42")
+
+    def fake_stream(*a, **k):
+        return CliResult(text="tried /admin\nno flag here\n", session="sess-x",
+                         raw_stderr="provider warning: slow", timed_out=True)
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    async def drive():
+        await s._emit_step(StreamStep("tool_result", text="curl /admin -> 403",
+                                      raw="x" * 20_000 + "\ncurl /admin -> 403\n"))
+        return await s.run()
+
+    asyncio.run(drive())
+
+    runtime = _worker_statuses(bus.events)[-1].payload["runtime"]
+    assert runtime["intent_id"] == "I-42"
+    assert "curl /admin -> 403" in runtime["stdout"]
+    assert len(runtime["stdout"]) <= 12_000
+    assert "slow" in runtime["stderr"]
+    assert runtime["artifact_ids"]
+    assert runtime["real_output_without_flag"] is True
+    assert _worker_statuses(bus.events)[-1].payload["worker_role"] == "explore"
+
+
 def test_cli_solver_worker_status_reports_asyncio_cancel(monkeypatch):
     bus = _CaptureBus()
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
@@ -3401,3 +3438,214 @@ def test_missing_attachment_guard_silent_without_attachment_mention():
     s = _cli_solver(ch)
     s._staged_files = []
     assert "NO attachment files were staged" not in s._build_prompt()
+
+
+# ── interrupted Intent parking vs real-output-without-flag (docs/17 §15.4) ────
+
+def test_worker_with_real_output_and_no_flag_is_not_an_interruption(monkeypatch):
+    """A worker that produced REAL tool output but no flag explored a direction;
+    it must conclude normally and never be parked as an empty interruption."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult, StreamStep
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    def fake_stream(*a, **k):
+        return CliResult(text="probed /admin, got 403", session="sess-x", timed_out=True)
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    async def drive():
+        await s._emit_step(StreamStep("tool_result", text="curl /admin -> 403",
+                                      raw="curl /admin -> 403\n"))
+        return await s.run()
+
+    outcome = asyncio.run(drive())
+
+    kinds = _bb_kinds(bus.events)
+    assert "intent_interrupted" not in kinds
+    assert getattr(outcome, "no_output_interruption", False) is False
+    runtime = _worker_statuses(bus.events)[-1].payload["runtime"]
+    assert runtime["no_feedback"] is False
+    assert runtime["real_output_without_flag"] is True
+
+
+def test_empty_worker_interruption_parks_intent_for_recovery(monkeypatch):
+    """No output at all, no stderr, no artifact: the claimed Intent is parked as
+    awaiting_validation (bounded recovery), not silently closed or respawned."""
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    def fake_stream(*a, **k):
+        return CliResult(text="", session="sess-x", timed_out=True)
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    outcome = asyncio.run(s.run())
+
+    interrupted = [e for e in bus.events
+                   if e.event_type is EventType.BLACKBOARD_DELTA
+                   and e.payload.get("kind") == "intent_interrupted"]
+    assert interrupted, "an empty interruption must be parked, not silently finished"
+    assert interrupted[0].payload["dispatch_state"] == "awaiting_validation"
+    required = [e for e in bus.events
+                if e.event_type is EventType.BLACKBOARD_DELTA
+                and e.payload.get("kind") == "intent_recovery_required"]
+    assert required, "Reason must be told to recover the parked Intent"
+    assert getattr(outcome, "no_output_interruption", False) is True
+    runtime = _worker_statuses(bus.events)[-1].payload["runtime"]
+    assert runtime["no_feedback"] is True
+    assert runtime["real_output_without_flag"] is False
+
+def test_worker_oom_without_feedback_parks_intent_with_oom_metadata(monkeypatch):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}", target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    def fake_stream(*args, **kwargs):
+        return CliResult(text="", session="sess-x", oom_killed=True,
+                         runtime_status={"status": "oom", "oom_killed": True})
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+    outcome = asyncio.run(s.run())
+
+    deltas = [e.payload for e in bus.events
+              if e.event_type is EventType.BLACKBOARD_DELTA]
+    interrupted = [d for d in deltas if d.get("kind") == "intent_interrupted"]
+    required = [d for d in deltas if d.get("kind") == "intent_recovery_required"]
+    assert interrupted and required
+    assert interrupted[0]["dispatch_state"] == "awaiting_validation"
+    assert interrupted[0]["lifecycle_reason"] == "oom"
+    assert outcome.no_output_interruption is True
+    assert outcome.lifecycle_reason == "oom"
+    assert outcome.runtime_status["oom_killed"] is True
+
+
+def test_worker_oom_with_real_tool_output_is_not_parked(monkeypatch):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}", target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    def fake_stream(*args, **kwargs):
+        return CliResult(text="", session="sess-x", oom_killed=True,
+                         runtime_status={"status": "oom", "oom_killed": True})
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+
+    async def drive():
+        await s._emit_step(StreamStep("tool_result", text="curl /health -> 200",
+                                      raw="curl /health -> 200\n"))
+        return await s.run()
+
+    outcome = asyncio.run(drive())
+    deltas = [e.payload for e in bus.events
+              if e.event_type is EventType.BLACKBOARD_DELTA]
+    assert not any(d.get("kind") == "intent_interrupted" for d in deltas)
+    assert outcome.no_output_interruption is False
+    runtime = _worker_statuses(bus.events)[-1].payload["runtime"]
+    assert runtime["oom_killed"] is True
+    assert runtime["no_feedback"] is False
+    assert runtime["real_output_without_flag"] is True
+
+
+def test_stalled_heartbeat_emits_once_and_does_not_kill_worker(monkeypatch, tmp_path):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}", target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    def silent_stream(*args, **kwargs):
+        time.sleep(0.13)
+        return CliResult(text="done", session="sess-x")
+
+    monkeypatch.setattr(mod, "_WORKER_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(mod, "run_cli_streaming", silent_stream)
+    asyncio.run(s._run_streaming(["true"], cwd=str(tmp_path), timeout=5))
+
+    stalled = [e for e in bus.events
+               if e.event_type is EventType.WORKER_LIFECYCLE
+               and e.payload.get("phase") == "stalled"]
+    assert len(stalled) == 1
+    assert s._stalled is True
+
+
+def test_stalled_worker_later_assistant_output_is_not_parked(monkeypatch):
+    from dswarm.solver import cli_solver as mod
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}", target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+    s._stalled = True
+    s._lifecycle_reason = "stalled"
+
+    def fake_stream(*args, **kwargs):
+        return CliResult(text="assistant completed a real check", session="sess-x",
+                         runtime_status={"status": "stalled"})
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    monkeypatch.setattr(mod, "run_cli", fake_stream)
+    outcome = asyncio.run(s.run())
+    deltas = [e.payload for e in bus.events
+              if e.event_type is EventType.BLACKBOARD_DELTA]
+    assert not any(d.get("kind") == "intent_interrupted" for d in deltas)
+    assert outcome.no_output_interruption is False
+
+
+def test_cancelled_worker_emits_exited_lifecycle_once(monkeypatch):
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}", target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    async def cancelled_bootstrap():
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(s, "_run_bootstrap", cancelled_bootstrap)
+    async def drive():
+        with pytest.raises(asyncio.CancelledError):
+            await s.run()
+    asyncio.run(drive())
+    exited = [e for e in bus.events
+              if e.event_type is EventType.WORKER_LIFECYCLE
+              and e.payload.get("phase") == "exited"]
+    assert len(exited) == 1
+
+
+def test_exception_worker_emits_exited_lifecycle_once(monkeypatch):
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}", target="http://x")
+    s = CliSolver(None, ch, bus=bus, driver=_StubDriver(""), engine="pi", kb=False)
+
+    async def failed_bootstrap():
+        raise RuntimeError("worker crashed")
+
+    monkeypatch.setattr(s, "_run_bootstrap", failed_bootstrap)
+    async def drive():
+        with pytest.raises(RuntimeError, match="worker crashed"):
+            await s.run()
+    asyncio.run(drive())
+    exited = [e for e in bus.events
+              if e.event_type is EventType.WORKER_LIFECYCLE
+              and e.payload.get("phase") == "exited"]
+    assert len(exited) == 1
+    assert exited[0].payload["stop_reason"] == "error"

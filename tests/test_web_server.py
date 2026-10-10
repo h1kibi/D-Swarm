@@ -8,7 +8,6 @@ incrementally), then drives it with httpx.
 
 import asyncio
 import json
-import os
 import socket
 import threading
 import time
@@ -37,7 +36,7 @@ def _free_port() -> int:
 class _Server:
     def __init__(self, app) -> None:
         self.port = _free_port()
-        cfg = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning")
+        cfg = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning", ws="websockets-sansio")
         self.server = uvicorn.Server(cfg)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 
@@ -158,9 +157,12 @@ async def test_credentials_endpoint_reads_shared_graph(tmp_path) -> None:
     assert creds[0]["value"] == "hunter2"
 
 
-async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
+async def test_btw_endpoint_rejects_worker_launch_and_stays_read_only(
     tmp_path, monkeypatch
 ) -> None:
+    """The Observer is read-only: any request that would launch a worker, pick a
+    profile/engine/backend, or run a deep audit is refused at the API boundary
+    with observer_read_only. No CLI run, no swarm slot, no runtime lease."""
     monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
     monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
     mgr = RunManager(sessions_root=tmp_path)
@@ -170,25 +172,16 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     run = mgr.create("btw-run")
     run.name = "btw demo"
     run.category = "web"
-    # UI does not pass profile/engine. Even if a historical winner exists, /btw
-    # should default to the configured review profile so it behaves like review
-    # without consuming a review/swarm slot.
     root = mgr.workspace_dir(run.run_id)
     (root / "winner.json").write_text(
         json.dumps({"engine": "pi-worker"}),
         encoding="utf-8",
     )
-    seen: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        "apps.web.worker_config.backend_for_profile",
-        lambda *args, **kwargs: "local",
-    )
+    called: dict[str, object] = {}
 
     async def fake_stream_btw_worker_deltas(**kwargs):
-        seen.update(kwargs)
+        called["worker"] = kwargs
         yield "worker "
-        yield "answer"
 
     monkeypatch.setattr(
         "dswarm.solver.btw.stream_btw_worker_deltas",
@@ -202,41 +195,18 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
         timeout=10,
         trust_env=False,
     ) as client:
-        resp = await client.post(
-            "/api/runs/btw-run/btw",
-            json={
-                "question": "本轮问题",
-                "transcript": [
-                    {"role": "user", "content": "上一问"},
-                    {"role": "assistant", "content": "上一答"},
-                ],
-                "worker_backend": "local",
-            },
-        )
+        for body in (
+            {"question": "本轮问题", "worker_backend": "local"},
+            {"question": "本轮问题", "profile": "pi-worker"},
+            {"question": "本轮问题", "engine": "pi"},
+            {"question": "本轮问题", "deep_audit": True},
+            {"question": "本轮问题", "mode": "audit"},
+        ):
+            resp = await client.post("/api/runs/btw-run/btw", json=body)
+            assert resp.status_code == 400, body
+            assert resp.json()["error"] == "observer_read_only", body
 
-    assert resp.status_code == 200
-    frames = [
-        json.loads(line.removeprefix("data: "))
-        for line in resp.text.splitlines()
-        if line.startswith("data: ")
-    ]
-    assert [f.get("delta") for f in frames if f.get("delta")] == [
-        "worker ",
-        "answer",
-    ]
-    assert frames[0] == {"status": "正在读取 run 证据…"}
-    assert frames[-1] == {"done": True}
-    prompt = str(seen["prompt"])
-    assert "本轮问题" in prompt
-    assert "上一问" in prompt
-    assert "上一答" in prompt
-    assert "shared_graph.db" in prompt
-    assert seen["web_access"] is False
-    assert seen["kb_access"] is False
-    assert seen["env"]["DSWARM_BTW_WORKER"] == "1"  # type: ignore[index]
-    assert getattr(seen["driver"], "profile", {}).get("name") == "pi-worker"
-    # cwd is the _btw worker dir; separators are platform-specific
-    assert ("workers" + os.sep + "_btw") in str(seen["cwd"])
+    assert called == {}
     assert run.worker_cmds.empty()
 
 
@@ -285,7 +255,8 @@ async def test_btw_default_uses_evidence_pack_and_authoritative_final(tmp_path, 
     ]
     assert frames[0]["status"] == "正在整理只读证据…"
     assert frames[-2]["final"] == "已读取 **只读证据**。"
-    assert frames[-1] == {"done": True}
+    assert frames[-2]["observer_source"] == "default"
+    assert frames[-2]["fallback_used"] is False
     assert not any("delta" in frame for frame in frames)
     assert seen["model"] == "deepseek-v4-flash"
     assert seen["stream"] is False
@@ -374,15 +345,312 @@ async def test_btw_readonly_httpx_read_timeout_is_normalized(tmp_path, monkeypat
     assert "只读总结请求超时" in failure["final"]
     assert "ReadTimeout" not in failure["final"]
     assert "error" not in failure
+
+
+async def test_btw_primary_failure_uses_configured_fallback_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    mgr.worker_config.set(llm_profiles={
+        "observer": {"provider": "deepseek", "model": "primary-model", "base_url": "https://primary.invalid/v1", "credential_source": "env"},
+        "observer_fallback": {"provider": "deepseek", "model": "fallback-model", "base_url": "https://fallback.invalid/v1", "credential_source": "env"},
+    })
+    mgr.create("btw-fallback-run")
+    calls: list[str] = []
+
+    class FakeResponse:
+        finish_reason = "stop"
+
+        def __init__(self, text: str):
+            self.content = text
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            self.model = ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def chat(self, **kwargs):
+            calls.append(str(kwargs["model"]))
+            if len(calls) == 1:
+                raise RuntimeError("primary unavailable")
+            return FakeResponse('{"answer_markdown":"备用观察结论","evidence_refs":[],"uncertainties":["fallback"],"answer_type":"status"}')
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FakeLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False) as client:
+        response = await client.post("/api/runs/btw-fallback-run/btw", json={"question": "总结"})
+
+    frames = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line.startswith("data: ")]
+    answer = frames[-2]
+    assert response.status_code == 200
+    assert calls == ["primary-model", "fallback-model"]
+    assert answer["final"] == "备用观察结论"
+    assert answer["observer_source"] == "fallback"
+    assert answer["fallback_used"] is True
     assert frames[-1] == {"done": True}
 
+
+async def test_btw_frozen_observer_fallback_is_attributed_to_observer(tmp_path, monkeypatch):
+    """When the frozen primary Observer fails, the frozen Observer fallback
+    answers and the turn is attributed to the Observer role — never Titler/Reason."""
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    run = mgr.create("btw-frozen-fallback-run")
+    run.binding_snapshot = {
+        "roles": {"observer": {"provider": "deepseek", "model": "frozen-primary", "base_url": "https://frozen.invalid/v1"}},
+        "fallback_candidates": {"observer": {"provider": "deepseek", "model": "frozen-fallback", "base_url": "https://frozen-fallback.invalid/v1"}},
+    }
+    cfg = mgr.worker_config.get()
+    cfg["llm_profiles"] = {
+        "observer": {"provider": "deepseek", "model": "mutable-primary", "base_url": "https://mutable.invalid/v1", "credential_source": "env"},
+        "observer_fallback": {"provider": "deepseek", "model": "mutable-fallback", "base_url": "https://mutable-fallback.invalid/v1", "credential_source": "env"},
+        "titler": {"provider": "deepseek", "model": "titler-must-not-answer", "base_url": "https://titler.invalid/v1", "credential_source": "env"},
+    }
+    monkeypatch.setattr(mgr.worker_config, "get", lambda: cfg)
+    seen: list[str] = []
+
+    class FakeResponse:
+        finish_reason = "stop"
+
+        def __init__(self, text: str):
+            self.content = text
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return None
+        async def chat(self, **kwargs):
+            seen.append(str(kwargs["model"]))
+            if len(seen) == 1:
+                raise RuntimeError("frozen primary unavailable")
+            return FakeResponse(
+                '{"answer_markdown":"冻结备用观察结论","evidence_refs":[],"uncertainties":["fallback"],"answer_type":"status"}')
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FakeLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False) as client:
+        response = await client.post(f"/api/runs/{run.run_id}/btw", json={"question": "总结"})
+
+    frames = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line.startswith("data: ")]
+    answer = frames[-2]
+    assert response.status_code == 200
+    assert seen == ["frozen-primary", "frozen-fallback"]
+    assert "titler-must-not-answer" not in seen
+    assert answer["final"] == "冻结备用观察结论"
+    assert answer["observer_source"] == "fallback"
+    assert answer["fallback_used"] is True
+    assert frames[-1] == {"done": True}
+
+
+async def test_btw_observer_chain_unavailable_does_not_call_other_roles(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    mgr.create("btw-unavailable-run")
+    calls: list[str] = []
+
+    class FailingLLM:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def chat(self, **kwargs):
+            calls.append(str(kwargs["model"]))
+            raise RuntimeError("unavailable")
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FailingLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False) as client:
+        response = await client.post("/api/runs/btw-unavailable-run/btw", json={"question": "总结"})
+
+    frames = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line.startswith("data: ")]
+    answer = frames[-2]
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert answer["observer_source"] == "unavailable"
+    assert answer["fallback_used"] is False
+    assert "不会回退到 Titler 或 Reason" in answer["final"]
+    assert frames[-1] == {"done": True}
+
+
+async def test_btw_missing_configured_fallback_reports_unavailable_without_other_roles(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    mgr.create("btw-missing-fallback-run")
+    cfg = mgr.worker_config.get()
+    cfg["llm_profiles"] = {
+        "observer": {
+            "provider": "deepseek", "model": "primary-model",
+            "base_url": "https://primary.invalid/v1", "credential_source": "env",
+        },
+    }
+    monkeypatch.setattr(mgr.worker_config, "get", lambda: cfg)
+    calls: list[str] = []
+
+    class FailingLLM:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def chat(self, **kwargs):
+            calls.append(str(kwargs["model"]))
+            raise RuntimeError("primary unavailable")
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FailingLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False) as client:
+        response = await client.post("/api/runs/btw-missing-fallback-run/btw", json={"question": "总结"})
+
+    frames = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line.startswith("data: ")]
+    answer = frames[-2]
+    assert response.status_code == 200
+    assert calls == ["primary-model"]
+    assert answer["observer_source"] == "unavailable"
+    assert answer["fallback_used"] is False
+    assert "不会回退到 Titler 或 Reason" in answer["final"]
+
+
+async def test_btw_preserves_snapshot_metadata_without_mutating_run_or_graph(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    run = mgr.create("btw-metadata-run")
+    workspace = mgr.workspace_dir(run.run_id)
+    graph_path = workspace / "graph" / "shared_graph.db"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_bytes(b"append-only graph sentinel")
+    graph_before = graph_path.read_bytes()
+    store_before = list(run.store.read_events(run.run_id))
+    target_before = mgr.target_store.list(include_archived=True)
+    run_before = (run.finished, run.solved, run.failure_reason, list(run.flags), run.paused)
+
+    pack = {
+        "schema_version": 1,
+        "run": {"id": run.run_id},
+        "run_stats": "",
+        "facts": [{"id": "fact:7", "kind": "verified", "seq": 7, "text": "verified"}],
+        "intents": [], "dead_ends": [],
+        "events": [{"id": "event:17", "seq": 17, "kind": "fact_added", "text": "verified"}],
+        "artifacts": [], "views": {}, "warnings": [],
+    }
+    monkeypatch.setattr("dswarm.solver.btw.build_btw_evidence_pack_sync", lambda **kwargs: pack)
+    calls: list[str] = []
+
+    class FakeResponse:
+        finish_reason = "stop"
+        content = json.dumps({
+            "answer_markdown": "基于只读证据的结论",
+            "evidence_refs": ["fact:7", "event:17"],
+            "uncertainties": ["仍需人工复核"],
+            "answer_type": "summary",
+        }, ensure_ascii=False)
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def chat(self, **kwargs):
+            calls.append(str(kwargs["model"]))
+            return FakeResponse()
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FakeLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False) as client:
+        response = await client.post("/api/runs/btw-metadata-run/btw", json={"question": "总结"})
+
+    frames = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line.startswith("data: ")]
+    answer = frames[-2]
+    assert response.status_code == 200
+    assert calls == ["deepseek-v4-flash"]
+    assert answer["observer_source"] == "default"
+    assert answer["fallback_used"] is False
+    assert answer["snapshot_event_seq"] == 17
+    assert answer["evidence_refs"] == ["fact:7", "event:17"]
+    assert answer["uncertainties"] == ["仍需人工复核"]
+    assert list(run.store.read_events(run.run_id)) == store_before
+    assert mgr.target_store.list(include_archived=True) == target_before
+    assert graph_path.read_bytes() == graph_before
+    assert (run.finished, run.solved, run.failure_reason, list(run.flags), run.paused) == run_before
+    assert run.worker_cmds.qsize() == 0
+    assert run.hitl.qsize() == 0
+
+
+async def test_btw_prefers_frozen_observer_and_fallback_bindings(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSWARM_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("DSWARM_WEB_BIND", raising=False)
+    monkeypatch.setenv("DSWARM_DEEPSEEK_API_KEY", "test-key")
+    mgr = RunManager(sessions_root=tmp_path)
+    run = mgr.create("btw-frozen-binding-run")
+    run.binding_snapshot = {
+        "roles": {"observer": {"provider": "deepseek", "model": "frozen-primary", "base_url": "https://frozen.invalid/v1"}},
+        "fallback_candidates": {"observer": {"provider": "deepseek", "model": "frozen-fallback", "base_url": "https://frozen-fallback.invalid/v1"}},
+    }
+    cfg = mgr.worker_config.get()
+    cfg["llm_profiles"] = {
+        "observer": {"provider": "deepseek", "model": "mutable-primary", "base_url": "https://mutable.invalid/v1", "credential_source": "env"},
+        "observer_fallback": {"provider": "deepseek", "model": "mutable-fallback", "base_url": "https://mutable-fallback.invalid/v1", "credential_source": "env"},
+    }
+    monkeypatch.setattr(mgr.worker_config, "get", lambda: cfg)
+    seen: list[str] = []
+
+    class FakeResponse:
+        finish_reason = "stop"
+        content = '{"answer_markdown":"frozen","evidence_refs":[],"uncertainties":[],"answer_type":"status"}'
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return None
+        async def chat(self, **kwargs):
+            seen.append(str(kwargs["model"]))
+            return FakeResponse()
+
+    monkeypatch.setattr("dswarm.core.llm.LLMClient", FakeLLM)
+    app = create_app(mgr)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10, trust_env=False) as client:
+        response = await client.post(f"/api/runs/{run.run_id}/btw", json={"question": "总结"})
+    assert response.status_code == 200
+    assert seen == ["frozen-primary"]
 
 async def _exercise_btw_frozen_pool_route(
     tmp_path,
     monkeypatch,
-    *,
-    stream_outcome: str,
 ) -> tuple[dict[str, object], object, dict[str, int], httpx.Response]:
+    """Set up a container-bound run and confirm the Observer never leases it."""
     from types import SimpleNamespace
 
     import dswarm.solver.container_exec as container_exec
@@ -447,7 +715,7 @@ async def _exercise_btw_frozen_pool_route(
     run.pool_manager = manager
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("BTW must use the frozen run pool lease")
+        raise AssertionError("Observer must never touch the container runtime")
 
     monkeypatch.setattr(
         "apps.web.worker_config.backend_for_profile",
@@ -460,10 +728,6 @@ async def _exercise_btw_frozen_pool_route(
 
     async def fake_stream_btw_worker_deltas(**kwargs):
         seen.update(kwargs)
-        if stream_outcome == "error":
-            raise RuntimeError("worker exploded")
-        if stream_outcome == "cancel":
-            raise asyncio.CancelledError()
         yield "ok"
 
     monkeypatch.setattr(
@@ -485,42 +749,20 @@ async def _exercise_btw_frozen_pool_route(
     return seen, manager, released, resp
 
 
-async def test_btw_container_uses_frozen_runtime_pool_lease(
+async def test_btw_container_request_never_leases_the_runtime_pool(
     tmp_path, monkeypatch
 ) -> None:
+    """A container-bound Run does NOT make /btw container-bound: the Observer is
+    read-only, so it refuses worker_backend and never acquires a runtime lease."""
     seen, manager, released, resp = await _exercise_btw_frozen_pool_route(
-        tmp_path, monkeypatch, stream_outcome="success",
+        tmp_path, monkeypatch,
     )
 
-    assert resp.status_code == 200
-    assert manager.acquire_calls == [{
-        "pool_id": "pool-frozen",
-        "worker_instance_id": manager.acquire_calls[0]["worker_instance_id"],
-        "operation_kind": "btw",
-    }]
-    assert manager.acquire_calls[0]["worker_instance_id"]
-    assert seen["container"] is not None
-    env = seen["env"]
-    assert env["LEASE_ONLY"] == "yes"  # type: ignore[index]
-    assert env["DSWARM_TASK_TOKEN"] == "lease-task-token"  # type: ignore[index]
-    assert env["DEEPSEEK_API_KEY"] == "lease-task-token"  # type: ignore[index]
-    assert env["DSWARM_BTW_WORKER"] == "1"  # type: ignore[index]
-    assert env["DSWARM_BLACKBOARD_DB"] == ""  # type: ignore[index]
-    assert released["count"] == 1
-
-
-@pytest.mark.parametrize("stream_outcome", ["error", "cancel"])
-async def test_btw_runtime_pool_lease_releases_on_non_success_paths(
-    tmp_path, monkeypatch, stream_outcome: str
-) -> None:
-    _seen, manager, released, resp = await _exercise_btw_frozen_pool_route(
-        tmp_path, monkeypatch, stream_outcome=stream_outcome,
-    )
-
-    assert resp.status_code == 200
-    assert len(manager.acquire_calls) == 1
-    assert manager.acquire_calls[0]["operation_kind"] == "btw"
-    assert released["count"] == 1
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "observer_read_only"
+    assert seen == {}
+    assert manager.acquire_calls == []
+    assert released["count"] == 0
 
 async def test_hitl_post_is_accepted_and_echoed(server) -> None:
     async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:

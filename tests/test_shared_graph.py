@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 
 from dswarm.models.solve_graph import Challenge
 from dswarm.swarm.shared_graph import SQLiteSharedGraph, SharedGraph, canonicalize_lane
@@ -110,6 +111,44 @@ def test_runtime_infra_facts_are_suppressed_from_derived_views_only(tmp_path):
     assert "dswarm-worker" not in g.fact_pin_context()
     assert g.fact_seqs_for_texts([infra, "/api/images returns 8 rows"]) == [real_seq]
     assert all(c["fact_seq"] != infra_seq for c in g.active_candidates())
+    g.close()
+
+def test_worker_fact_stays_quarantined_until_reviewed(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    fact = g.add_evidence(
+        actor="cli-worker", source="stdout", fact="admin panel returns 200",
+        artifact_id="artifact-1", verified=True, review_required=True,
+    )
+    report = g.worker_report_pending_review(
+        actor="cli-worker", worker_id="cli-worker", intent_id="I-1",
+        fact_seqs=[fact], artifact_ids=["artifact-1"], report_ref="fact:1",
+    )
+    assert fact > 0 and report > fact
+    assert "admin panel returns 200" not in g.to_reason_summary()
+    review = g.decide_evidence_review(
+        actor="reviewer", decision="verified", fact_seq=fact,
+        evidence_refs=["event:1", "artifact:artifact-1"], report_seq=report,
+    )
+    assert review > report
+    assert "admin panel returns 200" in g.to_reason_summary()
+    assert any(e["kind"] == "reviewed_context" for e in g.events())
+    g.close()
+
+
+def test_verified_review_requires_artifact_and_reference(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    fact = g.add_evidence(
+        actor="cli-worker", source="stdout", fact="candidate claim",
+        verified=True, review_required=True,
+    )
+    seq = g.decide_evidence_review(
+        actor="reviewer", decision="verified", fact_seq=fact,
+        evidence_refs=[],
+    )
+    row = [e for e in g.events() if e["seq"] == seq][0]
+    assert row["payload"]["requested_decision"] == "verified"
+    assert row["payload"]["decision"] == "candidate"
+    assert "candidate claim" not in g.to_reason_summary()
     g.close()
 
 
@@ -998,6 +1037,26 @@ def test_review_branch_split_records_branch_intents(tmp_path):
     g.close()
 
 
+def test_branch_split_publishes_stable_child_identity(tmp_path):
+    """The append-only branch_split event must carry each child's id so lineage
+    consumers link branch edges from published identity — never array position."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.split_branch(
+        actor="cli-review", title="Two hypotheses",
+        branches=[{"assumption": "A is true"}, {"id": "branch-b", "assumption": "B is true"}],
+    )
+
+    event = next(e for e in g.events() if e["kind"] == "branch_split")
+    children = event["payload"]["branches"]
+    ids = [c["id"] for c in children]
+    assert ids[1] == "branch-b"
+    # An unnamed branch gets a deterministic derived id (input-stable, not an index).
+    assert ids[0].startswith(f"{event['payload']['branch_id']}-")
+    assert len(set(ids)) == 2
+    assert {b["branch_id"] for b in g.branches()} == set(ids)
+    g.close()
+
+
 def test_review_branch_resolve_records_materialized_state(tmp_path):
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
     g.split_branch(
@@ -1073,7 +1132,7 @@ def test_candidate_fact_cap_per_source_route(tmp_path):
 
 def test_reject_fact_leaves_snapshot(tmp_path):
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
-    f1 = g.add_evidence(actor="s1", source="x", fact="good", verified=True)
+    g.add_evidence(actor="s1", source="x", fact="good", verified=True)
     f2 = g.add_evidence(actor="s2", source="x", fact="bad", verified=True)
     g.reject_fact(actor="rev", fact_seq=f2, reason="proven false")
     facts = [e.fact for e in g.snapshot().evidence]
@@ -1172,7 +1231,7 @@ def test_lifecycle_survives_reopen_cold_start(tmp_path):
     """Standby HITL cold-start: a re-opened DB still has fact_states/dispatch cols."""
     p = tmp_path / "g.db"
     g = SQLiteSharedGraph.open(db_path=p, challenge=_chal())
-    f1 = g.add_evidence(actor="s1", source="x", fact="keep", verified=True)
+    g.add_evidence(actor="s1", source="x", fact="keep", verified=True)
     f2 = g.add_evidence(actor="s2", source="x", fact="drop", verified=True)
     g.reject_fact(actor="rev", fact_seq=f2, reason="bad")
     g.close()
@@ -1393,4 +1452,125 @@ def test_reason_summary_preserves_fractional_intent_priority(tmp_path):
         payload={"priority": 0.5},
     )
     assert "priority=0.5" in g._open_intents_block()
+    g.close()
+
+
+# ── interrupted-Intent recovery + owner fencing (docs/17 §15.4) ───────────────
+
+def _seed_claimed_intent(g, *, intent_id="I-live", worker="cli-pi#1", goal="probe /admin"):
+    g.propose_intent(actor="reason", intent_id=intent_id, goal=goal,
+                     payload={"worker_class": "code", "route_hash": "web:admin:probe"})
+    assert g.claim_intent(worker=worker, intent_id=intent_id) is True
+
+
+def _intent_row(g, intent_id):
+    with g._lock:
+        return g._conn.execute(
+            "SELECT status, dispatch_state, worker, close_reason FROM intents "
+            "WHERE challenge_id=? AND intent_id=?",
+            (g.challenge.id, intent_id),
+        ).fetchone()
+
+
+def test_late_conclude_cannot_overwrite_recovered_intent_owner(tmp_path):
+    """Reason recovery reopens a parked Intent under a NEW recovery Intent id while
+    the original stays a tombstone. A late conclude from the OLD worker must not
+    close the live replacement."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    _seed_claimed_intent(g)
+
+    g.mark_intent_awaiting_validation(
+        actor="cli-pi#1", intent_id="I-live", worker_id="cli-pi#1",
+        reason="no execution feedback", recovery_attempt=1)
+    parked = g.awaiting_validation_intents()
+    assert [item["intent_id"] for item in parked] == ["I-live"]
+    assert parked[0]["dispatch_state"] == "awaiting_validation"
+
+    g.reopen_interrupted_intent(
+        actor="reason", intent_id="I-live", recovery_intent_id="I-live:recovery:1",
+        worker_id="cli-pi#1", reason="Reason recovery priority")
+    status, dispatch, _worker, _close = _intent_row(g, "I-live:recovery:1")
+    assert dispatch == "active"
+
+    # The old worker concludes LATE: it no longer owns an active/claimed Intent,
+    # so the owner fence refuses to transition anything.
+    g.conclude_intent(actor="cli-pi#1", intent_id="I-live", result="explored")
+
+    late_status, late_dispatch, _, _ = _intent_row(g, "I-live:recovery:1")
+    assert late_dispatch == "active", "late conclude must not close the recovery Intent"
+    assert late_status != "done"
+    assert status != "done"
+    g.close()
+
+
+def test_recovered_intent_claim_then_conclude_closes_only_the_new_owner(tmp_path):
+    """The recovery Intent is claimable by the new worker and only that owner can
+    conclude it — the fence admits the real owner, not just refusals."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    _seed_claimed_intent(g)
+    g.mark_intent_awaiting_validation(
+        actor="cli-pi#1", intent_id="I-live", worker_id="cli-pi#1",
+        reason="no execution feedback", recovery_attempt=1)
+    g.reopen_interrupted_intent(
+        actor="reason", intent_id="I-live", recovery_intent_id="I-live:recovery:1",
+        worker_id="cli-pi#1", reason="Reason recovery priority")
+
+    assert g.claim_intent(worker="cli-pi#2", intent_id="I-live:recovery:1") is True
+    g.conclude_intent(actor="cli-pi#2", intent_id="I-live:recovery:1", result="explored")
+
+    status, dispatch, _worker, _close = _intent_row(g, "I-live:recovery:1")
+    assert status == "done"
+    assert dispatch == "closed"
+    g.close()
+
+
+def test_abandoned_expired_claim_is_parked_not_silently_redispatched(tmp_path):
+    """docs/17 §9.2: a claim whose lease expired without a conclusion must become a
+    bounded awaiting_validation interruption. Previously ``dispatchable_intents``
+    handed it straight back out, so the Intent never showed the documented
+    "worker interrupted / no real feedback" state and left no recovery audit."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-abandoned", goal="probe /admin",
+                     payload={"worker_class": "code", "route_hash": "web:admin:probe"})
+    g.claim_intent(worker="cli-pi#1", intent_id="I-abandoned", lease_s=0.01)
+    time.sleep(0.05)
+
+    # It IS still offered by the dispatch query — that is why the reaper exists.
+    assert [row["intent_id"] for row in g.dispatchable_intents()] == ["I-abandoned"]
+
+    parked = g.park_expired_claims(actor="reason")
+    assert [row["intent_id"] for row in parked] == ["I-abandoned"]
+    assert [row["worker"] for row in parked] == ["cli-pi#1"]
+
+    status, dispatch, _worker, _close = _intent_row(g, "I-abandoned")
+    assert dispatch == "awaiting_validation"
+    assert status != "done"
+    # It left the silent re-dispatch set and entered the recovery queue.
+    assert g.dispatchable_intents() == []
+    assert [item["intent_id"] for item in g.awaiting_validation_intents()] == ["I-abandoned"]
+    # Append-only audit records the interruption and the recovery requirement.
+    kinds = [e["kind"] for e in g.events()]
+    assert "intent_interrupted" in kinds
+    assert "intent_recovery_required" in kinds
+    g.close()
+
+
+def test_park_expired_claims_skips_live_and_concluded_claims(tmp_path):
+    """Only genuinely abandoned claims are parked: a live (unexpired) lease and an
+    already-concluded intent must be left untouched."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-live", goal="live work",
+                     payload={"worker_class": "code"})
+    g.claim_intent(worker="cli-pi#1", intent_id="I-live", lease_s=600.0)
+
+    g.propose_intent(actor="reason", intent_id="I-done", goal="finished work",
+                     payload={"worker_class": "code"})
+    g.claim_intent(worker="cli-pi#2", intent_id="I-done", lease_s=0.01)
+    time.sleep(0.05)
+    g.conclude_intent(actor="cli-pi#2", intent_id="I-done", result="explored")
+
+    assert g.park_expired_claims(actor="reason") == []
+    assert g.awaiting_validation_intents() == []
+    assert _intent_row(g, "I-live")[1] == "active"
+    assert _intent_row(g, "I-done")[0] == "done"
     g.close()

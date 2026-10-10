@@ -189,6 +189,11 @@ def test_container_backend_defers_auth_hello_to_worker_container(tmp_path, monke
     hello inside the worker environment) is the authoritative auth check."""
     _register_pi(tmp_path)
     ran_hello = []
+    probe_seen: dict[str, object] = {}
+
+    def _probe(**kw):
+        probe_seen.update(kw)
+        return (True, None, "plumbing ok")
 
     def _boom(profile):
         ran_hello.append(profile)
@@ -196,17 +201,18 @@ def test_container_backend_defers_auth_hello_to_worker_container(tmp_path, monke
 
     monkeypatch.setattr("dswarm.solver.cli_driver.driver_for", _boom)
     monkeypatch.setattr(
-        "dswarm.solver.profile_health._probe_container_plumbing",
-        lambda **kw: (True, None, "plumbing ok"),
+        "dswarm.solver.profile_health._probe_container_plumbing", _probe,
     )
     h = evaluate_profile_health(
         {"name": "pi-glm", "engine": "pi",
          "credential_account": "pi-main", "model": "glm-5.3-flash",
-         "credential_mode": "api_key", "enabled": True},
+         "credential_mode": "api_key", "image": "ctf-swarm-pi:0.3.0-rc.1",
+         "enabled": True},
         backend="container", sessions_root=tmp_path, depth="auth",
     )
     assert h.status == "ok"
     assert "deferred" in (h.detail or "")
+    assert probe_seen["image"] == "ctf-swarm-pi:0.3.0-rc.1"
     assert not ran_hello
 
 

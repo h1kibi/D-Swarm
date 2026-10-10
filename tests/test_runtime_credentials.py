@@ -262,3 +262,44 @@ def test_custom_projection_preserves_only_allowlisted_binding_files(tmp_path):
         "BASE_URL",
         "ENGINE",
     ]
+
+def test_direct_and_custom_process_channels_are_secret_scoped_and_cleared(tmp_path):
+    store = CredentialAccountStore(tmp_path / "accounts")
+    store.upsert_secret(account_id="pi-main", engine="pi", secret="direct-key")
+    store.upsert_secret(
+        account_id="custom-main",
+        engine="api",
+        secret="custom-key",
+        base_url="https://provider.example/v1",
+        target_engine="pi",
+    )
+    projected = CredentialProjector(store.root, tmp_path / "sessions")
+
+    direct = projected.project(
+        run_id="r", pool_id="p", worker_instance_id="direct",
+        binding_id="pi-main", credential_mode="direct",
+    )
+    custom = projected.project(
+        run_id="r", pool_id="p", worker_instance_id="custom",
+        binding_id="custom-main", credential_mode="custom",
+    )
+
+    assert direct.env == {
+        "DSWARM_CREDENTIAL_ROOT": CONTAINER_CREDENTIAL_ROOT,
+        "DSWARM_CREDENTIAL_BINDING_ID": "pi-main",
+    }
+    assert direct.process_env == {"DEEPSEEK_API_KEY": "direct-key"}
+    assert custom.process_env == {
+        "OPENAI_API_KEY": "custom-key",
+        "DSWARM_WORKER_API_KEY": "custom-key",
+        "OPENAI_BASE_URL": "https://provider.example/v1",
+        "DSWARM_WORKER_BASE_URL": "https://provider.example/v1",
+    }
+    assert "direct-key" not in repr(direct)
+    assert "custom-key" not in repr(custom)
+    assert direct.process_env is not custom.process_env
+
+    direct.close()
+    custom.close()
+    assert direct.process_env == {}
+    assert custom.process_env == {}

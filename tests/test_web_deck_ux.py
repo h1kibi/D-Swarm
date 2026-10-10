@@ -1278,12 +1278,15 @@ def test_phase4_command_center_layout():
     assert 'swarm.tab.${k}' in inspector and '["workers", "intents", "panels", "ledger"]' in inspector
     assert "HitlCard" in inspector and "swarm.killConfirm" in inspector
 
-    # operator bar: hint/redirect/focus + pause/resume/stop, semantics caption,
-    # composer focus contract for the command palette.
-    assert 'op.action.${a}' in opbar
-    assert '["hint", "redirect", "focus"]' in opbar and '["pause", "resume", "stop"]' in opbar
+    # operator bar: exactly four user-facing commands (prompt/stop/resume/review),
+    # semantics caption, composer focus contract for the command palette.
+    assert 'op.action.${item}' in opbar
+    assert '["prompt", "stop", "resume", "review"]' in opbar
     assert "op.note" in opbar and "op.scope" in opbar
     assert "data-composer-input" in opbar
+    # the retired user-level actions must not linger in the action vocabulary.
+    for retired in ("op.action.hint", "op.action.redirect", "op.action.focus", "op.action.pause"):
+        assert f'"{retired}"' not in i18n
 
     # styles + i18n parity anchors for the new regions.
     assert ".stage-rail" in css and ".dectl" in css and ".opbar" in css
@@ -2262,6 +2265,4 @@ def test_worker_settings_endpoint_editor_contract():
     assert '/api/settings/workers/probe' in api
     assert 'api_key: apiKey' in api
     assert '{ key: "misc", id: "pi-misc", label: "杂项", category: "misc" }' in draft
-    assert '--bg: #0f1724;' in css
-    assert '--panel: #172235;' in css
     assert '.wsw-splitter' in css

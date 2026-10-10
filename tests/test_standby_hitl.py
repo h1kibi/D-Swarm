@@ -549,6 +549,7 @@ def test_finished_hitl_in_web_container_uses_frozen_runtime_pool(tmp_path, monke
                 self.runtime_operation_kind,
             )
             captured["lease"] = lease
+            captured["lease_env"] = dict(lease.worker_env)
             try:
                 return SolveOutcome(False, None, 1, None, "writeup",
                                     engine="pi", reply="# Writeup")
@@ -632,7 +633,9 @@ def test_finished_hitl_in_web_container_uses_frozen_runtime_pool(tmp_path, monke
     }]
     assert manager.acquire_calls[0]["worker_instance_id"] != "unset"
     assert captured["lease"].executor.container == "dswarm-runtime-pool"
-    assert captured["lease"].worker_env == {"LEASE_ONLY": "yes"}
+    assert captured["lease_env"] == {"LEASE_ONLY": "yes"}
+    # release() scrubs the worker env overlay: no secret-bearing mapping survives.
+    assert captured["lease"].worker_env == {}
     assert captured["released"] == 1
 
 def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, monkeypatch):

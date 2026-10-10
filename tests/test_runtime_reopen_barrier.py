@@ -158,8 +158,8 @@ async def test_delete_closes_pool_manager_before_removing_run(tmp_path: Path) ->
 
     run.pool_manager = PoolManager()  # type: ignore[assignment]
     await manager.delete("run-a")
-
     assert calls == ["close"]
+    assert manager.get("run-a") is None
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,6 @@ from dswarm.solver.runtime_policy import (
     RuntimePolicy,
     RuntimeResourceSpec,
     RuntimeSnapshot,
-    build_runtime_policy,
 )
 from dswarm.solver.runtime_snapshot import (
     DockerImageInspector,
@@ -180,7 +179,7 @@ def test_runtime_context_builds_once_then_reloads_frozen_snapshot(tmp_path: Path
     assert len(manager_calls) == 2
 
 
-def test_runtime_context_passes_direct_and_gateway_credential_modes(tmp_path: Path) -> None:
+def test_runtime_context_passes_custom_and_gateway_credential_modes(tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
     def manager_factory(**kwargs: Any) -> object:
@@ -207,7 +206,7 @@ def test_runtime_context_passes_direct_and_gateway_credential_modes(tmp_path: Pa
         pool.profile_id: modes[pool.pool_id]
         for pool in context["runtime_snapshot"].pools
     }
-    assert by_profile == {"pi-web": "direct", "pi-worker": "gateway"}
+    assert by_profile == {"pi-web": "custom", "pi-worker": "gateway"}
     assert captured["credential_projector"] is not None
     assert captured["probe"] is not None
     assert callable(captured["executor_factory"])
@@ -266,6 +265,76 @@ def test_provider_bound_profile_projects_gateway_mode(tmp_path: Path) -> None:
     assert pool.credential_binding_id == "zhipu"
     assert captured["credential_modes"][pool.pool_id] == "gateway"
 
+
+def test_provider_registry_is_available_to_standalone_runtime_probe(
+    tmp_path: Path,
+) -> None:
+    from dswarm.solver.llm_providers import (
+        LLMProviderSecretStore,
+        provider_secret_root,
+    )
+
+    sessions = tmp_path / "sessions"
+    LLMProviderSecretStore(provider_secret_root(sessions)).upsert_secret(
+        "zhipu", "test-provider-secret"
+    )
+    captured: dict[str, Any] = {}
+
+    def manager_factory(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return type("Manager", (), {
+            "run_id": kwargs["run_id"],
+            "snapshot": kwargs["snapshot"],
+        })()
+
+    provider = {
+        "id": "zhipu",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "wire_api": "openai-chat",
+        "auth_mode": "bearer",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "models": ["glm-5.3-flash"],
+    }
+    profile = {
+        "id": "pi-glm",
+        "name": "pi-glm",
+        "engine": "pi",
+        "runtime": "docker-web",
+        "image": "worker:web",
+        "provider_ref": "zhipu",
+        "model": "glm-5.3-flash",
+        "enabled": True,
+    }
+    runtime = {
+        "id": "docker-web",
+        "backend": "container",
+        "network": "bridge",
+        "cpus": "1",
+        "memory": "1g",
+        "pids_limit": 128,
+        "tmpfs_bytes": 1024,
+    }
+
+    build_docker_runtime_context(
+        run_id="standalone-probe",
+        sessions_root=sessions,
+        bus=EventBus(),
+        budget_gate=ProfileBudgetGate(),
+        worker_profiles=[profile],
+        runtime_profiles=[runtime],
+        run_max_workers=1,
+        llm_providers=[provider],
+        snapshot_builder=RecordingBuilder(),
+        pool_manager_factory=manager_factory,
+    )
+
+    resolver = captured["probe"].gateway_binding_resolver
+    binding = resolver("zhipu")
+    assert binding is not None
+    assert binding.provider_id == "zhipu"
+    assert binding.base_url == provider["base_url"]
+    assert binding.api_key == "test-provider-secret"
 
 def test_runtime_context_wires_transition_callback_to_private_diagnostics(
     tmp_path: Path,

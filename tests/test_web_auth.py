@@ -256,7 +256,7 @@ async def test_sse_events_accepts_valid_ticket_real_server(monkeypatch, tmp_path
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
-    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", ws="websockets-sansio")
     srv = uvicorn.Server(cfg)
     th = threading.Thread(target=srv.run, daemon=True)
     th.start()

@@ -300,6 +300,21 @@ def test_zero_token_turn_does_not_establish_session():
     sv._mark_session_if_live(CliResult(text="", output_tokens=0, session=None))
     assert not sv._session_established, "an empty 0-token turn never seats a session"
 
+def test_protocol_session_envelope_does_not_establish_session():
+    """Pi's leading session envelope is not proof that a resumable session exists."""
+    from dswarm.solver.cli_driver import CliResult
+
+    bus = EventBus()
+    sv = _worker(bus)
+    ghost = "ghost-session-envelope"
+    sv._mark_session_if_live(CliResult(
+        text=f'{{"type":"session","id":"{ghost}"}}', session=ghost))
+
+    assert not sv._session_established
+    argv = sv._resume_or_execute_argv("CONTINUE", ghost)
+    assert "--session" not in argv
+    assert ghost not in argv
+
 
 def test_p2_standing_guidance_does_not_interrupt_current_turn():
     """Standing guidance is persistent context for current/future prompts, not a

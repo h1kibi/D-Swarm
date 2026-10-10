@@ -21,6 +21,7 @@ from dswarm.solver.endpoint_probe import (
         ("https://api.example.com/v1/models", "https://api.example.com/v1"),
         ("https://api.example.com/v1/chat/completions", "https://api.example.com/v1"),
         ("https://api.example.com/v1/responses", "https://api.example.com/v1"),
+        ("https://api.anthropic.com/v1/messages", "https://api.anthropic.com/v1"),
     ],
 )
 def test_normalize_base_url_preserves_api_prefix(raw: str, expected: str) -> None:
@@ -45,6 +46,23 @@ def test_models_probe_parses_openai_list_and_never_returns_key() -> None:
     assert [row["id"] for row in result["models"]] == ["model-a", "model-b"]
     assert calls[0][0:2] == ("GET", "https://api.example.com/v1/models")
     assert "top-secret" not in repr(result)
+
+def test_model_probe_sends_configured_reasoning_effort() -> None:
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs.get("body") or {}))
+        if method == "GET":
+            return 200, {"data": [{"id": "terra"}]}, "ok"
+        return 200, {"choices": [{"message": {"content": "OK"}}]}, "ok"
+
+    result = probe_endpoint(
+        {"base_url": "https://api.example.com/v1", "model": "terra", "effort": "high"},
+        api_key="key", validate_model=True, request_json=request,
+    )
+    assert result["ok"] is True
+    assert calls[-1][2]["reasoning_effort"] == "high"
+
 
 
 def test_401_is_authentication_error_and_stops_before_model_call() -> None:
@@ -111,3 +129,22 @@ def test_resolve_saved_key_forces_openai_credential_mapping(tmp_path: Path) -> N
     account.mkdir(parents=True)
     (account / "API_KEY").write_text("saved-key\n", encoding="utf-8")
     assert resolve_saved_api_key({"credential_account": "pi-main"}, tmp_path) == "saved-key"
+
+
+def test_anthropic_probe_uses_messages_without_models_discovery() -> None:
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        assert kwargs["headers"]["x-api-key"] == "secret"
+        assert kwargs["headers"]["anthropic-version"] == "2023-06-01"
+        return 200, {"id": "msg_1"}, "ok"
+
+    result = probe_endpoint(
+        {"base_url": "https://api.anthropic.com/v1", "model": "claude-sonnet-4-5", "wire_api": "anthropic", "auth_mode": "x-api-key"},
+        api_key="secret", validate_model=True, request_json=request,
+    )
+    assert result["ok"] is True
+    assert result["detected_wire_api"] == "anthropic"
+    assert calls == [("POST", "https://api.anthropic.com/v1/messages", calls[0][2])]
+    assert result["model_discovery"]["ok"] is False

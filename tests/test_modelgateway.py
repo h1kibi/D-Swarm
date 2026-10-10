@@ -6,12 +6,14 @@ import asyncio
 import json
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from dswarm.solver.modelgateway import (
     GatewayUsageBridge,
+    GatewayUpstreamBinding,
     ModelGateway,
     TokenCapError,
     WorkerClaims,
@@ -24,6 +26,9 @@ from dswarm.solver.modelgateway import (
 class _FakeUpstream:
     def __init__(self):
         self.received_auth: list[str] = []
+        self.received_paths: list[str] = []
+        self.received_headers: list[dict[str, str]] = []
+        self.received_requests: list[dict] = []
         self.error_status = None
         self._srv = ThreadingHTTPServer(("127.0.0.1", 0), self._make_handler())
         self.port = self._srv.server_address[1]
@@ -40,20 +45,50 @@ class _FakeUpstream:
 
             def do_POST(self):  # noqa: N802
                 upstream.received_auth.append(self.headers.get("Authorization", ""))
+                upstream.received_paths.append(self.path)
+                upstream.received_headers.append({key.lower(): value for key, value in self.headers.items()})
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
                 req = json.loads(body or b"{}")
+                upstream.received_requests.append(req)
                 stream = bool(req.get("stream", False))
+                native_anthropic = self.path.rstrip("/").endswith("/messages")
                 if stream:
                     self.send_response(upstream.error_status or 200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
-                    self.wfile.write(b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
-                    self.wfile.write(b"data: {\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}\n\n")
-                    self.wfile.write(b"data: [DONE]\n\n")
+                    if native_anthropic:
+                        events = [
+                            {"type": "message_start", "message": {"id": "msg-native", "model": req.get("model", ""), "usage": {"input_tokens": 11}}},
+                            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+                            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "plan"}},
+                            {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+                            {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "OK"}},
+                            {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "tool-1", "name": "shell", "input": {}}},
+                            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"cmd\":\"id\"}"}},
+                            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 7}},
+                            {"type": "message_stop"},
+                        ]
+                        for event in events:
+                            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    else:
+                        self.wfile.write(b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+                        self.wfile.write(b"data: {\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}\n\n")
+                        self.wfile.write(b"data: [DONE]\n\n")
                 else:
-                    out = json.dumps({"choices": [{"message": {"content": "OK"}}],
-                                      "usage": {"input_tokens": 3, "output_tokens": 2}}).encode()
+                    if native_anthropic:
+                        out = json.dumps({
+                            "id": "msg-native", "model": req.get("model", ""), "stop_reason": "tool_use",
+                            "content": [
+                                {"type": "thinking", "thinking": "plan"},
+                                {"type": "text", "text": "OK"},
+                                {"type": "tool_use", "id": "tool-1", "name": "shell", "input": {"cmd": "id"}},
+                            ],
+                            "usage": {"input_tokens": 3, "output_tokens": 2},
+                        }).encode()
+                    else:
+                        out = json.dumps({"choices": [{"message": {"content": "OK"}}],
+                                          "usage": {"input_tokens": 3, "output_tokens": 2}}).encode()
                     self.send_response(upstream.error_status or 200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(out)))
@@ -218,6 +253,23 @@ def test_non_streaming_proxy(upstream):
         assert status == 200
         assert b"OK" in data
         assert up.received_auth == ["Bearer sk-non-stream"]
+    finally:
+        _os.environ.pop("DEEPSEEK_API_KEY", None)
+
+def test_non_streaming_proxy_forwards_reasoning_effort(upstream):
+    up, gw = upstream
+    gw.account_root = None
+    import os as _os
+    _os.environ["DEEPSEEK_API_KEY"] = "sk-effort"
+    try:
+        token = gw.issue("run-effort")
+        status, _ = _post(
+            gw, token,
+            {"model": "gpt-5.6-terra", "messages": [], "reasoning_effort": "high"},
+            stream=False,
+        )
+        assert status == 200
+        assert up.received_requests[-1]["reasoning_effort"] == "high"
     finally:
         _os.environ.pop("DEEPSEEK_API_KEY", None)
 
@@ -463,7 +515,6 @@ def test_gateway_transport_error_gets_terminal_unknown(tmp_path, monkeypatch):
     assert rows[-1]["call_outcome"] == "transport_error"
     assert rows[-1]["usage_status"] == "unknown"
 
-@pytest.mark.asyncio
 
 def test_gateway_call_keeps_entry_claims_after_token_revoke(upstream, tmp_path):
     up, gw = upstream
@@ -698,3 +749,84 @@ def test_upstream_key_resolver_is_consulted_per_request(upstream, tmp_path):
                          stream=False)
     assert status == 200
     assert up.received_auth[-1] == "Bearer sk-from-account-file"
+
+
+def _anthropic_binding(port: int) -> GatewayUpstreamBinding:
+    return GatewayUpstreamBinding(
+        base_url=f"http://127.0.0.1:{port}/v1",
+        api_key="sk-native-anthropic-secret",
+        wire_api="anthropic",
+        provider_id="anthropic",
+    )
+
+
+def test_gateway_translates_token_bound_anthropic_nonstream_without_leaking_key(upstream):
+    up, gw = upstream
+    token = gw.issue_worker(_claims("anthropic-ns", run_id="run-anthropic-ns"), upstream=_anthropic_binding(up.port))
+
+    status, data = _post(gw, token, {
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "system", "content": "You are a CTF worker."},
+            {"role": "user", "content": "inspect this"},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "shell", "description": "run a command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        }}],
+    }, stream=False)
+
+    assert status == 200
+    request = up.received_requests[-1]
+    assert up.received_paths[-1] == "/v1/messages"
+    assert up.received_headers[-1]["x-api-key"] == "sk-native-anthropic-secret"
+    assert up.received_headers[-1]["anthropic-version"] == "2023-06-01"
+    assert request["max_tokens"] == 8192
+    assert request["system"] == [{"type": "text", "text": "You are a CTF worker."}]
+    assert request["tools"][0]["input_schema"]["type"] == "object"
+    translated = json.loads(data)
+    message = translated["choices"][0]["message"]
+    assert message["content"] == "OK"
+    assert message["reasoning_content"] == "plan"
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"cmd": "id"}'
+    assert translated["choices"][0]["finish_reason"] == "tool_calls"
+    assert translated["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    assert b"sk-native-anthropic-secret" not in data
+    assert gw.upstream_for_token(token) is not None
+    gw.revoke_token(token)
+    assert gw.upstream_for_token(token) is None
+
+
+def test_gateway_translates_token_bound_anthropic_stream_and_accounts_usage(upstream):
+    up, gw = upstream
+    token = gw.issue_worker(_claims("anthropic-stream", run_id="run-anthropic-stream"), upstream=_anthropic_binding(up.port))
+
+    status, data = _post(gw, token, {
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "inspect this"}],
+    }, stream=True)
+
+    assert status == 200
+    assert up.received_paths[-1] == "/v1/messages"
+    assert up.received_headers[-1]["x-api-key"] == "sk-native-anthropic-secret"
+    assert b'"reasoning_content":"plan"' in data
+    assert b'"content":"OK"' in data
+    assert b'"tool_calls"' in data
+    assert b'"finish_reason":"tool_calls"' in data
+    assert b"data: [DONE]" in data
+    rows = _journal_rows(Path(gw.sessions_root) / "run-anthropic-stream-usage-journal.jsonl")
+    assert rows[-1]["call_outcome"] == "succeeded"
+    assert rows[-1]["input_tokens"] == 11
+    assert rows[-1]["output_tokens"] == 7
+
+
+def test_gateway_anthropic_provider_error_does_not_reflect_private_key(upstream):
+    up, gw = upstream
+    up.error_status = 401
+    token = gw.issue_worker(_claims("anthropic-error", run_id="run-anthropic-error"), upstream=_anthropic_binding(up.port))
+
+    status, data = _post(gw, token, {"model": "claude-sonnet-4-5", "messages": []}, stream=False)
+
+    assert status == 401
+    assert b"upstream provider rejected request" in data
+    assert b"sk-native-anthropic-secret" not in data

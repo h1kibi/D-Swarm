@@ -317,6 +317,40 @@ def test_resolve_preflight_failure_disposes_pool_and_bus(tmp_path):
     assert getattr(run.bus, "_closed", False)
 
 
+
+@pytest.mark.asyncio
+async def test_resolve_freezes_legacy_swarm_runtime_before_reopened(tmp_path, monkeypatch):
+    """A legacy swarm cannot publish RUN_REOPENED before runtime validation."""
+    from dswarm.core.events import Event, EventType
+
+    client, mgr, pool_calls, _launches = make_client(tmp_path)
+    run = mgr.create(RUN_ID + "-legacy-resolve")
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED,
+        run_id=run.run_id,
+        payload={"challenge": {"name": "legacy", "category": "pwn"}},
+    ))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED,
+        run_id=run.run_id,
+        payload={"solved": False, "reason": "runtime_failure", "detail": "old failure"},
+    ))
+    # Historical dispatch exists, but no runtime snapshot: the frozen local
+    # backend still needs both explicit local_dev and operator authorization.
+    mgr.remember_dispatch(run.run_id, {**LAUNCH_BODY, "worker_backend": "local"})
+    monkeypatch.delenv("DSWARM_ALLOW_LOCAL_WORKERS", raising=False)
+
+    response = client.post(f"/api/runs/{run.run_id}/resolve", json={})
+
+    assert response.status_code == 400
+    assert "local_worker_policy_denied" in response.json()["detail"]
+    assert pool_calls == []
+    assert run.finished is True
+    events = run.store.load_all(run.run_id)
+    assert not any(item["event_type"] == "run.reopened" for item in events)
+    assert events[-1]["event_type"] == "run.finished"
+
+
 def test_freeze_is_idempotent_across_redispatch(tmp_path):
     client, mgr, pool_calls, _ = make_client(tmp_path)
 

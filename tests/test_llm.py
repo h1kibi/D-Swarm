@@ -37,6 +37,41 @@ def _client_with(handler, **kw) -> LLMClient:
     return c
 
 
+async def test_reasoning_effort_is_sent_to_openai_compatible_provider() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    async with _client_with(handler, reasoning_effort="high") as client:
+        response = await client.chat(
+            model="gpt-5.6-terra",
+            messages=[{"role": "user", "content": "ping"}],
+            stream=False,
+        )
+    assert response.content == "OK"
+    assert seen["reasoning_effort"] == "high"
+
+async def test_reasoning_effort_none_is_omitted() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+        })
+
+    async with _client_with(handler) as client:
+        await client.chat(
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "ping"}],
+            stream=False,
+        )
+    assert "reasoning_effort" not in seen
 async def test_nonstreaming_splits_reasoning_and_content() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -446,3 +481,89 @@ async def test_streaming_usage_writer_does_not_double_record_legacy_cost(tmp_pat
 
     assert response.content == "hello"
     assert cost.calls == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_protocol_translates_request_and_response() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "inspect first"},
+                {"type": "text", "text": "answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 12, "output_tokens": 8},
+        })
+
+    async with _client_with(handler, wire_api="anthropic") as c:
+        response = await c.chat(
+            model="claude-sonnet-4-5",
+            messages=[
+                {"role": "system", "content": "Be precise."},
+                {"role": "user", "content": "hello"},
+            ],
+            stream=False,
+        )
+
+    assert captured["path"] == "/v1/messages"
+    headers = captured["headers"]
+    assert headers["x-api-key"] == "test"
+    assert headers["anthropic-version"] == "2023-06-01"
+    body = captured["body"]
+    assert body["system"][0]["text"] == "Be precise."
+    assert body["messages"] == [{"role": "user", "content": "hello"}]
+    assert response.content == "answer"
+    assert response.reasoning == "inspect first"
+    assert response.input_tokens == 12 and response.output_tokens == 8
+
+
+@pytest.mark.asyncio
+async def test_anthropic_streaming_reassembles_thinking_text_and_tool_use() -> None:
+    chunks = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 9}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "consider "}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "this"}},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "tool_1", "name": "run_python", "input": {}}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"code"'}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": ': "print(1)"}'}},
+        {"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "done"}},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 15}},
+        {"type": "message_stop"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/messages"
+        return httpx.Response(200, content=_sse(chunks), headers={"content-type": "text/event-stream"})
+
+    async with _client_with(handler, wire_api="anthropic") as c:
+        response = await c.chat(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "compute"}],
+            tools=[{"type": "function", "function": {"name": "run_python", "description": "execute", "parameters": {"type": "object"}}}],
+            stream=True,
+        )
+
+    assert response.reasoning == "consider this"
+    assert response.content == "done"
+    assert response.finish_reason == "tool_calls"
+    assert response.input_tokens == 9 and response.output_tokens == 15
+    assert response.tool_calls[0].id == "tool_1"
+    assert response.tool_calls[0].parsed_args() == {"code": "print(1)"}
+
+
+def test_default_provider_templates_include_requested_official_and_relay_entries():
+    from dswarm.solver.llm_providers import DEFAULT_PROVIDER_TEMPLATES
+
+    providers = {str(item["id"]): item for item in DEFAULT_PROVIDER_TEMPLATES}
+    assert {"deepseek", "openai", "anthropic", "zhipu", "moonshot", "xai", "custom-openai"} <= providers.keys()
+    assert providers["anthropic"]["wire_api"] == "anthropic"
+    assert providers["xai"]["base_url"] == "https://api.x.ai/v1"
+    assert providers["custom-openai"]["base_url"] == ""

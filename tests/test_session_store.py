@@ -199,6 +199,65 @@ def test_summary_resolve_reopen_preserves_prior_flags(tmp_path: Path) -> None:
     assert s["flag"] == "flag{a}"
 
 
+def test_summary_folds_role_scoped_provider_block_health(tmp_path: Path) -> None:
+    """After a restart the rail must reproduce the live health classification:
+    a Reason/planner provider block is reason_blocked (planner loop halted), a
+    Worker provider block is only degraded — not the other way round."""
+    store = SessionStore(root=tmp_path)
+    _write(tmp_path, "run-health", [
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "provider_recovery_blocked", "role": "reason",
+            "reason": "probe_failed", "attempt": 2}},
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "runtime_degraded", "engine": "pi", "reason": "provider_timeout"}},
+    ])
+    s = store.summary("run-health")
+    assert s["reason_blocked"] is True
+    assert s["reason_blocked_reason"] == "probe_failed"
+    assert s["degraded"] is True
+    assert s["degraded_reason"] == "provider_timeout"
+
+    _write(tmp_path, "run-health-worker", [
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "provider_recovery_blocked", "role": "worker",
+            "blocked_reason": "no_healthy_candidate"}},
+    ])
+    w = store.summary("run-health-worker")
+    assert w["reason_blocked"] is False
+    assert w["degraded"] is True
+    assert w["degraded_reason"] == "no_healthy_candidate"
+
+
+def test_summary_recovery_events_clear_block_and_activate_fallback(tmp_path: Path) -> None:
+    """Append-only health history must fold to the latest effective state: a
+    recovered Reason clears the block, and an activated fallback supersedes a
+    previous degradation instead of leaving both latched."""
+    store = SessionStore(root=tmp_path)
+    _write(tmp_path, "run-recover", [
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "reason_blocked", "stage": "reason", "reason": "planner unavailable"}},
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "provider_recovery_activated", "role": "reason",
+            "from": "deepseek-v4-pro", "to": "deepseek-v4-flash",
+            "reason": "default_binding_verified"}},
+    ])
+    s = store.summary("run-recover")
+    assert s["reason_blocked"] is True  # history retained
+    assert s["fallback_active"] is True
+    assert s["fallback_reason"] == "default_binding_verified"
+    assert s["degraded"] is False
+
+    _write(tmp_path, "run-recovered", [
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "reason_blocked", "stage": "reason", "reason": "planner unavailable"}},
+        {"event_type": "blackboard.delta", "payload": {
+            "kind": "reason_recovered", "reason": "planner healthy"}},
+    ])
+    r = store.summary("run-recovered")
+    assert r["reason_blocked"] is False
+    assert r["reason_blocked_reason"] == ""
+
+
 def test_summary_false_positive_reopen_drops_only_target_flag(tmp_path: Path) -> None:
     """A per-flag false-positive reopen removes only the targeted bad flag when the
     rail is rebuilt from JSONL after a server restart."""

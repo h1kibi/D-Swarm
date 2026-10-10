@@ -182,27 +182,13 @@ def test_review_lifecycle_module_isolation():
 
 
 def test_shared_graph_line_count_reduction():
-    """Document the line count reduction from review lifecycle extraction."""
+    """Keep the shared graph size guard without pinning implementation layout."""
     shared_graph_path = Path(__file__).parent.parent / "dswarm" / "swarm" / "shared_graph.py"
     review_lifecycle_path = Path(__file__).parent.parent / "dswarm" / "swarm" / "review_lifecycle.py"
-    
     assert shared_graph_path.exists()
     assert review_lifecycle_path.exists()
-    
     shared_graph_lines = len(shared_graph_path.read_text(encoding="utf-8").splitlines())
-    review_lifecycle_lines = len(review_lifecycle_path.read_text(encoding="utf-8").splitlines())
-    
-    # After 2026-09-02 refactoring:
-    # - shared_graph.py reduced from 4854 to ~4724 lines (130 lines removed)
-    # - review_lifecycle.py added with 302 lines
-    # Net: +172 lines total, but shared_graph.py is more maintainable
-    
     assert shared_graph_lines < 4800, (
         f"shared_graph.py grew to {shared_graph_lines} lines after review lifecycle extraction. "
-        f"Expected it to stay under 4800 lines."
-    )
-    
-    assert 280 < review_lifecycle_lines < 350, (
-        f"review_lifecycle.py is {review_lifecycle_lines} lines. "
-        f"Expected approximately 300 lines for the review domain."
+        "Expected it to stay under 4800 lines."
     )

@@ -13,7 +13,7 @@ from dswarm.solver.runtime_policy import (
     RuntimeNetworkSpec,
     RuntimeResourceSpec,
 )
-from dswarm.core.usage_journal import UsageCall, UsageRecord
+from dswarm.core.usage_journal import UsageCall
 
 
 @dataclass
@@ -21,7 +21,7 @@ class FakeProjection:
     env: dict[str, str]
     binding_id: str = "binding-1"
     credential_version_digest: str = "cred-v1"
-
+    credential_mode: str = ""
 
 class AllowBudget:
     def authorize(self, *, profile_id, account_id):
@@ -140,8 +140,65 @@ def pool_spec() -> PoolSpec:
     )
 
 
+def gateway_pool_spec() -> PoolSpec:
+    return PoolSpec.with_computed_id(
+        profile_id="pi-glm",
+        runtime_kind="pi",
+        resolved_image_id="sha256:gateway-image-1",
+        requested_image_ref="dswarm/pi:latest",
+        network=RuntimeNetworkSpec("bridge"),
+        resources=RuntimeResourceSpec("1", "512MiB", 128, 1024),
+        credential_binding_id="zhipu",
+        provider_binding_id="zhipu",
+        model="glm-5.3-flash",
+        uid=1000,
+        gid=1000,
+        runtime_features=("kali",),
+        protocol_version=2,
+        pool_max_concurrent_workers=1,
+    )
+
+
 def projection() -> FakeProjection:
     return FakeProjection(env={"SAFE_PROBE_ENV": "1"})
+
+
+def gateway_projection() -> FakeProjection:
+    return FakeProjection(
+        env={},
+        binding_id="zhipu",
+        credential_version_digest="provider-v1",
+        credential_mode="gateway",
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_binding_is_configuration_failure_without_executor_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dswarm.solver.modelgateway import ModelGateway
+    from dswarm.solver.runtime_probe import RuntimeProbe
+
+    calls = []
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+    monkeypatch.setattr(ModelGateway, "instance", staticmethod(lambda: gateway))
+    executor = FakeExecutor(calls)
+    result = await RuntimeProbe(
+        usage_writer=OrderedWriter(calls),
+        budget_gate=AllowBudget(),
+        gateway_binding_resolver=lambda _provider_id: None,
+    ).run(
+        executor=executor,
+        pool_spec=gateway_pool_spec(),
+        credential_projection=gateway_projection(),
+        generation=1,
+        timeout=5,
+    )
+
+    assert result.ready is False
+    assert result.failure.category == "configuration"
+    assert result.failure.code == "provider_binding_unavailable"
+    assert calls == ["usage_started", "usage_finished"]
 
 
 @pytest.mark.asyncio
@@ -320,6 +377,42 @@ async def test_auth_and_configuration_failures_are_classified_without_retry(erro
     assert result.failure.code == code
     assert result.failure.category == category
     assert calls.count("provider_request") == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_probe_revokes_its_token_after_executor_failure(monkeypatch):
+    from dswarm.solver.modelgateway import GatewayUpstreamBinding, ModelGateway
+    from dswarm.solver.runtime_probe import RuntimeProbe
+
+    calls = []
+    gateway = ModelGateway(host="127.0.0.1", port=0)
+    monkeypatch.setattr(ModelGateway, "instance", staticmethod(lambda: gateway))
+    executor = FakeExecutor(calls, error=RuntimeError("model not found"))
+    binding = GatewayUpstreamBinding(
+        base_url="https://provider.example/v1",
+        api_key="host-only-secret",
+        provider_id="zhipu",
+    )
+
+    result = await RuntimeProbe(
+        usage_writer=OrderedWriter(calls),
+        budget_gate=AllowBudget(),
+        gateway_binding_resolver=lambda _provider_id: binding,
+    ).run(
+        executor=executor,
+        pool_spec=gateway_pool_spec(),
+        credential_projection=gateway_projection(),
+        generation=1,
+        timeout=5,
+    )
+
+    assert result.ready is False
+    assert result.failure.category == "configuration"
+    assert result.failure.code == "model_or_config_failed"
+    assert calls.count("provider_request") == 1
+    assert gateway._tokens == {}
+    assert gateway._token_upstreams == {}
+    assert "host-only-secret" not in str(executor.last_request)
 
 
 @pytest.mark.asyncio
