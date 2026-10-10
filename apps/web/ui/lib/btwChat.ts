@@ -13,7 +13,10 @@ import { apiFetch } from "@/lib/useRun";
 import {
   applyBtwAnswerFrame,
   btwErrorBannerText,
+  btwFailureTurn,
+  observerSourceLabel,
   type BtwAnswerState,
+  type ObserverSource,
 } from "@/components/btwStream";
 
 export interface BtwTurn {
@@ -23,7 +26,12 @@ export interface BtwTurn {
   evidenceRefs?: string[];
   /** observer-flagged uncertainties (assistant only). */
   uncertainties?: string[];
+  observerSource?: ObserverSource;
+  /** Whether the configured lightweight Observer fallback answered. */
+  fallbackUsed?: boolean;
 }
+
+export { observerSourceLabel } from "@/components/btwStream";
 
 const MAX_TRANSCRIPT_CHARS = 60000;
 const STORAGE_PREFIX = "dswarm.btw.";
@@ -113,8 +121,6 @@ export function useBtwChat(runId: string) {
       const requestId = ++requestSeqRef.current;
       const transcript = turns.map(({ role, content }) => ({ role, content }));
 
-      // Do not create an empty assistant bubble up front. A failed/empty request
-      // must become an explicit answer, never a blank turn that looks like no reply.
       setTurns((prev) => [...prev, { role: "user", content: q }]);
       setInput("");
       setStreaming(true);
@@ -127,7 +133,14 @@ export function useBtwChat(runId: string) {
           if (last && last.role === "assistant") {
             next[next.length - 1] = { ...last, ...patch };
           } else {
-            next.push({ role: "assistant", content: patch.content, evidenceRefs: patch.evidenceRefs, uncertainties: patch.uncertainties });
+            next.push({
+              role: "assistant",
+              content: patch.content,
+              evidenceRefs: patch.evidenceRefs,
+              uncertainties: patch.uncertainties,
+              observerSource: patch.observerSource,
+              fallbackUsed: patch.fallbackUsed,
+            });
           }
           return next;
         });
@@ -144,7 +157,7 @@ export function useBtwChat(runId: string) {
           const txt = await resp.text().catch(() => "");
           const message = `请求失败 (${resp.status}): ${txt.slice(0, 160)}`;
           setError(message);
-          upsertAssistant({ content: `观察员暂时无法回答：${message}` });
+          upsertAssistant(btwFailureTurn("http", message));
           return;
         }
         const reader = resp.body.getReader();
@@ -153,38 +166,43 @@ export function useBtwChat(runId: string) {
         let answerState: BtwAnswerState = { content: "", final: false, error: "" };
         let refs: string[] | undefined;
         let unknowns: string[] | undefined;
+        let observerSource: BtwTurn["observerSource"];
+        let fallbackUsed: boolean | undefined;
 
         const consumeFrame = (frame: string) => {
           const m = frame.match(/^data: (.+)$/s);
           if (!m) return;
-          let obj: any;
+          let parsed: unknown;
           try {
-            obj = JSON.parse(m[1]);
+            parsed = JSON.parse(m[1]);
           } catch {
             return;
           }
-          if (obj.status) setWorkerStatus(String(obj.status).slice(0, 160));
-          // `final` is authoritative. Any provisional delta is replaced, so
-          // lifecycle echoes or a late complete message cannot duplicate text.
+          if (!parsed || typeof parsed !== "object") return;
+          const data = parsed as Record<string, unknown>;
+          if (data.status) setWorkerStatus(String(data.status).slice(0, 160));
           const previous = answerState;
-          answerState = applyBtwAnswerFrame(answerState, obj);
-          if (Array.isArray(obj.evidence_refs)) {
-            refs = obj.evidence_refs.map((r: unknown) => String(r)).filter(Boolean);
+          answerState = applyBtwAnswerFrame(answerState, data);
+          if (Array.isArray(data.evidence_refs)) {
+            refs = data.evidence_refs.map((r) => String(r)).filter(Boolean);
           }
-          if (Array.isArray(obj.uncertainties)) {
-            unknowns = obj.uncertainties.map((u: unknown) => String(u)).filter(Boolean);
+          if (Array.isArray(data.uncertainties)) {
+            unknowns = data.uncertainties.map((u) => String(u)).filter(Boolean);
           }
-          if (answerState.content !== previous.content) {
-            upsertAssistant({ content: answerState.content, evidenceRefs: refs, uncertainties: unknowns });
+          if (data.observer_source === "default" || data.observer_source === "fallback" || data.observer_source === "unavailable") {
+            observerSource = data.observer_source;
+          }
+          if (typeof data.fallback_used === "boolean") {
+            fallbackUsed = data.fallback_used;
+          }
+          if (answerState.content !== previous.content || observerSource !== undefined || fallbackUsed !== undefined) {
+            upsertAssistant({ content: answerState.content, evidenceRefs: refs, uncertainties: unknowns, observerSource, fallbackUsed });
           }
           if (answerState.error) {
-            // An error frame is also promoted into the assistant bubble by the
-            // state reducer. Only show a separate banner when it contains
-            // additional information; otherwise the same message appears twice.
             setError(btwErrorBannerText(answerState.content, answerState.error));
             setWorkerStatus("");
           }
-          if (obj.done) setWorkerStatus("");
+          if (data.done) setWorkerStatus("");
         };
 
         for (;;) {
@@ -197,17 +215,17 @@ export function useBtwChat(runId: string) {
         }
         if (buf.trim()) consumeFrame(buf);
         if (!answerState.final && !answerState.content.trim()) {
-          const message = "观察员未返回任何回答；没有启动深度 worker。";
-          setError(message);
-          upsertAssistant({ content: message });
+          const failure = btwFailureTurn("empty");
+          setError(failure.content);
+          upsertAssistant(failure);
         }
-      } catch (e: any) {
-        if (e?.name === "AbortError") {
+      } catch (e: unknown) {
+        if (e && typeof e === "object" && "name" in e && e.name === "AbortError") {
           // silent — operator closed / re-asked
         } else {
-          const message = String(e?.message || e).slice(0, 300);
+          const message = String(e instanceof Error ? e.message : e).slice(0, 300);
           setError(message);
-          upsertAssistant({ content: `观察员暂时无法回答：${message}` });
+          upsertAssistant(btwFailureTurn("transport", message));
         }
       } finally {
         if (requestSeqRef.current === requestId) {

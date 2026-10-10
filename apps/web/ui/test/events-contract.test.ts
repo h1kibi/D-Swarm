@@ -73,3 +73,36 @@ describe("run finish messaging", () => {
     expect(s.chat.map((m) => m.i18nKey)).toContain("sys.finishedNoFlag");
   });
 });
+
+describe("run health projection", () => {
+  const bb = (seq: number, payload: Record<string, unknown>): DSwarmEvent => ({
+    event_type: EventType.BLACKBOARD_DELTA, seq, ts: seq, run_id: "run-h", solver_id: "reason",
+    payload: { actor: "reason", ...payload },
+  } as DSwarmEvent);
+
+  it("folds a Reason provider block into reasonBlocked and clears it on recovery", () => {
+    let s = emptyDeck("run-h");
+    s = reduce(s, bb(1, { kind: "provider_recovery_blocked", role: "reason", reason: "probe_failed" }));
+    expect(s.reasonBlocked).toBe(true);
+    expect(s.reasonBlockedReason).toBe("probe_failed");
+
+    s = reduce(s, bb(2, { kind: "reason_recovered", reason: "planner healthy" }));
+    expect(s.reasonBlocked).toBe(false);
+  });
+
+  it("keeps fallback_active after a reopen, which only clears transient health", () => {
+    let s = emptyDeck("run-h");
+    s = reduce(s, bb(1, { kind: "provider_recovery_activated", role: "worker", reason: "default_binding_verified" }));
+    s = reduce(s, bb(2, { kind: "runtime_degraded", reason: "provider_timeout" }));
+    expect(s.fallbackActive).toBe(true);
+    expect(s.degraded).toBe(true);
+
+    s = reduce(s, { event_type: EventType.RUN_REOPENED, seq: 3, ts: 3, run_id: "run-h", payload: { reason: "resolve" } } as DSwarmEvent);
+    expect(s.reasonBlocked).toBe(false);
+    expect(s.degraded).toBe(false);
+    // Reopening resumes solving; it never asserts the provider fallback history
+    // was resolved. Claiming recovery here would be a fabricated health state.
+    expect(s.fallbackActive).toBe(true);
+    expect(s.fallbackReason).toBe("default_binding_verified");
+  });
+});

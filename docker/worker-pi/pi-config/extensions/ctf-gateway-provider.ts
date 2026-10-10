@@ -82,6 +82,30 @@ export default function registerCtfGateway(pi: ExtensionAPI) {
         max: "max",
       },
     },
+    {
+      id: "glm-5.3-flash",
+      name: "GLM 5.3 Flash (gateway)",
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: "low",
+        low: "low",
+        medium: "low",
+        high: "high",
+        max: "max",
+      },
+    },
+    {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra (gateway)",
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: "low",
+        medium: "medium",
+        high: "high",
+        max: "max",
+      },
+    },
   ];
 
   pi.registerProvider("ctf-gateway", {

@@ -13,9 +13,39 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
+
+_MANIFEST_LOCKS: dict[Path, threading.RLock] = {}
+_MANIFEST_LOCKS_GUARD = threading.Lock()
+_MANIFEST_REPLACE_RETRIES = 5
+
+
+def _manifest_lock(root: Path) -> threading.RLock:
+    key = root.resolve(strict=False)
+    with _MANIFEST_LOCKS_GUARD:
+        lock = _MANIFEST_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _MANIFEST_LOCKS[key] = lock
+        return lock
+
+
+def _replace_manifest_with_retry(tmp_name: str, path: Path) -> None:
+    for attempt in range(_MANIFEST_REPLACE_RETRIES + 1):
+        try:
+            os.replace(tmp_name, path)
+            return
+        except PermissionError:
+            if attempt >= _MANIFEST_REPLACE_RETRIES:
+                raise
+            # Windows scanners/indexers can briefly hold the destination. Keep the
+            # atomic replace, but give the handle a bounded chance to disappear.
+            time.sleep(0.02 * (attempt + 1))
+
+
 
 
 def workspace_root_for_worker(wd: str | Path) -> Path:
@@ -202,49 +232,55 @@ def link_shared_into_worker(root: str | Path, wd: str | Path, name: str, sha256:
 def write_manifest(root: str | Path, *, runtime: dict[str, Any] | None = None) -> Path:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    inputs: list[dict[str, Any]] = []
-    by_name = root / "inputs" / "by-name"
-    if by_name.exists():
-        for link in sorted(by_name.iterdir(), key=lambda p: p.name):
-            try:
-                resolved = link.resolve()
-                sha = resolved.name
-            except OSError:
-                sha = ""
-            inputs.append({
-                "name": link.name,
-                "sha256": sha,
-                "path": link.relative_to(root).as_posix(),
-                "object": f"inputs/objects/{sha[:2]}/{sha[2:4]}/{sha}" if sha else "",
-            })
-    manifest = {
-        "version": 1,
-        "topology": {
-            "inputs": "inputs",
-            "shared": "shared",
-            "graph": "graph",
-            "workers": "workers",
-            "homes": "homes",
-            "tmp": "tmp",
-            "logs": "logs",
-            "final": "final",
-        },
-        "inputs": inputs,
-        "runtime": runtime or {},
-        "artifact_truth": "shared_graph.events",
-        "shared_index": "shared/index.jsonl (rebuildable materialized view)",
-    }
     path = root / "manifest.json"
-    fd, tmp_name = tempfile.mkstemp(prefix=".manifest.", suffix=".json", dir=str(root))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp_name, path)
-    finally:
+    # ensure_workspace/materialize_* are called by parallel workers. Serialize the
+    # complete snapshot + temp-write + replace per manifest path so Windows never
+    # has competing writers replacing the same destination.
+    with _manifest_lock(root):
+        inputs: list[dict[str, Any]] = []
+        by_name = root / "inputs" / "by-name"
+        if by_name.exists():
+            for link in sorted(by_name.iterdir(), key=lambda p: p.name):
+                try:
+                    resolved = link.resolve()
+                    sha = resolved.name
+                except OSError:
+                    sha = ""
+                inputs.append({
+                    "name": link.name,
+                    "sha256": sha,
+                    "path": link.relative_to(root).as_posix(),
+                    "object": f"inputs/objects/{sha[:2]}/{sha[2:4]}/{sha}" if sha else "",
+                })
+        manifest = {
+            "version": 1,
+            "topology": {
+                "inputs": "inputs",
+                "shared": "shared",
+                "graph": "graph",
+                "workers": "workers",
+                "homes": "homes",
+                "tmp": "tmp",
+                "logs": "logs",
+                "final": "final",
+            },
+            "inputs": inputs,
+            "runtime": runtime or {},
+            "artifact_truth": "shared_graph.events",
+            "shared_index": "shared/index.jsonl (rebuildable materialized view)",
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".manifest.", suffix=".json", dir=str(root)
+        )
         try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+            _replace_manifest_with_retry(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
     return path
 
 

@@ -10,11 +10,9 @@ configuration is not part of this module's runtime contract.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
-import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +24,6 @@ if TYPE_CHECKING:
 
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
-from dswarm.core.runtime_env import is_web_container
 from dswarm.core.events import Event, EventType, blackboard_delta_payload
 from dswarm.core.llm import LLMClient
 from dswarm.core.usage_journal import UsageWriter
@@ -36,44 +33,41 @@ from dswarm.sandbox.manager import SandboxManager
 from dswarm.solver.result import ArtifactStore
 from dswarm.solver.runtime_policy import RuntimePolicy, RuntimePolicyError, RuntimeSnapshot
 from dswarm.solver.types import SolverConfig, SolveOutcome
-from dswarm.solver.credential_accounts import runtime_env_for_engine
-from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root, resolve_llm_provider
+from dswarm.solver.llm_providers import LLMProviderSecretStore, resolve_llm_provider, probe_llm_provider
 from dswarm.solver.worker_profiles import (
-    base_engine_for_profile,
     coerce_nonneg_int,
     direction_profile_name,
     normalize_profile_roster,
-    normalize_worker_profiles,
     profile_names,
 )
 from dswarm.solver.workspace import cleanup_worker_scratch, ensure_workspace
 from dswarm.swarm.cleanup_registry import validate_cleanup_action
 from dswarm.swarm.insight_bus import InsightBus
 from dswarm.swarm.lane_gate import WorkerLaneGate
-from dswarm.swarm.shared_graph import (
-    SharedGraph, SQLiteSharedGraph, canonicalize_lane, _is_runtime_infra_fact_text,
-)
+from dswarm.swarm.shared_graph import SharedGraph, SQLiteSharedGraph
 from dswarm.swarm.poc_verification import sanitize_public_text
 from dswarm.swarm.agents import AgentRegistry
 from dswarm.swarm.board import Board, MemoryBoard
 from dswarm.swarm.blackboard_bridge import BlackboardBridgeMixin
-from dswarm.swarm.budget import BudgetMixin, WorkerBudgetExhausted
-from dswarm.swarm.errors import WorkerSpawnRejected
-from dswarm.swarm.health import (
-    HealthMixin,
-    _health_cache_clear,
-    _health_cache_get,
-    _health_cache_put,
-)
+import dswarm.swarm.errors as _swarm_errors
+import dswarm.swarm.health as _health_module
 from dswarm.swarm.projection import BoardProjector
 from dswarm.swarm.route_telemetry import MetricsSink
 from dswarm.swarm.priority import normalize_priority, normalize_priority_scale
 from dswarm.swarm.reason_scheduler import ReasonSwarm
 from dswarm.swarm.review_capacity import ReviewCapacityMixin
+from dswarm.swarm.budget import BudgetMixin
 from dswarm.swarm.runtime import SwarmWorkerRuntime
 from dswarm.swarm.runtime_degradation import RuntimeDegradationMixin
 from dswarm.swarm.review_flow import ReviewFlowMixin
+from dswarm.swarm.graph_contract import EV_WORKER_REPORT_PENDING_REVIEW
 from dswarm.swarm.worker_runtime_mixin import WorkerRuntimeMixin
+
+HealthMixin = _health_module.HealthMixin
+_health_cache_clear = _health_module._health_cache_clear
+_health_cache_get = _health_module._health_cache_get
+_health_cache_put = _health_module._health_cache_put
+WorkerSpawnRejected = _swarm_errors.WorkerSpawnRejected
 
 _WORKER_BACKEND_UNSET = object()
 _RUNTIME_POLICY_UNSET = object()
@@ -130,6 +124,7 @@ class Swarm(
         challenge: Challenge,
         *,
         llm: LLMClient,
+        review_llm: Optional[LLMClient] = None,
         sandbox: SandboxManager,
         bus: Optional[EventBus] = None,
         cost: Optional[CostController] = None,
@@ -198,11 +193,17 @@ class Swarm(
         cost_budget_usd: "Optional[float]" = None,
         llm_profiles: "Optional[dict[str, Any]]" = None,
         llm_providers: "Optional[list[dict[str, Any]]]" = None,
+        # Immutable, non-secret Target/Run binding snapshot. Role overrides are
+        # applied by WorkerRuntimeMixin at spawn time; the solver core still owns
+        # the CLI loop, provenance gate, graph, and ledger.
+        binding_snapshot: "Optional[dict[str, Any]]" = None,
         reason_planner_diagnostic: "Optional[dict[str, Any]]" = None,
+        reviewer_diagnostic: "Optional[dict[str, Any]]" = None,
         usage_writer: Optional[UsageWriter] = None,
         fallback_usage_writer: Optional[UsageWriter] = None,
         spawn_guard: Optional[SpawnGuard] = None,
         budget_gate: Optional[Any] = None,
+        role_client_factory: Optional[Any] = None,
         metrics_sink: Optional[Any] = None,
         initial_runtime_operation_kind: str = "",
         cleanup_executor: Optional[Any] = None,
@@ -210,14 +211,17 @@ class Swarm(
         self.challenge = challenge
         self.cleanup_executor = cleanup_executor
         self.llm = llm
+        self.review_llm = review_llm
+        self.reviewer_diagnostic = dict(reviewer_diagnostic or {})
         self.usage_writer = usage_writer
         self.fallback_usage_writer = fallback_usage_writer
         self.spawn_guard = spawn_guard
-        self.budget_gate = budget_gate
         self.initial_runtime_operation_kind = str(initial_runtime_operation_kind or "")
+        self.role_client_factory = role_client_factory
         self.sandbox = sandbox
         self.bus = bus
         self.cost = cost
+        self.budget_gate = budget_gate
         self.artifacts = artifacts
         self.config = config
         self.run_id = run_id or challenge.id
@@ -275,6 +279,22 @@ class Swarm(
         self.cli_engine = cli_engine
         self.llm_profiles = dict(llm_profiles or {})
         self.llm_providers = list(llm_providers or [])
+        self.binding_snapshot = dict(binding_snapshot or {})
+        raw_roles = self.binding_snapshot.get("roles")
+        self.role_bindings = {
+            str(role): dict(value)
+            for role, value in (raw_roles.items() if isinstance(raw_roles, dict) else [])
+            if isinstance(value, dict)
+        }
+        # Mutable fallback state is keyed by logical role and current override
+        # identity. Configured bindings remain immutable for replay/audit.
+        self._effective_role_bindings: dict[str, dict[str, Any]] = dict(self.role_bindings)
+        self._role_failure_counts: dict[tuple[str, str, str], int] = {}
+        self._role_failure_windows: dict[str, dict[str, Any]] = {}
+        self._role_fallback_activated: set[str] = set()
+        self._role_last_fallback_ts: dict[str, float] = {}
+        self._role_fallback_blocked: dict[str, str] = {}
+
         self.reason_planner_diagnostic = dict(reason_planner_diagnostic or {})
         self.review_policy = self._clean_review_policy(review_policy)
         self._last_review_seq = 0
@@ -493,9 +513,7 @@ class Swarm(
         self.shared_graph: Optional[SharedGraph] = None
         try:
             # graph_dir (web driver) keeps the DB OUTSIDE sandbox.root so it
-            # survives sandbox.shutdown_all()'s rmtree of the sandbox root. Falls
-            # back to the sandbox tree when unset (TUI / tests, where ephemeral
-            # is fine).
+            # survives sandbox.shutdown_all()'s rmtree of the sandbox root.
             if self._graph_dir is not None:
                 self._graph_dir.mkdir(parents=True, exist_ok=True)
                 db_path = self._graph_dir / "shared_graph.db"
@@ -506,16 +524,271 @@ class Swarm(
                 metrics_sink=self._route_metrics,
             )
         except Exception:
-            # The shared graph is additive; never block solving if it cannot open.
             self.shared_graph = None
         self._last_graph_event_seq = 0
         self._graph_bridge_failures: dict[int, int] = {}
-        # multi-flag: the authoritative dedup set of flags collected so far. The
-        # run is "solved" once it holds expected_flags distinct flags. For a
-        # single-flag challenge (expected_flags=1) the first flag fills it and
-        # _flags_complete() flips true immediately — byte-identical to the old
-        # "first flag wins" behaviour.
+        self._reviewer_gate_failures = 0
+        # multi-flag: the authoritative dedup set of flags collected so far.
         self._found_flags: list[str] = []
+    def _fallback_probe(self, binding: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """Probe settings-default transport without exposing credentials."""
+        if not isinstance(binding, dict):
+            return False, {"ok": False, "reason": "missing_binding"}
+        base_url = str(binding.get("base_url") or "").strip()
+        provider_ref = str(binding.get("provider_ref") or "").strip()
+        if not base_url and not provider_ref:
+            return True, {"ok": True, "skipped": True, "reason": "legacy_unprobeable_binding"}
+        providers = [dict(item) for item in self.llm_providers if isinstance(item, dict)]
+        provider = next((item for item in providers if str(item.get("id") or "") == provider_ref), None)
+        probe_binding = dict(binding)
+        if provider is not None:
+            for key in ("base_url", "wire_api", "auth_mode", "auth_header", "auth_prefix"):
+                if probe_binding.get(key) in (None, "") and provider.get(key) not in (None, ""):
+                    probe_binding[key] = provider[key]
+        if not str(probe_binding.get("base_url") or "").strip():
+            return False, {"ok": False, "reason": "missing_default_endpoint"}
+        api_key = ""
+        if provider_ref:
+            try:
+                root = self.credential_accounts_root.parent / "llm_providers" if self.credential_accounts_root else None
+                store = LLMProviderSecretStore(root) if root is not None else None
+                resolved = resolve_llm_provider(provider_ref, providers, secret_store=store)
+                api_key = resolved.api_key if resolved is not None else ""
+            except Exception:
+                api_key = ""
+        if not api_key:
+            provider_name = str(probe_binding.get("provider") or provider_ref or "").strip().upper().replace("-", "_")
+            api_key = os.environ.get(f"DSWARM_{provider_name}_API_KEY", "") if provider_name else ""
+        result = probe_llm_provider(probe_binding, api_key=api_key, model="", validate_model=False)
+        return bool(result.get("ok")), {"ok": bool(result.get("ok")), "error_layer": str(result.get("error_layer") or "")[:40], "detail": str(result.get("detail") or "")[:160]}
+
+    async def trigger_role_fallback(
+        self, role: str, *, reason: str, is_fatal: bool = False,
+        failure_category: str = "", active_workers: int = 0,
+        affected_workers: int = 0,
+    ) -> bool:
+        """Switch one role to its frozen settings default after safe thresholds.
+
+        The host owns this state machine.  It counts failures only inside one
+        60-second window, probes the frozen default before changing the
+        effective binding, and records every transition append-only.  A failed
+        probe or client rebuild never changes the binding.
+        """
+        target_role = (
+            "review" if role in {"review", "reviewer"}
+            else "reason" if role in {"reason", "planner"}
+            else "worker"
+        )
+        cooldown_s = 60.0
+        now_mono = time.monotonic()
+        last_fallback = self._role_last_fallback_ts.get(target_role)
+        if last_fallback is not None and now_mono - float(last_fallback) < cooldown_s:
+            return False
+        # One default activation per role/run is deliberate.  There is no
+        # automatic switch back to an override, so this also prevents provider
+        # oscillation after the role has recovered.
+        if target_role in self._role_fallback_activated or target_role in self._role_fallback_blocked:
+            return False
+
+        current = dict(self._effective_role_bindings.get(target_role) or {})
+        override_id = str(
+            current.get("provider_ref") or current.get("provider")
+            or current.get("credential_account") or current.get("model") or "unknown"
+        )[:120]
+        category = str(failure_category or ("fatal" if is_fatal else "retryable"))[:80]
+
+        # A window is scoped to the current effective binding and category.
+        # Expiring it must not allow an old first/second failure to combine with
+        # a new window.
+        window = self._role_failure_windows.get(target_role)
+        window_expired = (
+            not isinstance(window, dict)
+            or now_mono - float(window.get("started_at", now_mono)) >= 60.0
+            or str(window.get("override_id") or "") != override_id
+            or str(window.get("category") or "") != category
+        )
+        if window_expired:
+            for key in list(self._role_failure_counts):
+                if key[0] == target_role:
+                    self._role_failure_counts.pop(key, None)
+            window = {
+                "started_at": now_mono,
+                "attempts": 0,
+                "category": category,
+                "override_id": override_id,
+            }
+            self._role_failure_windows[target_role] = window
+
+        key = (target_role, override_id, category)
+        attempt = self._role_failure_counts.get(key, 0) + 1
+        self._role_failure_counts[key] = attempt
+        window["attempts"] = attempt
+
+        active = max(int(active_workers or 0), 0)
+        affected = max(int(affected_workers or 0), 0)
+        majority = active > 0 and affected / active >= 0.5
+        if not is_fatal and attempt < 3 and not majority:
+            return False
+
+        def safe_binding(raw: Any) -> dict[str, Any]:
+            if not isinstance(raw, dict):
+                return {}
+            allowed = {
+                "provider", "provider_ref", "model", "base_url", "wire_api",
+                "auth_mode", "credential_source", "credential_account",
+            }
+            out: dict[str, Any] = {}
+            for raw_key, raw_value in raw.items():
+                key_name = str(raw_key)
+                if key_name not in allowed or raw_value in (None, ""):
+                    continue
+                if not isinstance(raw_value, (str, int, float, bool)):
+                    continue
+                value = str(raw_value) if isinstance(raw_value, str) else raw_value
+                if key_name == "base_url":
+                    match = re.match(r"(?i)^https?://[^/?#]+", str(value).strip())
+                    if not match:
+                        continue
+                    value = match.group(0)
+                out[key_name] = value
+            return out
+
+        def safe_probe(raw: Any) -> dict[str, Any]:
+            if not isinstance(raw, dict):
+                return {"ok": False, "reason": "invalid_probe_result"}
+            out: dict[str, Any] = {"ok": bool(raw.get("ok"))}
+            if raw.get("skipped") is True:
+                out["skipped"] = True
+            for field_name in ("error_layer", "reason", "detail"):
+                value = raw.get(field_name)
+                if value in (None, ""):
+                    continue
+                text = sanitize_public_text(value, limit=160)
+                text = re.sub(
+                    r"(?i)(api[_ -]?key|token|secret|password|authorization)\s*[:=]\s*\S+",
+                    r"\1=<redacted>", text,
+                )
+                text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer <redacted>", text)
+                text = re.sub(r"https?://\S+", "<endpoint>", text)
+                out[field_name] = text[:160]
+            return out
+
+        async def record_recovery(kind: str, event_payload: dict[str, Any]) -> None:
+            if self.shared_graph is not None:
+                try:
+                    self.shared_graph._append(kind, "swarm", dict(event_payload))
+                except Exception:
+                    pass
+            await self._emit_coord_bb(kind, **event_payload)
+
+        snap_fallbacks = self.binding_snapshot.get("fallback")
+        fallback_cand = (
+            dict(snap_fallbacks.get(target_role) or {})
+            if isinstance(snap_fallbacks, dict)
+            and isinstance(snap_fallbacks.get(target_role), dict)
+            else {}
+        )
+        if not fallback_cand:
+            candidates = self.binding_snapshot.get("fallback_candidates")
+            if isinstance(candidates, dict) and isinstance(candidates.get(target_role), dict):
+                fallback_cand = dict(candidates[target_role])
+        # Legacy/unit callers may not have an explicit snapshot.  Keep this
+        # compatibility fallback, but production launches always supply the
+        # frozen settings binding above.
+        if not fallback_cand and self.llm_profiles:
+            raw_cand = self.llm_profiles.get("planner" if target_role == "reason" else target_role)
+            if isinstance(raw_cand, dict):
+                fallback_cand = dict(raw_cand)
+        if not fallback_cand:
+            blocked_reason = "missing_settings_default"
+            self._role_fallback_blocked[target_role] = blocked_reason
+            payload = {
+                "role": target_role,
+                "from_binding": safe_binding(current), "to_binding": {},
+                "from": safe_binding(current), "to": {},
+                "reason": sanitize_public_text(reason, limit=200),
+                "blocked": True, "blocked_reason": blocked_reason,
+                "is_fatal": bool(is_fatal), "attempt": attempt,
+                "window_s": 60, "cooldown_s": cooldown_s,
+                "cooldown_until": 0.0, "category": category,
+                "active_workers": active, "affected_workers": affected,
+                "probe": {"ok": False, "reason": blocked_reason},
+            }
+            await record_recovery("provider_recovery_blocked", payload)
+            return False
+
+        from_ref = safe_binding(current)
+        to_ref = safe_binding(fallback_cand)
+        cooldown_until = time.time() + cooldown_s
+        payload = {
+            "role": target_role,
+            "from_binding": from_ref, "to_binding": to_ref,
+            "from": from_ref, "to": to_ref,
+            "reason": sanitize_public_text(reason, limit=200),
+            "is_fatal": bool(is_fatal), "attempt": attempt,
+            "window_s": 60, "cooldown_s": cooldown_s,
+            "cooldown_until": cooldown_until, "category": category,
+            "active_workers": active, "affected_workers": affected,
+        }
+        # A directive is an auditable intent to recover.  It precedes the
+        # probe; a failed probe receives a blocked event and never an activated
+        # event or effective-binding mutation.
+        await record_recovery("provider_recovery_directive", {
+            **payload,
+            "recovery_action": "switch_to_settings_default",
+            "current_worker_interrupted": False,
+        })
+        probe_ok, raw_probe = self._fallback_probe(fallback_cand)
+        probe = safe_probe(raw_probe)
+        payload["probe"] = probe
+        if not probe_ok:
+            blocked_reason = str(
+                (raw_probe or {}).get("reason") if isinstance(raw_probe, dict) else ""
+            ).strip() or str(
+                (raw_probe or {}).get("detail") if isinstance(raw_probe, dict) else ""
+            ).strip() or "default_probe_failed"
+            blocked_reason = sanitize_public_text(blocked_reason, limit=160)
+            self._role_fallback_blocked[target_role] = blocked_reason
+            await record_recovery("provider_recovery_blocked", {
+                **payload, "blocked": True, "blocked_reason": blocked_reason,
+            })
+            return False
+
+        # Reason and Reviewer need a rebuilt executable client.  Worker clients
+        # are created lazily from _effective_role_bindings, so their role-level
+        # fallback does not manufacture a second Reviewer client.
+        rebuilt: dict[str, Any] = {}
+        if self.role_client_factory is not None and target_role in {"reason", "review"}:
+            try:
+                result = await self.role_client_factory(target_role, dict(fallback_cand))
+                rebuilt = result if isinstance(result, dict) else {}
+                client_key = target_role
+                if rebuilt.get(client_key) is None:
+                    raise RuntimeError("role_client_missing")
+            except Exception as exc:
+                blocked_reason = f"client_rebuild_failed:{type(exc).__name__}"[:160]
+                self._role_fallback_blocked[target_role] = blocked_reason
+                await record_recovery("provider_recovery_blocked", {
+                    **payload, "blocked": True, "blocked_reason": blocked_reason,
+                    "probe": probe,
+                })
+                return False
+
+        self._effective_role_bindings[target_role] = dict(fallback_cand)
+        self._role_fallback_activated.add(target_role)
+        self._role_last_fallback_ts[target_role] = now_mono
+        if target_role == "reason" and rebuilt.get("reason") is not None:
+            self.llm = rebuilt["reason"]
+        if target_role == "review" and rebuilt.get("review") is not None:
+            self.review_llm = rebuilt["review"]
+        await record_recovery("provider_recovery_activated", payload)
+        await record_recovery("binding_effective_changed", payload)
+        return True
+
+    def effective_role_binding(self, role: str) -> dict[str, Any]:
+        """Return the current secret-free transport binding for a logical role."""
+        logical = "review" if role in {"review", "reviewer"} else "reason" if role in {"reason", "planner"} else "worker"
+        return dict(self._effective_role_bindings.get(logical) or {})
 
 
     def pool_id_for_profile(self, profile_id: str) -> str:
@@ -677,31 +950,17 @@ class Swarm(
                 stop_reason="solved")
 
     _GRAPH_BRIDGE_KINDS = {
-        "fact_added",
-        "dead_end",
-        "intent_proposed",
-        "intent_claimed",
-        "intent_concluded",
-        "intent_state_changed",
-        "flag_found",
-        "flag_unverified",
-        "poc_saved",
-        "poc_claimed",
-        "poc_concluded",
-        "poc_reproduction_registered",
-        "poc_reproduction_rejected",
-        "poc_verification_started",
-        "poc_verified",
-        "poc_verification_failed",
-        "review_finding",
-        "review_finding_verified",
-        "route_suppressed",
-        "route_reopened",
-        "branch_split",
-        "branch_resolved",
-        "coordinator_directive",
-        "cleanup_action_registered",
-        "cleanup_executed",
+        "fact_added", "dead_end", "intent_proposed", "intent_claimed",
+        "intent_concluded", "intent_state_changed", "flag_found", "flag_unverified",
+        "poc_saved", "poc_claimed", "poc_concluded", "poc_reproduction_registered",
+        "poc_reproduction_rejected", "poc_verification_started", "poc_verified",
+        "poc_verification_failed", "review_finding", "review_finding_verified",
+        "worker_report_pending_review", "evidence_review_decision", "reviewed_context",
+        "intent_quality_decision", "intent_interrupted", "intent_recovery_required",
+        "provider_recovery_directive", "provider_recovery_activated",
+        "provider_recovery_blocked", "binding_effective_changed",
+        "route_suppressed", "route_reopened", "branch_split", "branch_resolved",
+        "coordinator_directive", "cleanup_action_registered", "cleanup_executed",
         "cleanup_failed",
     }
 
@@ -731,6 +990,245 @@ class Swarm(
                 return
             self._last_graph_event_seq = max(self._last_graph_event_seq, seq)
             self._graph_bridge_failures.pop(seq, None)
+    def _reviewer_profile(self) -> dict[str, Any]:
+        raw = self._effective_role_bindings.get("review")
+        if isinstance(raw, dict) and raw:
+            return dict(raw)
+        raw = self.role_bindings.get("review")
+        if isinstance(raw, dict) and raw:
+            return dict(raw)
+        raw = self.llm_profiles.get("review")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _reviewer_context_payload(self) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+        if self.shared_graph is not None:
+            try:
+                context = dict(self.shared_graph.reviewed_context() or {})
+            except Exception:
+                context = {}
+        return {
+            "facts": [
+                {"fact_seq": int(row.get("fact_seq") or 0),
+                 "fact": str(row.get("fact") or "")[:500],
+                 "status": str(row.get("status") or "verified")}
+                for row in (context.get("facts") or []) if isinstance(row, dict)
+            ][-64:],
+            "candidates": [
+                {"fact_seq": int(row.get("fact_seq") or 0),
+                 "status": str(row.get("status") or "pending_review"),
+                 "reason": str(row.get("reason") or "")[:240]}
+                for row in (context.get("candidates") or []) if isinstance(row, dict)
+            ][-32:],
+            "rejected": [
+                {"fact_seq": int(row.get("fact_seq") or 0),
+                 "reason": str(row.get("reason") or "")[:240]}
+                for row in (context.get("rejected") or []) if isinstance(row, dict)
+            ][-32:],
+            "dead_ends": [
+                {"dead_end_seq": int(row.get("dead_end_seq") or 0),
+                 "reason": str(row.get("reason") or "")[:240]}
+                for row in (context.get("dead_ends") or []) if isinstance(row, dict)
+            ][-32:],
+        }
+
+    async def _review_worker_evidence(self) -> None:
+        """Audit pending Worker reports against durable evidence artifacts.
+
+        A verified verdict requires an immutable artifact and valid references.
+        Invalid requests fall back to candidate; review failures fail closed.
+        """
+        if self.shared_graph is None or self.review_llm is None:
+            return
+        profile = self._reviewer_profile()
+        if not profile.get("model"):
+            return
+        # Gather pending reports not yet decided
+        reports: list[dict[str, Any]] = []
+        for event in self.shared_graph.events():
+            if event.get("kind") != EV_WORKER_REPORT_PENDING_REVIEW:
+                continue
+            payload = dict(event.get("payload") or {})
+            reports.append({**payload, "report_seq": int(event.get("seq") or 0)})
+        if not reports:
+            return
+        decisions = self.shared_graph.evidence_review_decisions()
+        decided_facts = {int(d["fact_seq"]) for d in decisions if d.get("fact_seq") is not None}
+        decided_dead_ends = {int(d["dead_end_seq"]) for d in decisions if d.get("dead_end_seq") is not None}
+
+        for r in reports:
+            rep_seq = r.get("report_seq")
+            facts_to_review = [f for f in (r.get("fact_seqs") or []) if f not in decided_facts]
+            dead_ends_to_review = [d for d in (r.get("dead_end_seqs") or []) if d not in decided_dead_ends]
+            if not facts_to_review and not dead_ends_to_review:
+                continue
+            # Build bounded artifact excerpts
+            allowed_artifacts = set(r.get("artifact_ids") or []) | set(r.get("raw_artifact_ids") or [])
+            artifact_excerpts: dict[str, str] = {}
+            if getattr(self.shared_graph, "artifacts", None) is not None:
+                for aid in list(allowed_artifacts)[:4]:
+                    try:
+                        content = self.shared_graph.artifacts.get(aid)
+                        if isinstance(content, bytes):
+                            content = content.decode("utf-8", errors="replace")
+                        artifact_excerpts[aid] = str(content or "")[:2000]
+                    except Exception:
+                        pass
+
+            prompt_subjects = []
+            for f_seq in facts_to_review:
+                try:
+                    target = self.shared_graph._require_fact_target(f_seq)
+                    prompt_subjects.append({
+                        "subject_id": f"fact:{f_seq}",
+                        "type": "fact",
+                        "fact_seq": f_seq,
+                        "text": str(target.get("fact_text") or "")[:500],
+                        "artifact_id": str(target.get("artifact_id") or ""),
+                    })
+                except Exception:
+                    continue
+            for d_seq in dead_ends_to_review:
+                try:
+                    target = self.shared_graph._require_dead_end_target(d_seq)
+                    prompt_subjects.append({
+                        "subject_id": f"dead_end:{d_seq}",
+                        "type": "dead_end",
+                        "dead_end_seq": d_seq,
+                        "text": str(target.get("reason") or "")[:500],
+                        "artifact_id": str(target.get("artifact_id") or ""),
+                    })
+                except Exception:
+                    continue
+            if not prompt_subjects:
+                continue
+
+            messages = [
+                {"role": "system", "content": (
+                    "You are the Reviewer evidence gate for a CTF swarm. Return JSON only. "
+                    "Evaluate whether each reported fact or dead-end is proven by the provided "
+                    "durable artifact evidence. Never accept a flag. "
+                    "Allowed decisions: verified, candidate, rejected, needs_retest. "
+                    "For verified, you MUST reference at least one valid evidence reference (e.g. artifact:<id>). "
+                    "Format: {\"decisions\": [{\"subject_id\": \"...\", \"decision\": \"...\", "
+                    "\"evidence_refs\": [\"artifact:...\"], \"reason\": \"...\"}]}"
+                )},
+                {"role": "user", "content": json.dumps(
+                    {"report_seq": rep_seq, "subjects": prompt_subjects,
+                     "artifacts": artifact_excerpts,
+                     "allowed_artifacts": list(allowed_artifacts)[:8]},
+                    ensure_ascii=False, separators=(",", ":")
+                )},
+            ]
+            try:
+                resp = await self.review_llm.chat(
+                    model=str(profile.get("model")), messages=messages,
+                    temperature=0.0, max_tokens=1500, stream=False,
+                    run_id=self.run_id, challenge_id=self.challenge.id,
+                    solver_id="reviewer",
+                )
+                parsed = json.loads(str(getattr(resp, "content", "") or "").strip())
+                items = parsed.get("decisions") if isinstance(parsed, dict) else []
+                if not isinstance(items, list):
+                    items = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    sub_id = str(item.get("subject_id") or "")
+                    dec = str(item.get("decision") or "candidate").strip().lower()
+                    reason = str(item.get("reason") or "")[:500]
+                    refs = [str(x) for x in (item.get("evidence_refs") or []) if str(x).strip()]
+                    valid_refs = []
+                    for ref in refs:
+                        if ref.startswith("artifact:") and ref.removeprefix("artifact:") in allowed_artifacts:
+                            valid_refs.append(ref)
+                        elif ref.startswith("event:") or ref.startswith("report:"):
+                            valid_refs.append(ref)
+                    if sub_id.startswith("fact:"):
+                        try:
+                            f_seq = int(sub_id.removeprefix("fact:"))
+                            self.shared_graph.decide_evidence_review(
+                                actor="reviewer", decision=dec, subject_id=sub_id,
+                                fact_seq=f_seq, evidence_refs=valid_refs,
+                                reason=reason, report_seq=rep_seq,
+                            )
+                            decided_facts.add(f_seq)
+                        except Exception:
+                            pass
+                    elif sub_id.startswith("dead_end:"):
+                        try:
+                            d_seq = int(sub_id.removeprefix("dead_end:"))
+                            self.shared_graph.decide_evidence_review(
+                                actor="reviewer", decision=dec, subject_id=sub_id,
+                                dead_end_seq=d_seq, evidence_refs=valid_refs,
+                                reason=reason, report_seq=rep_seq,
+                            )
+                            decided_dead_ends.add(d_seq)
+                        except Exception:
+                            pass
+            except Exception as exc:
+                # Fail closed: emit blocked diagnostic without revealing keys or endpoints
+                if self.bus is not None:
+                    try:
+                        await self.bus.publish({
+                            "type": "reviewer_evidence_gate_blocked",
+                            "run_id": self.run_id,
+                            "report_seq": rep_seq,
+                            "reason": "reviewer_model_call_failed",
+                            "error_type": type(exc).__name__,
+                            "reviewer_profile": profile.get("model", ""),
+                            "operator_attention": True,
+                        })
+                    except Exception:
+                        pass
+                break
+    async def _review_intent_quality(self, decision: Any, reason_cycle_id: str) -> dict[str, Any]:
+        """Review one Reason proposal with only safe metadata and reviewed facts."""
+        profile = self._reviewer_profile()
+        if not self.review_policy.get("enabled", True):
+            raise RuntimeError("reviewer_disabled")
+        if self.review_llm is None or not profile.get("model"):
+            raise RuntimeError("reviewer_unavailable")
+        intent = {
+            "intent_id": str(getattr(decision, "intent_id", "")),
+            "goal": str(getattr(decision, "goal", ""))[:1000],
+            "worker_class": str(getattr(decision, "worker_class", "code")),
+            "mode": str(getattr(decision, "mode", "explore")),
+            "profile": str(getattr(decision, "profile", "")),
+            "direction": str(getattr(decision, "direction", "")),
+            "from_facts": [int(x) for x in (getattr(decision, "from_facts", []) or []) if int(x) > 0][:32],
+        }
+        messages = [
+            {"role": "system", "content": (
+                "You are the Reviewer quality gate for a CTF swarm. Return JSON only. "
+                "Review whether the proposed Intent is justified by reviewed facts and "
+                "worth dispatching. Never accept flags. Use decision approved, revise, "
+                "duplicate, blocked, or defer. A revise replacement must be narrower and "
+                "only reference original from_facts. Shape: {decision, reason, "
+                "evidence_refs, replacement:{goal,worker_class,from_facts,mode,profile,rationale}}."
+            )},
+            {"role": "user", "content": json.dumps(
+                {"intent": intent, "reviewed_context": self._reviewer_context_payload(),
+                 "runtime": {"run_id": str(self.run_id),
+                             "reason_cycle_id": str(reason_cycle_id),
+                             "active_workers": int(self._worker_lane_gate.snapshot().get("ordinary_active", 0))}},
+                ensure_ascii=False, separators=(",", ":"))},
+        ]
+        response = await self.review_llm.chat(
+            model=str(profile.get("model")), messages=messages,
+            temperature=0.0, max_tokens=1000, stream=False,
+            run_id=self.run_id, challenge_id=self.challenge.id,
+            solver_id="reviewer",
+        )
+        raw_content = str(getattr(response, "content", "") or "").strip()
+        try:
+            from dswarm.solver.reason import _extract_json
+            parsed = _extract_json(raw_content)
+        except (ImportError, TypeError, ValueError):
+            parsed = {}
+        if not isinstance(parsed, dict) or not parsed:
+            raise RuntimeError("reviewer_invalid_json")
+        return parsed
 
     async def _emit_run_finished(self, *, flag: "Optional[str]", solved: bool,
                                  reason: str = "finished") -> None:
@@ -1430,11 +1928,23 @@ class Swarm(
             planner_diagnostic=self.reason_planner_diagnostic,
             lane_gate=self._worker_lane_gate,
             initial_runtime_operation_kind=self.initial_runtime_operation_kind,
+            # Production runs must not dispatch ordinary intents without the
+            # independent Reviewer callback. Recon/recovery bypass in scheduler.
+            require_reviewer=True,
+            intent_review_fn=(self._review_intent_quality
+                              if (self.review_llm is not None or self.llm is not None)
+                              else None),
+            evidence_review_fn=(self._review_worker_evidence
+                                if self.review_llm is not None else None),
+            owner_swarm=self,
         )
         try:
             out = await swarm.run()
             flags = list(out.get("flags") or [])
-            solved = bool(out.get("solved") or flags)
+            # ReasonSwarm already applies the authoritative expected_flags and
+            # multi_flag completion rule. Never treat a partial flag list as a
+            # solved run at the coordinator boundary.
+            solved = bool(out.get("solved"))
             winner_outcome = out.get("winner_outcome")
             winner_name = (
                 (getattr(winner_outcome, "engine", "") or "reason")

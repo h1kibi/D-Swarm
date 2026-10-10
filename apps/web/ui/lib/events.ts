@@ -52,21 +52,16 @@ const BLACKBOARD_CONSUMED_KINDS = new Set([
   "fact_added", "dead_end", "poc_saved", "poc_claimed", "poc_concluded",
   "runtime_degraded", "worker_backend_degraded", "engine_degraded",
   "phase_transition", "worker_budget_exhausted", "cost_budget_exhausted",
-  "intent_reopened", "fact_rejected", "fact_superseded", "fact_merged",
-  "intent_state_changed", "operator_directive_changed", "hitl_classified",
-  "resource_lock_changed", "flag_invalidated", "flag_found", "flag_unverified",
-  "flag_audit", "review_proposal", "need_input", "awaiting_operator",
-  "operator_paused", "operator_resumed", "worker_spawned", "review_started",
-  "review_finished", "review_finding", "fact_challenged", "fact_revalidated",
+  "review_started", "review_finished", "review_finding", "fact_challenged", "fact_revalidated",
   "route_suppressed", "route_reopened", "branch_split", "branch_resolved",
-  "provider_recovery_directive", "worker_recovery_scheduled",
+  "provider_recovery_directive", "provider_recovery_scheduled", "provider_recovery_activated",
+  "provider_recovery_blocked", "binding_effective_changed", "worker_recovery_scheduled",
   "provider_dispatch_paused", "worker_recovery_exhausted", "provider_batch_alert",
-  "coordinator_directive", "worker_killed", "worker_spawn_rejected",
-  "worker_finished", "goal_complete", "budget_exhausted", "reason_start",
-  "reason_done", "race_started", "race_concluded",
-  // Secondary typed consumers (reason-loop and pheromone finding folds).
-  "finding_upserted", "recon_started", "recon_completed", "reason_cycle_started",
-  "intent_skipped", "dispatch_decision", "fallback_dispatch", "intent_completed",
+  "intent_interrupted", "intent_recovery_required", "intent_recovery_blocked", "intent_recovery_exhausted",
+  "reason_health_changed", "reason_blocked", "reason_recovered", "coordinator_directive", "worker_killed", "worker_spawn_rejected",
+  "worker_finished", "goal_complete", "budget_exhausted", "reason_start", "reason_done",
+  "race_started", "race_concluded", "finding_upserted", "recon_started", "recon_completed",
+  "reason_cycle_started", "intent_skipped", "dispatch_decision", "fallback_dispatch", "intent_completed",
   "intent_failed", "reason_cycle_completed", "reason_loop_finished",
 ]);
 
@@ -200,9 +195,17 @@ export interface WorkerRuntimeStatus {
   cancelled?: boolean;
   steered?: boolean;
   error?: string;
-  phase?: string;          // I: granular lifecycle phase
-  intent_id?: string;      // I: the intent this worker is executing
-  tokens_spent?: number;   // I: running token total for this worker
+  phase?: string;
+  intent_id?: string;
+  tokens_spent?: number;
+  claim_state?: string;
+  provider_status?: string;
+  provider_reason?: string;
+  stdout?: string;
+  stderr?: string;
+  artifact_ids?: string[];
+  no_feedback?: boolean;
+  real_output_without_flag?: boolean;
 }
 
 export type WorkerLaneRole = "worker" | "review";
@@ -364,9 +367,8 @@ export interface OperatorDirective {
 
 /** The shared knowledge blackboard (SQLiteSharedGraph), folded from the
  *  blackboard.delta event stream. This is the swarm's COLLABORATION layer:
- *  every intent's claim lifecycle (who took it, is it done), every fact with its
  *  full provenance, dead-ends, the flag — plus a raw event timeline. */
-export type IntentDispatchState = "active" | "resume" | "retired" | "closed";
+export type IntentDispatchState = "active" | "resume" | "awaiting_validation" | "retired" | "closed";
 export type FactLifecycleState =
   | "unresolved" | "challenged" | "revalidated"
   | "rejected" | "merged" | "superseded";
@@ -376,13 +378,13 @@ export interface BlackboardIntent {
   goal: string;
   summary?: string;      // deepseek-flash zh gist (replaces goal in the card head)
   workerClass: string;
-  fromFacts: number[];   // shared_graph fact seqs that motivated this intent
-  toFactSeq?: number;    // shared_graph fact seq produced when the intent concluded
+  fromFacts: number[];
+  toFactSeq?: number;
   status: "open" | "claimed" | "done";
-  dispatchState?: IntentDispatchState;  // A/J: active | resume | retired | closed
-  closeReason?: string;  // why it left the dispatch pool
-  worker?: string;       // the solver that claimed it
-  proposedTs: number;
+  dispatchState?: IntentDispatchState;
+  closeReason?: string;
+  worker?: string;
+  proposedTs?: number;
   claimedTs?: number;
   concludedTs?: number;
 }
@@ -414,6 +416,19 @@ export interface BlackboardReviewFinding {
   actor: string;
   ts: number;
 }
+export interface BlackboardLineageEdge {
+  id: string;
+  from: string;
+  to: string;
+  kind: "planned" | "claimed" | "produced" | "failed" | "reopened" | "suppressed";
+  sourceEventSeq?: number;
+  routeHash?: string;
+  branchId?: string;
+  intentId?: string;
+  workerId?: string;
+  factSeq?: number;
+  ts: number;
+}
 export interface BlackboardSuppressedRoute {
   routeHash: string;
   label?: string;
@@ -427,7 +442,7 @@ export interface BlackboardBranch {
   title: string;
   actor: string;
   ts: number;
-  status?: string;
+  status: "open" | "resolved";
 }
 export interface BlackboardDirective {
   action: string;
@@ -492,11 +507,12 @@ export interface BlackboardView {
   pocs: BlackboardPoc[];
   deadEnds: { deadEndSeq?: number; reason: string; actor: string; ts: number }[];
   reviewFindings: BlackboardReviewFinding[];
+  lineageEdges: BlackboardLineageEdge[];
   suppressedRoutes: BlackboardSuppressedRoute[];
   branches: BlackboardBranch[];
   directives: BlackboardDirective[];
   unverifiedFlags: BlackboardFlagClaim[];
-  flag?: string;                       // first/primary flag (back-comat)
+  flag?: string;                       // first/primary flag (back-compat)
   flags?: string[];                    // every distinct flag captured (multi-flag)
   events: BlackboardEvent[];           // append-only timeline
   workers: string[];                   // distinct actors seen (for lanes/legend)
@@ -568,13 +584,15 @@ export interface DeckState {
   outcomeDetail?: string;
   // pentest: why the engagement goal was judged met (from the goal_complete event).
   goalWhy?: string;
-  // set when the planner PAUSED waiting for operator input (a worker raised a
-  // NEED_INPUT / env_down). Holds the outstanding ask(s). Cleared on resume.
+  // set when the planner pauses waiting for operator input.
   awaitingOperator?: string;
-  // M9a runtime observability: run-level degradation feed, folded from
-  // actor="coordinator" runtime_degraded deltas (arrival order, deduped by
-  // engine+reason). Observational only — never a flag/verdict source.
   runtimeDegraded: { engine: string; reason: string; ts?: number }[];
+  reasonBlocked?: boolean;
+  reasonBlockedReason?: string;
+  fallbackActive?: boolean;
+  fallbackReason?: string;
+  degraded?: boolean;
+  degradedReason?: string;
 }
 
 export function emptyDeck(runId: string): DeckState {
@@ -599,6 +617,7 @@ export function emptyDeck(runId: string): DeckState {
       pocs: [],
       deadEnds: [],
       reviewFindings: [],
+      lineageEdges: [],
       suppressedRoutes: [],
       branches: [],
       directives: [],
@@ -611,6 +630,12 @@ export function emptyDeck(runId: string): DeckState {
     operatorDirectives: [],
     resourceLocks: [],
     runtimeDegraded: [],
+    reasonBlocked: false,
+    reasonBlockedReason: undefined,
+    fallbackActive: false,
+    fallbackReason: undefined,
+    degraded: false,
+    degradedReason: undefined,
     compactEpochs: 0,
     gauge: { zones: [], total: 0, limit: 0 },
     usd: 0,
@@ -735,7 +760,7 @@ function blackboardOwningIntent(
     if (exact) return exact;
   }
   const within = (it: BlackboardIntent) => {
-    const lo = it.claimedTs ?? it.proposedTs;
+    const lo = it.claimedTs ?? it.proposedTs ?? 0;
     const hi = it.concludedTs ?? Infinity;
     return ts >= lo - 1 && ts <= hi + 1;
   };
@@ -781,34 +806,27 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
   const s: DeckState = {
     ...prev,
     lanes: { ...prev.lanes },
-    graph: { ...prev.graph, evidence: [...prev.graph.evidence], hypotheses: [...prev.graph.hypotheses], deadEnds: [...prev.graph.deadEnds] },
-    sharedGraph: { verified: [...prev.sharedGraph.verified], candidates: [...prev.sharedGraph.candidates] },
-    reason: { ...prev.reason, intents: [...prev.reason.intents], audit: [...prev.reason.audit] },
-    insights: [...prev.insights],
-    terminal: [...prev.terminal],
-    chat: prev.chat,
-    model: { nodes: [...prev.model.nodes], edges: [...prev.model.edges], version: prev.model.version },
+    graph: { ...prev.graph, evidence: [...(prev.graph.evidence ?? [])], hypotheses: [...(prev.graph.hypotheses ?? [])], deadEnds: [...(prev.graph.deadEnds ?? [])] },
+    sharedGraph: { verified: [...(prev.sharedGraph.verified ?? [])], candidates: [...(prev.sharedGraph.candidates ?? [])] },
+    reason: { ...prev.reason, intents: [...(prev.reason.intents ?? [])], audit: [...(prev.reason.audit ?? [])] },
+    insights: [...(prev.insights ?? [])],
+    terminal: [...(prev.terminal ?? [])],
+    chat: [...(prev.chat ?? [])],
+    model: { nodes: [...(prev.model.nodes ?? [])], edges: [...(prev.model.edges ?? [])], version: prev.model.version },
     blackboard: {
-      intents: [...prev.blackboard.intents],
-      facts: [...prev.blackboard.facts],
-      pocs: [...prev.blackboard.pocs],
-      deadEnds: [...prev.blackboard.deadEnds],
-      reviewFindings: [...(prev.blackboard.reviewFindings ?? [])],
-      suppressedRoutes: [...(prev.blackboard.suppressedRoutes ?? [])],
-      branches: [...(prev.blackboard.branches ?? [])],
-      directives: [...(prev.blackboard.directives ?? [])],
-      unverifiedFlags: [...(prev.blackboard.unverifiedFlags ?? [])],
-      events: [...prev.blackboard.events],
-      workers: [...prev.blackboard.workers],
-      routeMetrics: prev.blackboard.routeMetrics
-        ? { ...prev.blackboard.routeMetrics }
-        : undefined,
-      flag: prev.blackboard.flag,
-      flags: [...(prev.blackboard.flags ?? [])],
+      intents: [...(prev.blackboard.intents ?? [])], facts: [...(prev.blackboard.facts ?? [])], pocs: [...(prev.blackboard.pocs ?? [])],
+      deadEnds: [...(prev.blackboard.deadEnds ?? [])], reviewFindings: [...(prev.blackboard.reviewFindings ?? [])],
+      lineageEdges: [...(prev.blackboard.lineageEdges ?? [])],
+      suppressedRoutes: [...(prev.blackboard.suppressedRoutes ?? [])], branches: [...(prev.blackboard.branches ?? [])],
+      directives: [...(prev.blackboard.directives ?? [])], unverifiedFlags: [...(prev.blackboard.unverifiedFlags ?? [])],
+      events: [...(prev.blackboard.events ?? [])], workers: [...(prev.blackboard.workers ?? [])],
+      routeMetrics: prev.blackboard.routeMetrics ? { ...prev.blackboard.routeMetrics } : undefined,
+      flag: prev.blackboard.flag, flags: [...(prev.blackboard.flags ?? [])],
     },
-    hitlRequests: [...prev.hitlRequests],
+    hitlRequests: [...(prev.hitlRequests ?? [])],
     operatorDirectives: [...(prev.operatorDirectives ?? [])],
     resourceLocks: [...(prev.resourceLocks ?? [])],
+    runtimeDegraded: [...(prev.runtimeDegraded ?? [])],
   };
   const m = s.model;
   const sid = ev.solver_id || "";
@@ -829,20 +847,15 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       s.challengeName = p.challenge?.name ?? s.challengeName;
       s.category = p.challenge?.category ?? s.category;
       s.target = p.challenge?.target ?? s.target;
-      // multi-flag: pick up the target flag count + mode bit so "collecting" works
-      // from the start of the run, not just at RUN_FINISHED.
       if (typeof p.challenge?.expected_flags === "number") s.expectedFlags = p.challenge.expected_flags;
       if (typeof p.challenge?.multi_flag === "boolean") s.multiFlag = p.challenge.multi_flag;
       if (sid) {
         const l = lane(s, sid);
         s.lanes[l.solverId] = { ...l, online: true, status: "online", statusReason: "started" };
       }
-      // relabel the root with the real challenge name
       const root = m.nodes.find((n) => n.id === "challenge");
       if (root && s.challengeName) { root.label = s.challengeName; m.version += 1; }
       if (firstStart) {
-        // surface the operator's launch prompt as the opening "you" bubble, so
-        // the thread shows what kicked the run off — not just a system line.
         const prompt = userPromptBubble(p.challenge);
         if (prompt) pushChat(s, { role: "human", kind: "text", content: prompt, ts: ev.ts });
         pushChat(s, { role: "system", kind: "status", content: `Run started — ${s.challengeName || s.runId}`, ts: ev.ts, i18nKey: "sys.runStarted", i18nVars: { name: s.challengeName || s.runId } });
@@ -854,6 +867,14 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       const online = p.online !== false;
       const phase = (p.phase ?? l.phase ?? "").toString() || undefined;
       const role = roleFromWorkerRole(p.worker_role) ?? reviewRoleFromPhase(phase) ?? l.role;
+      const runtimePayload = p.runtime && typeof p.runtime === "object" ? (p.runtime as WorkerRuntimeStatus) : undefined;
+      const runtime = runtimePayload ? {
+        ...(l.runtime ?? {}),
+        ...runtimePayload,
+        stdout: typeof runtimePayload.stdout === "string" ? runtimePayload.stdout.slice(-12000) : l.runtime?.stdout,
+        stderr: typeof runtimePayload.stderr === "string" ? runtimePayload.stderr.slice(-12000) : l.runtime?.stderr,
+        artifact_ids: Array.isArray(runtimePayload.artifact_ids) ? runtimePayload.artifact_ids.slice(-32) : l.runtime?.artifact_ids,
+      } : l.runtime;
       s.lanes[l.solverId] = {
         ...l,
         online,
@@ -862,15 +883,12 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
         engine: (p.engine ?? l.engine ?? "").toString() || undefined,
         role,
         phase,
-        // I: carry intent/tokens/paused when the status payload (or its runtime
-        // block) supplies them; sticky otherwise.
-        intentId: (p.intent_id ?? p.runtime?.intent_id ?? l.intentId ?? "").toString() || undefined,
+        intentId: (p.intent_id ?? runtimePayload?.intent_id ?? l.intentId ?? "").toString() || undefined,
         tokensSpent: typeof p.tokens_spent === "number" ? p.tokens_spent
-          : (typeof p.runtime?.tokens_spent === "number" ? p.runtime.tokens_spent : l.tokensSpent),
+          : (typeof runtimePayload?.tokens_spent === "number" ? runtimePayload.tokens_spent : l.tokensSpent),
         paused: p.reason === "paused" ? true : (online ? (l.paused ?? false) : false),
-        // sticky: a later status emit with no session must not wipe a known id.
         session: (p.session ?? l.session ?? "").toString() || undefined,
-        runtime: (p.runtime && typeof p.runtime === "object") ? p.runtime : l.runtime,
+        runtime,
       };
       break;
     }
@@ -952,25 +970,36 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
     }
     case EventType.TOOL_CALL_RESULT: {
       const l = lane(s, ev.solver_id);
-      const res = p.result || {};
-      const cond = (res.condensed ?? "").toString();
+      const res = p.result && typeof p.result === "object" ? p.result : {};
+      const cond = String((res as Record<string, unknown>).condensed ?? "");
+      const raw = String((res as Record<string, unknown>).raw ?? cond);
       const head = cond.split("\n")[0] || "(result)";
-      // keep a fuller preview in the transcript (up to ~6 lines / 800 chars) so a
-      // tool's output isn't reduced to a single line — the timeline redesign lets
-      // the bubble wrap/scroll instead of truncating to the first line.
       const preview = cond.split("\n").slice(0, 6).join("\n").slice(0, 800) || head;
+      const previousRuntime = l.runtime ?? {};
       s.lanes[l.solverId] = {
         ...l,
         toolLines: [...l.toolLines, head].slice(-12),
         online: activityOnline(s),
         statusReason: undefined,
+        runtime: raw && raw !== cond
+          ? { ...previousRuntime, stdout: `${previousRuntime.stdout ?? ""}${previousRuntime.stdout ? "\n" : ""}${raw}`.slice(-12000) }
+          : previousRuntime,
       };
       pushChat(s, { role: "agent", solverId: l.solverId, kind: "tool", content: `↳ ${preview}`, ts: ev.ts });
       break;
     }
-    case EventType.TERMINAL_OUTPUT:
-      s.terminal = [...s.terminal, p.text ?? ""].slice(-1000);
+    case EventType.TERMINAL_OUTPUT: {
+      const l = lane(s, ev.solver_id);
+      const text = String(p.text ?? "");
+      s.terminal = [...s.terminal, text].slice(-1000);
+      if (text) {
+        s.lanes[l.solverId] = {
+          ...l,
+          runtime: { ...(l.runtime ?? {}), stdout: `${l.runtime?.stdout ?? ""}${l.runtime?.stdout ? "\n" : ""}${text}`.slice(-12000) },
+        };
+      }
       break;
+    }
     case EventType.SOLVE_GRAPH_DELTA:
       if (p.kind === "evidence_added") {
         if (!isRuntimeInfraFactText(p.fact)) s.graph.evidence = [...s.graph.evidence, p.fact].slice(-50);
@@ -1077,48 +1106,52 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           break;
         }
         case "intent_proposed": {
-          const fromFacts: number[] = Array.isArray(p.from_facts)
-            ? p.from_facts.filter((seq: any) => typeof seq === "number" && seq > 0)
-            : [];
-          if (!bb.intents.some((i) => i.id === p.intent_id)) {
-            bb.intents = [...bb.intents, {
-              id: p.intent_id, goal: p.goal ?? "", workerClass: p.worker_class ?? "code",
-              fromFacts, status: "open", proposedTs: ev.ts,
-            }];
+          const fromFacts: number[] = Array.isArray(p.from_facts) ? p.from_facts.filter((seq: unknown) => typeof seq === "number" && seq > 0) : [];
+          const intentId = typeof p.intent_id === "string" ? p.intent_id.trim() : "";
+          if (!intentId) { tlabel("proposed intent without identity"); break; }
+          if (!bb.intents.some((i) => i.id === intentId)) {
+            bb.intents = [...bb.intents, { id: intentId, goal: p.goal ?? "", workerClass: p.worker_class ?? "code", fromFacts, status: "open", proposedTs: ev.ts }];
           } else {
-            bb.intents = bb.intents.map((i) =>
-              i.id === p.intent_id ? { ...i, fromFacts: fromFacts.length ? fromFacts : i.fromFacts } : i);
+            bb.intents = bb.intents.map((i) => i.id === intentId ? { ...i, fromFacts: fromFacts.length ? fromFacts : i.fromFacts } : i);
           }
-          tlabel(`proposed ${p.intent_id} · ${(p.goal ?? "").slice(0, 60)}`);
+          const explicitFrom = typeof p.lineage_from === "string" ? p.lineage_from.trim() : "";
+          const explicitTo = typeof p.lineage_to === "string" ? p.lineage_to.trim() : "";
+          if (explicitFrom && explicitTo === `intent:${intentId}`) {
+            bb.lineageEdges = [...bb.lineageEdges, {
+              id: `edge:planned:${p.intent_seq ?? ev.seq}:${intentId}`,
+              from: explicitFrom, to: explicitTo, kind: "planned" as const,
+              sourceEventSeq: Number(p.intent_seq ?? p.source_event_seq ?? ev.seq) || undefined,
+              routeHash: p.route_hash ? String(p.route_hash) : undefined,
+              branchId: p.branch_id ? String(p.branch_id) : undefined, intentId, ts: ev.ts,
+            }].slice(-240);
+          }
+          tlabel(`proposed ${intentId} · ${(p.goal ?? "").slice(0, 60)}`);
           const fromIds = fromFacts.map((seq: number) => `fact:${seq}`);
           const solverFrom = actor ? `solver:${actor}` : (sid ? `solver:${sid}` : undefined);
           if (solverFrom) ensureSolverNode(m, actor || sid);
-          addGraphNode(m, "intent", p.goal ?? "", {
-            id: `intent:${p.intent_id}`,
-            from: solverFrom,
-            fromMulti: fromIds.length > 0 ? fromIds : undefined,
-            kind: "plans",
-            // intentId = stable id for radar grouping; proposer = who planned it
-            // (usually the coordinator/reason actor) so the radar can label the
-            // intent centre without re-deriving it from incoming solver edges.
-            meta: { workerClass: p.worker_class ?? "code", intentId: p.intent_id, proposer: actor || sid || undefined },
-          });
+          addGraphNode(m, "intent", p.goal ?? "", { id: `intent:${intentId}`, from: solverFrom, fromMulti: fromIds.length > 0 ? fromIds : undefined, kind: "plans", meta: { workerClass: p.worker_class ?? "code", intentId, proposer: actor || sid || undefined } });
           break;
         }
         case "intent_claimed": {
-          bb.intents = bb.intents.map((i) =>
-            i.id === p.intent_id ? { ...i, status: "claimed", worker: p.worker ?? actor, claimedTs: ev.ts } : i);
-          tlabel(`${p.worker ?? actor} claimed ${p.intent_id}`);
+          const intentId = typeof p.intent_id === "string" ? p.intent_id.trim() : "";
+          const workerId = typeof p.worker === "string" ? p.worker.trim() : (actor || "");
+          bb.intents = intentId ? bb.intents.map((i) => i.id === intentId ? { ...i, status: "claimed", worker: workerId || i.worker, claimedTs: ev.ts } : i) : bb.intents;
+          if (intentId && workerId) {
+            bb.lineageEdges = [...bb.lineageEdges, { id: `edge:claimed:${p.intent_seq ?? ev.seq}:${intentId}:${workerId}`, from: `intent:${intentId}`, to: `worker:${workerId}`, kind: "claimed" as const, sourceEventSeq: Number(p.intent_seq ?? p.source_event_seq ?? ev.seq) || undefined, intentId, workerId, ts: ev.ts }].slice(-240);
+          }
+          tlabel(`${workerId || "unknown worker"} claimed ${intentId || "unknown intent"}`);
           break;
         }
         case "intent_concluded": {
+          const intentId = typeof p.intent_id === "string" ? p.intent_id.trim() : "";
+          const workerId = typeof p.worker === "string" ? p.worker.trim() : (actor || "");
           const toFactSeq = typeof p.to_fact_seq === "number" && p.to_fact_seq > 0 ? p.to_fact_seq : undefined;
-          bb.intents = bb.intents.map((i) =>
-            i.id === p.intent_id ? { ...i, status: "done", dispatchState: "closed", closeReason: p.result ?? i.closeReason, worker: i.worker ?? p.worker ?? actor, concludedTs: ev.ts, toFactSeq: toFactSeq ?? i.toFactSeq } : i);
-          tlabel(`${p.worker ?? actor} concluded ${p.intent_id}`);
-          if (toFactSeq) {
-            addGraphEdge(m, `intent:${p.intent_id}`, `fact:${toFactSeq}`, "produces");
+          bb.intents = intentId ? bb.intents.map((i) => i.id === intentId ? { ...i, status: "done", dispatchState: "closed", closeReason: p.result ?? i.closeReason, worker: i.worker ?? workerId, concludedTs: ev.ts, toFactSeq: toFactSeq ?? i.toFactSeq } : i) : bb.intents;
+          if (intentId && workerId && toFactSeq) {
+            bb.lineageEdges = [...bb.lineageEdges, { id: `edge:produced:${p.intent_seq ?? ev.seq}:${intentId}`, from: `worker:${workerId}`, to: `fact:${toFactSeq}`, kind: "produced" as const, sourceEventSeq: Number(p.intent_seq ?? p.source_event_seq ?? ev.seq) || undefined, intentId, workerId, factSeq: toFactSeq, routeHash: p.route_hash ? String(p.route_hash) : undefined, ts: ev.ts }].slice(-240);
           }
+          tlabel(`${workerId || "unknown worker"} concluded ${intentId || "unknown intent"}`);
+          if (intentId && toFactSeq) addGraphEdge(m, `intent:${intentId}`, `fact:${toFactSeq}`, "produces");
           break;
         }
         case "fact_added": {
@@ -1259,33 +1292,128 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
         case "runtime_degraded":
         case "worker_backend_degraded": {
           tlabel(`${actor} runtime degraded: ${p.reason ?? p.backend ?? "unknown"}`);
-          {
-            const engine = String(p.engine ?? p.solver_id ?? "");
-            const reason = String(p.reason ?? p.backend ?? "");
-            if (!s.runtimeDegraded.some(
-              (row) => row.engine === engine && row.reason === reason,
-            )) {
-              s.runtimeDegraded = [...s.runtimeDegraded, { engine, reason, ts: ev.ts }];
-            }
+          s.degraded = true;
+          s.degradedReason = String(p.reason ?? p.backend ?? p.kind ?? "runtime degraded");
+          const engine = String(p.engine ?? p.solver_id ?? "");
+          const reason = String(p.reason ?? p.backend ?? "");
+          if (!s.runtimeDegraded.some((row) => row.engine === engine && row.reason === reason)) {
+            s.runtimeDegraded = [...s.runtimeDegraded, { engine, reason, ts: ev.ts }];
           }
-          const sid = p.solver_id ?? p.engine ?? actor;
-          if (sid) {
-            const l = lane(s, sid);
-            s.lanes[l.solverId] = { ...l, runtime: {
-              backend: p.backend ?? p.requested_backend ?? "local",
-              status: p.status ?? "degraded",
-            } };
+          const degradedSid = p.solver_id ?? p.engine ?? actor;
+          if (degradedSid) {
+            const l = lane(s, degradedSid);
+            s.lanes[l.solverId] = { ...l, runtime: { backend: p.backend ?? p.requested_backend ?? "local", status: p.status ?? "degraded" } };
           }
           break;
         }
         case "engine_degraded": {
-          // Retired-path tolerance (docs/07 §7.3): pre-pi sessions recorded
-          // dispatch-time engine health checks. Keep a neutral log line so old
-          // sessions still replay; no live UI surface reads this anymore.
           const eng = String(p.engine ?? "");
+          s.degraded = p.status !== "recovered";
+          s.degradedReason = s.degraded ? String(p.reason ?? "engine unavailable") : undefined;
           tlabel(`engine ${eng || "?"} ${p.status === "recovered" ? "recovered" : `degraded: ${p.reason ?? "unavailable"}`}`);
           break;
         }
+        case "provider_recovery_activated":
+        case "binding_effective_changed": {
+          s.fallbackActive = true;
+          s.fallbackReason = String(p.reason ?? p.category ?? "provider fallback active");
+          s.degraded = false;
+          s.degradedReason = undefined;
+          tlabel(`provider fallback active: ${p.role ?? "worker"}`);
+          break;
+        }
+        case "provider_recovery_blocked": {
+          // Role-scoped, mirroring the host state machine: a Reason/planner
+          // binding that could not recover blocks the planner loop; a Worker
+          // binding only degrades the run. Never fabricate a recovery here.
+          const blockedRole = String(p.role ?? p.binding_role ?? p.component ?? "").trim().toLowerCase();
+          const blockedReason = String(p.blocked_reason ?? p.reason ?? "provider recovery blocked");
+          if (blockedRole === "reason" || blockedRole === "planner") {
+            s.reasonBlocked = true;
+            s.reasonBlockedReason = blockedReason;
+            s.awaitingOperator = blockedReason;
+          } else {
+            s.degraded = true;
+            s.degradedReason = blockedReason;
+          }
+          tlabel(`provider recovery blocked: ${blockedReason.slice(0, 72)}`);
+          break;
+        }
+        case "reason_health_changed": {
+          // Host-owned Reason state machine (docs/17 §5.4). The typed state lives
+          // in the reason-loop view (lib/reason.ts); here we only mirror the
+          // operator-visible transitions onto the run banner/timeline.
+          const healthState = String(p.health_state ?? "");
+          if (healthState === "healthy") {
+            if (s.awaitingOperator?.toLowerCase().includes("reason")) s.awaitingOperator = undefined;
+            tlabel("Reason health: healthy");
+          } else if (healthState) {
+            if (p.operator_attention) s.awaitingOperator = `Reason ${healthState}`;
+            tlabel(`Reason health: ${healthState}`);
+          }
+          break;
+        }
+        case "reason_blocked": {
+          s.reasonBlocked = true;
+          s.reasonBlockedReason = String(p.reason ?? "Reason planner unavailable");
+          s.awaitingOperator = s.reasonBlockedReason;
+          tlabel(`Reason blocked: ${s.reasonBlockedReason.slice(0, 72)}`);
+          break;
+        }
+        case "reason_recovered": {
+          s.reasonBlocked = false;
+          s.reasonBlockedReason = undefined;
+          if (s.awaitingOperator?.toLowerCase().includes("reason")) s.awaitingOperator = undefined;
+          tlabel("Reason recovered");
+          break;
+        }
+        case "intent_interrupted": {
+          const interruptedId = String(p.intent_id ?? "");
+          const interruptedWorker = String(p.worker ?? actor ?? "");
+          const interruptedLane = interruptedWorker ? lane(s, interruptedWorker) : undefined;
+          if (interruptedLane) {
+            s.lanes[interruptedLane.solverId] = {
+              ...interruptedLane, online: false, paused: true,
+              status: "awaiting_validation", statusReason: "no_feedback_interruption",
+              intentId: interruptedId || interruptedLane.intentId,
+            };
+          }
+          // The parked state belongs to the INTENT, not just the lane: the intent
+          // card, the route tree and the Observer summary all read it from here.
+          // Reason owns the next move, so the intent is NOT concluded.
+          if (interruptedId) {
+            bb.intents = bb.intents.map((intent) => intent.id === interruptedId
+              ? {
+                  ...intent,
+                  dispatchState: "awaiting_validation" as const,
+                  closeReason: String(p.reason ?? intent.closeReason ?? "no_feedback_interruption"),
+                  worker: intent.worker ?? (interruptedWorker || undefined),
+                }
+              : intent);
+          }
+          tlabel(`intent ${interruptedId || "?"} awaiting validation`);
+          break;
+        }
+        case "intent_recovery_required": {
+          const originalId = String(p.intent_id ?? "");
+          const recoveryId = p.recovery_intent_id ? String(p.recovery_intent_id) : "";
+          const recoveryWorker = String(p.worker ?? actor ?? "");
+          if (recoveryWorker) {
+            const recoveryLane = lane(s, recoveryWorker);
+            s.lanes[recoveryLane.solverId] = {
+              ...recoveryLane, online: true,
+              status: recoveryId ? "recovery_queued" : "awaiting_validation",
+              statusReason: recoveryId ? `recovery:${p.recovery_attempt ?? "?"}` : "validation_required",
+              intentId: recoveryId || originalId || recoveryLane.intentId,
+            };
+          }
+          tlabel(`intent ${originalId || "?"} recovery${recoveryId ? ` → ${recoveryId}` : " required"}`);
+          break;
+        }
+        case "intent_recovery_blocked":
+        case "intent_recovery_exhausted":
+          tlabel(`intent recovery ${p.intent_id ?? "?"} ${p.kind === "intent_recovery_exhausted" ? "exhausted" : "blocked"}`);
+          break;
         case "phase_transition": {
           tlabel(`${p.from ?? "phase"} → ${p.to ?? "phase"}`);
           break;
@@ -1655,56 +1783,71 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
           break;
         }
         case "route_suppressed": {
-          const routeHash = String(p.route_hash ?? "");
+          const routeHash = typeof p.route_hash === "string" ? p.route_hash.trim() : "";
           const row: BlackboardSuppressedRoute = {
-            routeHash,
-            label: p.label ? String(p.label) : undefined,
-            reason: String(p.reason ?? ""),
-            actor,
-            ts: ev.ts,
-            reopened: false,
+            routeHash, label: p.label ? String(p.label) : undefined,
+            reason: String(p.reason ?? ""), actor, ts: ev.ts, reopened: false,
           };
-          bb.suppressedRoutes = [
-            ...bb.suppressedRoutes.filter((r) => r.routeHash !== routeHash),
-            row,
-          ].slice(-60);
-          tlabel(`route suppressed: ${routeHash}${row.reason ? ` · ${row.reason.slice(0, 48)}` : ""}`);
-          const from = actor ? `solver:${actor}` : undefined;
-          if (from) ensureSolverNode(m, actor);
-          addGraphNode(m, "dead_end", `suppressed ${routeHash}: ${row.reason}`, {
-            id: `route:${routeHash}`,
-            from,
-            kind: "suppresses",
-            meta: { routeHash, reason: row.reason },
-          });
+          if (routeHash) bb.suppressedRoutes = [...bb.suppressedRoutes.filter((r) => r.routeHash !== routeHash), row].slice(-60);
+          const explicitFrom = typeof p.lineage_from === "string" ? p.lineage_from.trim() : "";
+          const explicitTo = typeof p.lineage_to === "string" ? p.lineage_to.trim() : "";
+          if (routeHash && explicitFrom && explicitTo) {
+            bb.lineageEdges = [...bb.lineageEdges, {
+              id: `edge:suppressed:${p.seq ?? ev.seq}:${routeHash}`,
+              from: explicitFrom, to: explicitTo, kind: "suppressed" as const,
+              sourceEventSeq: Number(p.seq ?? p.source_event_seq ?? ev.seq) || undefined,
+              routeHash, branchId: p.branch_id ? String(p.branch_id) : undefined, ts: ev.ts,
+            }].slice(-240);
+          }
+          tlabel(`route suppressed: ${routeHash || "unknown route"}${row.reason ? ` · ${row.reason.slice(0, 48)}` : ""}`);
           break;
         }
         case "route_reopened": {
-          const routeHash = String(p.route_hash ?? "");
-          bb.suppressedRoutes = bb.suppressedRoutes.map((r) =>
-            r.routeHash === routeHash ? { ...r, reopened: true } : r);
-          tlabel(`route reopened: ${routeHash}`);
+          const routeHash = typeof p.route_hash === "string" ? p.route_hash.trim() : "";
+          if (routeHash) bb.suppressedRoutes = bb.suppressedRoutes.map((r) => r.routeHash === routeHash ? { ...r, reopened: true } : r);
+          const explicitFrom = typeof p.lineage_from === "string" ? p.lineage_from.trim() : "";
+          const explicitTo = typeof p.lineage_to === "string" ? p.lineage_to.trim() : "";
+          if (routeHash && explicitFrom && explicitTo) {
+            bb.lineageEdges = [...bb.lineageEdges, {
+              id: `edge:reopened:${p.seq ?? ev.seq}:${routeHash}`,
+              from: explicitFrom, to: explicitTo, kind: "reopened" as const,
+              sourceEventSeq: Number(p.seq ?? p.source_event_seq ?? ev.seq) || undefined,
+              routeHash, branchId: p.branch_id ? String(p.branch_id) : undefined, ts: ev.ts,
+            }].slice(-240);
+          }
+          tlabel(`route reopened: ${routeHash || "unknown route"}`);
           break;
         }
         case "branch_split": {
-          const branchId = String(p.branch_id ?? p.parent ?? "");
-          bb.branches = [...bb.branches, {
-            branchId,
-            title: String(p.title ?? branchId),
-            actor,
-            ts: ev.ts,
-            status: "open",
-          }].slice(-60);
-          tlabel(`branch split: ${String(p.title ?? branchId).slice(0, 72)}`);
+          const branchId = typeof p.branch_id === "string" ? p.branch_id.trim() : "";
+          if (branchId) {
+            bb.branches = [...bb.branches.filter((branch) => branch.branchId !== branchId), {
+              branchId, title: String(p.title ?? branchId), actor, ts: ev.ts, status: "open" as const,
+            }].slice(-60);
+          }
+          const children: unknown[] = Array.isArray(p.branches) ? p.branches : [];
+          const childIds = children
+            .map((child: unknown): string => {
+              if (!child || typeof child !== "object") return "";
+              const id = (child as Record<string, unknown>).id;
+              return typeof id === "string" ? id.trim() : "";
+            })
+            .filter(Boolean);
+          if (branchId && childIds.length) {
+            const sourceEventSeq = Number(p.seq ?? p.source_event_seq ?? ev.seq) || undefined;
+            bb.lineageEdges = [...bb.lineageEdges, ...childIds.map((childId: string) => ({
+              id: `edge:branch:${sourceEventSeq ?? "event"}:${branchId}:${childId}`,
+              from: `branch:${branchId}`, to: `branch:${childId}`, kind: "planned" as const,
+              sourceEventSeq, branchId, ts: ev.ts,
+            }))].slice(-240);
+          }
+          tlabel(`branch split: ${String(p.title ?? (branchId || "unknown branch")).slice(0, 72)}`);
           break;
         }
         case "branch_resolved": {
-          const ids = [p.branch_id, ...(Array.isArray(p.resolved) ? p.resolved : [])]
-            .map((x) => String(x ?? "").trim())
-            .filter(Boolean);
+          const ids = [p.branch_id, ...(Array.isArray(p.resolved) ? p.resolved : [])].map((x) => String(x ?? "").trim()).filter(Boolean);
           const idSet = new Set(ids);
-          bb.branches = bb.branches.map((b) =>
-            idSet.has(b.branchId) ? { ...b, status: "resolved" } : b);
+          bb.branches = bb.branches.map((branch) => idSet.has(branch.branchId) ? { ...branch, status: "resolved" } : branch);
           tlabel(`branch resolved: ${ids.join(", ") || "branch"}`);
           break;
         }
@@ -1821,16 +1964,30 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
         // ── reason-scheduler / projector narration (folded structurally into
         // deck.reasonLoop / deck.findings below; these cases only give the
         // timeline a readable zh line instead of "unrecognized blackboard event")
+        case "reason_cycle_started": {
+          const cycleId = typeof p.reason_cycle_id === "string" ? p.reason_cycle_id.trim() : "";
+          const lineageFrom = typeof p.lineage_from === "string" ? p.lineage_from.trim() : "";
+          const lineageTo = typeof p.lineage_to === "string" ? p.lineage_to.trim() : "";
+          if (cycleId && lineageFrom && lineageTo) {
+            bb.lineageEdges = [...bb.lineageEdges, {
+              id: `edge:reason:${p.seq ?? ev.seq}:${cycleId}`,
+              from: lineageFrom, to: lineageTo, kind: "planned" as const,
+              sourceEventSeq: Number(p.seq ?? p.source_event_seq ?? ev.seq) || undefined,
+              ts: ev.ts,
+            }].slice(-240);
+          }
+          tlabel(`规划周期 ${cycleId || "?"} 开始（第 ${p.generation ?? "?"} 代）`);
+          break;
+        }
+        // ── reason-scheduler / projector narration (folded structurally into
+        // deck.reasonLoop / deck.findings below; these cases only give the
+        // timeline a readable zh line instead of "unrecognized blackboard event")
         case "recon_started": {
           tlabel(`侦察开始 · ${(p.goal ?? "").toString().slice(0, 56)}`);
           break;
         }
         case "recon_completed": {
           tlabel(`侦察完成 · 新发现 ${Number(p.new_findings ?? 0)} 条 · ${fmtMs(p.duration_ms)}`);
-          break;
-        }
-        case "reason_cycle_started": {
-          tlabel(`规划周期 ${p.reason_cycle_id ?? "?"} 开始（第 ${p.generation ?? "?"} 代）`);
           break;
         }
         case "reason_cycle_completed": {
@@ -2286,6 +2443,10 @@ export function reduce(prev: DeckState, ev: DSwarmEvent): DeckState {
       s.finished = false;
       s.solved = false;
       s.awaitingOperator = undefined;
+      s.reasonBlocked = false;
+      s.reasonBlockedReason = undefined;
+      s.degraded = false;
+      s.degradedReason = undefined;
       s.hitlRequests = [];
       const reopenedForResolve = p.reason === "resolve";
       if (reopenedForResolve) {

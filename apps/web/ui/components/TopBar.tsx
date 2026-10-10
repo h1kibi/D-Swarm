@@ -19,11 +19,14 @@ export function TopBar({
   running,
   stageInfo,
   inspectorOpen,
+  railCollapsed,
   onToggleRail,
   onToggleInspector,
   onJumpStage,
   onCommand,
   onResolve,
+  resolveBlocked = false,
+  onNewRun,
   onOpenBtw,
   theme,
   onToggleTheme,
@@ -33,11 +36,14 @@ export function TopBar({
   running: boolean;
   stageInfo: StageInfo;
   inspectorOpen: boolean;
+  railCollapsed: boolean;
   onToggleRail: () => void;
   onToggleInspector: () => void;
   onJumpStage: (stage: Stage) => void;
   onCommand: (target: string, action: string, text: string) => void;
   onResolve: (text?: string) => void;
+  resolveBlocked?: boolean;
+  onNewRun?: () => void;
   onOpenBtw?: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
@@ -60,15 +66,15 @@ export function TopBar({
   const stop = () => {
     if (window.confirm(t("op.stopConfirm"))) onCommand("global", "stop", "");
   };
-
   return (
     <header className="topbar" aria-label={t("topbar.aria")}>
       <button
-        className="icon-btn"
+        className={`icon-btn topbar-rail-toggle ${railCollapsed ? "is-collapsed" : ""}`}
         onClick={onToggleRail}
-        title={t("convo.toggleRuns")}
-        aria-label={t("convo.toggleRuns")}
-      ><Icon name="menu" /></button>
+        title={railCollapsed ? (lang === "zh" ? "显示目标列表" : "Show targets") : (lang === "zh" ? "隐藏目标列表" : "Hide targets")}
+        aria-label={railCollapsed ? (lang === "zh" ? "显示目标列表" : "Show targets") : (lang === "zh" ? "隐藏目标列表" : "Hide targets")}
+        aria-pressed={!railCollapsed}
+      ><Icon name={railCollapsed ? "panel" : "menu"} /></button>
       <span className="brand topbar-brand"><span>D-Swarm</span></span>
 
       {started && (
@@ -118,11 +124,26 @@ export function TopBar({
           {t("topbar.stop")}
         </button>
       )}
-      {started && deck.finished && (
+      {started && deck.finished && (resolveBlocked ? (
+        <>
+          <button
+            className="topbar-ctl danger"
+            disabled
+            title={lang === "zh" ? "该 Run 的历史绑定与当前 Target 不一致，不能继续恢复" : "This Run does not match its Target and cannot be resumed"}
+          >
+            {lang === "zh" ? "无法继续" : "Cannot continue"}
+          </button>
+          {onNewRun && (
+            <button className="topbar-ctl" onClick={onNewRun}>
+              {lang === "zh" ? "新建 Run" : "New Run"}
+            </button>
+          )}
+        </>
+      ) : (
         <button className="topbar-ctl" onClick={() => onResolve()}>
           {t("topbar.resolve")}
         </button>
-      )}
+      ))}
       {started && (
         <button
           className={`icon-btn ${inspectorOpen ? "on" : ""}`}

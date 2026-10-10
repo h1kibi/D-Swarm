@@ -30,6 +30,8 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 def _safe_dispatch_detail(exc: BaseException) -> str:
     """Return an operator-useful dispatch error without exposing host details."""
+    if getattr(exc, "code", None) == "target_dispatch_mismatch":
+        return "target_dispatch_mismatch: historical dispatch binding does not match the current Target; create a new Target Run"
     if isinstance(exc, RuntimeSnapshotBuildError):
         code = sanitize_public_text(exc.code, limit=160)
         safe_detail = sanitize_public_text(exc.safe_detail, limit=500)
@@ -214,8 +216,18 @@ async def retitle_run(run_id: str, request: Request) -> Any:
             mgr.rename(run_id, title)
         return {"ok": bool(title), "name": title, "pending": False}
 
+    saved_snapshot = run.binding_snapshot if isinstance(run.binding_snapshot, dict) else {}
+    snapshot_roles = saved_snapshot.get("roles") if isinstance(saved_snapshot.get("roles"), dict) else {}
+    saved_titler = snapshot_roles.get("titler") if isinstance(snapshot_roles.get("titler"), dict) else {}
     llm_profiles = mgr.worker_config.get().get("llm_profiles", {})
-    titler_profile = llm_profiles.get("titler") or {}
+    titler_profile = dict(saved_titler or llm_profiles.get("titler") or {})
+    from apps.web.reason_llm import resolve_reason_llm_endpoint
+    titler_endpoint = resolve_reason_llm_endpoint(
+        sessions_root=mgr.sessions_root,
+        worker_profiles=mgr.worker_config.get().get("worker_profiles", []),
+        profile=titler_profile,
+        llm_providers=mgr.worker_config.get().get("llm_providers", []),
+    )
     title_usage_writer = mgr.internal_usage_writer(
         run,
         solver_id="titler",
@@ -231,8 +243,13 @@ async def retitle_run(run_id: str, request: Request) -> Any:
         try:
             title = await generate_title(
                 prompt,
-                model=titler_profile.get("model"),
-                base_url=titler_profile.get("base_url") or None,
+                model=titler_profile.get("model") or titler_endpoint.get("model"),
+                base_url=titler_endpoint.get("base_url") or titler_profile.get("base_url") or None,
+                api_key=titler_endpoint.get("api_key"),
+                wire_api=str(titler_endpoint.get("wire_api") or titler_profile.get("wire_api") or "auto"),
+                auth_mode=str(titler_endpoint.get("auth_mode") or titler_profile.get("auth_mode") or "bearer"),
+                auth_header=str(titler_endpoint.get("auth_header") or titler_profile.get("auth_header") or "Authorization"),
+                auth_prefix=str(titler_endpoint.get("auth_prefix") if titler_endpoint.get("auth_prefix") is not None else titler_profile.get("auth_prefix") or "Bearer"),
                 usage_writer=title_usage_writer,
                 usage_context=title_usage_writer.context,
                 category=category,
@@ -292,6 +309,140 @@ async def new_run(request: Request) -> Any:
 @router.post("/{run_id}/start")
 async def start_run(run_id: str, request: Request) -> Any:
     body = await _require_dict_body(request)
+    # Target knowledge is a pre-launch, read-only context snapshot. Inject it
+    # before driver construction so the existing CLI prompt can see it, while
+    # retaining source attribution and keeping the provenance gate unchanged.
+    existing_run = request.app.state.manager.get(run_id)
+    inherited = list(getattr(existing_run, "inherited_verified_facts", []) or [])
+    if inherited:
+        body = dict(body)
+        body["inherited_verified_facts"] = inherited
+        original_prompt = str(body.get("prompt") or "").strip()
+        context_lines = [
+            "[READ-ONLY VERIFIED FACTS FROM PRIOR RUNS]",
+            "Treat these as leads/context only. Re-validate through real execution; they are not accepted flags or new evidence.",
+        ]
+        for fact in inherited:
+            text = str(fact.get("fact") or fact.get("fact_text") or "").strip()
+            if not text:
+                continue
+            source = str(fact.get("source_run_id") or "unknown")
+            seq = str(fact.get("fact_seq") or "?")
+            context_lines.append(f"- {text} (source run {source}, fact event #{seq})")
+        if len(context_lines) > 2:
+            context = "\n".join(context_lines)
+            body["prompt"] = (original_prompt + "\n\n" if original_prompt else "") + context
+            challenge = dict(body.get("challenge") or {})
+            challenge_description = str(challenge.get("description") or original_prompt).strip()
+            challenge["description"] = (challenge_description + "\n\n" if challenge_description else "") + context
+            body["challenge"] = challenge
+
+    # A Target card is reusable operator context. Fill missing challenge identity
+    # from the durable card and expose saved hints with an explicit boundary so
+    # workers can use them as leads without confusing them with execution facts.
+    target_id = str(body.get("target_id") or (body.get("challenge") or {}).get("target_id") or getattr(existing_run, "target_id", "") or "").strip()
+    target_store = getattr(request.app.state, "target_store", None)
+    target_card = target_store.get(target_id) if target_store is not None and target_id else None
+    if isinstance(target_card, dict):
+        body = dict(body)
+        challenge = dict(body.get("challenge") or {})
+        for key, target_key in (("name", "name"), ("category", "category"), ("target", "target_address"), ("flag_format_hint", "flag_format_hint")):
+            if target_card.get(target_key) and not challenge.get(key):
+                challenge[key] = target_card[target_key]
+        target_mode = str(target_card.get("kind") or "ctf").strip().lower()
+        if target_mode in {"ctf", "pentest"} and not challenge.get("mode"):
+            challenge["mode"] = target_mode
+        if "expected_flags" not in challenge:
+            challenge["expected_flags"] = max(1, int(target_card.get("expected_flags") or 1))
+        if "multi_flag" not in challenge:
+            challenge["multi_flag"] = bool(target_card.get("multi_flag", False))
+        if target_card.get("attachments") and not challenge.get("attachments"):
+            challenge["attachments"] = list(target_card["attachments"])
+        challenge["target_id"] = target_id
+
+        directions = [item for item in (target_card.get("directions") or []) if isinstance(item, dict)]
+        requested_direction_id = str(
+            body.get("direction_id")
+            or getattr(existing_run, "direction_id", "")
+            or target_card.get("primary_direction_id")
+            or ""
+        ).strip()
+        selected_direction = next(
+            (item for item in directions if str(item.get("id") or "") == requested_direction_id),
+            None,
+        )
+        if selected_direction is not None:
+            body["direction_id"] = requested_direction_id
+            body["direction"] = str(selected_direction.get("label") or "").strip()
+
+        target_description = str(target_card.get("description") or "").strip()
+        run_instruction = str(body.get("prompt") or challenge.get("description") or "").strip()
+        if target_description and run_instruction == target_description:
+            run_instruction = ""
+        elif target_description and run_instruction.startswith(target_description + "\n\n"):
+            run_instruction = run_instruction[len(target_description):].lstrip()
+        if "[TARGET DESCRIPTION]" not in run_instruction:
+            prompt_sections: list[str] = []
+            if run_instruction:
+                prompt_sections.append(f"[RUN INSTRUCTION]\n{run_instruction}")
+            if target_description:
+                prompt_sections.append(f"[TARGET DESCRIPTION]\n{target_description}")
+            if directions:
+                direction_lines = [
+                    "[TARGET DIRECTIONS]",
+                    "Primary is the initial focus; Reason may dispatch workers to any listed direction when evidence warrants it.",
+                ]
+                for direction in directions[:32]:
+                    direction_id = str(direction.get("id") or "")
+                    label = str(direction.get("label") or "Unnamed direction").strip()
+                    description = str(direction.get("description") or "").strip()
+                    primary = " [PRIMARY]" if direction_id == requested_direction_id else ""
+                    direction_lines.append(f"- {label}{primary}{f': {description}' if description else ''}")
+                prompt_sections.append("\n".join(direction_lines))
+            if prompt_sections:
+                combined_prompt = "\n\n".join(prompt_sections)
+                body["prompt"] = combined_prompt
+                challenge["description"] = combined_prompt
+        # A Target-bound launch may explicitly opt out of saved hints. The
+        # selection is persisted by create_target_run; direct/legacy clients
+        # without the field keep the historical default of all hints. Filter by
+        # stable ids from the Target card, never by array position or client text.
+        dispatch_context = getattr(existing_run, "dispatch_body", {}) or {}
+        include_hints = body.get("include_target_hints", dispatch_context.get("include_target_hints", True))
+        if isinstance(include_hints, str):
+            include_hints = include_hints.lower() in {"true", "1", "yes", "on"}
+
+        # Preserve the distinction between an omitted selector (legacy/direct
+        # clients mean "all hints") and an explicit empty selector (the
+        # operator selected none). The include switch remains authoritative.
+        if "target_hint_ids" in body:
+            selected_hint_ids_raw = body.get("target_hint_ids")
+        elif "target_hint_ids" in dispatch_context:
+            selected_hint_ids_raw = dispatch_context.get("target_hint_ids")
+        else:
+            selected_hint_ids_raw = None
+        if isinstance(selected_hint_ids_raw, str):
+            selected_hint_ids_raw = [selected_hint_ids_raw]
+        selected_hint_ids = None if selected_hint_ids_raw is None else {
+            str(value).strip() for value in (selected_hint_ids_raw or []) if str(value).strip()
+        }
+
+        raw_hints = [item for item in (target_card.get("hints") or []) if isinstance(item, dict)]
+        if include_hints is not True:
+            raw_hints = []
+        elif selected_hint_ids is not None:
+            raw_hints = [item for item in raw_hints if str(item.get("id") or "").strip() in selected_hint_ids]
+        hints = [str(item.get("text") or "").strip() for item in raw_hints]
+        hints = [item for item in hints if item]
+        marker = "[OPERATOR HINTS FROM TARGET CARD]"
+        if hints and marker not in str(body.get("prompt") or ""):
+            hint_context = "\n".join([marker, "Treat these as operator guidance only; verify every claim through real execution.", *[f"- {item}" for item in hints]])
+            prompt = str(body.get("prompt") or "").strip()
+            body["prompt"] = (prompt + "\n\n" if prompt else "") + hint_context
+            description = str(challenge.get("description") or prompt).strip()
+            challenge["description"] = (description + "\n\n" if description else "") + hint_context
+        body["challenge"] = challenge
+
     from apps.web.drivers import build_driver
 
     try:
@@ -311,6 +462,17 @@ async def start_run(run_id: str, request: Request) -> Any:
         run.name = ch["name"]
     if ch.get("category"):
         run.category = ch["category"]
+    # Target-centric dispatch metadata is a non-secret relationship snapshot.
+    target_id = str(body.get("target_id") or ch.get("target_id") or getattr(run, "target_id", "") or "").strip()
+    if target_id:
+        target = getattr(request.app.state, "target_store", None)
+        if target is not None and target.get(target_id) is not None:
+            run.target_id = target_id
+            run.target_name = str(target.get(target_id).get("name") or "")
+            run.target_category = str(target.get(target_id).get("category") or "")
+            target.attach_run(target_id, run_id)
+    run.direction_id = str(body.get("direction_id") or ch.get("direction_id") or "").strip() or run.direction_id
+    run.direction = str(body.get("direction") or ch.get("direction") or "").strip() or run.direction
     # Re-starting an existing run_id (e.g. a re-test redo of the same challenge):
     # the run object still carries the PRIOR run's terminal state (finished/solved/
     # flag). Reset it synchronously here so the rail doesn't show a freshly-
@@ -323,6 +485,11 @@ async def start_run(run_id: str, request: Request) -> Any:
     run.flags = []
     run.paused = False
     run.started = True
+    # Preserve the explicit Target knowledge snapshot selected at creation.
+    # It is non-secret context and remains isolated from the evidence graph.
+    if getattr(run, "inherited_verified_facts", None):
+        body = dict(body)
+        body["inherited_verified_facts"] = list(run.inherited_verified_facts)
     # Keep the non-secret roster/backend/profile settings beside the run so a
     # later "继续解题" does not silently resolve against a different global
     # configuration.
@@ -350,6 +517,7 @@ async def start_run(run_id: str, request: Request) -> Any:
         prompt = body.get("prompt") or ch.get("description") or ""
         if prompt.strip():
             from apps.web.titler import generate_title
+            from apps.web.reason_llm import resolve_reason_llm_endpoint
             from apps.web.drivers import _infer_challenge
 
             # rule naming needs the INFERRED category and the attachment
@@ -360,10 +528,19 @@ async def start_run(run_id: str, request: Request) -> Any:
                 Path(a).name for a in (inferred_ch.get("attachments") or [])
                 if isinstance(a, str)
             ]
+            saved_snapshot = run.binding_snapshot if isinstance(run.binding_snapshot, dict) else {}
+            snapshot_roles = saved_snapshot.get("roles") if isinstance(saved_snapshot.get("roles"), dict) else {}
+            saved_titler = snapshot_roles.get("titler") if isinstance(snapshot_roles.get("titler"), dict) else {}
             llm_profiles = request.app.state.manager.worker_config.get().get("llm_profiles", {})
-            titler_profile = llm_profiles.get("titler") or {}
-            title_model = titler_profile.get("model")
-            title_base_url = titler_profile.get("base_url") or None
+            titler_profile = dict(saved_titler or llm_profiles.get("titler") or {})
+            titler_endpoint = resolve_reason_llm_endpoint(
+                sessions_root=request.app.state.manager.sessions_root,
+                worker_profiles=request.app.state.manager.worker_config.get().get("worker_profiles", []),
+                profile=titler_profile,
+                llm_providers=request.app.state.manager.worker_config.get().get("llm_providers", []),
+            )
+            title_model = titler_profile.get("model") or titler_endpoint.get("model")
+            title_base_url = titler_endpoint.get("base_url") or titler_profile.get("base_url") or None
             title_usage_writer = request.app.state.manager.internal_usage_writer(
                 run,
                 solver_id="titler",
@@ -376,6 +553,11 @@ async def start_run(run_id: str, request: Request) -> Any:
                 generate_title(
                     prompt, bus=run.bus, run_id=run_id,
                     model=title_model, base_url=title_base_url,
+                    api_key=titler_endpoint.get("api_key"),
+                    wire_api=str(titler_endpoint.get("wire_api") or titler_profile.get("wire_api") or "auto"),
+                    auth_mode=str(titler_endpoint.get("auth_mode") or titler_profile.get("auth_mode") or "bearer"),
+                    auth_header=str(titler_endpoint.get("auth_header") or titler_profile.get("auth_header") or "Authorization"),
+                    auth_prefix=str(titler_endpoint.get("auth_prefix") if titler_endpoint.get("auth_prefix") is not None else titler_profile.get("auth_prefix") or "Bearer"),
                     usage_writer=title_usage_writer,
                     usage_context=title_usage_writer.context,
                     category=category,
@@ -651,10 +833,17 @@ async def kill_worker(run_id: str, request: Request) -> Any:
 @router.post("/{run_id}/hitl")
 async def hitl(run_id: str, request: Request) -> Any:
     body = await _require_dict_body(request)
+    action = str(body.get("action") or "").strip().lower()
+    if action not in {"prompt", "stop", "resume", "review", "hint", "ask", "pause", "redirect", "focus", "mark_false", "writeup"}:
+        raise HTTPException(status_code=400, detail="unsupported command action")
     ok = await request.app.state.manager.post_hitl(
         run_id,
         body.get("target", "global"),
-        body.get("action", "hint"),
+        action,
         **{k: v for k, v in body.items() if k not in ("target", "action")},
     )
-    return {"ok": ok}
+    if not ok:
+        if action == "review":
+            raise HTTPException(status_code=409, detail="review requires a terminated run")
+        raise HTTPException(status_code=409, detail="command rejected for this run or recipient")
+    return {"ok": True, "run_id": run_id}

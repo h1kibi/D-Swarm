@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from dswarm.swarm.shared_graph import _clean_lane_host
+from dswarm.swarm.graph_contract import _clean_lane_host
 
 
 # Broad host-like token heuristic — prefer false positives over missed violations.

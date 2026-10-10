@@ -33,13 +33,13 @@ from dswarm.swarm.shared_graph import (
 
 DEFAULT_CAPTURE_DEADLINE_S = 5.0
 
-# fact_effective column order (fact_events.FACT_EFFECTIVE_SELECT).
 _VIEW_COLUMNS = (
     "fact_seq", "challenge_id", "fact_text", "fact_source", "fact_actor",
     "fact_ts", "base_verified", "base_confidence", "route_hash", "finding_kind",
     "finding_target", "finding_data", "promotion_seq", "promotion_actor",
-    "promotion_artifact_id", "artifact_id", "witness", "verifier", "source",
-    "summary_seq", "summary", "state", "retired", "verified", "confidence",
+    "promotion_artifact_id", "artifact_id", "witness", "verifier", "summary_seq",
+    "summary", "review_required", "report_seq", "state", "retired", "verified",
+    "confidence",
 )
 
 _INTENT_CONCLUDED = "intent_concluded"
@@ -231,7 +231,7 @@ def _build_snapshot(phase1: dict[str, Any]) -> GraphCycleSnapshot:
                 confidence=confidence,
                 witness=str(cols["witness"] or ""),
                 artifact_id=artifact_id,
-                source=str(cols["source"] or ""),
+                source=str(cols["fact_source"] or ""),
                 actor=actor,
                 correlation_kind=correlation_kind,
                 correlation_basis_hash=basis_hash,

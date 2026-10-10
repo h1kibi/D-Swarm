@@ -10,6 +10,7 @@ import { compactLaneStatus, latestLaneActivity } from "@/lib/workerLanePresentat
 import { Icon } from "@/components/Icon";
 import { PanelEmpty } from "@/components/PanelEmpty";
 import { ChipFilterBar } from "@/components/ChipFilterBar";
+import { detailUrlForRun } from "@/lib/runRoute";
 
 /**
  * Rich per-worker lanes (the worker firehose, moved out of the main thread).
@@ -26,6 +27,31 @@ function runtimeLabel(lane: SolverLane): string {
   const status = runtime.status ? `:${runtime.status}` : "";
   const rc = typeof runtime.rc === "number" ? ` rc=${runtime.rc}` : "";
   return `${runtime.backend}${status}${rc}`;
+}
+
+/** One copyable diagnostics blob for a lane (docs/17 §10 复制诊断). Built only
+ *  from fields the lane already carries — no fabricated values. */
+function workerDiagnostics(lane: SolverLane, id: string): string {
+  const runtime = lane.runtime ?? {};
+  const lines = [
+    `worker: ${id}`,
+    `status: ${lane.status}${lane.online === false ? " (offline)" : ""}`,
+    `role: ${lane.role ?? "worker"}`,
+    `engine: ${lane.engine ?? "--"}`,
+    `intent: ${lane.intentId ?? "--"}`,
+    `session: ${lane.session ?? "--"}`,
+    `runtime: ${runtimeLabel(lane) || "--"}`,
+    `cwd: ${runtime.cwd ?? "--"}`,
+    `argv0: ${runtime.argv0 ?? "--"}`,
+    `rc: ${runtime.rc ?? "--"}`,
+    `timed_out: ${runtime.timed_out ?? false}`,
+    `oom_killed: ${runtime.oom_killed ?? false}`,
+    `cancelled: ${runtime.cancelled ?? false}`,
+    `no_feedback: ${runtime.no_feedback ?? false}`,
+    `real_output_without_flag: ${runtime.real_output_without_flag ?? false}`,
+    `artifacts: ${(runtime.artifact_ids ?? []).join(", ") || "--"}`,
+  ];
+  return lines.join("\n");
 }
 
 export function WorkerLanes({
@@ -85,6 +111,9 @@ export function WorkerLanes({
   // Lanes render in a .map(), so the per-component useCopied hook can't be used
   // here — track the copied worker id at the parent instead.
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // Same for the raw stdout/stderr blocks: keyed `<lane>:<stream>` so copying one
+  // worker's stdout never lights up another lane's button.
+  const [copiedRaw, setCopiedRaw] = useState<string | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyResume = (id: string, cmd: string) => {
     if (!cmd) return;
@@ -93,6 +122,15 @@ export function WorkerLanes({
       setCopiedId(id);
       if (copyTimer.current) clearTimeout(copyTimer.current);
       copyTimer.current = setTimeout(() => setCopiedId(null), 1200);
+    });
+  };
+  const copyRaw = (key: string, text: string) => {
+    if (!text) return;
+    void copyToClipboard(text).then((ok) => {
+      if (!ok) return;
+      setCopiedRaw(key);
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopiedRaw(null), 1200);
     });
   };
 
@@ -196,9 +234,6 @@ export function WorkerLanes({
         const engine = workerEngine(id, lane.engine);
         const color = workerColor(id, lane.engine);
         const chat = byWorker.get(id) || { reasoning: [], tools: [] };
-        // live lane text wins; historical runs only carry the phase summaries
-        // (⮑ lines) — show ALL of them, not just the last, so an old run's lane
-        // still tells its story.
         const reasoning = (lane.reasoning || chat.reasoning.slice(-8).join("\n") || "").trim();
         const tools = chat.tools.slice(-6);
         const session = lane.session;
@@ -207,6 +242,12 @@ export function WorkerLanes({
         const latestActivity = latestLaneActivity(lane.status, lane.statusReason, tools);
         const statusLabel = compactLaneStatus(lane, online, t);
         const runtime = runtimeLabel(lane);
+        const intent = lane.intentId ? deck.reasonLoop.cycles.flatMap((cycle) => cycle.intents).find((candidate) => candidate.id === lane.intentId) : undefined;
+        const rawStdout = lane.runtime?.stdout || "";
+        const rawStderr = lane.runtime?.stderr || "";
+        const rawArtifacts = lane.runtime?.artifact_ids || [];
+        const awaitingValidation = lane.status === "awaiting_validation" || intent?.status === "awaiting_validation";
+        const realOutputWithoutFlag = lane.runtime?.real_output_without_flag === true || intent?.realOutputWithoutFlag === true;
         const isExpanded = expandedLaneIds.has(id);
         const isReview = isReviewWorkerLane(lane);
         // I: highlight a stalled / paused lane so the operator spots a stuck worker
@@ -266,52 +307,78 @@ export function WorkerLanes({
                 <div className="wlane-tiles">
                   <div className="wlane-tile"><div className="tk">{t("wlane.facts")}</div><div className="tv">{verifiedByActor.get(id) || 0}</div></div>
                   <div className="wlane-tile"><div className="tk">{t("wlane.toolcount")}</div><div className="tv">{lane.toolLines.length}</div></div>
-                  {typeof lane.tokensSpent === "number" && lane.tokensSpent > 0 && (
-                    <div className="wlane-tile"><div className="tk">{t("wlane.tokensSpent")}</div><div className="tv">{lane.tokensSpent.toLocaleString()}</div></div>
-                  )}
-                  {(locksByOwner.get(id) || 0) > 0 && (
-                    <div className="wlane-tile"><div className="tk">{t("resource.lockActive")}</div><div className="tv">{locksByOwner.get(id)}</div></div>
-                  )}
-                  <div className="wlane-tile">
-                    <div className="tk">{t("wlane.statusLabel")}</div>
-                    <div className={`tv wlane-online ${online ? "on" : "off"}`}>
-                      <span className="wlane-online-dot" aria-hidden="true" />
-                      {online ? t("workerDock.online") : t("workerDock.offline")}
-                    </div>
-                  </div>
-                  <div className="wlane-tile">
-                    <div className="tk">{t("wlane.runtime")}</div>
-                    <div className="tv wlane-runtime" title={runtime || t("wlane.runtimeUnknown")}>
-                      {runtime || t("wlane.runtimeUnknown")}
-                    </div>
-                  </div>
+                  {typeof lane.tokensSpent === "number" && lane.tokensSpent > 0 && <div className="wlane-tile"><div className="tk">{t("wlane.tokensSpent")}</div><div className="tv">{lane.tokensSpent.toLocaleString()}</div></div>}
+                  {(locksByOwner.get(id) || 0) > 0 && <div className="wlane-tile"><div className="tk">{t("resource.lockActive")}</div><div className="tv">{locksByOwner.get(id)}</div></div>}
+                  <div className="wlane-tile"><div className="tk">{t("wlane.statusLabel")}</div><div className={`tv wlane-online ${online ? "on" : "off"}`}><span className="wlane-online-dot" aria-hidden="true" />{online ? t("workerDock.online") : t("workerDock.offline")}</div></div>
+                  <div className="wlane-tile"><div className="tk">{t("wlane.runtime")}</div><div className="tv wlane-runtime" title={runtime || t("wlane.runtimeUnknown")}>{runtime || t("wlane.runtimeUnknown")}</div></div>
                 </div>
-                <div className="wlane-body">
-                  <div>
-                    <div className="wlane-block-h">{t("wlane.reasoning")}</div>
-                    <div className={`wlane-reason ${reasoning ? "" : "idle"}`}>
-                      {reasoning
-                        || (running ? t("wlane.idle") : t("wlane.idleHistorical"))}
-                    </div>
+                <div className="wlane-diagnostics">
+                  <div><span>Intent</span><strong>{lane.intentId || t("swarm.noIntent")}</strong>{intent?.goal && <small>{intent.goal}</small>}</div>
+                  <div><span>{t("op.scope")}</span><strong>{intent?.dispatchReason || lane.statusReason || "--"}</strong></div>
+                  <div><span>Claim / owner</span><strong>{lane.intentId ? `${lane.intentId} · ${id}` : "--"}</strong></div>
+                  {awaitingValidation && <div className="warn"><span>Validation</span><strong>awaiting_validation</strong><small>{intent?.originalIntentId ? `recovery of ${intent.originalIntentId}` : "No feedback; Reason must validate before retry"}</small></div>}
+                  {realOutputWithoutFlag && <div className="warn"><span>Execution result</span><strong>real output without flag</strong></div>}
+                  {rawArtifacts.length > 0 && <div><span>Artifacts</span><strong>{rawArtifacts.join(" · ")}</strong></div>}
+                </div>
+                {/* Actions live in their own row so they never squeeze the body
+                    (docs/17 §10: 查看 Intent / 复制诊断 / 停止 / 重新请求验证). */}
+                <div className="wlane-actions">
+                  <button type="button" className="wlane-action" disabled={!lane.intentId}
+                    onClick={() => { window.location.href = `${detailUrlForRun(deck.runId, "intents")}${lane.intentId ? `?intent=${encodeURIComponent(lane.intentId)}` : ""}`; }}>
+                    <Icon name="crosshair" size={11} />{t("wlane.action.viewIntent")}
+                  </button>
+                  <button type="button" className={`wlane-action ${copiedRaw === `${id}:diag` ? "copied" : ""}`}
+                    onClick={() => copyRaw(`${id}:diag`, workerDiagnostics(lane, id))}>
+                    {copiedRaw === `${id}:diag` ? <><Icon name="check" size={11} />{t("common.copied")}</> : <><Icon name="copy" size={11} />{t("wlane.action.copyDiagnostics")}</>}
+                  </button>
+                  {running && online && (
+                    <button type="button" className="wlane-action danger" onClick={() => onKillWorker(id)}>
+                      <Icon name="x" size={11} />{t("worker.killTitle")}
+                    </button>
+                  )}
+                </div>
+                <details className="wlane-runtime-diag">
+                  <summary>{t("wlane.runtimeDiag")}</summary>
+                  <div className="wlane-diagnostics">
+                    <div><span>session</span><strong>{lane.session || "--"}</strong></div>
+                    <div><span>cwd</span><strong>{lane.runtime?.cwd || "--"}</strong></div>
+                    <div><span>argv0</span><strong>{lane.runtime?.argv0 || "--"}</strong></div>
+                    <div><span>rc</span><strong>{lane.runtime?.rc ?? "--"}</strong></div>
+                    <div><span>backend</span><strong>{lane.runtime?.backend || "--"}</strong></div>
                   </div>
-                  <div>
-                    <div className="wlane-block-h">{t("wlane.tools")}</div>
-                    {tools.length === 0 ? (
-                      <div className="wlane-reason idle">
-                        {running || anyToolLines
-                          ? t("wlane.noTools")
-                          : t("wlane.noToolsHistorical")}
-                      </div>
-                    ) : (
-                      <div className="wlane-tools">
-                        {tools.map((tl, i) => <div className="wlane-toolline" key={i}>{tl}</div>)}
+                </details>
+                <div className="wlane-body">
+                  <div><div className="wlane-block-h">{t("wlane.reasoning")}</div><div className={`wlane-reason ${reasoning ? "" : "idle"}`}>{reasoning || (running ? t("wlane.idle") : t("wlane.idleHistorical"))}</div></div>
+                  <div><div className="wlane-block-h">{t("wlane.tools")}</div>{tools.length === 0 ? <div className="wlane-reason idle">{running || anyToolLines ? t("wlane.noTools") : t("wlane.noToolsHistorical")}</div> : <div className="wlane-tools">{tools.map((tl, i) => <div className="wlane-toolline" key={i}>{tl}</div>)}</div>}</div>
+                </div>
+                {(rawStdout || rawStderr) && (
+                  <details className="wlane-raw">
+                    <summary>Raw stdout / stderr</summary>
+                    {rawStdout && (
+                      <div className="wlane-raw-block">
+                        <button type="button" className={`wlane-copy ${copiedRaw === `${id}:out` ? "copied" : ""}`}
+                          onClick={() => copyRaw(`${id}:out`, rawStdout)}
+                         aria-label={t("common.copyRaw")}>
+                          {copiedRaw === `${id}:out` ? <><Icon name="check" size={10} /> {t("common.copied")}</> : t("common.copyShort")}
+                        </button>
+                        <pre>{rawStdout}</pre>
                       </div>
                     )}
-                  </div>
-                </div>
+                    {rawStderr && (
+                      <div className="wlane-raw-block">
+                        <button type="button" className={`wlane-copy ${copiedRaw === `${id}:err` ? "copied" : ""}`}
+                          onClick={() => copyRaw(`${id}:err`, rawStderr)}
+                          aria-label={t("common.copyRaw")}>
+                          {copiedRaw === `${id}:err` ? <><Icon name="check" size={10} /> {t("common.copied")}</> : t("common.copyShort")}
+                        </button>
+                        <pre className="stderr">{rawStderr}</pre>
+                      </div>
+                    )}
+                  </details>
+                )}
               </div>
             )}
-          </div>
+            </div>
         );
       })}
     </div>

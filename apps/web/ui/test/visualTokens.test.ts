@@ -191,6 +191,21 @@ describe("main deck layout regression guards", () => {
     expect(css).toContain("appearance: none;");
   });
 
+  it("shows provider role usage instead of an opaque reference count", () => {
+    const source = readFileSync(join(process.cwd(), "components", "WorkerSettingsWorkspace.tsx"), "utf8");
+    expect(source).toContain("function providerUsageFor");
+    expect(source).toContain('className="wsw-provider-usage"');
+    expect(source).toContain('className="wsw-provider-role-list"');
+    expect(source).toContain('usage.slice(0, 6)');
+    expect(css).toContain(".wsw-provider-role");
+    expect(css).toContain(".wsw-provider-usage");
+  });
+
+  it("offers Anthropic as an explicit provider wire protocol", () => {
+    const source = readFileSync(join(process.cwd(), "components", "WorkerSettingsWorkspace.tsx"), "utf8");
+    expect(source).toContain('<option value="anthropic">anthropic</option>');
+  });
+
   it("shows Planner and Titler provider details clearly and chooses provider models from a select", () => {
     const source = readFileSync(join(process.cwd(), "components", "WorkerSettingsWorkspace.tsx"), "utf8");
     const reasonSource = source.slice(source.indexOf('const profile = draft.llm_profiles[key];'), source.indexOf('<datalist id="wsw-llm-models">'));

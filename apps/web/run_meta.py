@@ -10,7 +10,9 @@ table is tiny — a few dozen rows at most).
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,7 +37,22 @@ class RunMetaStore:
     def _flush(self) -> None:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=0), encoding="utf-8")
-        tmp.replace(self.path)  # atomic on POSIX
+        self._atomic_replace(tmp)
+
+    def _atomic_replace(self, tmp: Path) -> None:
+        """Atomically replace metadata, retrying transient Windows locks."""
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt == 4:
+                    break
+                time.sleep(0.02 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
 
     def get(self, run_id: str) -> dict[str, Any]:
         """Meta for one run with defaults filled in (never raises / KeyErrors)."""
@@ -130,6 +147,20 @@ class FolderStore:
         self._seq = 0
         self._load()
 
+    def _atomic_replace(self, tmp: Path) -> None:
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt == 4:
+                    break
+                time.sleep(0.02 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+
     def _load(self) -> None:
         if not self.path.exists():
             return
@@ -147,7 +178,7 @@ class FolderStore:
     def _flush(self) -> None:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        self._atomic_replace(tmp)
 
     def list(self) -> list[dict[str, Any]]:
         return [

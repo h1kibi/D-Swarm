@@ -42,6 +42,28 @@ All notable public release changes are tracked here.
 
 ### Fixed
 
+- **Credential isolation hardening (kernel).** The deprecated broad credential
+  projection (`project_account_root`) is removed; every one-shot, legacy, and
+  pool credential path now goes through `CredentialProjector` with exactly one
+  explicitly selected binding. A legacy `account_root` without an explicit
+  binding fails closed (`legacy_credential_binding_required`), projection
+  failures never fall back to the raw credential store, and pool workers
+  receive the current binding's secret only through the private per-worker RCP
+  process-env channel (public lease metadata stays secret-free; release
+  scrubs the overlay and removes on-disk staging). Verified end-to-end against
+  real Linux Docker workers (direct + custom bindings, cross-binding leak
+  checks, docker-socket exclusion).
+- **Deprecation-free web serve/test stack.** `starlette.testclient` uses
+  `httpx2` (dev extra) instead of the deprecated `httpx` shim, and every
+  Uvicorn launcher (`run.sh`, `docker/web`, the desktop supervisor, real-server
+  test configs) pins `--ws websockets-sansio` — the suite now runs with zero
+  Starlette/websockets deprecation warnings.
+- **SharedGraph contract split.** Pure event vocabulary, fact/intent lifecycle
+  states, route-lineage helpers, and the `SharedGraph` Protocol moved to
+  `dswarm/swarm/graph_contract.py`; the SQLite implementation (schema,
+  transaction ordering, materialized projections, replay, append-only writes)
+  is unchanged in `shared_graph.py`, which re-exports the contract for
+  compatibility.
 - **M9a web integration chain (end-to-end with GLM via bigmodel, 8/8 startup
   smoke).** Web launches now freeze the runtime policy (run-4408); worker
   identity is proved against the image's actual user instead of a hardcoded

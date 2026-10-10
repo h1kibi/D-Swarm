@@ -323,9 +323,9 @@ def validate_workspace_draft(
                 ))
 
         wire_api = str(profile.get("wire_api") or "auto").strip().lower()
-        if wire_api not in {"auto", "openai", "openai-chat", "openai-responses"}:
+        if wire_api not in {"auto", "openai", "openai-chat", "openai-responses", "anthropic"}:
             issues.append(_issue(
-                f"{path}.wire_api", sev, "invalid_wire_api", "Select a supported OpenAI protocol."
+                f"{path}.wire_api", sev, "invalid_wire_api", "Select a supported OpenAI or Anthropic protocol."
             ))
         auth_mode = str(profile.get("auth_mode") or "bearer").strip().lower()
         if auth_mode not in {"bearer", "x-api-key", "custom"}:
@@ -347,9 +347,13 @@ def validate_workspace_draft(
             ))
 
     valid_llm_sources = {"auto", "env", "account", "provider"}
-    valid_wire_apis = {"auto", "openai", "openai-chat", "openai-responses"}
-    for key in ("planner", "titler"):
-        profile = (draft.get("llm_profiles") or {}).get(key)
+    valid_wire_apis = {"auto", "openai", "openai-chat", "openai-responses", "anthropic"}
+    raw_llm_profiles = draft.get("llm_profiles") or {}
+    llm_keys = ["reason" if "reason" in raw_llm_profiles else "planner",
+                "observer", "observer_fallback", "titler"]
+    llm_keys.extend(key for key in ("worker", "review") if key in raw_llm_profiles)
+    for key in dict.fromkeys(llm_keys):
+        profile = raw_llm_profiles.get(key)
         normalized = llm_profiles.get(key) or {}
         path = f"llm_profiles.{key}"
         if not isinstance(profile, dict):
@@ -384,7 +388,7 @@ def validate_workspace_draft(
                 ))
         wire_api = str(profile.get("wire_api") or normalized.get("wire_api") or "auto").strip().lower()
         if wire_api not in valid_wire_apis:
-            issues.append(_issue(f"{path}.wire_api", "error", "invalid_wire_api", "Select a supported OpenAI protocol."))
+            issues.append(_issue(f"{path}.wire_api", "error", "invalid_wire_api", "Select a supported OpenAI or Anthropic protocol."))
 
     for update in secret_updates:
         aid = str(update.get("account_id") or "").strip()

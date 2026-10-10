@@ -22,6 +22,7 @@ export type ReasonIntentStatus =
   | "queued"
   | "claimed"
   | "running"
+  | "awaiting_validation"
   | "completed"
   | "skipped"
   | "failed";
@@ -40,12 +41,17 @@ export interface ReasonIntentView {
   taskKind?: string;
   hostScan?: string;
   workerId?: string;
+  originalIntentId?: string;
+  recoveryAttempt?: number;
+  noFeedback?: boolean;
+  realOutputWithoutFlag?: boolean;
   /** event ts of the dispatch decision that put this intent in flight. */
   dispatchedAt?: number;
   dispatchReason?: string;
   skipReason?: string;
   flag?: string;
 }
+
 
 export interface ReasonCycleView {
   id: string;
@@ -75,26 +81,26 @@ export interface ReasonLoopView {
   stopReason?: string;
   solved?: boolean;
   paused: boolean;
+  healthState?: "healthy" | "degraded" | "retrying" | "circuit_open" | "reason_blocked" | "waiting_for_operator";
+  healthFailures?: number;
+  healthMaxFailures?: number;
+  healthRequestFailures?: number;
+  healthRequestLimit?: number;
+  healthBlockedReason?: string;
 }
 
 export function emptyReasonLoop(): ReasonLoopView {
   return { cycles: [], paused: false };
 }
 
-/** The reason-scheduler delta kinds this fold understands (kernel contract). */
 const REASON_DELTA_KINDS = new Set([
-  "recon_started",
-  "recon_completed",
-  "operator_paused",
-  "reason_cycle_started",
-  "intent_proposed",
-  "intent_skipped",
-  "dispatch_decision",
-  "fallback_dispatch",
-  "intent_completed",
-  "intent_failed",
-  "reason_cycle_completed",
-  "reason_loop_finished",
+  "recon_started", "recon_completed", "operator_paused",
+  "reason_cycle_started", "intent_proposed", "intent_skipped", "dispatch_decision",
+  "fallback_dispatch", "intent_completed", "intent_failed", "intent_interrupted",
+  "intent_recovery_required", "intent_recovery_blocked", "intent_recovery_exhausted",
+  "reason_health_changed", "reason_blocked", "reason_recovered", "provider_recovery_activated",
+  "provider_recovery_blocked", "binding_effective_changed",
+  "reason_cycle_completed", "reason_loop_finished",
 ]);
 
 const str = (v: unknown): string | undefined =>
@@ -274,9 +280,7 @@ export function foldReasonEvent(
         taskKind: str(p.task_kind) ?? prev?.taskKind,
         hostScan: str(p.host_scan) ?? prev?.hostScan,
         dedupeKey: str(p.dedupe_key) ?? prev?.dedupeKey,
-        fromFactIds: factIds(p.from_facts).length
-          ? factIds(p.from_facts)
-          : (prev?.fromFactIds ?? []),
+        fromFactIds: factIds(p.from_facts).length ? factIds(p.from_facts) : (prev?.fromFactIds ?? []),
       }));
     case "dispatch_decision":
       return upsertIntent(loop, p, ev.ts, (prev) => ({
@@ -288,36 +292,76 @@ export function foldReasonEvent(
         workerId: str(p.worker_id) ?? str(p.worker) ?? prev?.workerId,
       }));
     case "fallback_dispatch":
-      return upsertIntent(
-        loop,
-        { ...p, intent_id: str(p.intent_id) ?? "fallback-bootstrap" },
-        ev.ts,
-        (prev) => ({
-          status: "running",
-          goal: prev?.goal || "fallback bootstrap",
-          dispatchedAt: prev?.dispatchedAt ?? ev.ts,
-          dispatchReason: str(p.reason) ?? prev?.dispatchReason,
-        }),
-      );
+      return upsertIntent(loop, { ...p, intent_id: str(p.intent_id) ?? "fallback-bootstrap" }, ev.ts, (prev) => ({
+        status: "running", goal: prev?.goal || "fallback bootstrap",
+        dispatchedAt: prev?.dispatchedAt ?? ev.ts,
+        dispatchReason: str(p.reason) ?? prev?.dispatchReason,
+      }));
+    case "intent_interrupted":
+      return upsertIntent(loop, p, ev.ts, (prev) => ({
+        status: "awaiting_validation",
+        workerId: str(p.worker) ?? prev?.workerId,
+        noFeedback: p.no_feedback !== false,
+        realOutputWithoutFlag: p.real_output_without_flag === true,
+        recoveryAttempt: num(p.recovery_attempt) ?? prev?.recoveryAttempt,
+        skipReason: str(p.result_detail) ?? prev?.skipReason,
+      }));
+    case "intent_recovery_required": {
+      const recoveryId = str(p.recovery_intent_id);
+      const originalId = str(p.intent_id);
+      const id = recoveryId || originalId;
+      if (!id) return loop;
+      return upsertIntent(loop, { ...p, intent_id: id }, ev.ts, (prev) => ({
+        status: recoveryId ? "queued" : "awaiting_validation",
+        originalIntentId: recoveryId ? originalId : prev?.originalIntentId,
+        recoveryAttempt: num(p.recovery_attempt) ?? prev?.recoveryAttempt,
+        goal: str(p.goal) ?? prev?.goal ?? "",
+        workerId: str(p.worker) ?? prev?.workerId,
+        dispatchReason: recoveryId ? "awaiting validation recovery" : prev?.dispatchReason,
+      }));
+    }
+    case "intent_recovery_blocked":
+    case "intent_recovery_exhausted":
+      return upsertIntent(loop, p, ev.ts, (prev) => ({
+        status: "failed",
+        recoveryAttempt: num(p.recovery_attempt) ?? prev?.recoveryAttempt,
+        skipReason: str(p.blocked_reason) ?? str(p.reason) ?? str(p.error_type) ?? prev?.skipReason,
+      }));
     case "intent_skipped":
       return upsertIntent(loop, p, ev.ts, (prev) => ({
         status: "skipped",
-        skipReason: str(p.skip_reason) ?? prev?.skipReason,
         dedupeKey: str(p.dedupe_key) ?? prev?.dedupeKey,
+        skipReason: str(p.skip_reason) ?? prev?.skipReason,
       }));
     case "intent_completed":
       return upsertIntent(loop, p, ev.ts, (prev) => ({
         status: "completed",
+        workerId: str(p.worker) ?? str(p.worker_id) ?? prev?.workerId,
         flag: str(p.flag) ?? prev?.flag,
-        profile: str(p.profile) ?? prev?.profile,
-        mode: str(p.mode) ?? prev?.mode ?? "",
       }));
     case "intent_failed":
       return upsertIntent(loop, p, ev.ts, (prev) => ({
         status: "failed",
-        profile: str(p.profile) ?? prev?.profile,
-        mode: str(p.mode) ?? prev?.mode ?? "",
+        workerId: str(p.worker) ?? str(p.worker_id) ?? prev?.workerId,
+        skipReason: str(p.error) ?? str(p.reason) ?? prev?.skipReason,
       }));
+    case "reason_health_changed": {
+      const health = str(p.health_state) as ReasonLoopView["healthState"];
+      if (!health) return loop;
+      return {
+        ...loop,
+        healthState: health,
+        healthFailures: num(p.failures) ?? loop.healthFailures,
+        healthMaxFailures: num(p.max_failures) ?? loop.healthMaxFailures,
+        healthRequestFailures: num(p.request_failures) ?? loop.healthRequestFailures,
+        healthRequestLimit: num(p.request_limit) ?? loop.healthRequestLimit,
+        healthBlockedReason: str(p.blocked_reason) ?? (health === "healthy" ? undefined : loop.healthBlockedReason),
+      };
+    }
+    case "reason_blocked":
+      return { ...loop, paused: true, healthState: "reason_blocked", healthBlockedReason: str(p.reason) ?? loop.healthBlockedReason, stopReason: str(p.reason) ?? loop.stopReason };
+    case "reason_recovered":
+      return { ...loop, paused: false, healthState: "healthy", healthFailures: 0, healthBlockedReason: undefined };
     case "reason_cycle_completed": {
       const ensured = ensureCycle(loop, p, ev.ts);
       loop = ensured.loop;
@@ -348,16 +392,12 @@ export function foldReasonEvent(
   }
 }
 
-// ── presentation projections (P0-2: make the folded loop observable) ────────
-
 /** Traffic-light tone for the loop banner. */
 export function reasonLoopTone(loop: ReasonLoopView): "ok" | "warn" | "bad" | "muted" {
   if (loop.solved) return "ok";
-  if (loop.paused) return "warn";
-  if (loop.stopReason) {
-    // an operator stop or a dry planner is a normal end; anything else is suspect
-    return loop.stopReason === "operator_stop" ? "muted" : "warn";
-  }
+  if (loop.healthState === "circuit_open" || loop.healthState === "reason_blocked" || loop.healthState === "waiting_for_operator") return "bad";
+  if (loop.healthState === "degraded" || loop.healthState === "retrying" || loop.paused) return "warn";
+  if (loop.stopReason) return loop.stopReason === "operator_stop" ? "muted" : "warn";
   return "ok";
 }
 

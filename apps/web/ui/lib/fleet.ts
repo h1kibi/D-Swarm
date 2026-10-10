@@ -48,13 +48,21 @@ export type BatchAction = "pause" | "resume" | "stop" | "archive" | "unarchive";
  * per-run health flag, so HITL-pending is the live signal here.
  */
 export function runNeedsAttention(r: RunSummary): boolean {
-  return (!!r.awaiting_help && !r.finished) || r.status === "failed";
+  return r.status === "failed" || (!r.finished && (
+    !!r.awaiting_help
+    || r.status === "reason_blocked"
+    || r.status === "degraded"
+    || r.status === "fallback_active"
+    || !!r.reason_blocked
+    || !!r.degraded
+    || !!r.fallback_active
+  ));
 }
 
-/** A run the fleet considers "active" (in flight, not terminal, not paused —
- *  paused runs have their own filter bucket per §5.2). */
+/** A run the fleet considers active: live and not explicitly paused. */
 export function isFleetActive(r: RunSummary): boolean {
-  return r.started && !r.finished && !r.archived && r.status !== "cancelled" && r.status !== "paused";
+  return r.started && !r.finished && !r.archived && r.status !== "cancelled"
+    && r.status !== "paused" && r.status !== "reason_blocked";
 }
 
 export function filterFleet(runs: RunSummary[], filter: FleetFilter): RunSummary[] {

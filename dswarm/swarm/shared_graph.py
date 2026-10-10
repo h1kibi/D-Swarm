@@ -7,7 +7,8 @@ a scratchpad but an auditable record of what was actually proven.
 Design (A+B+C+D):
 - (D) Local direct SQLite file, ONE per challenge. No HTTP server: same-host
   sub-process workers open the same `.db`; DELETE journal keeps the main file
-  self-contained on network/9p mounts. A `SharedGraph` Protocol keeps the backend swappable
+  self-contained on network/9p mounts. The `SharedGraph` Protocol (in
+  `dswarm.swarm.graph_contract`) keeps the backend swappable
   (a cross-container HTTP backend can be added later without touching callers).
 - (A) One long-lived connection per instance + one-time PRAGMA, incl.
   `busy_timeout` (avoids lost writes: SQLITE_BUSY → auto-queue, not drop) +
@@ -26,17 +27,17 @@ is NEVER reachable as a pluggable verifier here.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import json
 import hashlib
 import re
 import sqlite3
 import threading
 import time
+import logging
 import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Protocol, runtime_checkable
+from typing import Any, Iterable, Optional
 
 from dswarm.models.solve_graph import Challenge, SolveGraph
 from dswarm.solver.result_codes import is_genuine_giveup
@@ -56,7 +57,6 @@ from dswarm.core.normalization import (
     ROUTE_ALIAS as _ROUTE_ALIAS,
     ROUTE_STOPWORDS as _ROUTE_STOPWORDS,
     normalize_fact_identity as _normalize_fact_identity,
-    normalize_lane_host as _clean_lane_host,
     normalize_lane_key as _normalize_lane_key,
     normalize_lane_risk as _clean_lane_risk,
     normalize_observed_route as _normalize_observed_route_value,
@@ -77,542 +77,15 @@ from dswarm.swarm.poc_verification import (
 )
 
 
-# ── event types (C: append-only log) ─────────────────────────────────────────
-EV_FACT_ADDED = "fact_added"
-EV_HYP_PROPOSED = "hyp_proposed"
-EV_HYP_REFUTED = "hyp_refuted"
-EV_DEAD_END = "dead_end"
-EV_INTENT_PROPOSED = "intent_proposed"
-EV_INTENT_CLAIMED = "intent_claimed"
-EV_INTENT_CONCLUDED = "intent_concluded"
-EV_FLAG_FOUND = "flag_found"
-EV_FLAG_UNVERIFIED = "flag_unverified"  # claimed FOUND_FLAG that failed provenance; never accepted
-EV_FLAG_INVALIDATED = "flag_invalidated"  # multi-flag: a false-positive flag is removed
-EV_POC_SAVED = "poc_saved"
-EV_POC_CLAIMED = "poc_claimed"
-EV_POC_CONCLUDED = "poc_concluded"
-EV_POC_REPRODUCTION_REGISTERED = "poc_reproduction_registered"
-EV_POC_REPRODUCTION_REJECTED = "poc_reproduction_rejected"
-EV_POC_VERIFICATION_STARTED = "poc_verification_started"
-EV_POC_VERIFIED = "poc_verified"
-EV_POC_VERIFICATION_FAILED = "poc_verification_failed"
-EV_REVIEW_FINDING_VERIFIED = "review_finding_verified"
-EV_REVIEW_FINDING = "review_finding"
-EV_FACT_CHALLENGED = "fact_challenged"
-EV_FACT_REVALIDATED = "fact_revalidated"
-EV_FACT_VERIFIED = "fact_verified"
-EV_FACT_SUMMARIZED = "fact_summarized"
-EV_ROUTE_SUPPRESSED = "route_suppressed"
-EV_ROUTE_REOPENED = "route_reopened"
-EV_BRANCH_SPLIT = "branch_split"
-EV_BRANCH_RESOLVED = "branch_resolved"
-EV_COORDINATOR_DIRECTIVE = "coordinator_directive"
-EV_REVIEW_PROPOSAL = "review_proposal"
-EV_REVIEW_PROPOSAL_DECISION = "review_proposal_decision"
-EV_LANE_LOCKED = "lane_locked"
-EV_LANE_RELEASED = "lane_released"
-EV_INTENT_LANE_DEFERRED = "intent_lane_deferred"
-# A+J: fact lifecycle (reject/merge/supersede) + intent dispatch_state transitions.
-EV_FACT_REJECTED = "fact_rejected"
-EV_FACT_MERGED = "fact_merged"
-EV_FACT_SUPERSEDED = "fact_superseded"
-EV_FACT_PINNED = "fact_pinned"
-EV_INTENT_STATE_CHANGED = "intent_state_changed"
-# B/F: operator directive lifecycle + classified HITL request.
-EV_OPERATOR_DIRECTIVE = "operator_directive"
-EV_OPERATOR_DIRECTIVE_STATUS = "operator_directive_status"
-EV_HITL_CLASSIFIED = "hitl_classified"
-# E: unified resource lock (coexists with lane_locks via the adapter).
-EV_RESOURCE_LOCKED = "resource_locked"
-EV_RESOURCE_RELEASED = "resource_released"
-# M9: typed, run-scoped cleanup lifecycle. Raw shell commands are never stored.
-EV_CLEANUP_ACTION_REGISTERED = "cleanup_action_registered"
-EV_CLEANUP_EXECUTED = "cleanup_executed"
-EV_CLEANUP_FAILED = "cleanup_failed"
-# H: long-run graph compaction.
-EV_GRAPH_COMPACTED = "graph_compacted"
-
-
+from dswarm.swarm.graph_contract import *
+from dswarm.swarm.graph_contract import (
+    _FACT_TERMINAL_STATES,
+    _is_runtime_infra_fact_text,
+)
 from dswarm.swarm.event_reader import GraphEventReader
 from dswarm.swarm.poc_lifecycle import PocLifecycle
 from dswarm.swarm.review_lifecycle import ReviewLifecycle
 
-
-# A: fact lifecycle states. unresolved/challenged/revalidated keep the legacy
-# Immutable lifecycle event semantics; rejected/merged/superseded are terminal states.
-FACT_STATE_UNRESOLVED = "unresolved"
-FACT_STATE_CHALLENGED = "challenged"
-FACT_STATE_REVALIDATED = "revalidated"
-FACT_STATE_REJECTED = "rejected"
-FACT_STATE_MERGED = "merged"
-FACT_STATE_SUPERSEDED = "superseded"
-_FACT_TERMINAL_STATES = {FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED}
-_FACT_STATES = {
-    FACT_STATE_UNRESOLVED, FACT_STATE_CHALLENGED, FACT_STATE_REVALIDATED,
-    FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED,
-}
-
-
-def _is_runtime_infra_fact_text(text: object) -> bool:
-    """Facts synthesized from worker/LLM CLI failures are not challenge evidence.
-
-    Older runs could append stderr such as ``Unknown provider "dswarm-worker"``
-    as ``fact_added`` before the CLI runtime-failure path learned to short-circuit.
-    The event log remains append-only for audit, but derived board/planner views must
-    suppress these infrastructure facts so Reason/Reviewer do not chase the local
-    worker configuration as if it were a CTF clue.
-    """
-    s = str(text or "").strip().lower()
-    if not s:
-        return False
-    if "worker cli/runtime failed before producing solver output" in s:
-        return True
-    if "profile_incompatible offline eval cannot use custom endpoint profile" in s:
-        return True
-    if "unknown provider" in s and "dswarm-worker" in s and "--list-models" in s:
-        return True
-    if "endpoint probe failed:" in s and ("curl:" in s or "requested url returned error" in s):
-        return True
-    return False
-
-# A/J: intent dispatch_state — orthogonal to status (open/claimed/done).
-# active  → claimable + visible to planner/workers (the default)
-# resume  → held back from dispatch (paused/deferred), kept for audit/revival
-# retired → permanently dropped (compacted/stale); never re-dispatched
-# closed  → terminal-by-conclusion (solved/route_suppressed/etc.)
-INTENT_DISPATCH_ACTIVE = "active"
-INTENT_DISPATCH_RESUME = "resume"
-INTENT_DISPATCH_RETIRED = "retired"
-INTENT_DISPATCH_CLOSED = "closed"
-_INTENT_DISPATCH_STATES = {
-    INTENT_DISPATCH_ACTIVE, INTENT_DISPATCH_RESUME,
-    INTENT_DISPATCH_RETIRED, INTENT_DISPATCH_CLOSED,
-}
-
-
-_SERVICE_DEFAULT_PORTS = {
-    "smb": 445,
-    "microsoft-ds": 445,
-    "http": 80,
-    "https": 443,
-    "rdp": 3389,
-    "winrm": 5985,
-    "winrm-http": 5985,
-    "winrm-https": 5986,
-    "ssh": 22,
-    "redis": 6379,
-    "mysql": 3306,
-    "mssql": 1433,
-    "ldap": 389,
-    "ldaps": 636,
-    "kerberos": 88,
-    "postgres": 5432,
-}
-def canonicalize_lane(
-    host: str = "",
-    port: str | int | None = None,
-    service: str = "",
-    risk_class: str = "destructive",
-) -> tuple[str, float, str]:
-    """Return a stable lane key for dangerous/exclusive work.
-
-    The key is intentionally resource-only: technique text never participates, so
-    "MS17-010 on SMB" and "EternalBlue against 445" collide on the same lane.
-    """
-    risk = _clean_lane_risk(risk_class)
-    clean_host, host_conf, host_reason = _clean_lane_host(host)
-    if not clean_host:
-        return "", 0.0, host_reason
-
-    clean_service = re.sub(r"[^a-z0-9_-]+", "-", (service or "").strip().lower()).strip("-")
-    clean_port = ""
-    if port not in (None, ""):
-        try:
-            p = int(str(port).strip())
-            if 0 < p <= 65535:
-                clean_port = str(p)
-        except (TypeError, ValueError):
-            clean_port = ""
-    if not clean_port and clean_service in _SERVICE_DEFAULT_PORTS:
-        clean_port = str(_SERVICE_DEFAULT_PORTS[clean_service])
-
-    if not clean_port:
-        if risk == "listener_port":
-            return "", min(host_conf, 0.40), "listener_port_unknown"
-        if risk in {"destructive", "exclusive_shell", "relay_service"}:
-            clean_port = "*"
-        else:
-            return "", min(host_conf, 0.50), "port_unknown_fail_open"
-
-    reason = host_reason if host_reason else ""
-    conf = min(1.0, host_conf if clean_port != "*" else min(host_conf, 0.65))
-    return f"{risk}:tcp:{clean_port}@{clean_host}", conf, reason
-
-
-@dataclass(frozen=True)
-class IntentRouteRef:
-    intent_id: str
-    route_hash: str
-
-
-@dataclass(frozen=True)
-class RouteObservation:
-    fact_seq: int
-    event_ts: float
-    explicit_route_hash: str = ""
-    inherited_routes: tuple[IntentRouteRef, ...] = ()
-    effective_route_hash: str = ""
-    lineage: str = "unattributed"
-    reason: str = ""
-    attempted_orphan_intent_id: str = ""
-    attempted_orphan_route_hash: str = ""
-    eligible_for_energy: bool = False
-
-
-def resolve_route_observation(
-    *,
-    fact_seq: int,
-    event_ts: float,
-    explicit_route_hash: Any,
-    inherited_routes: Iterable[IntentRouteRef] = (),
-    payload_intent_id: Any = "",
-    payload_intent_route_hash: Any = "",
-    orphan_intent_id: Any = "",
-    orphan_intent_route_hash: Any = "",
-    normalize_route: Callable[[Any], str],
-) -> RouteObservation:
-    """Pure M6 lineage resolver shared by live graph reads and M7 capture.
-
-    Callers own the atomic read and stable ordering of ``inherited_routes``;
-    this function owns the single conflict/orphan eligibility policy.
-    """
-    explicit = normalize_route(explicit_route_hash)
-    inherited = [
-        IntentRouteRef(ref.intent_id, normalize_route(ref.route_hash))
-        for ref in inherited_routes
-    ]
-    inherited_reason = "intent_product"
-    payload_id = str(payload_intent_id or "").strip()
-    if not inherited and payload_id:
-        inherited.append(IntentRouteRef(
-            payload_id, normalize_route(payload_intent_route_hash)
-        ))
-        inherited_reason = "payload_intent_inherit"
-
-    orphan_id = str(orphan_intent_id or "").strip()
-    orphan_route = normalize_route(orphan_intent_route_hash) if orphan_id else ""
-    inherited_values = {ref.route_hash for ref in inherited if ref.route_hash}
-
-    effective = ""
-    lineage = "unattributed"
-    reason = "orphan_intent_reference" if orphan_id else "no_route_attribution"
-    eligible = False
-    if explicit:
-        effective = explicit
-        if any(route != explicit for route in inherited_values):
-            lineage = "explicit_conflict"
-            reason = "explicit_inherited_conflict"
-        else:
-            lineage = "explicit"
-            reason = (
-                "explicit_matches_inherited"
-                if inherited_values else "explicit_route"
-            )
-            eligible = True
-    elif len(inherited_values) > 1:
-        lineage = "inherited_conflict"
-        reason = "inherited_route_conflict"
-    elif len(inherited_values) == 1:
-        effective = next(iter(inherited_values))
-        lineage = "inherited"
-        reason = inherited_reason
-        eligible = True
-    elif inherited:
-        reason = inherited_reason
-
-    return RouteObservation(
-        fact_seq=int(fact_seq),
-        event_ts=float(event_ts),
-        explicit_route_hash=explicit,
-        inherited_routes=tuple(inherited),
-        effective_route_hash=effective,
-        lineage=lineage,
-        reason=reason,
-        attempted_orphan_intent_id=orphan_id,
-        attempted_orphan_route_hash=orphan_route,
-        eligible_for_energy=eligible,
-    )
-
-
-@runtime_checkable
-class SharedGraph(Protocol):
-    """Backend-swappable shared graph. Local = SQLite file; (future) cross-
-    container = HTTP. Callers depend only on this surface."""
-
-    def add_evidence(self, *, actor: str, source: str, fact: str,
-                     artifact_id: Optional[str] = None, verified: bool = False,
-                     confidence: float = 1.0, witness: Optional[str] = None,
-                     verifier: str = "", route_hash: str = "",
-                     intent_id: Optional[str] = None,
-                     finding: Optional[StructuredFinding] = None) -> int: ...
-
-    def route_observations(
-        self, fact_seqs: Iterable[int]
-    ) -> dict[int, RouteObservation]: ...
-
-    def route_lineage_for_fact(self, fact_seq: int) -> RouteObservation: ...
-
-    def add_dead_end(self, *, actor: str, reason: str) -> int: ...
-
-    def flag_found(self, *, actor: str, flag: str,
-                   artifact_id: Optional[str] = None,
-                   intent_id: Optional[str] = None) -> int: ...
-
-    def flag_unverified(self, *, actor: str, flag: str, reason: str = "",
-                        artifact_id: Optional[str] = None,
-                        intent_id: Optional[str] = None,
-                        context: str = "") -> int: ...
-
-    def propose_intent(self, *, actor: str, intent_id: str, goal: str,
-                       payload: Optional[dict] = None,
-                       from_fact_seqs: Optional[list[int]] = None) -> int: ...
-
-    def claim_intent(self, *, worker: str, intent_id: str,
-                     lease_s: float = 300.0) -> bool: ...
-
-    def conclude_intent(self, *, actor: str, intent_id: str,
-                        result: str = "",
-                        to_fact_seq: Optional[int] = None,
-                        result_detail: str = "") -> int: ...
-
-    def save_poc(self, *, actor: str, poc_id: str, path: str,
-                 entry_command: str, status: str = "available",
-                 note: str = "", artifact_id: Optional[str] = None,
-                 intent_id: Optional[str] = None, name: str = "") -> int: ...
-
-    def claim_poc(self, *, worker: str, poc_id: str,
-                  lease_s: float = 300.0) -> bool: ...
-
-    def conclude_poc(self, *, actor: str, poc_id: str,
-                     status: str = "spent", note: str = "") -> int: ...
-
-    def register_poc_reproduction(self, *, actor: str, poc_id: str,
-                                  indicator: str) -> dict[str, Any]: ...
-
-    def get_poc_reproduction(self, poc_id: str) -> Optional[dict[str, Any]]: ...
-
-    def register_cleanup_action(
-        self, *, actor: str, action_type: str, target: str,
-        intent_id: str = "", poc_id: str = "", owner_key: str = "",
-        idempotency_key: str = "",
-    ) -> dict[str, Any]: ...
-
-    def cleanup_actions(self, *, include_terminal: bool = True) -> list[dict[str, Any]]: ...
-
-    def cleanup_action_executed(self, *, actor: str, action_id: str,
-                                result: str = "") -> int: ...
-
-    def cleanup_action_failed(self, *, actor: str, action_id: str,
-                              reason: str = "") -> int: ...
-
-    def poc_verification_status(self, poc_id: str) -> Optional[dict[str, Any]]: ...
-
-    def begin_poc_verification(self, *, actor: str, poc_id: str,
-                               verification_id: str, reproduction_id: str,
-                               worker_id: str = "", finding_id: str = "",
-                               intent_id: str = "", pool_identity: str = "",
-                               lease_s: float = 600.0) -> Optional[dict[str, Any]]: ...
-
-    def append_poc_verification_terminal(
-        self, *, actor: str, poc_id: str, verification_id: str,
-        verified: bool, exit_code: Optional[int] = None,
-        failure_reason: Optional[VerificationFailure | str] = None,
-        observed_location: str = "",
-        provenance_artifact_ids: Optional[list[str]] = None,
-        diagnostics: str = "", elapsed_ms: Optional[int] = None,
-    ) -> int: ...
-
-    def mark_review_finding_verified(
-        self, *, actor: str, finding_id: str, poc_id: str,
-        reproduction_id: str, verification_id: str,
-    ) -> int: ...
-
-    def supersede_open_intents(self, *, actor: str, match: str,
-                               reason: str = "") -> list[str]: ...
-
-    def add_review_finding(self, *, actor: str, kind: str, severity: str,
-                           summary: str, evidence_seqs: Optional[list[int]] = None,
-                           intent_ids: Optional[list[str]] = None,
-                           route_hash: str = "", branch_id: str = "",
-                           recommended_actions: Optional[list[str]] = None,
-                           poc_id: str = "",
-                           poc_ids: Optional[list[str]] = None) -> int: ...
-
-    def add_review_proposal(self, *, actor: str, marker: str, payload: dict,
-                            tier: str = "tier1") -> int: ...
-
-    def decide_review_proposal(self, *, actor: str, proposal_seq: int,
-                               decision: str, reason: str = "",
-                               applied_seq: Optional[int] = None) -> int: ...
-
-    def challenge_fact(self, *, actor: str, fact_seq: int, reason: str,
-                       verification_goal: str) -> dict: ...
-
-    def revalidate_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int: ...
-
-    def reject_fact(self, *, actor: str, fact_seq: int, reason: str = "") -> int: ...
-
-    def merge_fact(self, *, actor: str, from_fact_seq: int, to_fact_seq: int,
-                   reason: str = "") -> int: ...
-
-    def supersede_fact(self, *, actor: str, fact_seq: int, reason: str = "",
-                       by_fact_seq: Optional[int] = None) -> int: ...
-
-    def review_fact(self, *, actor: str, fact_seq: int, action: str,
-                    reason: str = "", verification_goal: str = "",
-                    to_fact_seq: Optional[int] = None) -> dict: ...
-
-    def active_candidates(self) -> list[dict]: ...
-
-    def verified_evidence(self) -> list[dict]: ...
-
-    def suppress_route(self, *, actor: str, route_hash: str, label: str = "",
-                       reason: str = "", until: str = "new_evidence",
-                       matching_intents: Optional[list[str]] = None) -> dict: ...
-
-    def reopen_route(self, *, actor: str, route_hash: str, reason: str = "",
-                     intent_goal: str = "") -> dict: ...
-
-    def split_branch(self, *, actor: str, title: str,
-                     branches: list[dict[str, Any]]) -> dict: ...
-
-    def resolve_branch(self, *, actor: str, branch_id: str, reason: str = "",
-                       status: str = "resolved") -> dict: ...
-
-    def add_coordinator_directive(self, *, actor: str, action: str,
-                                  directive: str, priority: str = "normal",
-                                  route_hash: str = "") -> int: ...
-
-    def add_operator_directive(self, *, actor: str = "operator", action: str,
-                               text: str, scope: str = "global",
-                               standing: bool = False,
-                               preempt_policy: str = "soft_rebind",
-                               priority: Optional[int] = None) -> dict: ...
-
-    def update_directive_status(self, *, directive_id: str, status: str,
-                                actor: str = "coordinator",
-                                generated_fact_seq: Optional[int] = None,
-                                generated_intent_id: Optional[str] = None,
-                                bound_worker: Optional[str] = None,
-                                conflicts: Optional[list[str]] = None) -> int: ...
-
-    def operator_directives(self, *, active_only: bool = True) -> list[dict]: ...
-
-    def add_hitl_request(self, *, worker: str, need: str, need_kind: str,
-                         classification_confidence: float = 1.0,
-                         status: str = "classified",
-                         directive_id: Optional[str] = None,
-                         resource_lock_id: Optional[str] = None,
-                         auto_action_seq: Optional[int] = None) -> dict: ...
-
-    def lock_lane(self, *, actor: str, lane_key: str, risk_class: str,
-                  owner_worker: str, owner_intent: str,
-                  lease_s: float = 900.0) -> dict: ...
-
-    def release_lane(self, *, actor: str, lane_key: str,
-                     by_worker: str = "") -> dict: ...
-
-    def defer_intent_for_lane(self, *, actor: str, intent_id: str,
-                              lane_key: str, against_locked_seq: int = 0) -> int: ...
-
-    def active_lanes(self) -> list[dict]: ...
-
-    def request_resource_lock(self, *, actor: str, resource_key: str,
-                              scope: str = "activity", risk_class: str = "",
-                              owner_worker: str = "", owner_intent: str = "",
-                              conflict_policy: str = "exclusive",
-                              lease_s: float = 600.0, cooldown_s: float = 0.0) -> dict: ...
-
-    def release_resource_lock(self, *, actor: str, resource_key: str = "",
-                              lock_id: str = "", by_worker: str = "") -> dict: ...
-
-    def active_resource_locks(self) -> list[dict]: ...
-
-    def check_resource_conflicts(self, *, resource_key: str = "", lane_key: str = "",
-                                 by_worker: str = "") -> dict: ...
-
-    def is_lane_held_by_other(self, lane_key: str, by_worker: str) -> bool: ...
-
-    def in_lane_cooldown(self, lane_key: str, worker: str) -> bool: ...
-
-    def release_claims_for_finalize(self, *, reason: str) -> dict: ...
-
-    def compact_graph(self, *, actor: str = "coordinator",
-                      trigger: str = "no_progress_time", summary: str = "") -> dict: ...
-
-    def compact_epochs(self) -> list[dict]: ...
-
-    def revive_resume_intents(self, *, actor: str = "coordinator") -> list[str]: ...
-
-    def prior_intent_count(self) -> int: ...
-
-    def to_review_summary(self) -> str: ...
-
-    def suppressed_routes(self) -> list[dict]: ...
-
-    def challenged_facts(self) -> list[dict]: ...
-
-    def branches(self) -> list[dict]: ...
-
-    def coordinator_directives(self) -> list[dict]: ...
-
-    def snapshot(self) -> SolveGraph: ...
-
-    def invalidated_flags(self) -> set[str]: ...
-
-    def unverified_flags(self) -> list[dict]: ...
-
-    def events(self) -> list[dict]: ...
-    def events_since(self, after_seq: int, kinds: Optional[list[str]] = None) -> list[dict]: ...
-    async def subscribe_events(self, after_seq: int = 0,
-                               kinds: Optional[list[str]] = None,
-                               poll_interval: float = 0.5) -> Any: ...
-
-    def to_summary(self, max_evidence: int = 16,
-                   max_dead_ends: Optional[int] = None) -> str: ...
-
-    def to_reason_summary(self, standing_guidance: Optional[list[str]] = None) -> str: ...
-
-    def to_board_markdown(self) -> str: ...
-
-    def open_goal_texts(self) -> list[str]: ...
-
-    def dispatchable_goal_texts(self) -> list[str]: ...
-
-    def dispatchable_intents(self, *, now: Optional[float] = None) -> list[dict]: ...
-
-    def annotate_intent_lane(self, *, intent_id: str, lane_key: str,
-                             risk_class: str = "") -> bool: ...
-
-    def open_route_hashes(self) -> list[str]: ...
-
-    def barren_concluded_goal_texts(self) -> list[str]: ...
-
-    def pin_facts(self, *, actor: str, fact_seqs: list[int],
-                  reason: str = "") -> list[int]: ...
-
-    def pinned_fact_seqs(self) -> list[int]: ...
-
-    def fact_pin_context(self, limit: int = 240) -> str: ...
-
-    def try_claim_activity(self, *, worker: str, key: str,
-                           lease_s: float = 600.0) -> bool: ...
-
-    def release_activity(self, *, worker: str, key: str) -> None: ...
-
-    def active_activities(self) -> list[dict]: ...
-
-    def canonical_credentials(self) -> list[dict]: ...
 
 
 _SCHEMA = """
@@ -1019,7 +492,7 @@ class SQLiteSharedGraph:
     @staticmethod
     def _effective_row(row: sqlite3.Row | tuple, columns: list[str]) -> dict[str, Any]:
         item = dict(zip(columns, row))
-        for key in ("base_verified", "retired", "verified"):
+        for key in ("base_verified", "retired", "verified", "review_required"):
             item[key] = bool(item.get(key))
         raw_finding = item.get("finding_data")
         if isinstance(raw_finding, str):
@@ -1590,7 +1063,8 @@ class SQLiteSharedGraph:
                      confidence: float = 1.0, witness: Optional[str] = None,
                      verifier: str = "", route_hash: str = "",
                      intent_id: Optional[str] = None,
-                     finding: Optional[StructuredFinding] = None) -> int:
+                     finding: Optional[StructuredFinding] = None,
+                     review_required: bool = False) -> int:
         route = self.normalize_route_hash(route_hash) if route_hash else ""
         if not verified:
             if route:
@@ -1617,7 +1091,9 @@ class SQLiteSharedGraph:
                 if int(row[0] if row else 0) >= self.CANDIDATE_CAP_PER_SOURCE_NOROUTE:
                     return -1
         payload = {"source": source, "fact": fact, "source_solver": actor,
-                   "witness": witness, "verifier": verifier}
+                   "witness": witness, "verifier": verifier,
+                   "review_required": bool(review_required),
+                   "report_seq": None}
         if finding is not None:
             payload["finding"] = finding.to_dict()
         if route:
@@ -1696,11 +1172,37 @@ class SQLiteSharedGraph:
             )
         return seq
 
-    def add_dead_end(self, *, actor: str, reason: str) -> int:
+    def add_dead_end(self, *, actor: str, reason: str, review_required: bool = False,
+                     intent_id: Optional[str] = None,
+                     artifact_id: Optional[str] = None) -> int:
         if self._has_near_duplicate_dead_end(reason):
             return -1
-        return self._append(EV_DEAD_END, actor, {"reason": reason},
-                            dedupe_key=f"deadend::{reason}")
+        payload: dict[str, Any] = {"reason": reason}
+        if review_required:
+            payload["review_required"] = True
+        if intent_id:
+            payload["intent_id"] = str(intent_id).strip()
+        return self._append(
+            EV_DEAD_END, actor, payload, artifact_id=artifact_id,
+            dedupe_key=f"deadend::{reason}")
+
+    def _require_dead_end_target(self, dead_end_seq: int) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT seq, payload, artifact_id FROM events "
+                "WHERE challenge_id=? AND seq=? AND kind=?",
+                (self.challenge.id, int(dead_end_seq), EV_DEAD_END),
+            ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"dead_end_seq {int(dead_end_seq)} is not a same-challenge dead_end event")
+        try:
+            payload = dict(json.loads(row[1] or "{}"))
+        except (TypeError, ValueError):
+            payload = {}
+        payload["seq"] = int(row[0])
+        payload["artifact_id"] = str(row[2] or "")
+        return payload
 
     @staticmethod
     def _norm_dead_end_text(text: str) -> str:
@@ -1837,6 +1339,62 @@ class SQLiteSharedGraph:
             actor=actor, proposal_seq=proposal_seq, decision=decision,
             reason=reason, applied_seq=applied_seq,
         )
+    def worker_report_pending_review(
+        self, *, actor: str, worker_id: str, intent_id: str = "",
+        fact_seqs: Optional[list[int]] = None, dead_end_seqs: Optional[list[int]] = None,
+        artifact_ids: Optional[list[str]] = None, raw_artifact_ids: Optional[list[str]] = None,
+        report_ref: str = "", runtime_only: bool = False,
+    ) -> int:
+        return self._review_lifecycle.worker_report_pending_review(
+            actor=actor, worker_id=worker_id, intent_id=intent_id,
+            fact_seqs=fact_seqs, dead_end_seqs=dead_end_seqs,
+            artifact_ids=artifact_ids, raw_artifact_ids=raw_artifact_ids,
+            report_ref=report_ref, runtime_only=runtime_only,
+        )
+
+    def decide_evidence_review(
+        self, *, actor: str, decision: str, subject_id: str = "",
+        fact_seq: Optional[int] = None, dead_end_seq: Optional[int] = None,
+        intent_id: str = "", evidence_refs: Optional[list[str]] = None,
+        reason: str = "", report_seq: Optional[int] = None, route_hash: str = "",
+    ) -> int:
+        return self._review_lifecycle.decide_evidence_review(
+            actor=actor, decision=decision, subject_id=subject_id,
+            fact_seq=fact_seq, dead_end_seq=dead_end_seq, intent_id=intent_id,
+            evidence_refs=evidence_refs, reason=reason, report_seq=report_seq,
+            route_hash=route_hash,
+        )
+
+    def publish_reviewed_context(
+        self, *, actor: str, context_type: str, subject_id: str = "",
+        fact_seqs: Optional[list[int]] = None, intent_ids: Optional[list[str]] = None,
+        reason: str = "", source_review_seq: Optional[int] = None,
+    ) -> int:
+        return self._review_lifecycle.publish_reviewed_context(
+            actor=actor, context_type=context_type, subject_id=subject_id,
+            fact_seqs=fact_seqs, intent_ids=intent_ids, reason=reason,
+            source_review_seq=source_review_seq,
+        )
+
+    def decide_intent_quality(
+        self, *, actor: str, intent_id: str, decision: str, reason: str = "",
+        replacement: Optional[dict[str, Any]] = None,
+        evidence_refs: Optional[list[str]] = None, reason_cycle_id: str = "",
+    ) -> int:
+        return self._review_lifecycle.decide_intent_quality(
+            actor=actor, intent_id=intent_id, decision=decision, reason=reason,
+            replacement=replacement, evidence_refs=evidence_refs,
+            reason_cycle_id=reason_cycle_id,
+        )
+
+    def reviewed_context(self) -> dict[str, Any]:
+        return self._review_lifecycle.reviewed_context()
+
+    def evidence_review_decisions(self) -> list[dict[str, Any]]:
+        return self._review_lifecycle.evidence_review_decisions()
+
+    def intent_quality_decisions(self) -> list[dict[str, Any]]:
+        return self._review_lifecycle.intent_quality_decisions()
 
     def challenge_fact(
         self, *, actor: str, fact_seq: int, reason: str, verification_goal: str
@@ -2043,13 +1601,22 @@ class SQLiteSharedGraph:
     def split_branch(self, *, actor: str, title: str,
                      branches: list[dict[str, Any]]) -> dict:
         parent = f"branch-{hashlib.sha1((title or str(time.time())).encode()).hexdigest()[:10]}"
-        payload = {"branch_id": parent, "title": title, "branches": branches}
+        normalized: list[dict[str, str]] = []
+        for raw in branches:
+            if not isinstance(raw, dict):
+                continue
+            bid = str(raw.get("id") or "").strip() or (
+                f"{parent}-{hashlib.sha1(json.dumps(raw, sort_keys=True, default=str).encode()).hexdigest()[:6]}")
+            normalized.append({
+                "id": bid,
+                "assumption": str(raw.get("assumption") or "").strip(),
+                "prove_or_disprove": str(raw.get("prove_or_disprove") or "").strip(),
+            })
+        payload = {"branch_id": parent, "title": title, "branches": normalized}
         seq = self._append(EV_BRANCH_SPLIT, actor, payload,
-                           dedupe_key=f"branch-split::{title}::{len(branches)}")
+                           dedupe_key=f"branch-split::{title}::{len(normalized)}")
         with self._lock:
-            for raw in branches:
-                bid = str(raw.get("id") or "").strip() or (
-                    f"{parent}-{hashlib.sha1(str(raw).encode()).hexdigest()[:6]}")
+            for raw in normalized:
                 self._conn.execute(
                     "INSERT INTO branches "
                     "(branch_id, challenge_id, parent_id, title, assumption, "
@@ -2058,13 +1625,12 @@ class SQLiteSharedGraph:
                     "ON CONFLICT(branch_id) DO UPDATE SET "
                     " title=excluded.title, assumption=excluded.assumption, "
                     " prove_or_disprove=excluded.prove_or_disprove, status='open'",
-                    (bid, self.challenge.id, parent, title,
-                     str(raw.get("assumption") or "").strip(),
-                     str(raw.get("prove_or_disprove") or "").strip(),
+                    (raw["id"], self.challenge.id, parent, title,
+                     raw["assumption"], raw["prove_or_disprove"],
                      "open", seq if seq > 0 else 0),
                 )
             self._conn.commit()
-        return {"branch_id": parent, "seq": seq}
+        return {"branch_id": parent, "seq": seq, "branches": normalized}
 
     def resolve_branch(self, *, actor: str, branch_id: str, reason: str = "",
                        status: str = "resolved") -> dict:
@@ -3041,28 +2607,38 @@ class SQLiteSharedGraph:
         closed rows are held back even if their status is still 'open'."""
         now = time.time()
         with self._lock:
-            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
-            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
-            # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
-            renewed = self._conn.execute(
-                "UPDATE intents SET lease_until=? "
-                "WHERE intent_id=? AND challenge_id=? "
-                "  AND dispatch_state='active' "
-                "  AND status='claimed' AND worker=?",
-                (now + lease_s, intent_id, self.challenge.id, worker),
-            ).rowcount == 1
-            if renewed:
+            # BEGIN EXCLUSIVE ensures only one worker can hold this transaction,
+            # eliminating the TOCTOU window between the renewal check and new claim.
+            self._conn.execute("BEGIN EXCLUSIVE")
+            try:
+                # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+                # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+                # ⑤ operator_stop is the user DELIBERATELY ending the run — close the
+                renewed = self._conn.execute(
+                    "UPDATE intents SET lease_until=? "
+                    "WHERE intent_id=? AND challenge_id=? "
+                    "  AND dispatch_state='active' "
+                    "  AND status='claimed' AND worker=?",
+                    (now + lease_s, intent_id, self.challenge.id, worker),
+                ).rowcount == 1
+                if renewed:
+                    self._conn.commit()
+                    return True
+                cur = self._conn.execute(
+                    "UPDATE intents SET worker=?, status='claimed', lease_until=? "
+                    "WHERE intent_id=? AND challenge_id=? "
+                    "  AND dispatch_state='active' "
+                    "  AND (status='open' OR (status='claimed' AND lease_until < ?))",
+                    (worker, now + lease_s, intent_id, self.challenge.id, now),
+                )
                 self._conn.commit()
-                return True
-            cur = self._conn.execute(
-                "UPDATE intents SET worker=?, status='claimed', lease_until=? "
-                "WHERE intent_id=? AND challenge_id=? "
-                "  AND dispatch_state='active' "
-                "  AND (status='open' OR (status='claimed' AND lease_until < ?))",
-                (worker, now + lease_s, intent_id, self.challenge.id, now),
-            )
-            self._conn.commit()
-            won = cur.rowcount == 1
+                won = cur.rowcount == 1
+                # Defensive: log unexpected rowcount (should be 0 or 1 within EXCLUSIVE)
+                if cur.rowcount not in (0, 1):
+                    logging.error(f"claim_intent: unexpected rowcount {cur.rowcount}, expected 0 or 1")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
         if won:
             self._append(EV_INTENT_CLAIMED, worker, {"intent_id": intent_id})
         return won
@@ -3134,46 +2710,33 @@ class SQLiteSharedGraph:
         for a in acts[:30]:
             lines.append(f"- {a['activity']} [{a['worker']}]")
         return "\n".join(lines)
-
     def _lane_locks_block(self) -> str:
+        """Render active exclusive lane locks."""
         lanes = self.active_lanes()
         if not lanes:
             return ""
-        lines = ["\n## Exclusive lanes (do NOT duplicate dangerous work)"]
-        for lane in lanes[:30]:
-            lines.append(
-                f"- {lane['lane_key']} [{lane['owner_worker']}] "
-                f"intent={lane['owner_intent']}")
+        lines = ["\n## Active lane locks"]
+        for l in lanes[:30]:
+            lines.append(f"- lane {l['lane_key']} [{l['owner_worker']}]")
         return "\n".join(lines)
 
     def _resource_locks_block(self) -> str:
-        """E: active resource locks (site/account/listener) a teammate holds — a
-        worker must not run conflicting destructive/exclusive work on these."""
+        """Render active resource locks."""
         locks = self.active_resource_locks()
         if not locks:
             return ""
-        lines = ["\n## Held resource locks (do NOT run conflicting work)"]
+        lines = ["\n## Active resource locks"]
         for rl in locks[:30]:
-            risk = f" risk={rl['risk_class']}" if rl.get("risk_class") else ""
-            lines.append(
-                f"- {rl['resource_key']} (scope={rl['scope']}{risk}) "
-                f"[{rl['owner_worker']}]")
+            lines.append(f"- resource {rl['lock_id']} ({rl['scope']}) [{rl['owner_worker']}]")
         return "\n".join(lines)
 
     def conclude_intent(self, *, actor: str, intent_id: str,
                         result: str = "",
                         to_fact_seq: Optional[int] = None,
                         result_detail: str = "") -> int:
-        """Mark an intent done — but ONLY if `actor` still OWNS the claim (owner
-        fencing). The coordinator claims an explore intent under the worker's own
-        solver_id, so the worker that concludes is the owner. If the worker's lease
-        lapsed and the coordinator re-dispatched the intent to a NEW worker (owner
-        changes to that new solver_id via _open_intents → claim_intent), then a
-        slow/late ORIGINAL worker concluding now is NO LONGER the owner and must NOT
-        clobber the fresh claim. The EV_INTENT_CONCLUDED event is still appended
-        (provenance of what the late worker reported); only the intents-table state
-        row is fenced. Exceptions that always win: a 'solved' conclusion (a real flag
-        ends the run regardless), and actor 'coordinator' (legacy/admin path)."""
+        """Append a conclusion and update projection only for the live owner.
+
+        Interrupted intents retain their previous owner as a tombstone."""
         detail = (result_detail or "").strip()
         payload = {"intent_id": intent_id, "result": result}
         if detail:
@@ -3181,30 +2744,25 @@ class SQLiteSharedGraph:
         if to_fact_seq is not None:
             payload["to_fact_seq"] = to_fact_seq
         seq = self._append(EV_INTENT_CONCLUDED, actor, payload)
-        # owner fence: only the current owner (or coordinator, or a solved result)
-        # may flip the row to done. worker IS NULL handles never-claimed intents
-        # some paths conclude as a no-op.
         fence = "" if (result == "solved" or actor == "coordinator") else (
-            " AND (worker=? OR worker IS NULL)")
-        # A/J: a concluded intent also leaves the dispatch pool (closed), with the
-        # conclusion text as its close_reason — distinguishes it from resume/retired.
+            " AND ((dispatch_state=? AND status='claimed' AND worker=?) "
+            "OR (dispatch_state=? AND status='open' AND worker IS NULL))")
         close_reason = (result or "concluded").strip()[:200]
         with self._lock:
             if to_fact_seq is not None:
                 sql = ("UPDATE intents SET status='done', dispatch_state='closed', "
                        "close_reason=?, result_seq=?, result_detail=?, to_fact_seq=? "
                        "WHERE intent_id=? AND challenge_id=?" + fence)
-                params: list = [close_reason, seq if seq > 0 else None, detail or None,
-                                to_fact_seq,
-                                intent_id, self.challenge.id]
+                params: list[Any] = [close_reason, seq if seq > 0 else None, detail or None,
+                                     to_fact_seq, intent_id, self.challenge.id]
             else:
                 sql = ("UPDATE intents SET status='done', dispatch_state='closed', "
                        "close_reason=?, result_seq=?, result_detail=? "
                        "WHERE intent_id=? AND challenge_id=?" + fence)
-                params = [close_reason, seq if seq > 0 else None, detail or None, intent_id,
-                          self.challenge.id]
+                params = [close_reason, seq if seq > 0 else None, detail or None,
+                          intent_id, self.challenge.id]
             if fence:
-                params.append(actor)
+                params.extend([INTENT_DISPATCH_ACTIVE, actor, INTENT_DISPATCH_ACTIVE])
             self._conn.execute(sql, tuple(params))
             if self._intent_result_marks_poc_spent(result):
                 self._conn.execute(
@@ -3215,6 +2773,179 @@ class SQLiteSharedGraph:
                 )
             self._conn.commit()
         return seq
+
+    def mark_intent_awaiting_validation(
+        self, *, actor: str, intent_id: str, reason: str = "",
+        recovery_attempt: int = 0, worker_id: str = "",
+    ) -> int:
+        """Append interruption audit and park the intent for Reason.
+
+        Keep the previous owner in the projection as a tombstone. Recovery dispatch
+        uses a linked replacement Intent instead of clearing the owner in place.
+        """
+        iid = str(intent_id or "").strip()
+        if not iid:
+            return -1
+        owner = str(worker_id or "").strip()
+        payload = {
+            "intent_id": iid,
+            "worker_id": owner,
+            "reason": str(reason or "").strip()[:1000],
+            "recovery_attempt": max(0, int(recovery_attempt or 0)),
+            "dispatch_state": INTENT_DISPATCH_AWAITING_VALIDATION,
+        }
+        seq = self._append(EV_INTENT_INTERRUPTED, actor, payload)
+        self._append(
+            EV_INTENT_RECOVERY_REQUIRED, actor,
+            {**payload, "interruption_seq": seq if seq > 0 else None},
+        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE intents SET dispatch_state=?, status='open', "
+                "worker=COALESCE(NULLIF(?,''), worker), lease_until=NULL, "
+                "stop_reason=?, close_reason=? WHERE challenge_id=? AND intent_id=? "
+                "AND (worker=? OR (worker IS NULL AND ?=''))",
+                (INTENT_DISPATCH_AWAITING_VALIDATION, owner,
+                 payload["reason"][:200] or "awaiting_validation",
+                 "awaiting_validation", self.challenge.id, iid, owner, owner),
+            )
+            self._conn.commit()
+        self._append(
+            EV_INTENT_STATE_CHANGED, actor,
+            {"intent_id": iid, "dispatch_state": INTENT_DISPATCH_AWAITING_VALIDATION,
+             "reason": payload["reason"]},
+        )
+        return seq
+
+    def reopen_interrupted_intent(
+        self, *, actor: str, intent_id: str, recovery_intent_id: str,
+        worker_id: str = "", reason: str = "",
+    ) -> int:
+        """Reopen a parked Intent and append a linked replacement proposal."""
+        iid = str(intent_id or "").strip()
+        rid = str(recovery_intent_id or "").strip()
+        if not iid or not rid:
+            return -1
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT goal, worker_class, direction, raw_direction, "
+                "direction_resolution, direction_source, route_hash, branch_id, "
+                "lane_key, risk_class, priority, priority_scale FROM intents "
+                "WHERE challenge_id=? AND intent_id=?",
+                (self.challenge.id, iid),
+            ).fetchone()
+        if row is None:
+            return -1
+        (goal, worker_class, direction, raw_direction, direction_resolution,
+         direction_source, route_hash, branch_id, lane_key, risk_class,
+         priority, priority_scale) = row
+        seq = self._append(
+            EV_INTENT_RECOVERY_REQUIRED,
+            actor,
+            {"intent_id": iid, "recovery_intent_id": rid,
+             "worker_id": str(worker_id or "").strip(),
+             "reason": str(reason or "").strip()[:1000],
+             "dispatch_state": INTENT_DISPATCH_ACTIVE},
+        )
+        self.propose_intent(
+            actor=actor,
+            intent_id=rid,
+            goal=str(goal or ""),
+            payload={
+                "worker_class": str(worker_class or "code"),
+                "direction": str(direction or ""),
+                "raw_direction": str(raw_direction or ""),
+                "direction_resolution": str(direction_resolution or ""),
+                "direction_source": str(direction_source or ""),
+                "route_hash": str(route_hash or ""),
+                "branch_id": str(branch_id or ""),
+                "lane_key": str(lane_key or ""),
+                "risk_class": str(risk_class or ""),
+                "priority": priority,
+                "priority_scale": str(priority_scale or "planner"),
+                "recovery_of_intent_id": iid,
+                "source_worker_id": str(worker_id or "").strip(),
+            },
+        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE intents SET dispatch_state=? WHERE challenge_id=? AND intent_id=?",
+                (INTENT_DISPATCH_RESUME, self.challenge.id, iid),
+            )
+            self._conn.commit()
+        self._append(
+            EV_INTENT_STATE_CHANGED,
+            actor,
+            {"intent_id": iid, "dispatch_state": INTENT_DISPATCH_RESUME,
+             "recovery_intent_id": rid},
+        )
+        return seq
+    def awaiting_validation_intents(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        """Return parked interruptions in recovery priority order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT intent_id, goal, status, worker, worker_class, direction, "
+                "route_hash, priority, priority_scale, dispatch_state, stop_reason, "
+                "created_seq FROM intents WHERE challenge_id=? AND dispatch_state=? "
+                "ORDER BY priority DESC, created_seq ASC LIMIT ?",
+                (self.challenge.id, INTENT_DISPATCH_AWAITING_VALIDATION, int(limit)),
+            ).fetchall()
+        return [
+            {"intent_id": str(row[0]), "goal": str(row[1] or ""),
+             "status": str(row[2] or ""), "worker": str(row[3] or ""),
+             "worker_class": str(row[4] or "code"), "direction": str(row[5] or ""),
+             "route_hash": str(row[6] or ""), "priority": float(row[7] or 0),
+             "priority_scale": str(row[8] or "planner"),
+             "dispatch_state": str(row[9] or ""), "reason": str(row[10] or ""),
+             "created_seq": int(row[11] or 0)}
+            for row in rows
+        ]
+
+    def expired_claim_intents(self, *, now: Optional[float] = None,
+                              limit: int = 32) -> list[dict[str, Any]]:
+        """Claims whose lease expired without a conclusion and whose worker is gone.
+
+        These are exactly the rows ``dispatchable_intents`` would silently hand back
+        out. Reading them separately lets the coordinator record the abandoned claim
+        as an interruption instead of re-dispatching it as if nothing happened.
+        """
+        if now is None:
+            now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT intent_id, goal, worker, worker_class, direction, route_hash, "
+                "priority, priority_scale, lease_until FROM intents "
+                "WHERE challenge_id=? AND dispatch_state='active' AND status='claimed' "
+                "AND result_seq IS NULL AND lease_until IS NOT NULL AND lease_until < ? "
+                "ORDER BY priority DESC, created_seq ASC LIMIT ?",
+                (self.challenge.id, float(now), int(limit)),
+            ).fetchall()
+        return [
+            {"intent_id": str(row[0]), "goal": str(row[1] or ""),
+             "worker": str(row[2] or ""), "worker_class": str(row[3] or "code"),
+             "direction": str(row[4] or ""), "route_hash": str(row[5] or ""),
+             "priority": float(row[6] or 0), "priority_scale": str(row[7] or "planner"),
+             "lease_expired_at": float(row[8] or 0)}
+            for row in rows
+        ]
+
+    def park_expired_claims(self, *, actor: str, reason: str = "claim_lease_expired",
+                            limit: int = 32) -> list[dict[str, Any]]:
+        """Convert abandoned (expired-lease, unconcluded) claims into parked
+        interruptions so Reason recovers them under the documented
+        ``awaiting_validation`` semantics instead of a silent re-dispatch.
+
+        Append-only: each parking goes through ``mark_intent_awaiting_validation``,
+        which records ``intent_interrupted`` + ``intent_recovery_required``.
+        """
+        parked: list[dict[str, Any]] = []
+        for row in self.expired_claim_intents(limit=limit):
+            self.mark_intent_awaiting_validation(
+                actor=actor, intent_id=row["intent_id"], reason=reason,
+                worker_id=str(row.get("worker") or ""),
+            )
+            parked.append(row)
+        return parked
 
 
 
@@ -3234,14 +2965,10 @@ class SQLiteSharedGraph:
 
     def reopen_after_false_positive(self, *, actor: str, flag: str,
                                     reason: str = "") -> dict:
-        """A human marked ONE flag as a FALSE POSITIVE. Record it as a dead-end (so
-        nobody retries it), DROP it from the flag set (other collected flags are
-        kept — multi-flag), and re-open the concluded intent(s) so a standby worker
-        re-finds the missing flag from the verified facts.
+        """A human marked one flag as a false positive. Record it as a dead-end,
+        remove only that flag, and reopen only intents that produced that flag.
 
-        Returns {dead_end_seq, dead_end_reason, reopened: [intent_id, ...]} so the
-        caller can emit the matching blackboard/graph deltas (fact-graph + board
-        grow a dead-end node; the reopened intents flip back to 'open')."""
+        Returns dead-end metadata and the reopened intent ids."""
         why = reason or f"false positive: {flag}"
         dead_seq = self._append(EV_DEAD_END, actor, {"reason": why},
                                 dedupe_key=f"deadend::fp::{flag}")
@@ -3305,22 +3032,10 @@ class SQLiteSharedGraph:
 
     def supersede_open_intents(self, *, actor: str, match: str,
                                reason: str = "") -> list[str]:
-        """Retire every OPEN/claimed-lease-expired intent whose goal contains the
-        `match` substring (case-insensitive) — they've been made obsolete by an
-        operator action. run-11190: a worker proposes "Request the operator for the
-        L2 SSH password", the operator then SUPPLIES it as a standing hint, but the
-        old "ask for the password" intents stayed status='open' forever, so fresh
-        explore workers kept claiming them and re-asking for a password they already
-        had → 238-worker dead loop. Flipping them to status='done' (result=
-        'superseded') stops _open_intents from re-dispatching them. Returns the list
-        of superseded intent_ids (for a blackboard delta). Only OPEN or expired-lease
-        rows are touched — a live claim a worker is actively working is left alone.
+        """Retire open or expired-lease intents matching the supplied substring.
 
-        #11: a marker EV_INTENT_CONCLUDED event with result='superseded' is appended
-        and its seq stored in each row's result_seq, so the rows are DISTINGUISHABLE
-        from a genuinely solved 'done' intent. reopen_after_false_positive uses that
-        result text to reopen ONLY solved intents and leave these superseded asks
-        retired (run-11190 regression)."""
+        The appended superseded conclusion distinguishes these rows from solved
+        intents, so false-positive recovery does not resurrect obsolete asks."""
         import time as _time
         now = _time.time()
         like = f"%{match.lower()}%"
@@ -3356,11 +3071,7 @@ class SQLiteSharedGraph:
 
     # ── read paths ──────────────────────────────────────────────────────
     def invalidated_flags(self) -> set[str]:
-        """Every flag the operator marked false (an EV_FLAG_INVALIDATED event).
-
-        snapshot().flags already excludes these; this accessor lets the coordinator
-        DROP a stale in-memory flag during reconciliation so a blacklisted flag can
-        never count toward expected_flags (BUG③ cross-check). Cheap, read-only."""
+        """Return every flag the operator marked false."""
         out: set[str] = set()
         with self._lock:
             rows = self._conn.execute(
@@ -3541,17 +3252,10 @@ class SQLiteSharedGraph:
         return [m[t] for t in texts if t in m]
 
     def per_flag_evidence_chains(self) -> dict[str, list[str]]:
-        """G: per-flag evidence chains for multi-flag writeups. For each captured
-        flag, build the ordered VERIFIED-fact trail that led to it:
+        """Build ordered verified-fact chains for each captured flag.
 
-          1. INTENT-LINKED (preferred): the flag_found event carries intent_id →
-             use that intent's source facts (intent_sources) + produced fact
-             (to_fact_seq), in seq order. This is the precise per-flag path.
-          2. TEMPORAL FALLBACK (no intent_id): every verified fact with seq < the
-             flag's seq (the breadcrumb trail up to that flag's discovery).
-
-        Single-flag runs return {flag: chain} too — the caller can fall back to the
-        flat evidence_chain when only one flag exists (byte-identical behavior)."""
+        Prefer intent-linked source facts; otherwise use the temporal verified
+        breadcrumb before the flag event."""
         # collect flag_found events (flag, seq, intent_id) and flag invalidations
         flag_events: list[tuple[str, int, str]] = []
         invalidated: set[str] = set()
@@ -3678,21 +3382,14 @@ class SQLiteSharedGraph:
 
     @staticmethod
     def _norm_entity(ent: str) -> str:
-        """ghost 3 / Ghost3 / GHOST3 → ghost3 (canonical dedup key)."""
+        """Normalize an entity name to a canonical deduplication key."""
         return re.sub(r"\s+", "", ent).lower()
 
     def canonical_credentials(self) -> list[dict]:
-        """Deduped recovered-credential rows derived from VERIFIED fact text, in
-        unlock order. Each row: {entity, value, seq}. Newest verified fact per
-        entity wins. Returns [] when nothing qualifies (graceful — the raw facts
-        are still rendered in the verified-facts section).
+        """Extract conservative credential rows from verified fact text.
 
-        Extraction is conservative by design (DESIGN §4-P2A false-positive guard):
-        a row is emitted ONLY from a verified fact that (a) carries a success cue,
-        (b) lacks a failure cue, AND (c) yields BOTH a level/user entity and a
-        password-shaped value via a keyword/pair pattern. A miss is fine — the raw
-        fact still appears in the verified-facts section; a wrong row would mislead
-        workers told to reuse it, so we prefer to emit nothing when unsure."""
+        Rows require success cues, no explicit failure cue, and both an entity
+        and password-shaped value."""
         rows = [
             (int(item["fact_seq"]), str(item.get("fact_text") or ""), bool(item["verified"]))
             for item in self.effective_facts(active_only=True)
@@ -3749,8 +3446,7 @@ class SQLiteSharedGraph:
         return sorted(by_entity.values(), key=lambda r: r["seq"])
 
     def _open_intents_block(self, limit: int = 24) -> str:
-        """Render open/claimed intents (not in the SolveGraph snapshot — they live
-        only in the intents table). Empty string when none."""
+        """Render active open and claimed intents for the board."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT goal, status, worker, worker_class, route_hash, branch_id, "
@@ -3962,6 +3658,22 @@ class SQLiteSharedGraph:
         return {str(iid): is_genuine_giveup(str(reason or "")) for iid, reason in rows}
 
     def _reason_relevant_fact_seqs(self) -> set[int]:
+        reviewed = self.reviewed_context()
+        reviewed_ids = {
+            int(row["fact_seq"])
+            for row in reviewed.get("facts", [])
+            if str(row.get("status") or "") == "verified"
+        }
+        required = {
+            int(item["fact_seq"])
+            for item in self.effective_facts(active_only=True)
+            if bool(item.get("review_required"))
+        }
+        # Legacy direct graph fixtures have no review_required marker. Preserve
+        # their existing summary semantics while all Worker-origin facts remain
+        # behind the Reviewer gate.
+        if required:
+            return reviewed_ids
         active = self._active_intent_rows()
         active_ids = {str(i["intent_id"]) for i in active}
         sources = self._intent_sources_map()
@@ -3986,11 +3698,9 @@ class SQLiteSharedGraph:
                         stack.append(producer)
             for seq in products.get(iid, []):
                 facts.add(seq)
-        facts.update(self._latest_verified_fact_seqs(
-            limit=8, exclude_giveup_products=True))
+        facts.update(self._latest_verified_fact_seqs(limit=8, exclude_giveup_products=True))
         facts.update(self.pinned_fact_seqs(exclude_giveup_products=True))
-        facts.update(self._latest_candidate_fact_seqs(
-            limit=16, exclude_giveup_products=True))
+        facts.update(self._latest_candidate_fact_seqs(limit=16, exclude_giveup_products=True))
         return facts
 
     def _summary_for_fact_seqs(self, fact_seqs: set[int],
@@ -4017,12 +3727,12 @@ class SQLiteSharedGraph:
         if candidate_lines:
             lines.append("\n## Candidates / needs verification")
             lines.extend(candidate_lines)
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT json_extract(payload,'$.reason') FROM events "
-                "WHERE kind=? ORDER BY seq", (EV_DEAD_END,),
-            ).fetchall()
-        reasons = [str(r[0]) for r in rows if r[0]]
+        reviewed = self.reviewed_context()
+        reasons = [
+            str(item.get("reason") or "")
+            for item in reviewed.get("dead_ends", [])
+            if str(item.get("reason") or "").strip()
+        ]
         if max_dead_ends is not None:
             reasons = reasons[-int(max_dead_ends):]
         if reasons:
@@ -4079,9 +3789,7 @@ class SQLiteSharedGraph:
         return "\n".join(lines)
 
     def open_goal_texts(self) -> list[str]:
-        """Goal texts of every open/claimed intent — the dedup reference set for
-        dispatch_intents' near-duplicate filter (reason.py). Claimed included:
-        a direction someone is actively working must not be re-proposed either."""
+        """Return goal texts of active open and claimed intents for dedupe."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT goal FROM intents WHERE status IN ('open','claimed') "
@@ -4090,13 +3798,7 @@ class SQLiteSharedGraph:
         return [str(r[0]) for r in rows if r[0]]
 
     def dispatchable_goal_texts(self) -> list[str]:
-        """Goal texts that can be claimed right now.
-
-        This intentionally differs from open_goal_texts(): a live claimed intent is
-        active for dedupe, but it is not dispatchable until its lease expires. Reason's
-        starvation valve needs this narrower view to avoid treating a stale live claim
-        as available work.
-        """
+        """Return goal texts that can be claimed right now."""
         return [str(row.get("goal") or "")
                 for row in self.dispatchable_intents()
                 if row.get("goal")]
@@ -4221,13 +3923,7 @@ class SQLiteSharedGraph:
         return [dict(zip(cols, r)) for r in rows]
 
     def barren_concluded_goal_texts(self) -> list[str]:
-        """P1 escape-valve dedup set: goals of CONCLUDED intents that yielded NOTHING
-        — result is a barren 'explored'/dead-end/no-flag AND no fact was attached
-        (result_seq → to_fact_seq is NULL). These are safe to suppress re-proposal of
-        (a tried-and-empty direction). Intents that DID produce a fact (to_fact_seq
-        set) are EXCLUDED, so re-proposing a productive direction under new evidence
-        stays a planner judgment call — avoiding the run-7349 starvation where a
-        blanket concluded-dedup proposed 0 intents and Explore starved."""
+        """Return concluded goals that produced no fact, PoC, or flag."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT i.goal, e.payload FROM intents i "
@@ -4257,13 +3953,7 @@ class SQLiteSharedGraph:
         return out
 
     def _attempted_intents_block(self, limit: int = 40) -> str:
-        """Render CONCLUDED intents with each one's conclusion text, so the Reason
-        planner sees what was already tried AND what came of it (run-11190: the
-        planner kept re-proposing paraphrases of concluded directions because the
-        summary never showed them). The result comes from the EV_INTENT_CONCLUDED
-        event the row's result_seq points at; superseded/no-result rows render a
-        placeholder. Most recent `limit` shown (oldest→ newest); earlier ones are
-        collapsed into a count line — a goal is one line, so 40 stays cheap."""
+        """Render concluded intents and their result details for Reason."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT i.goal, e.payload, i.worker_class, i.route_hash, i.branch_id, "
@@ -4491,6 +4181,12 @@ class SQLiteSharedGraph:
                 parts.append(
                     f"- #{d.get('seq')} {d.get('action')}[{d.get('priority','normal')}]: "
                     f"{str(d.get('directive',''))[:220]}")
+        reviewed = self.reviewed_context()
+        rejected = reviewed.get("rejected") or []
+        if rejected:
+            parts.append("\n## Reviewer rejected claims (do NOT pursue)")
+            for item in rejected[-20:]:
+                parts.append(f"- [#{item.get('fact_seq')}] rejected: {str(item.get('reason') or '')[:180]}")
         return "\n".join(parts)
 
     def _poc_block(self, *, limit: int = 30) -> str:
@@ -4561,8 +4257,7 @@ class SQLiteSharedGraph:
         return "\n".join(lines)
 
     def _forbidden_zones_block(self) -> str:
-        """D/E: the exclusive lanes + held resource locks the planner must route
-        AROUND (don't propose intents that collide with an active lock)."""
+        """Render active lane and resource locks as forbidden zones."""
         parts: list[str] = []
         lanes = self.active_lanes()
         locks = self.active_resource_locks()
@@ -4577,17 +4272,7 @@ class SQLiteSharedGraph:
         return "\n".join(parts)
 
     def to_reason_summary(self, standing_guidance: Optional[list[str]] = None) -> str:
-        """The PLANNER's board view: the uncapped [#seq]-labelled summary (all
-        facts AND all dead-ends — the P1.5 un-blinding lifted only the evidence
-        cap; dead-ends stayed clipped to the last 8, so long-run planners forgot
-        old dead directions) plus the two intent sections the snapshot can't
-        carry: in-flight (open/claimed) and attempted-with-results. REASON_SYSTEM
-        references both section titles in its no-re-proposal rule.
-
-        Phase 4: now also carries active operator directives (B, must-prioritize)
-        and forbidden zones (D/E, locked lanes/resources to route around). Retired
-        facts (rejected/merged/superseded) are already dropped by snapshot(); only
-        dispatch_state='active' intents appear in the open-intents block."""
+        """Render the uncapped planner summary with active and attempted intents."""
         relevant = self._reason_relevant_fact_seqs()
         parts = [self._summary_for_fact_seqs(relevant, max_dead_ends=10**9),
                  self._captured_flags_block(),   # defect-9: already-solved directions
@@ -4602,10 +4287,7 @@ class SQLiteSharedGraph:
         return "\n".join(p for p in parts if p and p.strip())
 
     def _captured_flags_block(self) -> str:
-        """defect-9: the flags the run already holds. Surfaced to the planner so it
-        does NOT re-propose intents aiming at an already-captured flag (the ezrop-ROP
-        re-do: a worker re-running a direction that already yielded flag1). Empty when
-        no flags yet — single/zero-flag runs are byte-identical."""
+        """Render flags already captured so the planner avoids duplicate work."""
         flags = self.snapshot().flags
         if not flags:
             return ""
@@ -4648,14 +4330,7 @@ class SQLiteSharedGraph:
                 f"{chain}\n")
 
     def _brief_block(self) -> str:
-        """The FULL, untruncated challenge brief for the board file. SolveGraph's
-        to_summary caps the description at 300 chars — but the brief is exactly where
-        target/connection blocks live (e.g. an `SSH Access` host/port/creds section,
-        run-10070), so capping it forces workers to dig the target out of session
-        files. The file has no budget, so carry the whole thing here.
-
-        Target/attachments come from the prompt builder (not the graph), so we render
-        what the SolveGraph snapshot has: the challenge description verbatim."""
+        """Render the complete challenge description for worker context."""
         c = self.challenge
         desc = (getattr(c, "description", "") or "").strip()
         if not desc:
@@ -4664,18 +4339,7 @@ class SQLiteSharedGraph:
                 f"{desc}\n")
 
     def to_board_markdown(self) -> str:
-        """The FULL board rendered for the workdir file (no truncation): the
-        canonical credential chain on top, the FULL challenge brief (target/SSH
-        block lives here), then the untruncated [#seq]-labelled fact summary, then
-        open intents. The credential section is also the inline prompt digest
-        (rendered alone via _credential_block).
-
-        Uses to_summary(max_evidence=10**9, max_dead_ends=10**9) so stage-1 [-16]
-        is defeated, ALL dead-ends are shown (a worker re-walking a long-ruled-out
-        path is the same waste the planner suffers — see to_reason_summary), and
-        the [#seq] labels (the stable fact ids that Reason cites via `from`)
-        are preserved; the caller drops the stage-2 [:2000] clip by using this
-        method instead of the inline path."""
+        """Render the complete board markdown with facts and lifecycle context."""
         creds = self.canonical_credentials()
         parts = [self._credential_block(creds), self._brief_block(),
                  self.to_summary(max_evidence=10**9, max_dead_ends=10**9),
@@ -4696,10 +4360,7 @@ class SQLiteSharedGraph:
         return "\n".join(p for p in parts if p and p.strip())
 
     def to_review_summary(self) -> str:
-        """Review-Arbiter's full audit view. It intentionally includes more than
-        Reason's compact planner view: raw event tails, all fact classes, route
-        state, branch state, intent lifecycle, PoCs, flags, and operator/review
-        directives. It is still derived from append-only events/materialized views."""
+        """Render the full append-only audit summary for Reviewer and operators."""
         parts = [
             "# Review-Arbiter audit board",
             self._brief_block(),

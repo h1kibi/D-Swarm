@@ -46,7 +46,7 @@ SSE/`/api` contract the deck consumes.
 Or run them separately:
 
 ```bash
-uv run uvicorn apps.web.server:create_app --factory --port 8000   # backend (API only)
+uv run uvicorn apps.web.server:create_app --factory --port 8000 --ws websockets-sansio   # backend (API only)
 cd apps/web/ui && npm install
 # point the browser straight at the backend (the Next dev proxy buffers SSE):
 DSWARM_BACKEND=http://127.0.0.1:8000 npm run dev -- -p 3001  # http://localhost:3001

@@ -1,3 +1,4 @@
+import { observerSourceLabel, btwFailureTurn } from "./btwStream";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
@@ -78,4 +79,30 @@ describe("BTW SSE answer state", () => {
 it("does not render the same stream error in both answer and error banner", () => {
   expect(btwErrorBannerText("观察员暂时无法完成只读总结：", "观察员暂时无法完成只读总结：")).toBe("");
   expect(btwErrorBannerText("观察员暂时无法回答", "认证失败")).toBe("认证失败");
+});
+
+describe("Observer source metadata", () => {
+  it("keeps the three backend attribution states distinct", () => {
+    expect(observerSourceLabel("default")).toBe("Observer default");
+    expect(observerSourceLabel("fallback")).toBe("Observer fallback");
+    expect(observerSourceLabel("unavailable")).toBe("Observer unavailable");
+    expect(observerSourceLabel(undefined)).toBe("Observer");
+  });
+
+  it("attributes every client-side failure to the isolated Observer chain", () => {
+    // An HTTP non-2xx, a transport exception, and an empty stream must all read
+    // as `unavailable` — never as a successful Observer answer, and never as a
+    // silent Titler/Reason fallback (docs/17 §12.2).
+    for (const turn of [
+      btwFailureTurn("http", "请求失败 (500): boom"),
+      btwFailureTurn("transport", "Failed to fetch"),
+      btwFailureTurn("empty"),
+    ]) {
+      expect(turn.observerSource).toBe("unavailable");
+      expect(turn.fallbackUsed).toBe(false);
+      expect(turn.content.trim().length).toBeGreaterThan(0);
+    }
+    expect(btwFailureTurn("http", "请求失败 (500): boom").content).toContain("500");
+    expect(btwFailureTurn("transport", "").content).toContain("未知错误");
+  });
 });

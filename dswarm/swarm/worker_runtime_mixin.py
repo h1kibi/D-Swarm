@@ -5,12 +5,18 @@ import asyncio
 import os
 import uuid
 from typing import Any, Optional
+from pathlib import Path
 
 from dswarm.core.runtime_env import is_web_container
 from dswarm.solver.credential_accounts import runtime_env_for_engine
 from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root, resolve_llm_provider
 from dswarm.solver.runtime_policy import RuntimePolicyError
-from dswarm.solver.worker_profiles import base_engine_for_profile, direction_profile_name, normalize_profile_roster, normalize_worker_profiles
+from dswarm.solver.worker_profiles import (
+    base_engine_for_profile,
+    direction_profile_name,
+    normalize_profile_roster,
+    normalize_worker_profiles,
+)
 from dswarm.solver.workspace import ensure_workspace
 from dswarm.swarm._bootstrap_assets import (
     _CONTAINER_BLACKBOARD_SKILL,
@@ -122,6 +128,94 @@ class WorkerRuntimeMixin:
             )
         return self._active_profile_counts.get(pid, 0) < int(profile.get("max_running") or 1)
 
+    def _gateway_upstream_binding_for_profile(self, profile: dict | None):
+        """Resolve a provider-ref into a private, token-scoped gateway binding.
+
+        Strict container workers must never receive an upstream API key. Resolve it
+        only on the host at token issuance and keep the resulting transport in the
+        gateway's in-memory token table. A missing provider binding fails closed
+        rather than accidentally falling back to the process-default endpoint.
+        """
+        provider_ref = str((profile or {}).get("provider_ref") or "").strip()
+        if not provider_ref:
+            return None
+        provider_store = None
+        # The account root is the authoritative sessions/_secrets location.
+        # Prefer it over the per-Run workspace; a workspace parent is not the
+        # global sessions root and would silently create an empty secret store.
+        if self.credential_accounts_root is not None:
+            provider_store = LLMProviderSecretStore(self.credential_accounts_root.parent / "llm_providers")
+        elif self.workspace_root is not None:
+            provider_store = LLMProviderSecretStore(provider_secret_root(self.workspace_root.parent))
+        resolved = resolve_llm_provider(
+            provider_ref, self.llm_providers, secret_store=provider_store,
+        )
+        from dswarm.solver.modelgateway import GatewayUpstreamBinding
+
+        # A Run snapshot may outlive the mutable provider registry.  Prefer its
+        # frozen endpoint/protocol when present, but always fetch the credential
+        # from the current host-only secret store.  Missing metadata or secret is
+        # an explicit blocked state; never fall back to DeepSeek or another URL.
+        frozen_base_url = str((profile or {}).get("base_url") or "").strip().rstrip("/")
+        frozen_wire_api = str((profile or {}).get("wire_api") or "").strip()
+        frozen_auth_mode = str((profile or {}).get("auth_mode") or "").strip()
+        frozen_auth_header = str((profile or {}).get("auth_header") or "").strip()
+        frozen_auth_prefix = str((profile or {}).get("auth_prefix") or "")
+        if frozen_base_url and provider_store is not None:
+            api_key = provider_store.read_secret(provider_ref)
+            if not api_key:
+                raise RuntimePolicyError("gateway_provider_binding_unavailable")
+            return GatewayUpstreamBinding(
+                base_url=frozen_base_url,
+                api_key=api_key,
+                wire_api=frozen_wire_api or "auto",
+                auth_mode=frozen_auth_mode or "bearer",
+                auth_header=frozen_auth_header or "Authorization",
+                auth_prefix=frozen_auth_prefix,
+                provider_id=provider_ref,
+            )
+        if resolved is None or not resolved.base_url or not resolved.api_key:
+            raise RuntimePolicyError("gateway_provider_binding_unavailable")
+        return GatewayUpstreamBinding(
+            base_url=resolved.base_url,
+            api_key=resolved.api_key,
+            wire_api=resolved.wire_api,
+            auth_mode=resolved.auth_mode,
+            auth_header=resolved.auth_header,
+            auth_prefix=resolved.auth_prefix,
+            provider_id=resolved.provider_id,
+        )
+
+    def _effective_role_profile(self, profile: dict, role: "Optional[str]") -> dict:
+        """Apply the immutable Run binding for the logical worker role.
+
+        Worker profiles still own runtime/image/capacity metadata. The Target/Run
+        snapshot owns the model/provider selection for the logical ``worker`` and
+        ``review`` roles. Keeping this merge at the last profile-resolution
+        boundary means every existing CLI path (bootstrap, explore, resume,
+        review, and container/local env setup) receives the same frozen binding
+        without changing the agent loop or provenance gate.
+        """
+        logical_role = "review" if role == "review" else "worker"
+        active_map = getattr(self, "_effective_role_bindings", None)
+        if isinstance(active_map, dict) and logical_role in active_map:
+            override = active_map.get(logical_role)
+        else:
+            bindings = getattr(self, "role_bindings", {})
+            override = bindings.get(logical_role) if isinstance(bindings, dict) else None
+        if not isinstance(override, dict) or not override:
+            return profile
+        merged = dict(profile)
+        for key in (
+            "provider", "provider_ref", "model", "base_url", "wire_api",
+            "auth_mode", "auth_header", "auth_prefix", "effort",
+            "credential_source", "credential_account",
+        ):
+            value = override.get(key)
+            if value not in (None, ""):
+                merged[key] = value
+        return merged
+
     def _profile_for_engine(
         self,
         engine: str,
@@ -145,14 +239,12 @@ class WorkerRuntimeMixin:
                 continue
             if advance:
                 self._profile_rr[engine] = (idx + 1) % len(profiles)
-            return p
+            return self._effective_role_profile(p, role)
         return None
 
     def _profile_for_direction(self, direction: str) -> str:
         """Profile id for an intent's direction ("" when the direction profile is
         not configured/healthy on this run's roster)."""
-        from dswarm.solver.worker_profiles import direction_profile_name
-
         profile = direction_profile_name(direction)
         if profile and profile in getattr(self, "_profiles_by_name", {}):
             return profile
@@ -301,16 +393,16 @@ class WorkerRuntimeMixin:
         config (Unknown provider ctf-gateway).
         """
 
-        explicit_endpoint = bool(
+        explicit_credential = bool(
             (profile or {}).get("base_url")
             or (profile or {}).get("api_key_ref")
         )
+        explicit_custom_endpoint = bool((profile or {}).get("base_url"))
         # provider_ref is NOT an explicit endpoint for container workers: a
         # provider binding owns its secret on the relay/gateway side, so the
-        # worker authenticates with a gateway task token (the ctf-gateway
-        # provider), never with the provider's raw key.
+        # worker authenticates to the model gateway with a task token.
         source_env = None
-        if explicit_endpoint and not home_and_gateway_only:
+        if explicit_custom_endpoint and not home_and_gateway_only:
             source_env = {**os.environ, "DSWARM_PI_PROVIDER": "dswarm-worker"}
         if home_and_gateway_only:
             env: dict[str, str] = {}
@@ -332,11 +424,11 @@ class WorkerRuntimeMixin:
                 # the worker authenticates to the model gateway with a task
                 # token instead (block below).
                 provider_store = None
-                if self.workspace_root is not None:
-                    provider_store = LLMProviderSecretStore(provider_secret_root(self.workspace_root.parent))
-                elif self.credential_accounts_root is not None:
+                if self.credential_accounts_root is not None:
                     # account root is normally sessions/_secrets/accounts
                     provider_store = LLMProviderSecretStore(self.credential_accounts_root.parent / "llm_providers")
+                elif self.workspace_root is not None:
+                    provider_store = LLMProviderSecretStore(provider_secret_root(self.workspace_root.parent))
                 resolved_provider = resolve_llm_provider(provider_ref, self.llm_providers, secret_store=provider_store)
                 if resolved_provider is not None:
                     env["DSWARM_PI_PROVIDER"] = "dswarm-worker"
@@ -358,7 +450,7 @@ class WorkerRuntimeMixin:
                 env["DSWARM_WORKER_MODEL"] = str(profile["model"])
             if profile.get("effort"):
                 env["DSWARM_WORKER_THINKING"] = str(profile["effort"])
-            if explicit_endpoint and not provider_ref:
+            if explicit_custom_endpoint and not provider_ref:
                 env["DSWARM_PI_PROVIDER"] = "dswarm-worker"
                 base_url = str(profile.get("base_url") or "").strip().rstrip("/")
                 if base_url:
@@ -374,6 +466,10 @@ class WorkerRuntimeMixin:
                     env["DSWARM_WORKER_API_KEY"] = env["OPENAI_API_KEY"]
                 if env.get("OPENAI_API_KEY_FILE"):
                     env["DSWARM_WORKER_API_KEY_FILE"] = env["OPENAI_API_KEY_FILE"]
+            elif explicit_credential and not provider_ref:
+                # A direct account key uses pi's native provider. The selected
+                # account is supplied by the lease-owned process channel.
+                env["DSWARM_PI_PROVIDER"] = "deepseek"
             direction = _direction_from_profile_id(profile["id"])
             if direction:
                 if container is not None:
@@ -474,7 +570,7 @@ class WorkerRuntimeMixin:
         # provider that reads DSWARM_TASK_TOKEN / DSWARM_GATEWAY_URL; the explicit
         # DSWARM_PI_PROVIDER keeps selection deterministic. Overrides the account
         # FILE injection (the raw key must never cross into the container).
-        if container is not None and task_token and not explicit_endpoint:
+        if container is not None and task_token and not explicit_credential:
             env["DEEPSEEK_API_KEY"] = task_token
             env.pop("DEEPSEEK_API_KEY_FILE", None)
             env["DSWARM_TASK_TOKEN"] = task_token
@@ -696,30 +792,33 @@ class WorkerRuntimeMixin:
             raise RuntimePolicyError("runtime_policy_required")
         container = None
         gateway_token = None
-        explicit_endpoint = bool(
+        explicit_credential = bool(
             (profile or {}).get("base_url")
             or (profile or {}).get("api_key_ref")
         )
         # provider_ref binds the profile to a relay whose secret stays host-side:
         # container workers authenticate with a gateway task token, so a
         # provider_ref alone must NOT suppress token minting.
-        if (strict_docker or container is not None) and not explicit_endpoint:
-            from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
-            gateway_token = ModelGateway.instance().issue_worker(WorkerClaims(
-                run_id=self.run_id,
-                challenge_id=str(self.challenge.id),
-                worker_instance_id=worker_instance_id,
-                solver_id=label,
-                profile_id=str((profile or {}).get("id") or engine),
-                configured_account_id=(
-                    str((profile or {}).get("credential_account")).strip() or None
-                    if (profile or {}).get("credential_account") is not None else None
+        from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
+        if (strict_docker or container is not None) and not explicit_credential:
+            gateway_token = ModelGateway.instance().issue_worker(
+                WorkerClaims(
+                    run_id=self.run_id,
+                    challenge_id=str(self.challenge.id),
+                    worker_instance_id=worker_instance_id,
+                    solver_id=label,
+                    profile_id=str((profile or {}).get("id") or engine),
+                    configured_account_id=(
+                        str((profile or {}).get("credential_account")).strip() or None
+                        if (profile or {}).get("credential_account") is not None else None
+                    ),
+                    token_scope=(
+                        "review" if role == "review" else
+                        "recon" if role == "recon" else "worker"
+                    ),
                 ),
-                token_scope=(
-                    "review" if role == "review" else
-                    "recon" if role == "recon" else "worker"
-                ),
-            ))
+                upstream=self._gateway_upstream_binding_for_profile(profile),
+            )
         from dswarm.solver.cli_driver import driver_for
         try:
             if runtime_lease_factory is not None and gateway_token:
@@ -779,7 +878,6 @@ class WorkerRuntimeMixin:
             )
         except BaseException:
             if gateway_token:
-                from dswarm.solver.modelgateway import ModelGateway
                 ModelGateway.instance().revoke_token(gateway_token)
             raise
         worker.worker_instance_id = worker_instance_id

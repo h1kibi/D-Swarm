@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -70,11 +71,19 @@ class RuntimeProbe:
     A successful result is cached per pool generation and credential/image
     identity.  Failures are deliberately never cached: recovery may replace a
     broken container generation and must get a fresh probe.
+
+    ``gateway_binding_resolver`` is supplied by standalone control planes such
+    as the TUI.  Web runs may leave it unset and use the process-wide gateway
+    resolver installed by ``RunManager``.  Keeping the resolver explicit makes
+    provider-bound Docker probes use the same frozen provider as workers,
+    without copying an upstream secret into the container.
     """
 
-    def __init__(self, *, usage_writer: Any, budget_gate: Any) -> None:
+    def __init__(self, *, usage_writer: Any, budget_gate: Any,
+                 gateway_binding_resolver: Any = None) -> None:
         self.usage_writer = usage_writer
         self.budget_gate = budget_gate
+        self.gateway_binding_resolver = gateway_binding_resolver
         self._cache: dict[RuntimeProbeCacheKey, RuntimeProbeResult] = {}
         self._inflight: dict[RuntimeProbeCacheKey, asyncio.Task[RuntimeProbeResult]] = {}
         self._lock = asyncio.Lock()
@@ -299,11 +308,25 @@ class RuntimeProbe:
         session_dir = f"/home/kali/workspace/probe/{probe_id}/sessions"
         driver = PiDriver()
         spec = driver.probe_spec(model=pool_spec.model, session_dir=session_dir)
-        env = dict(getattr(credential_projection, "env", {}) or {})
-        if getattr(credential_projection, "credential_mode", "") == "gateway":
-            argv = list(spec.argv)
-            prompt_index = len(argv) - 1
-            argv[prompt_index:prompt_index] = ["--provider", "ctf-gateway"]
+        mode = str(getattr(credential_projection, "credential_mode", "") or "")
+        env = dict(
+            getattr(
+                credential_projection,
+                "process_env",
+                getattr(credential_projection, "env", {}),
+            )
+            or {}
+        )
+        env.update(dict(getattr(credential_projection, "env", {}) or {}))
+        argv = list(spec.argv)
+        prompt_index = len(argv) - 1
+        provider = {
+            "direct": "deepseek",
+            "custom": "dswarm-worker",
+            "gateway": "ctf-gateway",
+        }.get(mode)
+        if provider:
+            argv[prompt_index:prompt_index] = ["--provider", provider]
             spec = replace(spec, argv=tuple(argv))
         # The runtime agent's baseEnv HOME (/home/kali) has NO pi provider
         # config — only the image's own user home and the run-materialized
@@ -334,9 +357,12 @@ class RuntimeProbe:
             )
             _chown_tree_to_worker(str(probe_home))
             env["HOME"] = f"{CONTAINER_WORKSPACE}/homes/{probe_label}"
-            env["PI_CODING_AGENT_DIR"] = f'{env["HOME"]}/.pi/agent'
         except Exception:  # noqa: BLE001 - HOME prep is best-effort preflight
             pass
+        if env.get("HOME"):
+            env["PI_CODING_AGENT_DIR"] = f'{env["HOME"]}/.pi/agent'
+        gateway = None
+        gateway_token = ""
         if getattr(credential_projection, "credential_mode", "") == "gateway":
             # The readiness probe runs BEFORE any worker spawn, so no task token
             # exists yet — but its pi call goes through the ctf-gateway provider,
@@ -345,42 +371,59 @@ class RuntimeProbe:
             from dswarm.solver.modelgateway import ModelGateway, WorkerClaims
 
             gateway = ModelGateway.instance()
-            token = gateway.issue_worker(WorkerClaims(
-                run_id=str(getattr(executor, "run_id", "") or ""),
-                challenge_id=None,
-                worker_instance_id=worker_instance_id,
-                solver_id=None,
-                profile_id=str(pool_spec.profile_id or ""),
-                configured_account_id=(
-                    str(pool_spec.credential_binding_id or "").strip() or None
+            provider_id = str(pool_spec.provider_binding_id or "")
+            resolver = self.gateway_binding_resolver
+            if callable(resolver):
+                try:
+                    upstream = resolver(provider_id)
+                except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                    raise RuntimeProbeError("provider_binding_unavailable") from exc
+            else:
+                upstream = gateway.resolve_upstream_binding(provider_id)
+            if upstream is None:
+                raise RuntimeProbeError("provider_binding_unavailable")
+            gateway_token = gateway.issue_worker(
+                WorkerClaims(
+                    run_id=str(getattr(executor, "run_id", "") or ""),
+                    challenge_id=None,
+                    worker_instance_id=worker_instance_id,
+                    solver_id=None,
+                    profile_id=str(pool_spec.profile_id or ""),
+                    configured_account_id=(
+                        str(pool_spec.credential_binding_id or "").strip() or None
+                    ),
+                    token_scope="worker",
                 ),
-                token_scope="worker",
-            ))
-            import os as _os
-            gateway_url = _os.environ.get(
+                upstream=upstream,
+            )
+            gateway_url = os.environ.get(
                 "DSWARM_GATEWAY_URL",
                 "http://host.docker.internal:"
-                f"{_os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
+                f"{os.environ.get('DSWARM_MODEL_GATEWAY_PORT', '9101')}/v1",
             )
             env.update({
-                "DEEPSEEK_API_KEY": token,
-                "DSWARM_TASK_TOKEN": token,
+                "DEEPSEEK_API_KEY": gateway_token,
+                "DSWARM_TASK_TOKEN": gateway_token,
                 "DSWARM_GATEWAY_URL": gateway_url,
                 "DSWARM_PI_PROVIDER": "ctf-gateway",
                 "DSWARM_WORKER_MODEL": str(pool_spec.model or "deepseek-v4-flash"),
             })
-        return await asyncio.wait_for(
-            executor.run(
-                driver,
-                list(spec.argv),
-                host_cwd=str(host_cwd),
-                timeout=max(1, int(timeout)),
-                env=env,
-                worker_instance_id=worker_instance_id,
-                operation_kind="runtime_probe",
-            ),
-            timeout=timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                executor.run(
+                    driver,
+                    list(spec.argv),
+                    host_cwd=str(host_cwd),
+                    timeout=max(1, int(timeout)),
+                    env=env,
+                    worker_instance_id=worker_instance_id,
+                    operation_kind="runtime_probe",
+                ),
+                timeout=timeout,
+            )
+        finally:
+            if gateway is not None and gateway_token:
+                gateway.revoke_token(gateway_token)
 
     @staticmethod
     def _log_probe_evidence(
@@ -429,6 +472,11 @@ class RuntimeProbe:
 
     @staticmethod
     def _classify_exception(exc: Exception) -> RuntimeFailure:
+        if isinstance(exc, RuntimeProbeError):
+            if exc.code == "provider_binding_unavailable":
+                return RuntimeFailure("configuration", exc.code)
+            if exc.code in {"accounting_unavailable", "budget_denied"}:
+                return RuntimeFailure("configuration", exc.code)
         text = str(exc).lower()
         if any(token in text for token in ("401", "403", "unauthorized", "forbidden", "api key", "authentication")):
             return RuntimeFailure("auth", "auth_failed")

@@ -29,12 +29,28 @@ export interface DispatchOpts {
   // optional flag count for collect mode: >0 → stop after collecting that many
   // distinct flags; blank/0 → unknown count, collect until the operator stops.
   collectCount?: number;
-  // worker isolation: when true, the run uses a controlled Docker runtime that
-  // can't read the host challenge-source tree. Default false = host subprocess.
+  // worker isolation: an explicit true/false overrides the server config;
+  // omitted follows worker_config/env/default. Local remains subject to the
+  // backend's dual safety gate and is never authorized here implicitly.
   containerMode?: boolean;
   wallClockBudget?: number;
   maxTotalWorkers?: number;
   costBudgetUsd?: number;
+  targetId?: string;
+  directionId?: string;
+  runId?: string;
+  workerProfileId?: string;
+  llmMode?: "settings_default" | "per_run_override";
+  llmOverrides?: {
+    reason?: Record<string, unknown>;
+    worker?: Record<string, unknown>;
+    review?: Record<string, unknown>;
+  };
+  reviewPolicy?: Record<string, unknown>;
+  // Launch-only dispatch errors are rethrown so the wizard can keep its state
+  // and render the safe backend detail inline. Ordinary conversation dispatch
+  // keeps its existing toast-only behavior.
+  throwOnError?: boolean;
 }
 
 // max height the dispatch textarea auto-grows to (~6–7 rows) before it scrolls
@@ -114,6 +130,7 @@ function Composer({
   const [flagFormat, setFlagFormat] = useState<"brace" | "token" | "custom">("brace");
   const [flagWrapper, setFlagWrapper] = useState("");
   const [containerMode, setContainerMode] = useState(false);
+  const [containerModeExplicit, setContainerModeExplicit] = useState(false);
   // P2-v3: when the control plane runs inside a container, local worker mode is
   // rejected server-side — force container mode and lock the toggle.
   const [containerLocked, setContainerLocked] = useState(false);
@@ -134,10 +151,15 @@ function Composer({
       const savedFlagWrapper = readKey("dswarm.flagWrapper");
       if (savedFlagWrapper) setFlagWrapper(savedFlagWrapper);
       const savedContainer = readKey("dswarm.containerMode");
-      if (savedContainer === "1") setContainerMode(true);
-      else if (savedContainer !== "0") {
+      if (savedContainer === "1") {
+        setContainerMode(true);
+        setContainerModeExplicit(true);
+      } else if (savedContainer === "0") {
+        setContainerMode(false);
+        setContainerModeExplicit(true);
+      } else {
         getWorkerSettings().then((c) => {
-          if (!cancelled && c?.worker_backend === "container") setContainerMode(true);
+          if (!cancelled) setContainerMode(c?.worker_backend === "container");
         });
       }
     } catch { /* ignore */ }
@@ -145,7 +167,11 @@ function Composer({
     // mode is mandatory — force it on and lock the toggle (local is server-side
     // rejected, so a local toggle would only produce confusing 400s).
     checkAuth().then((a) => {
-      if (!cancelled && a?.inContainer) { setContainerMode(true); setContainerLocked(true); }
+      if (!cancelled && a?.inContainer) {
+        setContainerMode(true);
+        setContainerModeExplicit(true);
+        setContainerLocked(true);
+      }
     }).catch(() => { /* ignore */ });
     return () => { cancelled = true; };
   }, []);
@@ -169,6 +195,7 @@ function Composer({
   };
   const toggleContainer = () => {
     if (containerLocked) return;  // P2-v3: forced on inside a container
+    setContainerModeExplicit(true);
     setContainerMode((v) => {
       const nv = !v;
       writeKey("dswarm.containerMode", nv ? "1" : "0");
@@ -179,7 +206,6 @@ function Composer({
     setMode(m);
     writeKey("dswarm.mode", m);
   };
-
   const dispatch = () => {
     const v = text.trim();
     if (!v) return;
@@ -196,12 +222,14 @@ function Composer({
       maxTotalWorkers: optionalInt(maxTotalWorkers),
       costBudgetUsd: optionalFloat(costBudgetUsd),
     };
+    const containerOption = containerModeExplicit ? { containerMode } : {};
     onDispatch(v, mode === "pentest"
-      ? { webSearch, mode, goal: goal.trim(), scope: scope.trim(), containerMode, ...runCaps }
-      : { webSearch, mode: "ctf", collect, containerMode,
+      ? { webSearch, mode, goal: goal.trim(), scope: scope.trim(), ...containerOption, ...runCaps }
+      : { webSearch, mode: "ctf", collect,
           flagFormat,
           flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
           collectCount: collect ? (parseInt(collectCount, 10) || 0) : undefined,
+          ...containerOption,
           ...runCaps });
     setText("");
   };

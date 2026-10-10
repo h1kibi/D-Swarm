@@ -576,7 +576,7 @@ func BackendService(root string, python string, port int) *Service {
 	}
 	return &Service{
 		Name:          "backend",
-		Argv:          []string{python, "-m", "uvicorn", "apps.web.server:create_app", "--host", "127.0.0.1", "--port", fmt.Sprint(port)},
+		Argv:          []string{python, "-m", "uvicorn", "apps.web.server:create_app", "--host", "127.0.0.1", "--port", fmt.Sprint(port), "--ws", "websockets-sansio"},
 		Dir:           root,
 		HealthURL:     fmt.Sprintf("http://127.0.0.1:%d/api/runs", port),
 		ReuseExisting: true,

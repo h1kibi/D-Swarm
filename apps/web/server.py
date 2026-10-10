@@ -41,7 +41,7 @@ from apps.web.auth import (
 from apps.web.run_manager import RunManager
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
-from apps.web.routes.accounts import router as accounts_auth_router, accounts_router
+from apps.web.routes.audit import router as audit_router
 from apps.web.routes.blackboard import router as blackboard_router
 from apps.web.routes.btw import router as btw_router
 from apps.web.routes.credentials import router as credentials_router
@@ -111,7 +111,11 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             # never wired up before 鈥?shutdown() existed but nothing called it.
             await mgr.shutdown()
 
-    app = FastAPI(title="Project D-Swarm 鈥?Command Deck", lifespan=lifespan)
+    # Initialize database
+    from apps.web.db.session import init_db
+    init_db()
+    
+    app = FastAPI(title="Project D-Swarm — Command Deck", lifespan=lifespan)
     app.state.manager = mgr
     app.state.target_store = mgr.target_store
     app.state.startup_test = StartupTestController(mgr)
@@ -126,7 +130,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.state.engine_refresh_lock = asyncio.Lock()
     app.include_router(accounts_auth_router)
     app.include_router(accounts_router)
-    app.include_router(auth_router)
+    app.include_router(events_router)
+    app.include_router(runs_ctf_router)
+    app.include_router(audit_router)
     app.include_router(blackboard_router)
     app.include_router(btw_router)
     app.include_router(credentials_router)

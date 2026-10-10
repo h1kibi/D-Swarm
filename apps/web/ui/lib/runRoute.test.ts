@@ -30,6 +30,9 @@ describe("run path parsing", () => {
 
   it("whitelist membership", () => {
     expect(isDetailView("evidence")).toBe(true);
+    expect(isDetailView("intents")).toBe(true);
+    expect(isDetailView("ledger")).toBe(true);
+    expect(isDetailView("routes")).toBe(true);
     expect(isDetailView("nope")).toBe(false);
     // btw ships with its dedicated full-page chat
     expect(DETAIL_VIEWS).toContain("btw");

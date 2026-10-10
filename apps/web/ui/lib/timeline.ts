@@ -275,30 +275,26 @@ export function stageAnchors(items: TimelineItem[]): Partial<Record<Stage, strin
 /** Run-level status, orthogonal to stage (docs/07 §P0-3):
  *  stage answers WHERE the run is, status answers HOW it is going. */
 export type RunStatus =
-  | "active" | "waiting" | "paused" | "degraded" | "failed" | "solved" | "completed";
+  | "active" | "waiting" | "paused" | "reason_blocked" | "degraded" | "fallback_active" | "failed" | "solved" | "completed";
 
-/** Two-dim run state for the Stage Rail + top bar (docs/07 §P0-3). */
+/** Two-dimensional run state for the Stage Rail + top bar. */
 export interface StageInfo {
   stage: Stage;
-  /** true when the stage was INFERRED (legacy session, no explicit kernel
-   *  stage events) — the UI must render it as approximate. */
   derived: boolean;
-  /** paused / waiting on operator / degraded — renders yellow on the rail. */
   waiting: boolean;
   failed: boolean;
-  /** structured status dimension; derivable from the flags + solved/finished. */
   status: RunStatus;
 }
 
-/** Collapse the orthogonal flags into the single display status
- *  (precedence: failure > pause > operator wait > degradation > outcome). */
 export function runStatusOf(deck: DeckState, waiting: boolean, failed: boolean): RunStatus {
   if (failed) return "failed";
-  if (deck.reasonLoop.paused) return "paused";
-  if (waiting) return "waiting";
-  if (deck.runtimeDegraded.length > 0 && !deck.finished) return "degraded";
   if (deck.solved) return "solved";
   if (deck.finished) return "completed";
+  if (deck.reasonBlocked) return "reason_blocked";
+  if (deck.reasonLoop.paused) return "paused";
+  if (waiting) return "waiting";
+  if (deck.fallbackActive) return "fallback_active";
+  if (deck.degraded || deck.runtimeDegraded.length > 0) return "degraded";
   return "active";
 }
 

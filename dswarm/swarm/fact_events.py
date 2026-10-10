@@ -93,9 +93,10 @@ SELECT
     COALESCE(pv.artifact_id, f.artifact_id) AS artifact_id,
     COALESCE(json_extract(pv.payload, '$.witness'), json_extract(f.payload, '$.witness')) AS witness,
     COALESCE(json_extract(pv.payload, '$.verifier'), json_extract(f.payload, '$.verifier')) AS verifier,
-    COALESCE(json_extract(pv.payload, '$.source'), json_extract(f.payload, '$.source')) AS source,
     se.seq AS summary_seq,
     COALESCE(json_extract(s.payload, '$.summary'), json_extract(f.payload, '$.summary')) AS summary,
+    CASE WHEN json_extract(f.payload, '$.review_required') IN (1, 'true') THEN 1 ELSE 0 END AS review_required,
+    json_extract(f.payload, '$.report_seq') AS report_seq,
     CASE
         WHEN ll.kind IS NULL THEN CASE WHEN f.verified <> 0 OR p.seq IS NOT NULL THEN 'verified' ELSE 'candidate' END
         WHEN ll.kind = 'fact_challenged' THEN 'challenged'

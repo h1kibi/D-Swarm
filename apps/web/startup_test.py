@@ -10,6 +10,7 @@ import asyncio
 import copy
 import json
 import time
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -185,7 +186,7 @@ class StartupTestController:
         if mode not in {"startup", "full_flow"}:
             raise ValueError(f"unsupported startup-test mode: {mode}")
         benchmark = str(benchmark or "local-smoke").strip() or "local-smoke"
-        test_id = f"startup-{int(time.time() * 1000)}-{id(self):x}"
+        test_id = f"startup-{time.time_ns()}-{id(self):x}"
         session = StartupTestSession(test_id, self, mode=mode, benchmark=benchmark)
         self.sessions[test_id] = session
         session.task = asyncio.create_task(self._run(session))
@@ -704,6 +705,18 @@ class StartupTestController:
         return min(30.0, max(20.0, worker_timeout * 0.25))
 
     @staticmethod
+    def _isolated_run_id(session: StartupTestSession, profile: dict[str, Any]) -> str:
+        """Keep startup-test worker runs out of the operator Run namespace."""
+        raw = str(
+            profile.get("id")
+            or profile.get("name")
+            or profile.get("label")
+            or profile.get("engine")
+            or "worker"
+        )
+        suffix = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-") or "worker"
+        return f"startup-test-{session.id}-{suffix[:48]}"
+
     async def default_run_worker_test(
         profile: dict[str, Any],
         timeout: float,
@@ -754,20 +767,64 @@ class StartupTestController:
             "llm_providers": cfg.get("llm_providers") or [],
         }
 
-        run = test_manager.create_new()
+        # This manager shares the sessions root for credentials/configuration,
+        # but the worker Run itself must use an internal namespace. A numeric
+        # create_new() id can collide with a Target-bound draft in the main
+        # manager, causing a startup test to overwrite that Run's history.
+        run = test_manager.create(
+            StartupTestController._isolated_run_id(session, profile)
+        )
 
         marker_seen: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        failure_seen: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+
+        def event_name(ev: Any) -> str:
+            raw = getattr(ev, "event_type", "")
+            value = getattr(raw, "value", raw)
+            name = str(value or "").strip().lower()
+            return name.removeprefix("eventtype.")
+
+        def mark_failure(detail: str = "") -> None:
+            if marker_seen.done() or failure_seen.done():
+                return
+            if detail:
+                state["detail"] = detail[:500]
+            failure_seen.set_result(None)
+
+
 
         async def _sink(ev: Any) -> None:
             await session.emit_raw_event(worker_id, ev)
             payload = getattr(ev, "payload", {}) or {}
-            fact = str(payload.get("fact") or "")
-            text = str(payload.get("text") or payload.get("message") or "")
-            if marker in fact or marker in text:
-                state["ok"] = True
-                state["detail"] = marker
-                if not marker_seen.done():
-                    marker_seen.set_result(None)
+            name = event_name(ev)
+            if name in {"sharedgraph.delta", "blackboard.delta"}:
+                fact = str(payload.get("fact") or "")
+                if marker in fact:
+                    state["ok"] = True
+                    state["detail"] = marker
+                    if not marker_seen.done():
+                        marker_seen.set_result(None)
+                    return
+            if name == "tool.result":
+                result = payload.get("result")
+                condensed = result.get("condensed") if isinstance(result, dict) else None
+                if isinstance(condensed, str) and marker in condensed:
+                    state["ok"] = True
+                    state["detail"] = marker
+                    if not marker_seen.done():
+                        marker_seen.set_result(None)
+                    return
+            if name == "provider.error":
+                state["detail"] = str(
+                    payload.get("user_message") or "worker provider request failed"
+                )[:500]
+            elif name == "usage.recorded" and payload.get("call_outcome") in {
+                "provider_error", "transport_error", "timeout",
+            }:
+                state["detail"] = "worker provider request failed before startup_test_ok marker"
+            if name == "run.finished":
+                mark_failure()
 
         run.bus.add_sink(_sink)
         driver = build_driver(body, mgr=manager)
@@ -777,7 +834,7 @@ class StartupTestController:
         test_manager.remember_dispatch(run.run_id, body)
         await test_manager.start(run.run_id, driver)
         try:
-            waitables: list[asyncio.Future | asyncio.Task] = [marker_seen]
+            waitables: list[asyncio.Future | asyncio.Task] = [marker_seen, failure_seen]
             if run.task is not None:
                 waitables.append(run.task)
             done, _pending = await asyncio.wait(
@@ -785,6 +842,8 @@ class StartupTestController:
             )
             if marker_seen in done and state["ok"]:
                 return {"ok": True, "detail": marker, "phase": "done"}
+            if failure_seen in done:
+                return {"ok": False, "detail": state["detail"], "phase": "run"}
             if not done:
                 return {"ok": False, "detail": "worker startup test timed out", "phase": "run"}
         finally:

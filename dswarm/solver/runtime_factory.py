@@ -26,6 +26,54 @@ from dswarm.solver.runtime_snapshot import (
     RuntimeSnapshotStore,
 )
 
+def _provider_binding_resolver(
+    sessions_root: str | Path,
+    providers: Sequence[Mapping[str, Any]],
+) -> Callable[[str], Any | None]:
+    """Build a host-only resolver for provider-bound container probes.
+
+    The runtime snapshot stores only provider identity. A standalone control
+    plane still needs to resolve that identity before the first probe so the
+    gateway token is bound to the selected endpoint and secret. The resolver
+    returns no public DTO and never places secret material in the snapshot.
+    """
+    root = Path(sessions_root)
+    configured = [dict(item) for item in providers if isinstance(item, Mapping)]
+
+    def resolve(provider_ref: str) -> Any | None:
+        ref = str(provider_ref or "").strip()
+        if not ref:
+            return None
+        try:
+            from dswarm.solver.llm_providers import (
+                LLMProviderSecretStore,
+                provider_secret_root,
+                resolve_llm_provider,
+            )
+            from dswarm.solver.modelgateway import GatewayUpstreamBinding
+
+            resolved = resolve_llm_provider(
+                ref,
+                configured,
+                secret_store=LLMProviderSecretStore(provider_secret_root(root)),
+            )
+            if resolved is None or not resolved.base_url or not resolved.api_key:
+                return None
+            return GatewayUpstreamBinding(
+                base_url=resolved.base_url,
+                api_key=resolved.api_key,
+                wire_api=resolved.wire_api,
+                auth_mode=resolved.auth_mode,
+                auth_header=resolved.auth_header,
+                auth_prefix=resolved.auth_prefix,
+                provider_id=resolved.provider_id,
+            )
+        except (OSError, TypeError, ValueError, RuntimeError):
+            # K=provider binding; R=resolver/preflight; T=fail closed; D=public-safe.
+            return None
+
+    return resolve
+
 
 def build_pool_manager_for_run(
     *,
@@ -37,6 +85,8 @@ def build_pool_manager_for_run(
     budget_gate: Any | None = None,
     pool_manager_factory: Callable[..., Any] | None = None,
     receiver: Any | None = None,
+    llm_providers: Sequence[Mapping[str, Any]] | None = None,
+    gateway_binding_resolver: Callable[[str], Any | None] | None = None,
 ) -> ContainerPoolManager:
     """Compose the M9a pool manager (executor/probe/credentials) for one snapshot.
 
@@ -47,7 +97,14 @@ def build_pool_manager_for_run(
     root = Path(sessions_root)
     journal = UsageJournal(root / f"{run_id}-usage-journal.jsonl")
     usage_writer = UsageWriter(journal, bus=bus)
-    probe = RuntimeProbe(usage_writer=usage_writer, budget_gate=budget_gate)
+    resolver = gateway_binding_resolver
+    if resolver is None and llm_providers:
+        resolver = _provider_binding_resolver(root, llm_providers)
+    probe = RuntimeProbe(
+        usage_writer=usage_writer,
+        budget_gate=budget_gate,
+        gateway_binding_resolver=resolver,
+    )
     projector = CredentialProjector(account_store_root(root), root)
     profile_by_id = {
         str(profile.get("name") or profile.get("id") or "").strip(): profile
@@ -108,6 +165,7 @@ def build_docker_runtime_context(
     snapshot_store: RuntimeSnapshotStore | None = None,
     pool_manager_factory: Callable[..., Any] | None = None,
     receiver: Any | None = None,
+    llm_providers: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build or reload the strict Docker runtime context for one run.
 
@@ -153,13 +211,13 @@ def build_docker_runtime_context(
         run_id=run_id,
         snapshot=snapshot,
         worker_profiles=profiles,
+        llm_providers=llm_providers,
         sessions_root=root,
         bus=bus,
         budget_gate=budget_gate,
         pool_manager_factory=pool_manager_factory,
         receiver=receiver,
     )
-
     return {
         "runtime_policy": snapshot.runtime_policy,
         "runtime_snapshot": snapshot,
@@ -169,12 +227,15 @@ def build_docker_runtime_context(
 
 
 def _credential_mode(profile: Mapping[str, Any]) -> str:
-    if profile.get("base_url") or profile.get("api_key_ref"):
+    frozen_mode = str(profile.get("runtime_credential_mode") or "").strip()
+    if frozen_mode in {"gateway", "direct", "custom"}:
+        return frozen_mode
+    if profile.get("base_url"):
+        return "custom"
+    if profile.get("api_key_ref"):
         return "direct"
     # A provider_ref-only binding owns its secret on the relay side; container
     # workers authenticate with gateway task tokens (never the upstream key).
-    # ("direct" would make the projector look for an accounts-store entry that
-    # provider bindings intentionally do not have.)
     return "gateway"
 
 

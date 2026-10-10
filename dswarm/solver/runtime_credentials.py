@@ -46,12 +46,16 @@ class CredentialProjectionLease:
         root: Path | None,
         operation_root: Path | None,
         env: Mapping[str, str],
+        process_env: Mapping[str, str],
         binding_id: str,
         credential_mode: CredentialMode,
         credential_version_digest: str,
     ) -> None:
         self.root = root
+        # Public projection metadata never contains secret bytes. The private
+        # process channel is consumed only by the current probe/Worker RCP spec.
         self.env = dict(env)
+        self.process_env = dict(process_env)
         self.binding_id = binding_id
         self.credential_mode = credential_mode
         self.credential_version_digest = credential_version_digest
@@ -64,28 +68,34 @@ class CredentialProjectionLease:
         return self._closed
 
     def close(self) -> None:
-        """Remove this operation's private root; repeated success is a no-op."""
+        """Remove this operation's private root and clear secret memory."""
 
         with self._close_lock:
             if self._closed:
                 return
-            if self._operation_root is not None:
-                try:
-                    shutil.rmtree(self._operation_root)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    raise CredentialProjectionCleanupError(
-                        "credential_cleanup_failed",
-                        "worker credential cleanup could not be confirmed",
-                    ) from exc
-                if self._operation_root.exists():
-                    raise CredentialProjectionCleanupError(
-                        "credential_cleanup_failed",
-                        "worker credential cleanup could not be confirmed",
-                    )
+            cleanup_error: CredentialProjectionCleanupError | None = None
+            try:
+                if self._operation_root is not None:
+                    try:
+                        shutil.rmtree(self._operation_root)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        cleanup_error = CredentialProjectionCleanupError(
+                            "credential_cleanup_failed",
+                            "worker credential cleanup could not be confirmed",
+                        )
+                        cleanup_error.__cause__ = exc
+                    if cleanup_error is None and self._operation_root.exists():
+                        cleanup_error = CredentialProjectionCleanupError(
+                            "credential_cleanup_failed",
+                            "worker credential cleanup could not be confirmed",
+                        )
+            finally:
+                self.process_env.clear()
+            if cleanup_error is not None:
+                raise cleanup_error
             self._closed = True
-
     def __enter__(self) -> CredentialProjectionLease:
         return self
 
@@ -166,6 +176,33 @@ def _read_binding_material(source: Path, *, mode: CredentialMode) -> dict[str, b
     return material
 
 
+def _private_process_env(
+    material: Mapping[str, bytes], *, mode: CredentialMode
+) -> dict[str, str]:
+    """Translate one frozen binding into the current worker process channel."""
+    try:
+        api_key = material["API_KEY"].decode("utf-8").strip()
+        base_url = material.get("BASE_URL", b"").decode("utf-8").strip()
+    except (KeyError, UnicodeDecodeError) as exc:
+        raise CredentialProjectionError(
+            "credential_binding_unavailable", "credential binding is unavailable"
+        ) from exc
+    if not api_key or (mode == "custom" and not base_url):
+        raise CredentialProjectionError(
+            "credential_binding_unavailable", "credential binding is unavailable"
+        )
+    if mode == "direct":
+        return {"DEEPSEEK_API_KEY": api_key}
+    if mode == "custom":
+        return {
+            "OPENAI_API_KEY": api_key,
+            "DSWARM_WORKER_API_KEY": api_key,
+            "OPENAI_BASE_URL": base_url,
+            "DSWARM_WORKER_BASE_URL": base_url,
+        }
+    return {}
+
+
 def _write_private_file(path: Path, value: bytes) -> None:
     # Native Windows may not honor POSIX owner-only bits. Keep the request for
     # Linux/Docker and do not treat host-side credential staging as isolation.
@@ -222,6 +259,7 @@ class CredentialProjector:
                 root=None,
                 operation_root=None,
                 env={},
+                process_env={},
                 binding_id=binding_id,
                 credential_mode=credential_mode,
                 credential_version_digest=_version_digest(
@@ -238,6 +276,7 @@ class CredentialProjector:
         version_digest = _version_digest(
             mode=credential_mode, binding_id=binding_id, material=material
         )
+        process_env = _private_process_env(material, mode=credential_mode)
 
         operation_root = (
             self._sessions_root
@@ -285,6 +324,7 @@ class CredentialProjector:
                 "DSWARM_CREDENTIAL_ROOT": CONTAINER_CREDENTIAL_ROOT,
                 "DSWARM_CREDENTIAL_BINDING_ID": binding_id,
             },
+            process_env=process_env,
             binding_id=binding_id,
             credential_mode=credential_mode,
             credential_version_digest=version_digest,

@@ -17,8 +17,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from dswarm.core.runtime_env import is_web_container
 from apps.web.llm_providers import clean_llm_providers
@@ -72,6 +74,36 @@ DEFAULT_LLM_PROFILES = {
         "base_url": DEFAULT_DEEPSEEK_BASE_URL,
         "effort": "medium",
         "timeout": 120,
+        "credential_source": "auto",
+        "credential_account": "pi-main",
+        "wire_api": "auto",
+    },
+    "review": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "effort": "low",
+        "timeout": 120,
+        "credential_source": "auto",
+        "credential_account": "pi-main",
+        "wire_api": "auto",
+    },
+    "observer": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "effort": "low",
+        "timeout": 60,
+        "credential_source": "auto",
+        "credential_account": "pi-main",
+        "wire_api": "auto",
+    },
+    "observer_fallback": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "effort": "low",
+        "timeout": 45,
         "credential_source": "auto",
         "credential_account": "pi-main",
         "wire_api": "auto",
@@ -417,7 +449,18 @@ class WorkerConfigStore:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
-        tmp.replace(self.path)  # atomic on POSIX
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt == 4:
+                    break
+                time.sleep(0.02 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
 
     def revision(self) -> str:
         """Stable non-secret revision for optimistic settings updates."""
@@ -1103,63 +1146,109 @@ class WorkerConfigStore:
 
     @staticmethod
     def _clean_llm_profiles(value: Any, *, reject_invalid: bool = False) -> dict[str, dict[str, Any]]:
+        """Normalize role bindings while keeping ``planner`` as a legacy alias.
+
+        ``reason`` is the product-facing name for the planner role.  The solver
+        still consumes ``planner`` today, so an explicit reason binding mirrors
+        into planner.  Worker and Review bindings are persisted and exposed to
+        Run snapshots now; their solver injection is intentionally a later
+        execution milestone.
+        """
         if value is None:
             return {k: dict(v) for k, v in DEFAULT_LLM_PROFILES.items()}
         if not isinstance(value, dict):
             if reject_invalid:
                 raise ValueError("llm_profiles must be an object")
             return {k: dict(v) for k, v in DEFAULT_LLM_PROFILES.items()}
-        out = {k: dict(v) for k, v in DEFAULT_LLM_PROFILES.items()}
-        for key in ("planner", "titler"):
-            raw = value.get(key)
+
+        defaults = {k: dict(v) for k, v in DEFAULT_LLM_PROFILES.items()}
+        out = {k: dict(v) for k, v in defaults.items()}
+
+        def normalize(key: str, raw: Any, fallback: Mapping[str, Any]) -> dict[str, Any] | None:
             if raw is None:
-                continue
+                return None
             if not isinstance(raw, dict):
                 if reject_invalid:
                     raise ValueError(f"llm_profiles.{key} must be an object")
-                continue
-            model = str(raw.get("model") or out[key]["model"]).strip()
-            provider = str(raw.get("provider") or out[key]["provider"]).strip()
-            # base_url is visible and explicit in the UI. Empty/non-string values
-            # restore the DeepSeek OpenAI-compatible default; the API key is never
-            # stored here (env/account store remains authoritative for secrets).
+                return None
+            base = dict(fallback)
+            model = str(raw.get("model") or base.get("model") or "").strip()
+            provider = str(raw.get("provider") or base.get("provider") or "").strip()
             raw_base = raw.get("base_url")
             base_url = str(raw_base).strip() if isinstance(raw_base, str) else ""
-            provider_ref = str(raw.get("provider_ref") or out[key].get("provider_ref") or "").strip()
+            provider_ref = str(raw.get("provider_ref") or base.get("provider_ref") or "").strip()
             if provider_ref:
-                # Provider registry owns endpoint, auth and protocol. Keep the
-                # legacy fields only as non-secret compatibility markers.
                 base_url = ""
             elif not base_url:
-                base_url = DEFAULT_DEEPSEEK_BASE_URL
-            effort = str(raw.get("effort") or out[key].get("effort") or "medium").strip().lower()
-            timeout = WorkerConfigStore._coerce_nonneg_int(raw.get("timeout"), int(out[key].get("timeout") or 0))
+                base_url = str(base.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL)
+            effort = str(raw.get("effort") or base.get("effort") or "medium").strip().lower()
+            timeout = WorkerConfigStore._coerce_nonneg_int(raw.get("timeout"), int(base.get("timeout") or 0))
             if not model:
                 if reject_invalid:
                     raise ValueError(f"llm_profiles.{key}.model must be non-empty")
-                model = str(out[key]["model"])
-            credential_source = str(raw.get("credential_source") or out[key].get("credential_source") or "auto").strip().lower()
+                model = str(base.get("model") or "")
+            credential_source = str(raw.get("credential_source") or base.get("credential_source") or "auto").strip().lower()
             if credential_source not in {"auto", "env", "account", "provider"}:
                 credential_source = "auto"
-            credential_account = str(raw.get("credential_account") or out[key].get("credential_account") or "pi-main").strip()
-            wire_api = str(raw.get("wire_api") or out[key].get("wire_api") or "auto").strip().lower()
-            if wire_api not in {"auto", "openai", "openai-chat", "openai-responses"}:
+            credential_account = str(raw.get("credential_account") or base.get("credential_account") or "pi-main").strip()
+            wire_api = str(raw.get("wire_api") or base.get("wire_api") or "auto").strip().lower()
+            if wire_api not in {"auto", "openai", "openai-chat", "openai-responses", "anthropic"}:
                 wire_api = "auto"
             if provider_ref:
                 credential_source = "provider"
                 credential_account = provider_ref
                 wire_api = "auto"
-            out[key] = {
-                "provider": provider or out[key]["provider"],
+            return {
+                "provider": provider or str(base.get("provider") or "openai"),
                 "model": model,
                 "base_url": base_url,
-                "effort": effort or str(out[key].get("effort") or "medium"),
+                "effort": effort or str(base.get("effort") or "medium"),
                 "timeout": timeout,
                 "credential_source": credential_source,
                 "credential_account": credential_account,
                 "wire_api": wire_api,
                 "provider_ref": provider_ref,
             }
+
+        planner_raw = value.get("planner")
+        reason_raw = value.get("reason")
+        # Explicit reason is canonical; planner-only callers remain compatible.
+        if reason_raw is not None:
+            reason = normalize("reason", reason_raw, defaults["planner"])
+            if reason is not None:
+                out["reason"] = reason
+                out["planner"] = dict(reason)
+        elif planner_raw is not None:
+            planner = normalize("planner", planner_raw, defaults["planner"])
+            if planner is not None:
+                out["planner"] = planner
+
+        observer = normalize("observer", value.get("observer"), defaults["observer"])
+        if observer is not None:
+            out["observer"] = observer
+
+        observer_fallback = normalize(
+            "observer_fallback", value.get("observer_fallback"),
+            defaults["observer_fallback"],
+        )
+        if observer_fallback is not None:
+            out["observer_fallback"] = observer_fallback
+
+        titler = normalize("titler", value.get("titler"), defaults["titler"])
+        if titler is not None:
+            out["titler"] = titler
+
+        # Role bindings are independent.  An omitted role must keep its own
+        # settings default, and an explicitly blank provider_ref must not inherit
+        # a provider reference from any other role.
+        for key in ("worker", "review"):
+            raw_role = value.get(key)
+            if raw_role is None:
+                continue
+            fallback = defaults.get(key) or defaults["planner"]
+            role = normalize(key, raw_role, fallback)
+            if role is not None:
+                out[key] = role
         return out
 
 
@@ -1171,19 +1260,11 @@ class WorkerConfigStore:
 
     @staticmethod
     def _clean_review_policy(value: Any) -> dict[str, Any]:
-        """Normalize Reason review settings without the retired stage wrapper."""
+        """Normalize Reviewer quality-gate policy, separate from its LLM role."""
         raw = value if isinstance(value, dict) else {}
         review = dict(DEFAULT_REVIEW_POLICY)
         review["enabled"] = bool(raw.get("enabled", review["enabled"]))
         review["engine"] = str(raw.get("engine") or review["engine"]).strip()
-        for key in ("provider_ref", "credential_source", "credential_account", "base_url", "wire_api", "model"):
-            if raw.get(key) is not None:
-                review[key] = str(raw.get(key) or "").strip()
-        if review.get("provider_ref"):
-            review["credential_source"] = "provider"
-            review["credential_account"] = review["provider_ref"]
-            review["base_url"] = ""
-            review["wire_api"] = "auto"
         for key in (
             "after_fruitless_workers", "after_duplicate_intents",
             "every_completed_workers", "candidate_spike_threshold",

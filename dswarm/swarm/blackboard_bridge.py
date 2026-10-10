@@ -46,12 +46,14 @@ class BlackboardBridgeMixin:
             fields["intent_id"] = p.get("intent_id", "")
             fields["goal"] = p.get("goal", "")
             fields["intent_seq"] = seq
+            fields["source_event_seq"] = seq
             return [("intent_proposed", fields)]
         if kind == "intent_claimed":
             return [("intent_claimed", {
                 "intent_id": p.get("intent_id", ""),
                 "worker": actor,
                 "intent_seq": seq,
+                "source_event_seq": seq,
             })]
         if kind == "intent_concluded":
             out = []
@@ -62,7 +64,9 @@ class BlackboardBridgeMixin:
                     "result": p.get("result", ""),
                     "result_detail": p.get("result_detail", ""),
                     "to_fact_seq": p.get("to_fact_seq"),
+                    "route_hash": p.get("route_hash", ""),
                     "intent_seq": seq,
+                    "source_event_seq": seq,
                 }))
             return out
         if kind == "intent_state_changed":
@@ -190,6 +194,17 @@ class BlackboardBridgeMixin:
             if "kind" in fields:
                 fields["finding_kind"] = fields.pop("kind")
             return [("review_finding", fields)]
+        if kind in {
+            "worker_report_pending_review", "evidence_review_decision",
+            "reviewed_context", "intent_quality_decision", "intent_interrupted",
+            "intent_recovery_required", "provider_recovery_directive",
+            "provider_recovery_activated", "provider_recovery_blocked",
+            "binding_effective_changed",
+        }:
+            fields = dict(p)
+            fields["seq"] = seq
+            fields["actor"] = actor
+            return [(kind, fields)]
         if kind in {"route_suppressed", "route_reopened", "branch_split",
                     "branch_resolved", "coordinator_directive"}:
             fields = dict(p)

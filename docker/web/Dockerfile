@@ -48,4 +48,4 @@ EXPOSE 8000
 # compose network. Auth (P3) gates the surface; compose sets DSWARM_WEB_PASSWORD.
 ENV DSWARM_WEB_BIND=0.0.0.0
 CMD ["uv", "run", "uvicorn", "apps.web.server:create_app", "--factory", \
-     "--host", "0.0.0.0", "--port", "8000"]
+     "--host", "0.0.0.0", "--port", "8000", "--ws", "websockets-sansio"]

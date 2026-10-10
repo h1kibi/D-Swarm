@@ -149,6 +149,7 @@ class Seat:
     engine: str
     credential_id: str
     environment_id: str
+    image: str = ""
     model: str = ""
     effort: str = ""
     roles: list[str] = field(default_factory=lambda: list(DEFAULT_ROLES))
@@ -158,7 +159,7 @@ class Seat:
     enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "id": self.id, "label": self.label, "engine": self.engine,
             "credential_id": self.credential_id, "environment_id": self.environment_id,
             "model": self.model, "roles": list(self.roles),
@@ -169,6 +170,9 @@ class Seat:
             },
             "priority": self.priority, "enabled": self.enabled,
         }
+        if self.image:
+            d["image"] = self.image
+        return d
 
 
 def kind_from_mode(mode: str) -> str:
@@ -335,6 +339,7 @@ def migrate_legacy_config(
         seats.append(Seat(
             id=sid, label=label, engine=engine,
             credential_id=cid, environment_id=env_id,
+            image=str(p.get("image") or "").strip(),
             model=str(p.get("model") or "").strip(),
             effort=str(p.get("effort") or "").strip().lower(),
             roles=roles,
@@ -378,6 +383,9 @@ def _seat_direction_image(seat: dict[str, Any]) -> str:
     Without this the new-shape config silently ran every direction seat on the
     base image (same bug class as the stale single-profile roster).
     """
+    explicit = str(seat.get("image") or "").strip()
+    if explicit:
+        return explicit
     for key in ("label", "id"):
         name = str(seat.get(key) or "").strip().lower()
         if not name.startswith("pi-"):

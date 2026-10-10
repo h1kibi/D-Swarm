@@ -154,6 +154,7 @@ async def _swarm_driver(
             worker_profiles=selected_profiles,
             runtime_profiles=cfg.get("runtime_profiles", []),
             run_max_workers=cfg.get("max_workers", 0),
+            llm_providers=cfg.get("llm_providers", []),
         )
 
     if factory_supplied:
@@ -166,6 +167,7 @@ async def _swarm_driver(
             "engines": names,
             "worker_profiles": selected_profiles,
             "runtime_profiles": cfg.get("runtime_profiles"),
+            "llm_providers": cfg.get("llm_providers") or [],
             "max_workers": cfg.get("max_workers", 8),
             "wall_clock_budget": cfg.get("wall_clock_budget"),
             "max_total_workers": cfg.get("max_total_workers"),

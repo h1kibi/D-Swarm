@@ -59,4 +59,5 @@ async def test_llm_endpoint_route(request: Request) -> Any:
             body.get("credential_source") if body.get("credential_source") is not None else None
         ),
         wire_api=(body.get("wire_api") if body.get("wire_api") is not None else None),
+        effort=(body.get("effort") if body.get("effort") is not None else None),
     )

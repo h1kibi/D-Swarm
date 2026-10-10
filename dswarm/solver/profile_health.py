@@ -269,7 +269,10 @@ def evaluate_profile_health(
     # readability and CLI launch — but spends NO quota. Local backend has no
     # container plumbing, so this layer is a no-op there.
     if backend == "container":
-        pl = _probe_container_plumbing(engine=engine, account_id=effective_account_id, root=root)
+        pl = _probe_container_plumbing(
+            engine=engine, account_id=effective_account_id, root=root,
+            image=str(profile.get("image") or "").strip(),
+        )
         if not pl[0]:
             return mk("auth_failed", layer=pl[1], detail=pl[2],
                       binding_kind=bk, effective_credential_id=effective_account_id)
@@ -348,7 +351,7 @@ def evaluate_profile_health(
 
 
 def _probe_container_plumbing(
-    *, engine: str, account_id: str, root: Path
+    *, engine: str, account_id: str, root: Path, image: str = ""
 ) -> tuple[bool, str | None, str]:
     """Container plumbing probe: image present + credential mount readable + CLI
     launches. Returns (ok, layer, detail). NEVER spends model quota.
@@ -359,5 +362,5 @@ def _probe_container_plumbing(
     """
     from dswarm.solver.container_probe import _probe_container
 
-    res = _probe_container(engine=engine, account_id=account_id, root=root)
+    res = _probe_container(engine=engine, account_id=account_id, root=root, image=image)
     return bool(res.get("ok")), res.get("layer"), str(res.get("detail") or "")

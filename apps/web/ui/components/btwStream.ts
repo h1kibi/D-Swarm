@@ -28,3 +28,31 @@ export function btwErrorBannerText(content: string, error: string): string {
   const detail = (error || "").trim();
   return detail && detail !== answer ? detail.slice(0, 300) : "";
 }
+
+export type ObserverSource = "default" | "fallback" | "unavailable";
+
+export function observerSourceLabel(source: ObserverSource | undefined): string {
+  if (source === "default") return "Observer default";
+  if (source === "fallback") return "Observer fallback";
+  if (source === "unavailable") return "Observer unavailable";
+  return "Observer";
+}
+
+export type BtwFailureKind = "http" | "transport" | "empty";
+
+/**
+ * The assistant turn for any client-side Observer failure (HTTP non-2xx, stream
+ * exception, or an empty stream). Every one of them is attributed to the
+ * isolated Observer chain as `unavailable` — never to Titler/Reason, and never
+ * as a successful answer (docs/17 §12.2).
+ */
+export function btwFailureTurn(
+  kind: BtwFailureKind,
+  detail = "",
+): { content: string; observerSource: ObserverSource; fallbackUsed: boolean } {
+  const clean = String(detail || "").trim().slice(0, 300);
+  const content = kind === "empty"
+    ? "观察员未返回任何回答；没有启动深度 worker。"
+    : `观察员暂时无法回答：${clean || "未知错误"}`;
+  return { content, observerSource: "unavailable", fallbackUsed: false };
+}

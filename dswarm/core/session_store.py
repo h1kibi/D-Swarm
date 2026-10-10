@@ -203,6 +203,9 @@ class SessionStore:
             "run_id": run_id, "name": run_id, "category": "",
             "started": False, "finished": False, "solved": False, "flag": None,
             "reason": None, "flags": [], "expected_flags": 1, "multi_flag": False,
+            "reason_blocked": False, "reason_blocked_reason": "",
+            "degraded": False, "degraded_reason": "",
+            "fallback_active": False, "fallback_reason": "",
             "events": 0, "ts": 0.0,
         }
         if not path.exists():
@@ -240,7 +243,7 @@ class SessionStore:
                     if "multi_flag" in ch:
                         summary["multi_flag"] = bool(ch["multi_flag"])
                 elif et == "run.titled":
-                    # ChatGPT-style auto-title persisted on the run 鈥?survives restart
+                    # ChatGPT-style auto-title persisted on the run — survives restart
                     summary["name"] = p.get("title") or summary["name"]
                 elif et == "run.finished":
                     summary["finished"] = True
@@ -248,7 +251,7 @@ class SessionStore:
                     finished_solved = bool(p.get("solved"))
                     _add_flag(p.get("flags") or p.get("flag"))
                     # run.finished may carry the authoritative mode (the single-solver
-                    # _emit_finished does not 鈥?default fallbacks above cover that).
+                    # _emit_finished does not — default fallbacks above cover that).
                     if p.get("expected_flags"):
                         summary["expected_flags"] = int(p["expected_flags"])
                     if "multi_flag" in p:
@@ -264,6 +267,42 @@ class SessionStore:
                         flags[:] = [f for f in flags if f != bad]
                     else:
                         flags.clear()
+                elif et == "blackboard.delta":
+                    kind = p.get("kind")
+                    if kind == "reason_blocked":
+                        intent_id = str(p.get("intent_id") or "").strip()
+                        stage = str(p.get("stage") or "").strip().lower()
+                        if not intent_id or stage == "reason":
+                            summary["reason_blocked"] = True
+                            summary["reason_blocked_reason"] = str(p.get("reason") or "Reason planner unavailable")[:240]
+                    elif kind in ("reason_recovered", "operator_resumed"):
+                        summary["reason_blocked"] = False
+                        summary["reason_blocked_reason"] = ""
+                    elif kind in ("runtime_degraded", "worker_backend_degraded", "engine_degraded"):
+                        summary["degraded"] = True
+                        summary["degraded_reason"] = str(p.get("reason") or p.get("backend") or kind)[:240]
+                    elif kind in ("provider_recovery_activated", "binding_effective_changed"):
+                        summary["fallback_active"] = True
+                        summary["fallback_reason"] = str(p.get("reason") or p.get("category") or "provider fallback active")[:240]
+                        summary["degraded"] = False
+                        summary["degraded_reason"] = ""
+                    elif kind == "provider_recovery_blocked":
+                        # Role-scoped: a Reason/planner binding that could not be
+                        # recovered blocks the planner loop; a Worker binding is
+                        # only a degraded run. Restart must reproduce the live
+                        # classification instead of flattening both to degraded.
+                        role = str(
+                            p.get("role") or p.get("binding_role") or p.get("component") or ""
+                        ).strip().lower()
+                        reason = str(
+                            p.get("blocked_reason") or p.get("reason") or "provider recovery blocked"
+                        )[:240]
+                        if role in {"reason", "planner"}:
+                            summary["reason_blocked"] = True
+                            summary["reason_blocked_reason"] = reason
+                        else:
+                            summary["degraded"] = True
+                            summary["degraded_reason"] = reason
                 elif et == "insight.event" and p.get("kind") == "FlagFound":
                     _add_flag(p.get("flag"))
 

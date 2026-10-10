@@ -19,12 +19,13 @@ from dswarm.solver.endpoint_probe import normalize_base_url, probe_endpoint
 from dswarm.solver.secret_store import atomic_write, chmod_private_dir, updated_at
 
 _PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_VALID_WIRE_APIS = {"auto", "openai", "openai-chat", "openai-responses"}
+_VALID_WIRE_APIS = {"auto", "openai", "openai-chat", "openai-responses", "anthropic"}
 _VALID_AUTH_MODES = {"bearer", "x-api-key", "custom"}
 
 DEFAULT_PROVIDER_TEMPLATES: list[dict[str, Any]] = [
     {"id": "deepseek", "label": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "wire_api": "auto", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"]},
     {"id": "openai", "label": "OpenAI", "base_url": "https://api.openai.com/v1", "wire_api": "auto", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": ["gpt-5.5", "gpt-5.6", "gpt-4.1", "o3"]},
+    {"id": "anthropic", "label": "Anthropic", "base_url": "https://api.anthropic.com/v1", "wire_api": "anthropic", "auth_mode": "x-api-key", "auth_header": "x-api-key", "auth_prefix": "", "models": ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]},
     {"id": "openrouter", "label": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": []},
     {"id": "moonshot", "label": "Moonshot / Kimi", "base_url": "https://api.moonshot.cn/v1", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": ["kimi-k2-0711-preview", "moonshot-v1-128k"]},
     {"id": "zhipu", "label": "Zhipu GLM", "base_url": "https://open.bigmodel.cn/api/paas/v4", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": ["glm-4.5", "glm-4-plus"]},
@@ -33,7 +34,8 @@ DEFAULT_PROVIDER_TEMPLATES: list[dict[str, Any]] = [
     {"id": "volcengine-ark", "label": "Volcengine Ark", "base_url": "https://ark.cn-beijing.volces.com/api/v3", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": []},
     {"id": "groq", "label": "Groq", "base_url": "https://api.groq.com/openai/v1", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": ["llama-3.3-70b-versatile"]},
     {"id": "together", "label": "Together AI", "base_url": "https://api.together.xyz/v1", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": []},
-    {"id": "custom-openai", "label": "自定义 OpenAI 兼容中转站", "base_url": "", "wire_api": "auto", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": []},
+    {"id": "xai", "label": "xAI / Grok", "base_url": "https://api.x.ai/v1", "wire_api": "openai-chat", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": ["grok-4", "grok-4-fast", "grok-3"]},
+    {"id": "custom-openai", "label": "Custom OpenAI-compatible relay", "base_url": "", "wire_api": "auto", "auth_mode": "bearer", "auth_header": "Authorization", "auth_prefix": "Bearer", "models": []},
 ]
 
 

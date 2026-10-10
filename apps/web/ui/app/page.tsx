@@ -1,10 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRun, useRunList, useFolders, useBudgetSnapshot, useRuntimePools, newRun, patchRun, deleteRun, retitleRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile } from "@/lib/useRun";
-import { useT } from "@/lib/i18n";
+import { useRun, useRunList, useFolders, useBudgetSnapshot, useRuntimePools, useRunObservability, hasTargetDispatchMismatch, newRun, patchRun, deleteRun, retitleRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile, type RunSummary } from "@/lib/useRun";
+import { useLang, useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
 import { I18nProvider } from "@/lib/i18n";
+import { Icon } from "@/components/Icon";
 import { ThreadRail } from "@/components/ThreadRail";
 import { StartupTestPanel } from "@/components/StartupTestPanel";
 import { Conversation } from "@/components/Conversation";
@@ -25,17 +26,26 @@ import type { BatchAction } from "@/lib/fleet";
 import { clampRailWidth, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_STORAGE_KEY } from "@/lib/railSizing";
 import { readKey, writeKey } from "@/lib/storage";
 import { useDeckMotion } from "@/lib/useDeckMotion";
+import { TargetLibrary } from "@/components/TargetLibrary";
+import { TargetWorkspace } from "@/components/TargetWorkspace";
+import { TargetDetailsModal } from "@/components/TargetDetailsModal";
+import { TargetCreateModal, type TargetCreateForm } from "@/components/TargetCreateModal";
+import { RunLaunchWizard, type LaunchBindingSelection } from "@/components/RunLaunchWizard";
+import { initialTargetId, projectTargets, targetForRun, type TargetProjection } from "@/lib/targetProjection";
+import { addTargetHint, archiveTarget, auditTargetReview, createTarget, createTargetDirection, createTargetRun, patchTarget, useTargets, type TargetRecord } from "@/lib/useTargets";
+import { workerBackendOverride } from "@/lib/launch";
+import { RunDeleteDialog } from "@/components/RunDeleteDialog";
 
 /**
- * D-Swarm Command Deck — Command-center shell (docs/07 §5, Phase 4).
+ * D-Swarm Command Deck 鈥?Command-center shell (docs/07 搂5, Phase 4).
  *
  * The conversation is NO LONGER the spine. The layout is:
  *
- *   TopBar (brand · run/target · Stage Rail · flags · cost · connection · controls)
- *   Run Fleet (left) │ Decision Timeline (center) │ Live Swarm Inspector (right)
+ *   TopBar (brand 路 run/target 路 Stage Rail 路 flags 路 cost 路 connection 路 controls)
+ *   Run Fleet (left) 鈹?Decision Timeline (center) 鈹?Live Swarm Inspector (right)
  *   Operator Command Bar (persistent bottom)
  *
- * The deck stays a dumb subscriber (§3): dispatch POSTs /start with the prose
+ * The deck stays a dumb subscriber (搂3): dispatch POSTs /start with the prose
  * prompt, commands POST /hitl, and everything else folds back from the run's
  * SSE stream. A not-yet-dispatched DRAFT still gets the conversational
  * welcome/composer (that surface is how a run is launched); once a run exists,
@@ -43,7 +53,7 @@ import { useDeckMotion } from "@/lib/useDeckMotion";
  */
 
 // A draft is a local, not-yet-dispatched conversation. It never hits the backend
-// until the operator sends a prompt — see dispatch() / onNewSolve().
+// until the operator sends a prompt 鈥?see dispatch() / onNewSolve().
 const newDraftId = () => `draft-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 const isDraft = (id: string) => id.startsWith("draft-");
 const INSPECTOR_WIDTH_MIN = 280;
@@ -83,49 +93,71 @@ export default function Page() {
 }
 
 function Deck() {
-  // Start every page load on a FRESH draft conversation (ChatGPT-style: open →
+  // Start every page load on a FRESH draft conversation (ChatGPT-style: open 鈫?
   // empty new chat, history lives in the rail). We must NOT bind to a shared
-  // fixed id like "deck-run" — that reopens (and replays) one ever-growing log,
+  // fixed id like "deck-run" 鈥?that reopens (and replays) one ever-growing log,
   // which is exactly the "new solve still shows old chat" bug.
   //
   // The draft id is LOCAL until the operator actually dispatches: a draft never
   // touches the backend, so opening the deck (or hitting "+ New solve") never
   // mints empty run-NNNN stubs that clutter the rail. dispatch() promotes the
   // draft to a real backend run id at send time.
+  const { lang } = useLang();
   const t = useT();
   // Init to "" (deterministic across the static-export prerender AND client
   // hydration), then mint the real random draft id in a mount-only effect.
   // newDraftId() uses Date.now()+Math.random(), so calling it during useState
-  // initialization runs it twice — once at build prerender, once at hydration —
+  // initialization runs it twice 鈥?once at build prerender, once at hydration 鈥?
   // producing different ids and a React hydration "text content does not match"
   // error. Deferring to a post-mount effect keeps the first render identical.
   const [runId, setRunId] = useState("");
+  // Hydration-safe: "" on the prerender, then adopt the path's run id on mount.
+  // `/run/<id>` deep links (including `?review=1` from a terminal Run) must
+  // restore THAT run — without this the deck always ignored the path. With no
+  // path we keep "" (the welcome surface); a draft id is minted by explicit
+  // actions like "New solve", exactly as before.
   useEffect(() => {
-    // seed from the URL (/run/<id> deep-link / refresh); else a fresh draft.
-    setRunId((cur) => cur || runIdFromPath() || newDraftId());
-    // back/forward navigation between runs → re-read the path.
-    const onPop = () => setRunId(runIdFromPath() || newDraftId());
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
+    const fromPath = runIdFromPath();
+    if (fromPath) setRunId(fromPath);
   }, []);
+  const [activeTargetId, setActiveTargetId] = useState<string | null>(null);
+  const [targetCreateOpen, setTargetCreateOpen] = useState(false);
+  // Select the newest durable Target once on boot so returning operators land on
+  // the Target workspace instead of the generic welcome composer. After that
+  // explicit navigation (including “New solve”) always wins.
+  const initialTargetSelectionDone = useRef(false);
+  const [launchWizardTarget, setLaunchWizardTarget] = useState<TargetRecord | null>(null);
+  // A Target Run is created before /start. Keep its id across a failed launch
+  // so retrying the wizard never creates a second Target -> Run relationship.
+  const [launchRunId, setLaunchRunId] = useState<string | null>(null);
+  const [targetDetails, setTargetDetails] = useState<TargetProjection | null>(null);
+  const [deleteRunTarget, setDeleteRunTarget] = useState<RunSummary | null>(null);
   // keep the URL in sync with the active run (replace, not push — internal run
   // switches shouldn't pile up history entries; deep-link/refresh still work).
+  // A `?review=1` deep link is preserved until the Review effect below consumes
+  // it, otherwise this sync would strip the query before the modal can open.
   useEffect(() => {
     if (!runId) return;
     const url = urlForRun(runId);
-    if (window.location.pathname !== url) window.history.replaceState({}, "", url);
+    if (window.location.pathname !== url) {
+      const keepQuery = window.location.search;
+      window.history.replaceState({}, "", `${url}${keepQuery}`);
+    }
   }, [runId]);
   const { deck, connected, start, sendHitl, resolve } = useRun(runId);
   const budget = useBudgetSnapshot(runId);
   const runtime = useRuntimePools(runId);
+  const observability = useRunObservability(runId);
 
-  const [railCollapsed, setRailCollapsed] = useState(false);
+  // Desktop opens on the focused workspace; the target rail is available from
+  // the top-left control and never consumes space while hidden.
+  const [railCollapsed, setRailCollapsed] = useState(true);
   const [railWidth, setRailWidth] = useState(RAIL_WIDTH_DEFAULT);
   const [railWidthReady, setRailWidthReady] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [btwOpen, setBtwOpen] = useState(false);
   const [startupTestOpen, setStartupTestOpen] = useState(false);
-  // Roster-row → Worker 详情 focus seed. The nonce bumps on every click so
+  // Roster-row 鈫?Worker 璇︽儏 focus seed. The nonce bumps on every click so
   // re-clicking the same worker re-focuses the lanes panel; WorkerLanes reacts
   // only to a new nonce, leaving the operator's manual chip filtering intact.
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
@@ -139,9 +171,9 @@ function Deck() {
   // dispatch() can put them on challenge.attachments. Lives at this level (not
   // in the Composer) so it survives into dispatch and resets on run switch.
   const [attachments, setAttachments] = useState<SavedFile[]>([]);
-  // Phase 4 shell state: right-column inspector visibility, Stage Rail →
+  // Phase 4 shell state: right-column inspector visibility, Stage Rail 鈫?
   // Decision Timeline jump target, and the Operator Command Bar's target.
-  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [inspectorWidth, setInspectorWidth] = useState(INSPECTOR_WIDTH_DEFAULT);
   const [inspectorWidthReady, setInspectorWidthReady] = useState(false);
   const [stageJump, setStageJump] = useState<{ stage: Stage; nonce: number } | null>(null);
@@ -149,27 +181,39 @@ function Deck() {
   const [opFocusNonce, setOpFocusNonce] = useState(0);
 
   const runs = useRunList(4000, listBump);
+  const persistedTargets = useTargets(5000, listBump);
+  const targets = projectTargets(runs, persistedTargets);
+  const selectedTarget = targetForRun(targets, runId) || targets.find((target) => target.id === activeTargetId);
+  useEffect(() => {
+    if (initialTargetSelectionDone.current) return;
+    // A deep-linked Run already determines its Target; do not overwrite it.
+    if (runId && !isDraft(runId)) {
+      initialTargetSelectionDone.current = true;
+      return;
+    }
+    const firstTargetId = initialTargetId(targets, runId);
+    if (firstTargetId) {
+      setActiveTargetId(firstTargetId);
+      initialTargetSelectionDone.current = true;
+    }
+  }, [persistedTargets.length, targets, runs.length, runId]);
   const folders = useFolders(8000, listBump);
   const bump = () => setListBump((n) => n + 1);
 
-  // shorthand for a failure toast — shown whenever a mutation helper returns
+  // shorthand for a failure toast 鈥?shown whenever a mutation helper returns
   // null/false (network / backend error), the biggest silent-failure gap today.
   const toastFail = () => pushToast({ msg: t("toast.actionFailed"), variant: "error" });
 
   const { theme, toggleTheme } = useTheme();
 
-  // Operator command → swarm. Wraps sendHitl so the otherwise-silent "生成复盘"
-  // (writeup) command gives immediate feedback: the planner takes seconds to
-  // produce the report and it lands as a normal chat bubble, so without this the
-  // button looked dead. Every other command path is untouched (pass-through).
+  // Operator commands are scoped to this Run.  The bar supplies explicit
+  // recipients for Prompt; stop/resume are normalized as Run-wide by the bar
+  // and backend. Review is a local Target audit entry point.
   const onCommand = useCallback(
-    (target: string, action: string, text: string) => {
-      if (action === "writeup") {
-        pushToast({ msg: t("toast.writeupRequested"), variant: "info", icon: "pencil" });
-      }
-      return sendHitl(target, action, text);
+    (target: string, action: string, text: string, recipients?: string[]) => {
+      return sendHitl(target, action, text, { recipients });
     },
-    [sendHitl, pushToast, t]
+    [sendHitl]
   );
 
   useEffect(() => {
@@ -229,7 +273,7 @@ function Deck() {
     setInspectorWidth(clampInspectorWidth(width, viewport));
   }, []);
 
-  // Cmd/Ctrl+K opens (toggles) the command palette — the single, more-powerful
+  // Cmd/Ctrl+K opens (toggles) the command palette 鈥?the single, more-powerful
   // power-user entry point. This OWNS Cmd+K now: the old composer-focus path in
   // Conversation.tsx was moved off Cmd+K (it kept the bare "/" key, and the
   // palette also exposes a "focus composer" command), so the two never
@@ -270,7 +314,7 @@ function Deck() {
   //
   // The make-or-break guard is "never fire while typing": we bail on any modifier
   // (so Cmd+K composer-focus, browser shortcuts, and Ctrl/Alt combos pass through),
-  // on IME composition, and when focus is in a text field — checked on BOTH the
+  // on IME composition, and when focus is in a text field 鈥?checked on BOTH the
   // event.target AND document.activeElement so a steer like "go" typed into the
   // composer can never clobber a panel. Only armed once a run has started (panels
   // are meaningless on the welcome screen) and no modal is up.
@@ -300,7 +344,7 @@ function Deck() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deck.started, paletteOpen]);
 
-  // When the auto-title lands live (RUN_TITLED → deck.challengeName), refetch the
+  // When the auto-title lands live (RUN_TITLED 鈫?deck.challengeName), refetch the
   // rail immediately so the active row's "new conversation" placeholder is
   // replaced at once instead of waiting up to one poll interval.
   useEffect(() => {
@@ -314,16 +358,35 @@ function Deck() {
   // event yet (deck.started still false). The SSE replay populates a beat after
   // selection, leaving a visible blank gap → show skeletons until RUN_STARTED
   // lands and flips deck.started true. Flips off the instant data arrives.
-  const activeSummary = runs.find((r) => r.run_id === runId);
+  const activeSummary = runs.find((r) => r.run_id === runId)
+    ?? selectedTarget?.runs.find((r) => r.run_id === runId);
+  // A historical Target Run with a binding mismatch is replayable but cannot be
+  // resumed: it would execute a different challenge under the old sidecar.
+  const resolveBlocked = hasTargetDispatchMismatch(activeSummary);
   const loading = !isDraft(runId)
     && !!activeSummary?.started
     && !activeSummary?.finished
     && !deck.started;
+  const terminal = Boolean(activeSummary?.finished || deck.finished);
+  const onReview = useCallback(() => {
+    if (!terminal || !selectedTarget) return;
+    setTargetDetails(selectedTarget);
+  }, [terminal, selectedTarget]);
+  useEffect(() => {
+    // A terminal Run's Review action uses the home Target workspace as the
+    // durable audit entry point. Open it only after the target projection has
+    // arrived; the modal still requires explicit operator approval before write.
+    if (!initialTargetSelectionDone.current || !selectedTarget || !terminal) return;
+    const review = new URLSearchParams(window.location.search).get("review");
+    if (review !== "1") return;
+    setTargetDetails(selectedTarget);
+    window.history.replaceState({}, "", window.location.pathname);
+  }, [selectedTarget, terminal]);
   useDeckMotion(shellRef, { flagCount: deck.flags.length });
   // Attach files to the next dispatch. They're uploaded to the run's folder
   // immediately and we keep the saved absolute paths. A draft conversation has
   // no backend run yet, so promote it to a real run-NNNN FIRST (same idiom as
-  // dispatch) — then the upload lands under that id and dispatch reuses it.
+  // dispatch) 鈥?then the upload lands under that id and dispatch reuses it.
   const addFiles = async (files: FileList | File[]) => {
     if (!files || files.length === 0) return;
     let id = runId;
@@ -337,7 +400,7 @@ function Deck() {
   const removeFile = (path: string) =>
     setAttachments((prev) => prev.filter((f) => f.path !== path));
 
-  // Dispatch the REAL swarm conversationally: one prose prompt → /start. The
+  // Dispatch the REAL swarm conversationally: one prose prompt 鈫?/start. The
   // backend infers category/target from the prompt and dispatches the shelled
   // pi CLI workers. The flag still only counts if it traces to real
   // execution output (provenance gate).
@@ -347,17 +410,34 @@ function Deck() {
     // or promoted by addFiles when a file was attached) dispatch as-is. start()
     // reads the current `runId`; pass the freshly minted id explicitly to avoid
     // racing the setRunId state update.
+    let targetId = opts?.targetId || (selectedTarget?.id && selectedTarget.id.startsWith("target-") ? selectedTarget.id : null);
+    if (!targetId) {
+      const createdTarget = await createTarget({
+        name: prompt.trim().split(/\s+/).slice(0, 8).join(" ") || "Untitled target",
+        description: prompt,
+        category: "misc",
+      });
+      targetId = createdTarget?.id || null;
+      if (targetId) setActiveTargetId(targetId);
+    }
     let id = runId;
-    if (!id || isDraft(id)) {
+    if (opts?.runId) {
+      id = opts.runId;
+      setRunId(id);
+    } else if (!id || isDraft(id)) {
       id = await newRun();
       setRunId(id);
     }
-    // webSearch off → offline (backend denies the worker's WebSearch/WebFetch and,
-    // by implication, the KB — a clean black-box run).
+    // webSearch off 鈫?offline (backend denies the worker's WebSearch/WebFetch and,
+    // by implication, the KB 鈥?a clean black-box run).
     const offline = opts ? !opts.webSearch : false;
     // pentest mode (goal-driven, no flag) adds goal/scope. CTF (default) sends
     // nothing extra so its dispatch body stays byte-identical.
+    const launchTarget = opts?.targetId ? targets.find((item) => item.id === opts.targetId) : selectedTarget;
     const challenge: Record<string, unknown> = {
+      name: launchTarget?.name || undefined,
+      category: launchTarget?.category || undefined,
+      target: launchTarget?.targetAddress || undefined,
       description: prompt,
       attachments: attachments.map((f) => f.path),
     };
@@ -380,40 +460,204 @@ function Deck() {
         }
       }
     }
-    // worker isolation toggle → backend's worker_backend ("container" runs each
-    // worker in a Docker container that can't read the host bench tree; default
-    // "local" = host subprocess).
-    const worker_backend = opts?.containerMode ? "container" : "local";
-    const runOverrides: Record<string, unknown> = {};
+    // An omitted backend is intentional: the server resolves the configured
+    // worker_config/env/default backend. A local request remains explicit and
+    // still goes through the backend's dual local-worker safety gate.
+    const runOverrides: Record<string, unknown> = workerBackendOverride(opts?.containerMode);
     if (opts?.wallClockBudget != null) runOverrides.wall_clock_budget = opts.wallClockBudget;
     if (opts?.maxTotalWorkers != null) runOverrides.max_total_workers = opts.maxTotalWorkers;
     if (opts?.costBudgetUsd != null) runOverrides.cost_budget_usd = opts.costBudgetUsd;
+    if (opts?.directionId) runOverrides.direction_id = opts.directionId;
+    if (opts?.workerProfileId) runOverrides.engines = [opts.workerProfileId];
+    if (opts?.llmMode) runOverrides.llm_mode = opts.llmMode;
+    if (opts?.llmOverrides) runOverrides.llm_overrides = opts.llmOverrides;
+    if (opts?.reviewPolicy) runOverrides.review_policy = opts.reviewPolicy;
     // attachments: absolute paths the backend saved; the worker stages them into
     // its cwd. Filtered server-side to existing paths, so a stale one is harmless.
     try {
-      await start({ kind: "swarm", prompt, offline, challenge, worker_backend, ...runOverrides }, id);
+      await start({ kind: "swarm", prompt, offline, challenge, target_id: targetId, ...runOverrides }, id);
       setAttachments([]); // chips consumed by this dispatch
       setListBump((n) => n + 1);
     } catch (err) {
       const detail = err instanceof Error ? err.message : "";
       pushToast({
-        msg: detail ? `${t("toast.dispatchFailed")}：${detail}` : t("toast.dispatchFailed"),
+        msg: detail ? `${t("toast.dispatchFailed")}: ${detail}` : t("toast.dispatchFailed"),
         variant: "error",
       });
+      if (opts?.throwOnError) throw err;
     }
   };
 
   const onNewSolve = () => {
-    // Purely local: reset to a fresh empty draft. No backend run is created until
-    // the operator dispatches, so "+ New solve" can't litter the rail with stubs.
     setAttachments([]);
+    setLaunchRunId(null);
+    setLaunchWizardTarget(null);
+    setTargetCreateOpen(true);
+  };
+
+  const createTargetFromModal = async (form: TargetCreateForm) => {
+    const created = await createTarget({
+      name: form.name,
+      kind: form.kind,
+      category: form.category,
+      description: form.description,
+      target_address: form.target_address || undefined,
+      flag_format_hint: form.flag_format_hint || undefined,
+      expected_flags: form.expected_flags,
+      multi_flag: form.multi_flag,
+      primary_direction: form.direction ? {
+        label: form.direction,
+        description: form.direction_description,
+        category: form.category,
+      } : undefined,
+    });
+    if (!created?.id) throw new Error("Target 创建失败，请检查后端连接。");
+    setTargetCreateOpen(false);
+    setLaunchRunId(null);
+    setLaunchWizardTarget(null);
+    setActiveTargetId(created.id);
     setRunId(newDraftId());
+    bump();
+    pushToast({ msg: "目标已创建", variant: "success" });
+  };
+
+  const onNewTargetRun = async () => {
+    const targetId = selectedTarget?.id;
+    if (!targetId || !targetId.startsWith("target-")) {
+      setTargetCreateOpen(true);
+      return;
+    }
+    const targetRecord = persistedTargets.find((item) => item.id === targetId);
+    if (!targetRecord) {
+      setTargetCreateOpen(true);
+      return;
+    }
+    setLaunchRunId(null);
+    setLaunchWizardTarget(targetRecord);
+  };
+
+  const launchConfiguredRun = async (target: TargetRecord, selection: LaunchBindingSelection) => {
+    let id = launchRunId;
+    if (!id) {
+      const created = await createTargetRun(target.id, {
+        direction_id: selection.directionId || undefined,
+        direction: selection.direction || undefined,
+        inherit_verified_facts: selection.inheritVerifiedFacts,
+        verified_fact_ids: selection.verifiedFactIds,
+        include_target_hints: selection.includeTargetHints,
+        target_hint_ids: selection.targetHintIds,
+      });
+      id = created.run_id;
+      setLaunchRunId(id);
+    }
+    setActiveTargetId(target.id);
+    setRunId(id);
+    // Target metadata and saved hints are merged by /start; this prompt is the
+    // operator's per-Run instruction and remains independent from the Target.
+    // Launch errors are rethrown by dispatch so RunLaunchWizard keeps the form
+    // open and can retry this same already-created Run.
+    await dispatch(selection.prompt, {
+      webSearch: true,
+      mode: target.kind === "pentest" ? "pentest" : "ctf",
+      targetId: target.id,
+      directionId: selection.directionId || undefined,
+      runId: id,
+      workerProfileId: selection.workerProfileId,
+      llmMode: selection.llmMode,
+      llmOverrides: selection.llmOverrides,
+      reviewPolicy: selection.review,
+      throwOnError: true,
+    });
+    // Only a successful /start closes the wizard and releases the retry id.
+    setLaunchRunId(null);
+    setLaunchWizardTarget(null);
+  };
+
+  const updateTargetDetails = async (changes: Record<string, unknown>): Promise<boolean> => {
+    if (!targetDetails) return false;
+    const updated = await patchTarget(targetDetails.id, changes);
+    if (!updated) {
+      toastFail();
+      return false;
+    }
+    bump();
+    const nextProjection = projectTargets(runs, [updated]).find((item) => item.id === targetDetails.id);
+    if (nextProjection) setTargetDetails(nextProjection);
+    pushToast({ msg: "目标已更新", variant: "success" });
+    return true;
+  };
+
+  const addHintToTarget = async (text: string): Promise<boolean> => {
+    if (!targetDetails) return false;
+    const hint = await addTargetHint(targetDetails.id, text);
+    if (!hint) {
+      toastFail();
+      return false;
+    }
+    bump();
+    setTargetDetails((current) => current ? {
+      ...current,
+      hints: [...(current.hints || []), hint],
+      updated: Date.now(),
+    } : current);
+    pushToast({ msg: "提示已保存到目标", variant: "success" });
+    return true;
+  };
+  const auditTargetFacts = async (facts: Array<Record<string, unknown>>): Promise<boolean> => {
+    if (!targetDetails || !facts.length) return false;
+    const ok = await auditTargetReview(targetDetails.id, facts);
+    if (!ok) {
+      toastFail();
+      return false;
+    }
+    bump();
+    pushToast({ msg: "已将审计事实写入目标", variant: "success" });
+    return true;
+  };
+
+  const addDirectionToTarget = async (label: string, description?: string, category?: string): Promise<boolean> => {
+    if (!targetDetails) return false;
+    const direction = await createTargetDirection(targetDetails.id, { label, description, category });
+    if (!direction) {
+      toastFail();
+      return false;
+    }
+    bump();
+    setTargetDetails((current) => current ? {
+      ...current,
+      directions: [...(current.directions || []), direction],
+      primaryDirection: current.primaryDirection || String(direction.label || label),
+      primaryDirectionId: current.primaryDirectionId || String(direction.id || ""),
+      updated: Date.now(),
+    } : current);
+    pushToast({ msg: "方向已添加到目标", variant: "success" });
+    return true;
+  };
+
+  const onSelectTarget = (targetId: string) => {
+    const target = targets.find((item) => item.id === targetId);
+    if (!target) return;
+    setLaunchRunId(null);
+    setLaunchWizardTarget(null);
+    setActiveTargetId(targetId);
+    const firstRun = target.runs[0]?.run_id;
+    if (firstRun) {
+      onSelectRun(firstRun);
+    } else {
+      setAttachments([]);
+      setOpTarget("global");
+      setRunId(newDraftId());
+    }
   };
 
   const onSelectRun = (id: string) => {
     if (id === runId) return;
+    setLaunchRunId(null);
+    setLaunchWizardTarget(null);
     setAttachments([]);
     setOpTarget("global");
+    const nextTarget = targets.find((target) => target.runs.some((run) => run.run_id === id));
+    if (nextTarget?.id.startsWith("target-")) setActiveTargetId(nextTarget.id);
     setRunId(id);
   };
 
@@ -430,14 +674,38 @@ function Deck() {
     | { kind: "newFolder" }
     | { kind: "renameFolder"; folderId: string; name: string }
     | { kind: "deleteFolder"; folderId: string }
+    | { kind: "renameTarget"; targetId: string; name: string }
+    | { kind: "archiveTarget"; targetId: string; archived: boolean }
+    | { kind: "detailsTarget"; targetId: string }
   ) => {
-    if (a.kind === "move") {
+    if (a.kind === "detailsTarget") {
+      const target = targets.find((item) => item.id === a.targetId);
+      if (target) {
+        setActiveTargetId(target.id);
+        setTargetDetails(target);
+      }
+    } else if (a.kind === "renameTarget") {
+      const updated = await patchTarget(a.targetId, { name: a.name });
+      bump();
+      if (updated) {
+        if (a.targetId === activeTargetId) setActiveTargetId(a.targetId);
+        pushToast({ msg: t("toast.renamed"), variant: "success" });
+      } else toastFail();
+    } else if (a.kind === "archiveTarget") {
+      const updated = await archiveTarget(a.targetId, a.archived);
+      bump();
+      if (!updated) { toastFail(); return; }
+      if (a.targetId === activeTargetId && a.archived) setActiveTargetId(null);
+      pushToast({
+        msg: a.archived ? "目标已归档" : "目标已恢复",
+        variant: "info",
+        undo: a.archived ? async () => { await archiveTarget(a.targetId, false); bump(); } : undefined,
+      });
+    } else if (a.kind === "move") {
       const ok = await patchRun(a.runId, { folder_id: a.folderId });
       bump();
       if (!ok) toastFail();
     } else if (a.kind === "newFolder") {
-      // Create instantly with a default name and hand the folder back so the rail
-      // drops it into inline-rename — no blocking prompt(). Blur keeps the default.
       const folder = await createFolder(t("rail.newFolderDefault"));
       bump();
       if (folder) pushToast({ msg: t("toast.folderCreated"), variant: "success" });
@@ -464,13 +732,10 @@ function Deck() {
       if (ok) pushToast({ msg: t("toast.renamed"), variant: "success" });
       else toastFail();
     } else if (a.kind === "retitle") {
-      // Re-derive the naming rule ({category}-{url|attachment|题目}) from the
-      // run's remembered dispatch. Deterministic rule hits come back with the
-      // name; pwn (题目名) is named by the background titler LLM → pending.
       const res = await retitleRun(a.runId);
       bump();
       if (!res.ok) {
-        pushToast({ msg: res.detail ? `${t("toast.retitleFailed")}：${res.detail}` : t("toast.retitleFailed"), variant: "error" });
+        pushToast({ msg: res.detail ? `${t("toast.retitleFailed")}: ${res.detail}` : t("toast.retitleFailed"), variant: "error" });
       } else if (res.pending) {
         pushToast({ msg: t("toast.retitlePending"), variant: "info" });
       } else {
@@ -481,7 +746,6 @@ function Deck() {
       bump();
       if (!ok) { toastFail(); return; }
       if (a.archived) {
-        // KEEP the archive-undo behavior — migrated into the unified lane.
         pushToast({
           msg: t("rail.toast.archived"),
           variant: "info",
@@ -489,17 +753,32 @@ function Deck() {
         });
       }
     } else if (a.kind === "delete") {
-      if (!window.confirm(t("rail.confirmDelete"))) return;
-      const ok = await deleteRun(a.runId);
-      // if we just deleted the open conversation, fall back to a fresh draft
-      if (ok && a.runId === runId) { setAttachments([]); setRunId(newDraftId()); }
-      bump();
-      if (ok) pushToast({ msg: t("toast.deleted"), variant: "success" });
-      else toastFail();
+      const targetRun = runs.find((run) => run.run_id === a.runId);
+      if (targetRun) requestRunDelete(targetRun);
     }
   };
 
-  // Fleet batch control (§5.2): the rail already confirmed (for stop) and
+  const requestRunDelete = (run: RunSummary) => setDeleteRunTarget(run);
+  const confirmRunDelete = async (run: RunSummary): Promise<boolean> => {
+    const ok = await deleteRun(run.run_id);
+    if (!ok) return false;
+    if (targetDetails) setTargetDetails((current) => current ? {
+      ...current,
+      runs: current.runs.filter((item) => item.run_id !== run.run_id),
+    } : current);
+    if (run.run_id === runId) {
+      setAttachments([]);
+      setLaunchRunId(null);
+      setLaunchWizardTarget(null);
+      setRunId(newDraftId());
+    }
+    bump();
+    pushToast({ msg: t("toast.deleted"), variant: "success" });
+    return true;
+  };
+
+
+  // Fleet batch control (搂5.2): the rail already confirmed (for stop) and
   // filtered eligibility. pause/resume/stop fan out the single-run HITL API;
   // archive/unarchive fan out the run-metadata PATCH (no history is touched).
   const onBatch = async (action: BatchAction, runIds: string[]) => {
@@ -529,7 +808,7 @@ function Deck() {
     bump();
   };
 
-  // Detail views are real pages now (/run/<id>/<view>): navigate in-tab —
+  // Detail views are real pages now (/run/<id>/<view>): navigate in-tab 鈥?
   // links elsewhere keep native middle/ctrl-click new-tab semantics. The old
   // in-page drawer is gone (it crammed a fourth column into the deck).
   const openArtifact = (view: DetailView) => {
@@ -537,19 +816,25 @@ function Deck() {
     window.location.href = detailUrlForRun(runId, view);
   };
 
-  // Roster/inspector worker click → the worker firehose page (same tab).
+  const openTargetFact = (sourceRunId: string) => {
+    if (!sourceRunId || isDraft(sourceRunId)) return;
+    setTargetDetails(null);
+    window.location.href = detailUrlForRun(sourceRunId, "evidence");
+  };
+
+  // Roster/inspector worker click 鈫?the worker firehose page (same tab).
   const onOpenWorker = (_id: string) => {
     openArtifact("workers");
   };
 
-  // Inspector worker card "Redirect" → seed the Operator Command Bar with that
+  // Inspector worker card "Redirect" 鈫?seed the Operator Command Bar with that
   // worker as the target and focus its input (the bar sends via onCommand).
   const onRedirectWorker = (id: string) => {
     setOpTarget(`solver:${id}`);
     setOpFocusNonce((n) => n + 1);
   };
 
-  // Stage Rail click → scroll the Decision Timeline to that stage's anchor.
+  // Stage Rail click 鈫?scroll the Decision Timeline to that stage's anchor.
   const onJumpStage = (stage: Stage) =>
     setStageJump((prev) => ({ stage, nonce: (prev?.nonce ?? 0) + 1 }));
 
@@ -579,16 +864,20 @@ function Deck() {
     } catch (err) {
       const detail = err instanceof Error ? err.message : "";
       pushToast({
-        msg: detail ? `${t("toast.dispatchFailed")}：${detail}` : t("toast.dispatchFailed"),
+        msg: detail ? `${t("toast.dispatchFailed")}: ${detail}` : t("toast.dispatchFailed"),
         variant: "error",
       });
     }
   };
 
   const showTimeline = deck.started || loading;
+  // Target is the primary navigation object. A persisted Target with no Run is
+  // still a useful workspace (metadata, directions, facts and the New Run entry
+  // point), so it should not fall back to the first-run composer.
+  const showTargetWorkspace = Boolean(selectedTarget);
 
   return (
-    <div ref={shellRef} className="shell cc-shell motion-root">
+    <div ref={shellRef} className="shell cc-shell target-shell motion-root">
       <a href="#main-conversation" className="skip-link">{t("a11y.skipToMain")}</a>
       <TopBar
         deck={deck}
@@ -596,11 +885,14 @@ function Deck() {
         running={running}
         stageInfo={deriveStage(deck)}
         inspectorOpen={inspectorOpen}
+        railCollapsed={railCollapsed}
         onToggleRail={() => setRailCollapsed((v) => !v)}
         onToggleInspector={() => setInspectorOpen((v) => !v)}
         onJumpStage={onJumpStage}
         onCommand={onCommand}
         onResolve={onResolve}
+        resolveBlocked={resolveBlocked}
+        onNewRun={selectedTarget ? onNewTargetRun : onNewSolve}
         onOpenBtw={() => {
           if (runId && !isDraft(runId)) {
             // the dedicated BTW page is the primary surface now
@@ -613,31 +905,46 @@ function Deck() {
         onToggleTheme={toggleTheme}
       />
       <div className="cc-body layout-refined">
-        <ThreadRail
+        <TargetLibrary
           collapsed={railCollapsed}
           width={railWidth}
+          targets={targets}
           runs={runs}
           folders={folders}
           activeRunId={runId}
+          activeTargetId={activeTargetId}
           draftActive={isDraft(runId)}
           connected={connected}
           onNew={onNewSolve}
           onSelect={onSelectRun}
+          onSelectTarget={onSelectTarget}
+          onDeleteRun={requestRunDelete}
           onAction={onRailAction}
           onResize={onRailResize}
           onOpenSettings={() => { window.location.href = "/settings/workers"; }}
           onStartupTest={() => setStartupTestOpen(true)}
           onBatch={onBatch}
         />
-        <main id="main-conversation" className="main motion-shell-piece" aria-label={t("a11y.main")}>
-          {showTimeline ? (
-            <DecisionTimeline
-              deck={deck}
-              loading={loading}
-              jump={stageJump}
-              onOpenWorker={onOpenWorker}
-              onOpenEvidence={() => openArtifact("evidence")}
-            />
+        <main id="main-conversation" className="main motion-shell-piece target-main" aria-label={t("a11y.main")}>
+          {showTargetWorkspace ? (
+            <>
+              <TargetWorkspace
+                target={selectedTarget}
+                deck={deck}
+                activeRunId={runId}
+                onSelectRun={onSelectRun}
+                onNewRun={onNewTargetRun}
+                onDeleteRun={requestRunDelete}
+                onOpenDetails={openArtifact}
+                onOpenTargetDetails={() => { if (selectedTarget) setTargetDetails(selectedTarget); }}
+                onOpenKnowledge={() => openArtifact("evidence")}
+                observability={observability.snapshot}
+              />
+              {showTimeline && <div className="target-decision-feed">
+                <div className="target-feed-header"><span className="eyebrow">{lang === "zh" ? "实时决策流" : "LIVE DECISION FEED"}</span><button onClick={() => openArtifact("timeline")}>{lang === "zh" ? "打开时间线" : "Open timeline"} <Icon name="chevronRight" size={13} /></button></div>
+                <DecisionTimeline deck={deck} loading={loading} jump={stageJump} onOpenWorker={onOpenWorker} onOpenEvidence={() => openArtifact("evidence")} />
+              </div>}
+            </>
           ) : (
             <Conversation
               onDispatch={dispatch}
@@ -677,18 +984,56 @@ function Deck() {
                 pushToast({ msg: `${t("budget.rebuildFailed")}: ${err instanceof Error ? err.message : String(err)}`, variant: "error" });
               }
             }}
+            bindingSnapshot={activeSummary?.binding_snapshot}
+            observability={observability.snapshot}
           />
         )}
       </div>
-      <OperatorBar
-        started={deck.started}
-        running={running}
-        solvers={Object.keys(deck.lanes)}
-        target={opTarget}
-        onTargetChange={setOpTarget}
-        focusNonce={opFocusNonce}
-        onCommand={onCommand}
+      {targetCreateOpen && (
+        <TargetCreateModal
+          onClose={() => setTargetCreateOpen(false)}
+          onCreate={createTargetFromModal}
+        />
+      )}
+      {runId && !isDraft(runId) && (
+        <OperatorBar
+          started={deck.started}
+          running={running}
+          lanes={deck.lanes}
+          target={opTarget}
+          onTargetChange={setOpTarget}
+          focusNonce={opFocusNonce}
+          onCommand={onCommand}
+          onReview={onReview}
+          terminal={terminal}
+          canReview={terminal && Boolean(selectedTarget)}
+        />
+      )}
+      {targetDetails && (
+        <TargetDetailsModal
+          target={targetDetails}
+          onClose={() => setTargetDetails(null)}
+          onSelectRun={onSelectRun}
+          onDeleteRun={requestRunDelete}
+          onOpenFact={openTargetFact}
+          onPatch={updateTargetDetails}
+          onAddHint={addHintToTarget}
+          onAddDirection={addDirectionToTarget}
+          onAuditReview={auditTargetFacts}
+        />
+      )}
+      <RunDeleteDialog
+        run={deleteRunTarget}
+        onClose={() => setDeleteRunTarget(null)}
+        onConfirm={confirmRunDelete}
       />
+      {launchWizardTarget && (
+        <RunLaunchWizard
+          target={launchWizardTarget}
+          onClose={() => { setLaunchWizardTarget(null); setLaunchRunId(null); }}
+          onLaunch={(selection) => launchConfiguredRun(launchWizardTarget, selection)}
+        />
+      )}
       <ToastLane toasts={toasts} onDismiss={dismissToast} />
       <CommandPalette
         open={paletteOpen}

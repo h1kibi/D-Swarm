@@ -164,6 +164,11 @@ async def generate_title(
     run_id: Optional[str] = None,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    wire_api: str = "auto",
+    auth_mode: str = "bearer",
+    auth_header: Optional[str] = None,
+    auth_prefix: Optional[str] = None,
     usage_writer: Optional[UsageWriter] = None,
     usage_context: Optional[UsageContext] = None,
     category: str = "",
@@ -208,11 +213,21 @@ async def generate_title(
         elif (base_url or "").strip():
             client = LLMClient(
                 base_url=base_url,
+                api_key=api_key,
+                wire_api=wire_api,
+                auth_mode=auth_mode,
+                auth_header=auth_header,
+                auth_prefix=auth_prefix,
                 usage_writer=usage_writer,
                 usage_context=usage_context,
             )
         else:
             client = LLMClient(
+                api_key=api_key,
+                wire_api=wire_api,
+                auth_mode=auth_mode,
+                auth_header=auth_header,
+                auth_prefix=auth_prefix,
                 usage_writer=usage_writer,
                 usage_context=usage_context,
             )

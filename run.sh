@@ -235,7 +235,7 @@ run_web_local() {
     export DSWARM_CONTROL_BIND=0.0.0.0
   fi
   uv run uvicorn apps.web.server:create_app --factory \
-      --host "$host" --port "$port" "${passthru[@]+"${passthru[@]}"}"
+      --host "$host" --port "$port" --ws websockets-sansio "${passthru[@]+"${passthru[@]}"}"
 }
 
 

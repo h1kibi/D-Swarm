@@ -237,6 +237,7 @@ async def probe_reason_llm_endpoint(
     credential_account: str | None = None,
     credential_source: str | None = None,
     wire_api: str | None = None,
+    effort: str | None = None,
     provider_ref: str | None = None,
     llm_providers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -249,6 +250,7 @@ async def probe_reason_llm_endpoint(
     profile = {
         "base_url": (base_url or "").strip(),
         "model": model,
+        "effort": (effort or "").strip().lower(),
         "credential_account": (credential_account or "").strip(),
         "credential_source": (credential_source or "auto").strip() or "auto",
         "wire_api": (wire_api or "auto").strip() or "auto",
@@ -292,6 +294,8 @@ async def probe_reason_llm_endpoint(
         auth_mode=str(resolved.get("auth_mode") or "bearer"),
         auth_header=str(resolved.get("auth_header") or "Authorization"),
         auth_prefix="Bearer" if resolved_auth_prefix is None else str(resolved_auth_prefix),
+        wire_api=str(resolved.get("wire_api") or wire_api or "auto"),
+        reasoning_effort=str(profile.get("effort") or "").strip().lower() or None,
     )
     try:
         resp = await client.chat(
@@ -314,7 +318,7 @@ async def probe_reason_llm_endpoint(
             "ok": True, "code": "ok", "detail": "端点可达，凭据有效，模型可调用",
             "model": model, "base_url": endpoint, "base_url_host": base_url_host(endpoint),
             "credential_source": resolved["credential_source"], "credential_account": resolved["credential_account"],
-            "detected_wire_api": "openai-chat" if (wire_api or "auto") in {"auto", "openai-chat", ""} else wire_api,
+            "detected_wire_api": str(resolved.get("wire_api") or wire_api or "auto"),
             "layers": layers,
         }
     except Exception as exc:  # noqa: BLE001

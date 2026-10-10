@@ -10,7 +10,7 @@ import {
   applyWorkerSettingsDraft, getWorkerSettingsWorkspace, probeLlmProvider, probeWorkerEndpoint, testLlmEndpoint,
   validateWorkerSettingsDraft, type CredentialAccount, type WorkerSecretUpdate,
   type LLMProvider, type LLMProviderSecretMeta, type LLMProviderTemplate, type ProviderSecretUpdate,
-  type ReasonLlmProbe, type WorkerEndpointProbe, type WorkerSettings, type WorkerSettingsValidation,
+  type ReasonLlmProbe, type ReasonLlmProfile, type WorkerEndpointProbe, type WorkerSettings, type WorkerSettingsValidation,
   type WorkerSettingsWorkspace as Workspace,
 } from "@/lib/useRun";
 import { useLang } from "@/lib/i18n";
@@ -35,7 +35,7 @@ type Section = "workers" | "reason" | "providers";
 type AuxSection = "runtimes" | "diagnostics";
 type AuxNavItem = [AuxSection, string, string];
 type ThemeMode = "light" | "dark";
-type LlmProfileKey = "planner" | "titler";
+type LlmProfileKey = "planner" | "review" | "observer" | "observer_fallback" | "titler";
 
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
 type TestState = { busy: boolean; ok?: boolean; detail?: string; models?: { id: string; name: string }[]; detectedWireApi?: string | null; probe?: WorkerEndpointProbe };
@@ -64,6 +64,36 @@ function host(value: string, fallback: string): string {
 
 function translatedMissing(w: WswText, missing: string[]): string {
   return missing.map((item) => w(`missing.${item}`)).join(", ");
+}
+
+/** Project provider references into operator-facing roles, not an opaque count. */
+function providerUsageFor(draft: WorkerSettings, providerId: string, lang: "zh" | "en"): string[] {
+  const usage: string[] = [];
+  const roleName = (role: string) => {
+    const labels: Record<string, [string, string]> = {
+      worker: ["Worker", "Worker"],
+      reason: ["Reason", "Reason"],
+      planner: ["Reason", "Reason"],
+      review: ["Reviewer", "Reviewer"],
+      observer: ["Observer", "Observer"],
+      observer_fallback: ["Observer fallback", "Observer fallback"],
+      titler: ["Titler", "Titler"],
+    };
+    return labels[role]?.[lang === "zh" ? 0 : 1] || role;
+  };
+  for (const profile of draft.worker_profiles) {
+    if (String(profile.provider_ref || "").trim() !== providerId) continue;
+    const label = profileLabel(profile);
+    usage.push(`${label} · ${roleName("worker")}`);
+  }
+  for (const key of ["planner", "observer", "observer_fallback", "review", "titler"] as const) {
+    if (String(draft.llm_profiles?.[key]?.provider_ref || "").trim() === providerId) {
+      usage.push(roleName(key));
+    }
+  }
+  const review = draft.review_policy as Record<string, unknown> | undefined;
+  if (String(review?.provider_ref || "").trim() === providerId) usage.push(roleName("review"));
+  return Array.from(new Set(usage));
 }
 
 export function WorkerSettingsWorkspace() {
@@ -801,18 +831,18 @@ function ProviderSettings({ draft, templates, secrets, secretUpdates, onChange, 
   onChange: (draft: WorkerSettings) => void;
   onSecret: (providerId: string, action: "retain" | "replace" | "remove", value?: string) => void;
 }) {
-  const { w } = useWswText();
+  const { lang, w } = useWswText();
   const [templateId, setTemplateId] = useState(templates[0]?.id || "");
   const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({});
   const [probeState, setProbeState] = useState<Record<string, TestState>>({});
-  const providers = draft.llm_providers || [];
+  const providers = useMemo(() => draft.llm_providers || [], [draft.llm_providers]);
   const refs = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const profile of draft.worker_profiles) {
       const ref = String(profile.provider_ref || "").trim();
       if (ref) counts[ref] = (counts[ref] || 0) + 1;
     }
-    for (const key of ["planner", "titler"] as const) {
+    for (const key of ["planner", "observer", "observer_fallback", "review", "titler"] as const) {
       const ref = String(draft.llm_profiles?.[key]?.provider_ref || "").trim();
       if (ref) counts[ref] = (counts[ref] || 0) + 1;
     }
@@ -866,6 +896,7 @@ function ProviderSettings({ draft, templates, secrets, secretUpdates, onChange, 
       const probe = probeState[provider.id];
       const keyValue = keyDrafts[provider.id] || "";
       const modelOptions = provider.models || [];
+      const usage = providerUsageFor(draft, provider.id, lang);
       const secretStatus = providerSecretStatus(provider.id, secrets, secretUpdates, w);
       return <article className="wsw-runtime-card wsw-provider-card" key={`${provider.id}-${index}`}>
         <div className="wsw-card-head"><div><span className="wsw-kicker">{provider.kind || w("provider")}</span>
@@ -884,6 +915,7 @@ function ProviderSettings({ draft, templates, secrets, secretUpdates, onChange, 
             onChange={(event) => patchProvider(index, { wire_api: event.target.value })}>
             <option value="auto">auto</option><option value="openai-chat">openai-chat</option>
             <option value="openai-responses">openai-responses</option><option value="openai">openai</option>
+            <option value="anthropic">anthropic</option>
           </select></Field>
           <Field label={w("authMode")}><select value={provider.auth_mode || "bearer"}
             onChange={(event) => patchProvider(index, {
@@ -919,7 +951,13 @@ function ProviderSettings({ draft, templates, secrets, secretUpdates, onChange, 
             <button className="wsw-btn quiet" type="button" aria-label={w("fetchModels")} disabled={probe?.busy} onClick={() => void runProbe(provider, false)}>{probe?.busy ? w("testing") : w("fetchProviderModels")}</button>
             <button className="wsw-btn quiet" type="button" disabled={probe?.busy || !provider.default_model} onClick={() => void runProbe(provider, true)}>{w("validateModel")}</button>
             <button className="wsw-btn quiet danger" type="button" onClick={() => removeProvider(provider)}>{w("deleteProvider")}</button>
-            {!!refs[provider.id] && <small>{w("providerRefs", { count: refs[provider.id] })}</small>}
+          </div>
+          <div className="wsw-provider-usage">
+            <span>{w("providerUsage")}</span>
+            {usage.length ? <div className="wsw-provider-role-list" role="list">
+              {usage.slice(0, 6).map((item) => <span className="wsw-provider-role" role="listitem" key={item}>{item}</span>)}
+              {usage.length > 6 && <span className="wsw-provider-role more">+{usage.length - 6}</span>}
+            </div> : <small>{w("providerNotReferenced")}</small>}
           </div>
           {probe?.detail && <div className={`wsw-llm-test ${probe.ok ? "good" : "bad"}`}>
             <b>{probe.ok ? w("ready") : w("connectionFailed")}</b><span>{probe.detail}</span>
@@ -937,7 +975,7 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
 }) {
   const { w } = useWswText();
   const [llmTests, setLlmTests] = useState<Record<LlmProfileKey, { busy?: boolean; result?: ReasonLlmProbe }>>({
-    planner: {}, titler: {},
+    planner: {}, review: {}, observer: {}, observer_fallback: {}, titler: {},
   });
   const review = draft.review_policy || {};
   const reviewOptions = draft.worker_profiles
@@ -952,9 +990,9 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
   const updateReview = (patch: Record<string, unknown>) => onChange({
     ...draft, review_policy: { ...review, ...patch },
   });
-  const updateLlm = (key: LlmProfileKey, patch: Partial<WorkerSettings["llm_profiles"][LlmProfileKey]>) => onChange({
+  const updateLlm = (key: LlmProfileKey, patch: Partial<ReasonLlmProfile>) => onChange({
     ...draft, llm_profiles: { ...draft.llm_profiles,
-      [key]: { ...draft.llm_profiles[key], ...patch } },
+      [key]: { ...(draft.llm_profiles[key] || draft.llm_profiles.titler), ...patch } },
   });
   const restoreDeepSeek = (key: LlmProfileKey) => {
     const deepseek = providers.find((item) => /deepseek/i.test(`${item.id} ${item.label}`));
@@ -971,31 +1009,36 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
   };
   const copyFromWorker = (key: LlmProfileKey) => {
     if (!workerSource) return;
+    const current = draft.llm_profiles[key] || draft.llm_profiles.titler;
     updateLlm(key, {
       provider_ref: workerSource.provider_ref || "",
       provider: workerSource.provider_ref ? "registry" : "openai-compatible",
-      model: workerSource.model || draft.llm_profiles[key].model,
+      model: workerSource.model || current.model,
       base_url: workerSource.provider_ref ? "" : (workerSource.base_url || DEFAULT_DEEPSEEK_BASE_URL),
-      effort: workerSource.effort || draft.llm_profiles[key].effort || "medium",
+      effort: workerSource.effort || current.effort || "medium",
       credential_source: workerSource.provider_ref ? "provider" : "account",
-      credential_account: workerSource.provider_ref || workerSource.credential_account || draft.llm_profiles[key].credential_account || "pi-main",
-      wire_api: workerSource.wire_api || draft.llm_profiles[key].wire_api || "auto",
+      credential_account: workerSource.provider_ref || workerSource.credential_account || current.credential_account || "pi-main",
+      wire_api: workerSource.wire_api || current.wire_api || "auto",
     });
   };
   const testLlm = async (key: LlmProfileKey) => {
-    const profile = draft.llm_profiles[key];
+    const profile = draft.llm_profiles[key] || draft.llm_profiles.titler;
     setLlmTests((prev) => ({ ...prev, [key]: { busy: true } }));
     const result = await testLlmEndpoint(key, profile);
     setLlmTests((prev) => ({ ...prev, [key]: { busy: false, result } }));
   };
   const planner = draft.llm_profiles.planner;
+  const observer = draft.llm_profiles.observer;
+  const observerFallback = draft.llm_profiles.observer_fallback;
   const titler = draft.llm_profiles.titler;
   const plannerTest = llmTests.planner.result;
+  const observerTest = llmTests.observer.result;
+  const observerFallbackTest = llmTests.observer_fallback.result;
   const titlerTest = llmTests.titler.result;
-  const reviewerAccount = accounts.find((account) => account.account_id === String((review as Record<string, unknown>).credential_account || ""));
+  const reviewer = draft.llm_profiles.review || planner;
+  const reviewerTest = llmTests.review.result;
+  const reviewerAccount = accounts.find((account) => account.account_id === String(reviewer.credential_account || ""));
   const providerById = (id?: string) => providers.find((provider) => provider.id === String(id || ""));
-  const reviewProviderRef = String((review as Record<string, unknown>).provider_ref || "").trim();
-  const reviewerProvider = providerById(reviewProviderRef);
   const layerLabel = (name: string) => {
     if (name === "base_url") return w("baseUrl");
     if (name === "auth") return w("credentialReady");
@@ -1014,9 +1057,9 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
         <div className="wsw-health-card"><span>{w("intentPlanner")}</span>
           <b>{planner.model || w("noModel")}</b>
           <small>{providerById(planner.provider_ref)?.label || plannerTest?.base_url_host || host(planner.base_url || DEFAULT_DEEPSEEK_BASE_URL, "deepseek")}</small></div>
-        <div className="wsw-health-card"><span>{w("reviewerAuditPool")}</span>
-          <b>{review.enabled ? w("enabled") : w("disabled")}</b>
-          <small>{review.engine || "pi-worker"}{reviewerProvider ? ` · ${reviewerProvider.label || reviewerProvider.id}` : reviewerAccount ? ` · ${reviewerAccount.present ? w("credentialReady") : w("credentialMissing")}` : ""}</small></div>
+        <div className="wsw-health-card"><span>{w("reviewerRole")}</span>
+          <b>{reviewer.model || w("noModel")}</b>
+          <small>{providerById(reviewer.provider_ref)?.label || reviewerTest?.base_url_host || host(reviewer.base_url || DEFAULT_DEEPSEEK_BASE_URL, "deepseek")}{review.enabled === false ? ` · ${w("disabled")}` : ""}</small></div>
         <div className="wsw-health-card"><span>{w("runTitler")}</span>
           <b>{titler.model || w("noModel")}</b>
           <small>{titlerTest?.ok ? w("ready") : (titlerTest?.code || providerById(titler.provider_ref)?.label || host(titler.base_url || DEFAULT_DEEPSEEK_BASE_URL, "deepseek"))}</small></div>
@@ -1033,14 +1076,7 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
               <small>{w("reviewerAuditPool")}</small></span></label>
         </div>
         <div className="wsw-runtime-fields">
-          <Field label={w("providerRef")}><select value={reviewProviderRef}
-             onChange={(event) => {
-               const ref = event.target.value;
-               updateReview({ provider_ref: ref, credential_source: ref ? "provider" : "", credential_account: ref || "", base_url: "", wire_api: "auto" });
-             }}>
-             <option value="">{w("chooseProvider")}</option>
-             {providers.map((item) => <option value={item.id} key={item.id}>{item.label || item.id}</option>)}
-           </select><small>{reviewerProvider ? w("providerManagedNote") : w("reviewerProviderNote")}</small></Field><Field label={w("reviewEngine")}><select value={String(review.engine || "pi-worker")}
+          <Field label={w("reviewEngine")}><select value={String(review.engine || "pi-worker")}
             onChange={(event) => updateReview({ engine: event.target.value })}>
             {(reviewOptions.length ? reviewOptions : [String(review.engine || "pi-worker")]).map((name) =>
               <option value={name} key={name}>{name}</option>)}
@@ -1050,14 +1086,10 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
             onChange={(event) => updateReview({ max_concurrent: Number(event.target.value || 1) })} /></Field>
           <Field label={w("afterFruitless")}><input type="number" min={1}
             value={Number(review.after_fruitless_workers || 3)}
-            onChange={(event) => updateReview({
-              after_fruitless_workers: Number(event.target.value || 1),
-            })} /></Field>
+            onChange={(event) => updateReview({ after_fruitless_workers: Number(event.target.value || 1) })} /></Field>
           <Field label={w("everyCompleted")}><input type="number" min={1}
             value={Number(review.every_completed_workers || 6)}
-            onChange={(event) => updateReview({
-              every_completed_workers: Number(event.target.value || 1),
-            })} /></Field>
+            onChange={(event) => updateReview({ every_completed_workers: Number(event.target.value || 1) })} /></Field>
           <Field label={w("cooldownEvents")}><input type="number" min={0}
             value={Number(review.cooldown_events || 8)}
             onChange={(event) => updateReview({ cooldown_events: Number(event.target.value || 0) })} /></Field>
@@ -1066,26 +1098,34 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
             onChange={(event) => updateReview({ timeout: Number(event.target.value || 30) })} /></Field>
         </div>
       </article>
-      {(["planner", "titler"] as const).map((key) => {
+      {(["planner", "observer", "observer_fallback", "review", "titler"] as const).map((key) => {
         const profile = draft.llm_profiles[key];
+        const effectiveProfile = profile as ReasonLlmProfile | undefined;
         const test = llmTests[key];
-        const account = accounts.find((item) => item.account_id === String(profile.credential_account || ""));
-        const boundProvider = providerById(profile.provider_ref);
+        const account = accounts.find((item) => item.account_id === String(effectiveProfile?.credential_account || ""));
+        const boundProvider = providerById(effectiveProfile?.provider_ref);
         const modelOptions = boundProvider?.models || [];
-        const usesProvider = Boolean(profile.provider_ref);
-        const effectiveHost = boundProvider?.label || test.result?.base_url_host || host(profile.base_url || DEFAULT_DEEPSEEK_BASE_URL, "deepseek");
+        const usesProvider = Boolean(effectiveProfile?.provider_ref);
+        const configured = Boolean(effectiveProfile && (effectiveProfile.model || effectiveProfile.provider_ref || effectiveProfile.base_url));
+        const effectiveHost = boundProvider?.label || test?.result?.base_url_host || (configured ? host(effectiveProfile?.base_url || DEFAULT_DEEPSEEK_BASE_URL, "deepseek") : w("notConfigured"));
+        const isReason = key === "planner";
+        const isObserver = key === "observer";
+        const isObserverFallback = key === "observer_fallback";
+        const isReviewer = key === "review";
+        const roleLabel = isReason ? w("intentPlanner") : isObserverFallback ? w("observerFallbackRole") : isObserver ? w("observerRole") : isReviewer ? w("reviewerRole") : w("runTitler");
+        const roleKicker = isReason ? w("plannerRelay") : isObserverFallback ? w("observerFallbackRelay") : isObserver ? w("observerRelay") : isReviewer ? w("reviewerRelay") : w("titlerRelay");
+        const roleNote = isReason ? w("plannerNote") : isObserverFallback ? w("observerFallbackNote") : isObserver ? w("observerNote") : isReviewer ? w("reviewerNote") : w("titlerNote");
         return <article className="wsw-runtime-card wsw-relay-card" key={key}>
-          <div className="wsw-card-head"><div><span className="wsw-kicker">{key === "planner" ? w("plannerRelay") : w("titlerRelay")}</span>
-            <h3>{key === "planner" ? w("intentPlanner") : w("runTitler")}</h3>
-            <p>{key === "planner" ? w("plannerNote") : w("titlerNote")}</p></div>
-            <span className={`wsw-credential-pill ${usesProvider || account?.present ? "good" : "warn"}`}>
-              {usesProvider ? w("providerBound") : account?.present ? w("credentialReady") : w("credentialMissing")}
+          <div className="wsw-card-head"><div><span className="wsw-kicker">{roleKicker}</span>
+            <h3>{roleLabel}</h3><p>{roleNote}</p></div>
+            <span className={`wsw-credential-pill ${configured && (usesProvider || account?.present) ? "good" : "warn"}`}>
+              {!configured ? w("notConfigured") : usesProvider ? w("providerBound") : account?.present ? w("credentialReady") : w("credentialMissing")}
             </span></div>
           <div className="wsw-relay-main">
-            <b>{profile.model || w("noModel")}</b><span>{w("effectiveEndpoint")}: {effectiveHost}</span>
+            <b>{effectiveProfile?.model || w("noModel")}</b><span>{w("effectiveEndpoint")}: {effectiveHost}</span>
           </div>
           <div className="wsw-runtime-fields">
-            <Field label={w("providerRef")}><select value={profile.provider_ref || ""}
+            <Field label={w("providerRef")}><select value={effectiveProfile?.provider_ref || ""}
                onChange={(event) => {
                  const ref = event.target.value;
                  const selectedProvider = providers.find((item) => item.id === ref);
@@ -1100,23 +1140,22 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
                  });
                }}>
                <option value="">{w("chooseProvider")}</option>
-               {providers.map((item) => <option key={item.id} value={item.id}>{item.label || item.id}</option>)}
              </select></Field>
              {usesProvider ? <div className="wsw-provider-facts">
                <div><span>{w("providerEndpoint")}</span><b>{host(boundProvider?.base_url || "", w("notConfigured"))}</b></div>
                <div><span>{w("providerProtocol")}</span><b>{boundProvider?.wire_api || w("protocolAuto")}</b></div>
-             </div> : <div className="wsw-provider-empty">{w("providerRequiredNote")}</div>}
-             <Field label={w("groupModel")}>{modelOptions.length ? <select className="wsw-model-select" value={profile.model}
+             </div> : <div className="wsw-provider-empty">{configured ? w("providerRequiredNote") : w("notConfigured")}</div>}
+             <Field label={w("groupModel")}>{modelOptions.length ? <select className="wsw-model-select" value={effectiveProfile?.model || ""}
                onChange={(event) => updateLlm(key, { model: event.target.value })}>
                {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
-             </select> : <input className="wsw-model-input" value={profile.model}
+             </select> : <input className="wsw-model-input" value={effectiveProfile?.model || ""}
                onChange={(event) => updateLlm(key, { model: event.target.value })} />}</Field>
-             <Field label={w("effort")}><select value={profile.effort || "medium"}
+             <Field label={w("effort")}><select value={effectiveProfile?.effort || "medium"}
               onChange={(event) => updateLlm(key, { effort: event.target.value })}>
               <option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
             </select></Field>
             <Field label={w("llmTimeout")}><input type="number" min={0}
-              value={Number(profile.timeout || (key === "planner" ? 120 : 60))}
+              value={Number(effectiveProfile?.timeout || (key === "planner" ? 120 : 60))}
               onChange={(event) => updateLlm(key, { timeout: Number(event.target.value || 0) })} /></Field>
             <div className="wsw-llm-actions">
               <button type="button" className="wsw-btn quiet" onClick={() => restoreDeepSeek(key)}>{w("restoreDeepSeek")}</button>
@@ -1125,8 +1164,7 @@ function ReasonSettings({ draft, accounts, providers, onChange }: {
               <button type="button" className="wsw-btn primary" disabled={test?.busy}
                 onClick={() => void testLlm(key)}>{test?.busy ? w("testing") : w("testConnection")}</button>
             </div>
-            {test.result && <div className={`wsw-llm-test ${test.result.ok ? "good" : "bad"}`}>
-              <b>{test.result.ok ? w("ready") : (test.result.code || w("connectionFailed"))}</b>
+            {test?.result && <div className={`wsw-llm-test ${test.result.ok ? "good" : "bad"}`}>
               <span>{test.result.detail || test.result.model}</span>
               {!!test.result.layers?.length && <div className="wsw-probe-stack">
                 {test.result.layers.map((layer, index) => <div className={`wsw-probe-row ${layer.ok ? "good" : "bad"}`} key={`${layer.name}-${index}`}>

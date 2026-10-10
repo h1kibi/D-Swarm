@@ -25,7 +25,7 @@ from dswarm.swarm.poc_verification import (
     verification_failure_value,
 )
 from dswarm.solver.result_codes import is_genuine_giveup
-from dswarm.swarm.shared_graph import (
+from dswarm.swarm.graph_contract import (
     EV_POC_CLAIMED,
     EV_POC_CONCLUDED,
     EV_POC_REPRODUCTION_REGISTERED,

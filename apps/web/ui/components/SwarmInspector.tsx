@@ -33,21 +33,20 @@ import { formatDurationMs, reasonCycleRows, reasonLoopTone } from "@/lib/reason"
 import { detailUrlForRun, type DetailView } from "@/lib/runRoute";
 import type { RuntimePoolsSnapshot } from "@/components/runtimeStatus";
 import type { BudgetSnapshot } from "@/components/budgetStatus";
+import type { RunBindingSnapshot, RunObservabilitySnapshot } from "@/lib/useRun";
+import { RunBindingInspector } from "@/components/RunBindingInspector";
 
 /**
- * Live Swarm Inspector (docs/07 §5.5) — the right column. Default Workers view:
- * worker cards per §6.2 —
- *   collapsed: identity (worker/profile/mode) · current intent (id + goal) ·
- *     latest structured finding · provenance status · latest activity ·
- *     tokens/cost/runtime · health/timeout;
- *   expanded (hierarchical, in this order): structured findings → intent &
- *     dispatch reason → provenance → reasoning → tool calls → tool results →
- *     raw terminal output (collapsed by default, fully expandable) → artifacts →
- *     runtime diagnostics → kill/redirect controls.
+ * Live Swarm Inspector (docs/07 搂5.5) 鈥?the right column. Default Workers view:
+ * worker cards per 搂6.2 鈥? *   collapsed: identity (worker/profile/mode) 路 current intent (id + goal) 路
+ *     latest structured finding 路 provenance status 路 latest activity 路
+ *     tokens/cost/runtime 路 health/timeout;
+ *   expanded (hierarchical, in this order): structured findings 鈫?intent &
+ *     dispatch reason 鈫?provenance 鈫?reasoning 鈫?tool calls 鈫?tool results 鈫? *     raw terminal output (collapsed by default, fully expandable) 鈫?artifacts 鈫? *     runtime diagnostics 鈫?kill/redirect controls.
  * The Intent queue lists proposed/queued intents by priority. The Attention
  * block hosts the HITL cards. Every other artifact
- * view (graph / blackboard / evidence / …) opens as the drawer panel from the
- * Panels tab — no capability is removed.
+ * view (graph / blackboard / evidence / 鈥? opens as the drawer panel from the
+ * Panels tab 鈥?no capability is removed.
  */
 
 const PANEL_VIEWS: { view: DetailView; key: string; icon: IconName }[] = [
@@ -94,8 +93,8 @@ function healthOf(lane: SolverLane): { key: string; cls: string } {
   return { key: "swarm.health.offline", cls: "muted" };
 }
 
-/** Per-worker chat-derived streams: reasoning, tool CALLS (▶) and tool RESULTS
- *  (↳) as separate layers (§6.2 levels 4–6), plus the untouched concatenation
+/** Per-worker chat-derived streams: reasoning, tool CALLS (鈻? and tool RESULTS
+ *  (鈫? as separate layers (搂6.2 levels 4鈥?), plus the untouched concatenation
  *  for the raw-output disclosure (level 7). */
 interface WorkerStreams {
   reasoning: string[];
@@ -104,7 +103,7 @@ interface WorkerStreams {
   raw: string;
 }
 
-/** Pheromone strength chip for one structured finding — N/A when the session
+/** Pheromone strength chip for one structured finding 鈥?N/A when the session
  *  has no pheromone parameters for it. Never merged with the verified chip. */
 function FindingPheromone({ deck, fact, nowSec }: {
   deck: DeckState;
@@ -162,9 +161,9 @@ function WorkerCard({
   onInspect: (id: string) => void;
   onRedirect: (id: string) => void;
   onKill: (id: string) => void;
-  /** structured finding click → Evidence panel (cross-view link). */
+  /** structured finding click 鈫?Evidence panel (cross-view link). */
   onOpenEvidence: () => void;
-  /** intent id click → the inspector's own Intents tab (anchor + highlight). */
+  /** intent id click 鈫?the inspector's own Intents tab (anchor + highlight). */
   onOpenIntent: (intentId: string) => void;
 }) {
   const t = useT();
@@ -215,7 +214,7 @@ function WorkerCard({
             <span className="tl-chip">{intent.mode || "intent"}</span>
             <button type="button" className="evi-link" title={t("swarm.viewIntent")}
               onClick={() => onOpenIntent(intent.id)}>{intent.id}</button>
-            {" · "}{intent.goal}
+            {" 路 "}{intent.goal}
           </>
         ) : (
           <span className="tl-muted">{t("swarm.noIntent")}</span>
@@ -245,7 +244,7 @@ function WorkerCard({
       {controls}
       {expanded && (
         <div className="sw-worker-detail">
-          {/* 1 — structured findings */}
+          {/* 1 鈥?structured findings */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.findings")}</div>
             {facts.length === 0 ? (
@@ -263,7 +262,7 @@ function WorkerCard({
               ))
             )}
           </div>
-          {/* 2 — intent & dispatch reason */}
+          {/* 2 鈥?intent & dispatch reason */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.intent")}</div>
             {intent ? (
@@ -271,7 +270,7 @@ function WorkerCard({
                 <div>
                   <button type="button" className="evi-link" title={t("swarm.viewIntent")}
                     onClick={() => onOpenIntent(intent.id)}>{intent.id}</button>
-                  {" · "}{intent.mode && <span className="tl-chip">{intent.mode}</span>}
+                  {" 路 "}{intent.mode && <span className="tl-chip">{intent.mode}</span>}
                   {intent.priority != null && <span className="tl-priority">P{intent.priority.toFixed(2)}</span>}
                 </div>
                 <div className="sw-sec-line">{intent.goal}</div>
@@ -283,7 +282,7 @@ function WorkerCard({
               <div className="sw-sec-empty">{t("swarm.noIntent")}</div>
             )}
           </div>
-          {/* 3 — provenance */}
+          {/* 3 鈥?provenance */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.provenance")}</div>
             {facts.length === 0 ? (
@@ -293,21 +292,21 @@ function WorkerCard({
                 <div className="sw-sec-line">{t("swarm.provenanceFacts", { verified: verifiedCount, total: facts.length })}</div>
                 {facts.slice().reverse().map((f, i) => (
                   <div className="sw-sec-line tl-muted" key={`prov-${f.factSeq ?? i}`}>
-                    {f.factSeq != null && <>#{f.factSeq} · </>}
+                    {f.factSeq != null && <>#{f.factSeq} 路 </>}
                     {f.verifier && f.verifier !== "none" ? f.verifier : t("insp.unverified")}
-                    {f.witness && <> · {t("evidence.hasWitness")}</>}
-                    {f.artifactId && <> · {t("evidence.hasArtifact")}</>}
+                    {f.witness && <> 路 {t("evidence.hasWitness")}</>}
+                    {f.artifactId && <> 路 {t("evidence.hasArtifact")}</>}
                   </div>
                 ))}
               </div>
             )}
           </div>
-          {/* 4 — reasoning */}
+          {/* 4 鈥?reasoning */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.reasoning")}</div>
             <div className={`sw-sec-pre ${reasoning ? "" : "idle"}`.trim()}>{reasoning || t("swarm.none")}</div>
           </div>
-          {/* 5 — tool calls */}
+          {/* 5 鈥?tool calls */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.toolCalls")}</div>
             {streams.toolCalls.length === 0 ? (
@@ -316,7 +315,7 @@ function WorkerCard({
               <div className="sw-sec-pre">{streams.toolCalls.join("\n")}</div>
             )}
           </div>
-          {/* 6 — tool results */}
+          {/* 6 鈥?tool results */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.toolResults")}</div>
             {streams.toolResults.length === 0 ? (
@@ -325,14 +324,14 @@ function WorkerCard({
               <div className="sw-sec-pre">{streams.toolResults.join("\n")}</div>
             )}
           </div>
-          {/* 7 — raw terminal output: collapsed by default, FULLY expandable */}
+          {/* 7 鈥?raw terminal output: collapsed by default, FULLY expandable */}
           <div className="sw-sec">
             <details className="sw-raw">
               <summary className="sw-sec-h sw-raw-summary">{t("swarm.sec.rawOutput")}</summary>
               <div className="sw-sec-pre sw-raw-body">{streams.raw || t("swarm.none")}</div>
             </details>
           </div>
-          {/* 8 — artifacts */}
+          {/* 8 鈥?artifacts */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.artifacts")}</div>
             {artifactIds.length === 0 && pocs.length === 0 ? (
@@ -348,7 +347,7 @@ function WorkerCard({
               </div>
             )}
           </div>
-          {/* 9 — runtime diagnostics */}
+          {/* 9 鈥?runtime diagnostics */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.runtime")}</div>
             <dl className="evi-prov">
@@ -365,7 +364,7 @@ function WorkerCard({
               {lane.runtime?.error && <><dt>error</dt><dd>{lane.runtime.error}</dd></>}
             </dl>
           </div>
-          {/* 10 — kill / redirect controls */}
+          {/* 10 鈥?kill / redirect controls */}
           <div className="sw-sec">
             <div className="sw-sec-h">{t("swarm.sec.controls")}</div>
             {controls}
@@ -398,6 +397,8 @@ export function SwarmInspector({
   budgetRebuilding,
   budgetError,
   onRebuildBudget,
+  bindingSnapshot,
+  observability,
 }: {
   deck: DeckState;
   running: boolean;
@@ -405,7 +406,7 @@ export function SwarmInspector({
   /** seed the Operator Command Bar with this worker as the redirect target. */
   onRedirectWorker: (id: string) => void;
   onKillWorker: (id: string) => void;
-  /** active run id — panel chips deep-link to the detail routes (new-tab friendly). */
+  /** active run id 鈥?panel chips deep-link to the detail routes (new-tab friendly). */
   runId: string;
   onCommand: (target: string, action: string, text: string) => void;
   onHitlAnswered?: () => void;
@@ -422,6 +423,9 @@ export function SwarmInspector({
   budgetRebuilding?: boolean;
   budgetError?: string | null;
   onRebuildBudget?: () => void | Promise<void>;
+  /** Immutable public provider/model references captured at Run launch. */
+  bindingSnapshot?: RunBindingSnapshot | null;
+  observability?: RunObservabilitySnapshot | null;
 }) {
   const t = useT();
   const [tab, setTab] = useState<Tab>("workers");
@@ -487,7 +491,7 @@ export function SwarmInspector({
   };
 
   // intent currently bound to each worker (latest dispatch wins) + the pending
-  // intent queue (proposed/queued), priority desc (§5.5).
+  // intent queue (proposed/queued), priority desc (搂5.5).
   const { intentByWorker, queue, dispatched } = useMemo(() => {
     const byWorker = new Map<string, ReasonIntentView>();
     const pending: ReasonIntentView[] = [];
@@ -496,7 +500,7 @@ export function SwarmInspector({
       for (const it of cycle.intents) {
         if (it.workerId) byWorker.set(it.workerId, it);
         if (it.status === "proposed" || it.status === "queued") pending.push(it);
-        // worker-bound intents stay listed so worker-card → intent links have
+        // worker-bound intents stay listed so worker-card 鈫?intent links have
         // an anchor to land on (the queue alone drops them once dispatched).
         else if (it.workerId && (it.status === "running" || it.status === "claimed")) dispatched.push(it);
       }
@@ -505,7 +509,7 @@ export function SwarmInspector({
     return { intentByWorker: byWorker, queue: pending, dispatched };
   }, [deck.reasonLoop]);
 
-  // §6.2 card data: structured findings (non-retired facts) per worker,
+  // 搂6.2 card data: structured findings (non-retired facts) per worker,
   // chat-derived streams (reasoning / tool calls / tool results / raw), PoCs.
   const factsByActor = useMemo(() => {
     const m = new Map<string, BlackboardFact[]>();
@@ -548,7 +552,7 @@ export function SwarmInspector({
     setExpandedIds((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   // Fact/intent cross-link: a worker card's intent id switches to the Intents
-  // tab, scrolls the row into view and flashes it (anchor + highlight, §6.2).
+  // tab, scrolls the row into view and flashes it (anchor + highlight, 搂6.2).
   const openIntent = (intentId: string) => {
     setTab("intents");
     setFlashIntent(intentId);
@@ -612,6 +616,7 @@ export function SwarmInspector({
         )}
         {tab === "workers" && (
           <>
+            <RunBindingInspector snapshot={bindingSnapshot} observability={observability} compact />
             <div className="swarm-count">
               {t("swarm.activeWorkers", { active, total: lanes.length })}
             </div>
@@ -653,23 +658,25 @@ export function SwarmInspector({
                 <span className="budget-eyebrow">{t("reason.strip")}</span>
                 <span className={`budget-state ${reasonLoopTone(deck.reasonLoop)}`}>
                   <span className="budget-state-dot" aria-hidden="true" />
-                  {deck.reasonLoop.solved
-                    ? t("reason.loopSolved")
-                    : deck.reasonLoop.paused
-                      ? t("reason.loopPaused")
-                      : deck.reasonLoop.stopReason
-                        ? t("reason.loopStopped", { reason: deck.reasonLoop.stopReason })
-                        : t("reason.loopRunning", { n: deck.reasonLoop.cycles.length })}
+                  {deck.reasonLoop.healthState
+                    ? `Reason ${deck.reasonLoop.healthState}${deck.reasonLoop.healthFailures ? ` · ${deck.reasonLoop.healthFailures}${deck.reasonLoop.healthMaxFailures ? `/${deck.reasonLoop.healthMaxFailures}` : ""} failures` : ""}${deck.reasonLoop.healthRequestFailures ? ` · req ${deck.reasonLoop.healthRequestFailures}${deck.reasonLoop.healthRequestLimit ? `/${deck.reasonLoop.healthRequestLimit}` : ""}` : ""}`
+                    : deck.reasonLoop.solved
+                      ? t("reason.loopSolved")
+                      : deck.reasonLoop.paused
+                        ? t("reason.loopPaused")
+                        : deck.reasonLoop.stopReason
+                          ? t("reason.loopStopped", { reason: deck.reasonLoop.stopReason })
+                          : t("reason.loopRunning", { n: deck.reasonLoop.cycles.length })}
                 </span>
               </div>
               {deck.reasonLoop.recon && (
                 <div className="reason-recon">
                   {t(deck.reasonLoop.recon.status === "completed" ? "reason.reconDone" : "reason.reconRunning")}
                   {deck.reasonLoop.recon.durationMs != null && (
-                    <span> · {formatDurationMs(deck.reasonLoop.recon.durationMs)}</span>
+                    <span> 路 {formatDurationMs(deck.reasonLoop.recon.durationMs)}</span>
                   )}
                   {deck.reasonLoop.recon.newFindings != null && (
-                    <span> · {t("reason.reconFindings", { n: deck.reasonLoop.recon.newFindings })}</span>
+                    <span> 路 {t("reason.reconFindings", { n: deck.reasonLoop.recon.newFindings })}</span>
                   )}
                 </div>
               )}
@@ -678,9 +685,9 @@ export function SwarmInspector({
                   <span className="tl-intent-id">{row.id}</span>
                   <span className={`tl-chip intent-${row.status}`}>{t(`intent.status.${row.status}`)}</span>
                   <span className="reason-cycle-meta">
-                    g{row.generation} · {formatDurationMs(row.durationMs)}
-                    {row.trigger ? ` · ${row.trigger}` : ""}
-                    {row.auditCount > 0 ? ` · ${t("reason.auditShort", { n: row.auditCount })}` : ""}
+                    g{row.generation} 路 {formatDurationMs(row.durationMs)}
+                    {row.trigger ? ` 路 ${row.trigger}` : ""}
+                    {row.auditCount > 0 ? ` 路 ${t("reason.auditShort", { n: row.auditCount })}` : ""}
                   </span>
                 </div>
               ))}
@@ -724,7 +731,7 @@ export function SwarmInspector({
                       <span className={`tl-chip intent-${it.status}`}>{t(`intent.status.${it.status}`)}</span>
                       {it.workerId && (
                         <button type="button" className="evi-link" title={t("evidence.viewWorker")}
-                          onClick={() => onOpenWorker(it.workerId!)}>→ {it.workerId}</button>
+                          onClick={() => onOpenWorker(it.workerId!)}>→{it.workerId}</button>
                       )}
                     </div>
                   </div>

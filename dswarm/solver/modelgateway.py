@@ -9,6 +9,10 @@ the REAL upstream key (from the credential account store, falling back to the ho
 env), forwards the OpenAI-compatible request (streaming SSE transparent), parses the
 usage from the stream, and records it per run.
 
+Workers always speak the OpenAI chat-completions dialect to this gateway. A task token
+can nevertheless be bound to a native Anthropic Messages upstream, which the gateway
+translates without ever projecting that upstream credential into the container.
+
 This mirrors BTFly's modelgateway (task token + reverse proxy + usage capture),
 implemented as a small threading HTTP server so it can live in the daemon process
 alongside the ControlReceiver 鈥?no extra service to deploy. One gateway per process,
@@ -32,7 +36,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -71,6 +75,11 @@ _VALID_EFFORT_LEVELS = {"low", "high", "max"}
 
 def normalize_upstream_request(req: dict, *, upstream_base: str = _UPSTREAM_BASE) -> dict:
     """Adapt OpenAI-style request fields to the configured upstream's dialect."""
+    effort = req.get("reasoning_effort")
+    if isinstance(effort, str):
+        normalized = effort.strip().lower()
+        if normalized in {"minimal", "low", "medium", "high", "max"}:
+            req["reasoning_effort"] = normalized
     if _BIGMODEL_HOST in str(upstream_base or ""):
         effort = req.get("reasoning_effort")
         if isinstance(effort, str) and effort.strip().lower() not in _VALID_EFFORT_LEVELS:
@@ -104,6 +113,64 @@ class WorkerClaims:
             raise ValueError("configured_account_id must be None or non-empty")
         if self.token_scope not in _TOKEN_SCOPES:
             raise ValueError(f"invalid token_scope: {self.token_scope}")
+
+
+@dataclass(frozen=True)
+class GatewayUpstreamBinding:
+    """Private, immutable upstream transport captured with one task token.
+
+    This object only lives in the host-side gateway token table. In particular it is
+    never included in :class:`WorkerClaims`, usage events, HTTP responses, or a Run
+    binding snapshot: ``api_key`` must never cross the host/container boundary.
+    """
+
+    base_url: str
+    api_key: str = field(repr=False, compare=False)
+    wire_api: str = "openai-chat"
+    auth_mode: str = "bearer"
+    auth_header: str = "Authorization"
+    auth_prefix: str = "Bearer"
+    provider_id: str = ""
+
+    def __post_init__(self) -> None:
+        base_url = str(self.base_url or "").strip().rstrip("/")
+        wire_api = str(self.wire_api or "openai-chat").strip().lower()
+        if wire_api in {"anthropic", "anthropic-messages", "messages"}:
+            wire_api = "anthropic"
+            if base_url.endswith("/messages"):
+                base_url = base_url[:-len("/messages")]
+        elif wire_api in {"", "auto", "openai", "openai-chat", "chat-completions"}:
+            wire_api = "openai-chat"
+        else:
+            raise ValueError("unsupported gateway upstream protocol")
+        if not base_url:
+            raise ValueError("gateway upstream base_url is required")
+        if not str(self.api_key or "").strip():
+            raise ValueError("gateway upstream API key is required")
+        auth_mode = str(self.auth_mode or "bearer").strip().lower()
+        auth_header = str(self.auth_header or "Authorization").strip()
+        auth_prefix = str(self.auth_prefix if self.auth_prefix is not None else "Bearer").strip()
+        # Native Anthropic uses x-api-key by default. Explicit custom relay
+        # settings still win, exactly as they do for the host-side LLMClient.
+        if (
+            wire_api == "anthropic"
+            and auth_mode == "bearer"
+            and auth_header == "Authorization"
+            and auth_prefix == "Bearer"
+        ):
+            auth_mode, auth_header, auth_prefix = "x-api-key", "x-api-key", ""
+        object.__setattr__(self, "base_url", base_url)
+        object.__setattr__(self, "wire_api", wire_api)
+        object.__setattr__(self, "auth_mode", auth_mode)
+        object.__setattr__(self, "auth_header", auth_header)
+        object.__setattr__(self, "auth_prefix", auth_prefix)
+
+    def headers(self) -> dict[str, str]:
+        value = f"{self.auth_prefix} {self.api_key}".strip() if self.auth_prefix else self.api_key
+        headers = {self.auth_header: value, "Content-Type": "application/json"}
+        if self.wire_api == "anthropic":
+            headers["anthropic-version"] = "2023-06-01"
+        return headers
 
 
 class TokenCapError(RuntimeError):
@@ -269,8 +336,7 @@ class _Handler(BaseHTTPRequestHandler):
         token = self._token()
         claims = self._gw.claims_for_token(token)
         run_id = claims.run_id if claims is not None else None
-        log.info("gateway POST %s run=%s token=%s...%s", self.path,
-                 run_id, token[:4] if token else "none", token[-4:] if token else "")
+        log.info("gateway POST %s run=%s authenticated=%s", self.path, run_id, bool(claims))
         if claims is None:
             self._write(401, b'{"error":{"message":"invalid or revoked task token","type":"authentication_error"}}')
             return
@@ -278,7 +344,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not body:
             self._write(400, b'{"error":{"message":"empty request body"}}')
             return
-        self._gw.proxy(run_id, body, self, claims=claims)
+        self._gw.proxy(
+            run_id, body, self, claims=claims,
+            upstream=self._gw.upstream_for_token(token),
+        )
 
     # 鈹€鈹€ keep-alive / streaming plumbing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     def _chunk(self, data: bytes) -> None:
@@ -304,10 +373,17 @@ class ModelGateway:
     # actually needs it). Re-read on every proxy request, so settings edits and
     # separate managers (startup tests) resolve bindings fresh.
     _class_upstream_key_resolver: Optional[Callable[[], str]] = None
+    _class_upstream_binding_resolver: Optional[Callable[[str], GatewayUpstreamBinding | None]] = None
 
     @classmethod
     def set_upstream_key_resolver(cls, resolver: Optional[Callable[[], str]]) -> None:
         cls._class_upstream_key_resolver = resolver
+
+    @classmethod
+    def set_upstream_binding_resolver(
+        cls, resolver: Optional[Callable[[str], GatewayUpstreamBinding | None]],
+    ) -> None:
+        cls._class_upstream_binding_resolver = resolver
 
     def __init__(
         self, host: Optional[str] = None, port: int = _GATEWAY_PORT,
@@ -319,6 +395,7 @@ class ModelGateway:
             raise ValueError("max_active_tokens must be positive")
         self.max_active_tokens = int(max_active_tokens)
         self._tokens: dict[str, WorkerClaims] = {}
+        self._token_upstreams: dict[str, GatewayUpstreamBinding] = {}
         self._run_tokens: dict[str, set[str]] = {}
         self._lock = threading.Lock()
         self._srv: Optional[ThreadingHTTPServer] = None
@@ -333,6 +410,7 @@ class ModelGateway:
         # an eager override set per run; both beat the legacy pi-main file.
         self.upstream_key: Optional[str] = None
         self.upstream_key_resolver: Optional[Callable[[], str]] = None
+        self.upstream_binding_resolver: Optional[Callable[[str], GatewayUpstreamBinding | None]] = None
         self.sessions_root: Optional[str] = None  # per-run usage ledgers land here
         self.usage_bridge: GatewayUsageBridge | Any | None = None
 
@@ -363,7 +441,9 @@ class ModelGateway:
         self._started = False
 
     # 鈹€鈹€ token management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    def issue_worker(self, claims: WorkerClaims) -> str:
+    def issue_worker(
+        self, claims: WorkerClaims, *, upstream: GatewayUpstreamBinding | None = None,
+    ) -> str:
         """Issue one independent token; never revoke or evict another worker."""
         with self._lock:
             active = len(self._tokens)
@@ -375,6 +455,8 @@ class ModelGateway:
             while token in self._tokens:
                 token = secrets.token_hex(32)
             self._tokens[token] = claims
+            if upstream is not None:
+                self._token_upstreams[token] = upstream
             self._run_tokens.setdefault(claims.run_id, set()).add(token)
             return token
 
@@ -386,11 +468,30 @@ class ModelGateway:
                     return claims
         return None
 
+    def upstream_for_token(self, token: str) -> GatewayUpstreamBinding | None:
+        """Return the host-private transport snapshot for a still-live token."""
+        with self._lock:
+            for known, upstream in self._token_upstreams.items():
+                if hmac.compare_digest(known, token):
+                    return upstream
+        return None
+
+    def resolve_upstream_binding(self, provider_id: str) -> GatewayUpstreamBinding | None:
+        """Resolve a probe-time provider binding without exposing its credential."""
+        resolver = self.upstream_binding_resolver or type(self)._class_upstream_binding_resolver
+        if resolver is None:
+            return None
+        try:
+            return resolver(str(provider_id or ""))
+        except Exception:
+            return None
+
     def revoke_token(self, token: str) -> None:
         with self._lock:
             claims = self._tokens.pop(token, None)
             if claims is None:
                 return
+            self._token_upstreams.pop(token, None)
             tokens = self._run_tokens.get(claims.run_id)
             if tokens is not None:
                 tokens.discard(token)
@@ -405,6 +506,7 @@ class ModelGateway:
             ]
             for token in doomed:
                 claims = self._tokens.pop(token)
+                self._token_upstreams.pop(token, None)
                 tokens = self._run_tokens.get(claims.run_id)
                 if tokens is not None:
                     tokens.discard(token)
@@ -415,6 +517,7 @@ class ModelGateway:
         with self._lock:
             for token in self._run_tokens.pop(run_id, set()):
                 self._tokens.pop(token, None)
+                self._token_upstreams.pop(token, None)
 
     def run_for_token(self, token: str) -> Optional[str]:
         claims = self.claims_for_token(token)
@@ -553,19 +656,112 @@ class ModelGateway:
                 log.error("gateway canonical usage publish failed: %s", exc)
         return record
 
+    @staticmethod
+    def _anthropic_request_from_openai(req: dict[str, Any]) -> dict[str, Any]:
+        # Keep the gateway's conversion semantically identical to the host-side
+        # client. The worker still talks only OpenAI chat-completions to us.
+        from dswarm.core.llm import LLMClient
+
+        return LLMClient._anthropic_request_body(req)
+
+    @staticmethod
+    def _openai_finish_reason(stop_reason: Any) -> str:
+        value = str(stop_reason or "")
+        if value == "tool_use":
+            return "tool_calls"
+        if value == "max_tokens":
+            return "length"
+        if value in {"", "end_turn", "stop_sequence"}:
+            return "stop"
+        return value
+
+    @classmethod
+    def _anthropic_response_as_openai(cls, value: dict[str, Any], *, fallback_model: str) -> dict[str, Any]:
+        """Translate a complete native Messages response for an OpenAI client."""
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in value.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            kind = str(block.get("type") or "")
+            if kind == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif kind in {"thinking", "reasoning"}:
+                thinking_parts.append(str(block.get("thinking") or block.get("text") or ""))
+            elif kind == "tool_use":
+                tool_calls.append({
+                    "id": str(block.get("id") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(block.get("name") or ""),
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    },
+                })
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+        if thinking_parts:
+            # Pi's OpenAI-compatible provider understands the reasoning_content
+            # extension used by DeepSeek-style reasoning endpoints.
+            message["reasoning_content"] = "".join(thinking_parts)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+        prompt_tokens = int(usage.get("input_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or 0)
+        return {
+            "id": str(value.get("id") or f"msg_{uuid.uuid4().hex}"),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": str(value.get("model") or fallback_model),
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": cls._openai_finish_reason(value.get("stop_reason")),
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+
+    @staticmethod
+    def _anthropic_usage(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        result: dict[str, Any] = {}
+        if value.get("input_tokens") is not None:
+            result["input_tokens"] = int(value["input_tokens"])
+        if value.get("output_tokens") is not None:
+            result["output_tokens"] = int(value["output_tokens"])
+        return result
+
+    @staticmethod
+    def _write_openai_sse(handler: _Handler, value: dict[str, Any]) -> None:
+        handler._chunk(
+            b"data: " + json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n\n"
+        )
+
     def proxy(
         self, run_id: str, body: bytes, handler: _Handler, *,
         claims: WorkerClaims | None = None,
+        upstream: GatewayUpstreamBinding | None = None,
     ) -> None:
-        explicit = self.upstream_key
-        if explicit is None:
-            resolver = self.upstream_key_resolver or type(self)._class_upstream_key_resolver
-            if resolver is not None:
-                try:
-                    explicit = resolver()
-                except Exception:
-                    explicit = None  # resolver failure → legacy resolution paths
-        real_key = resolve_upstream_key(explicit, self.account_root, run_id)
+        # A token-bound transport is authoritative and immutable for the life of
+        # that worker token. Legacy task tokens retain the old resolver path.
+        if upstream is not None:
+            real_key = upstream.api_key
+        else:
+            explicit = self.upstream_key
+            if explicit is None:
+                resolver = self.upstream_key_resolver or type(self)._class_upstream_key_resolver
+                if resolver is not None:
+                    try:
+                        explicit = resolver()
+                    except Exception:
+                        explicit = None  # resolver failure -> legacy resolution paths
+            real_key = resolve_upstream_key(explicit, self.account_root, run_id)
         if not real_key:
             self._write_json(handler, 502, {"error": {"message": "gateway has no upstream key configured"}})
             return
@@ -596,62 +792,195 @@ class ModelGateway:
             self._write_json(handler, 503, {"error": {"code": "accounting_unavailable", "message": str(exc)}})
             return
 
+        wire_api = upstream.wire_api if upstream is not None else "openai-chat"
         try:
             msgs = req.get("messages") or []
             lens = ", ".join(
                 f"{str(m.get('role'))}={len(str(m.get('content') or ''))}" for m in msgs
             )
-            log.info("gateway req run=%s stream=%s model=%s msgs=%d [%s] body_bytes=%d",
-                     run_id, stream, req.get("model"), len(msgs), lens or "-", len(body))
-        except Exception:
-            pass
-        upstream_url = f"{_UPSTREAM_BASE}{_UPSTREAM_PATH}"
-        req = normalize_upstream_request(req)
-        headers = {
-            "Authorization": f"Bearer {real_key}",
-            "Content-Type": "application/json",
-        }
+            log.info("gateway req run=%s stream=%s protocol=%s model=%s msgs=%d [%s] body_bytes=%d",
+                     run_id, stream, wire_api, req.get("model"), len(msgs), lens or "-", len(body))
+            if wire_api == "anthropic":
+                upstream_req = self._anthropic_request_from_openai(req)
+                upstream_url = f"{upstream.base_url}/messages"  # type: ignore[union-attr]
+                headers = upstream.headers()  # type: ignore[union-attr]
+            else:
+                upstream_req = normalize_upstream_request(
+                    req, upstream_base=upstream.base_url if upstream is not None else _UPSTREAM_BASE,
+                )
+                upstream_url = f"{upstream.base_url if upstream is not None else _UPSTREAM_BASE}{_UPSTREAM_PATH}"
+                headers = upstream.headers() if upstream is not None else {
+                    "Authorization": f"Bearer {real_key}", "Content-Type": "application/json",
+                }
+        except Exception as exc:
+            log.warning("gateway request conversion failed run=%s type=%s", run_id, type(exc).__name__)
+            self._finish_gateway_call(call, outcome="provider_error", usage={})
+            self._write_json(handler, 400, {"error": {"message": "unsupported provider request"}})
+            return
         try:
-            log.info("gateway request fields run=%s keys=%s", run_id, sorted(req.keys()))
+            log.info("gateway request fields run=%s keys=%s", run_id, sorted(upstream_req.keys()))
         except Exception:
             pass
         t0 = time.time()
         finished = False
         try:
             with httpx.stream(
-                "POST", upstream_url, json=req, headers=headers,
+                "POST", upstream_url, json=upstream_req, headers=headers,
                 timeout=httpx.Timeout(300.0, connect=20.0),
-                # The gateway is the controlled upstream funnel: route DIRECTLY to
-                # the provider, never through the operator's ambient HTTP(S)_PROXY.
-                # Routing through a local proxy turns connection-refused into a
-                # proxy 502 with an empty body, which both corrupts the terminal
-                # usage semantics and made the transport-error path untestable
-                # (test_gateway_transport_error_gets_terminal_unknown).
                 trust_env=False,
             ) as resp:
                 log.info("gateway upstream status=%s ttfb=%.2fs (run %s)",
                          resp.status_code, time.time() - t0, run_id)
-                if stream:
-                    self._proxy_stream(run_id, handler, resp, req, call=call)
+                if wire_api == "anthropic":
+                    if stream:
+                        self._proxy_anthropic_stream(run_id, handler, resp, req, call=call)
+                    else:
+                        self._proxy_anthropic_json(run_id, handler, resp, req, call=call)
+                elif stream:
+                    self._proxy_stream(run_id, handler, resp, upstream_req, call=call)
                 else:
                     self._proxy_json(run_id, handler, resp, call=call)
                 finished = True
         except Exception as exc:
             outcome = "timeout" if isinstance(exc, (TimeoutError, httpx.TimeoutException)) else "transport_error"
             if not finished:
-                # A successful proxy that only failed writing back to a
-                # disconnected client must keep its terminal "succeeded"
-                # outcome — double-finishing the same usage call id recorded
-                # contradictory ledgers (conflicting usage id).
                 try:
                     self._finish_gateway_call(call, outcome=outcome, usage={})
                 except Exception as finish_exc:
                     log.error("gateway terminal usage write failed: %s", finish_exc)
-            log.warning("gateway upstream error (run %s): %s", run_id, exc)
+            # Do not reflect an SDK exception: it can contain a URL or request
+            # headers. The worker only needs a stable retryable diagnostic.
+            log.warning("gateway upstream error run=%s type=%s", run_id, type(exc).__name__)
             try:
-                self._write_json(handler, 502, {"error": {"message": f"upstream error: {exc}"}})
+                self._write_json(handler, 502, {"error": {"message": "upstream error"}})
             except Exception:
-                pass  # the worker client is already gone (broken pipe)
+                pass
+
+    def _proxy_anthropic_json(
+        self, run_id: str, handler: _Handler, resp: Any, original_req: dict[str, Any], *, call: UsageCall,
+    ) -> None:
+        data = resp.read()
+        payload = data.decode("utf-8", "replace")
+        usage = self._extract_usage(payload)
+        outcome = "provider_error" if resp.status_code >= 400 else "succeeded"
+        self._finish_gateway_call(call, outcome=outcome, usage=usage, legacy_payload=payload)
+        if resp.status_code >= 400:
+            # Native provider diagnostics are not relayed because a custom relay
+            # may echo request headers. Keep credentials and endpoints private.
+            self._write_json(handler, resp.status_code, {"error": {"message": "upstream provider rejected request", "type": "provider_error"}})
+            return
+        try:
+            translated = self._anthropic_response_as_openai(
+                json.loads(payload), fallback_model=str(original_req.get("model") or ""),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._write_json(handler, 502, {"error": {"message": "invalid upstream response"}})
+            return
+        self._write_json(handler, 200, translated)
+
+    def _proxy_anthropic_stream(
+        self, run_id: str, handler: _Handler, resp: Any, original_req: dict[str, Any], *, call: UsageCall,
+    ) -> None:
+        handler.send_response(resp.status_code)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.end_headers()
+        if resp.status_code >= 400:
+            # See the non-streaming path: never pass arbitrary relay diagnostics
+            # (which may include sensitive request metadata) into a container.
+            self._write_openai_sse(handler, {"error": {"message": "upstream provider rejected request", "type": "provider_error"}})
+            handler._chunk(b"data: [DONE]\n\n")
+            self._finish_gateway_call(call, outcome="provider_error", usage={})
+            handler._end_chunked()
+            return
+
+        usage: dict[str, Any] = {}
+        message_id = f"chatcmpl_{uuid.uuid4().hex}"
+        model = str(original_req.get("model") or "")
+        tool_indices: dict[int, int] = {}
+        next_tool_index = 0
+        completed = False
+        for line in resp.iter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            try:
+                event = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = str(event.get("type") or "")
+            if kind == "message_start":
+                message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                message_id = str(message.get("id") or message_id)
+                model = str(message.get("model") or model)
+                usage.update(self._anthropic_usage(message.get("usage")))
+                self._write_openai_sse(handler, {
+                    "id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                })
+            elif kind == "content_block_start":
+                block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+                if block.get("type") == "tool_use":
+                    block_index = int(event.get("index") or 0)
+                    tool_index = tool_indices.setdefault(block_index, next_tool_index)
+                    if tool_index == next_tool_index:
+                        next_tool_index += 1
+                    self._write_openai_sse(handler, {
+                        "id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{
+                            "index": tool_index, "id": str(block.get("id") or ""), "type": "function",
+                            "function": {"name": str(block.get("name") or ""), "arguments": ""},
+                        }]}, "finish_reason": None}],
+                    })
+            elif kind == "content_block_delta":
+                delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                delta_kind = str(delta.get("type") or "")
+                choice_delta: dict[str, Any] = {}
+                if delta_kind == "text_delta":
+                    choice_delta["content"] = str(delta.get("text") or "")
+                elif delta_kind == "thinking_delta":
+                    choice_delta["reasoning_content"] = str(delta.get("thinking") or "")
+                elif delta_kind == "input_json_delta":
+                    block_index = int(event.get("index") or 0)
+                    tool_index = tool_indices.setdefault(block_index, next_tool_index)
+                    if tool_index == next_tool_index:
+                        next_tool_index += 1
+                    choice_delta["tool_calls"] = [{"index": tool_index, "function": {
+                        "arguments": str(delta.get("partial_json") or ""),
+                    }}]
+                if choice_delta:
+                    self._write_openai_sse(handler, {
+                        "id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+                        "choices": [{"index": 0, "delta": choice_delta, "finish_reason": None}],
+                    })
+            elif kind == "message_delta":
+                usage.update(self._anthropic_usage(event.get("usage")))
+                delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                self._write_openai_sse(handler, {
+                    "id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": self._openai_finish_reason(delta.get("stop_reason"))}],
+                })
+            elif kind == "message_stop":
+                completed = True
+                break
+        if usage:
+            prompt_tokens = int(usage.get("input_tokens") or 0)
+            completion_tokens = int(usage.get("output_tokens") or 0)
+            self._write_openai_sse(handler, {
+                "id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+                "choices": [],
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                          "total_tokens": prompt_tokens + completion_tokens},
+            })
+        handler._chunk(b"data: [DONE]\n\n")
+        self._finish_gateway_call(
+            call, outcome="succeeded" if completed else "transport_error", usage=usage,
+            legacy_payload=json.dumps({"usage": usage}),
+        )
+        handler._end_chunked()
 
     def _proxy_json(self, run_id: str, handler: _Handler, resp, *, call: UsageCall) -> None:
         data = resp.read()

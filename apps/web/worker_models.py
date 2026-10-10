@@ -20,8 +20,11 @@ from dswarm.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
     CredentialAccountStore,
     account_store_root,
-    project_account_root,
     runtime_env_for_engine,
+)
+from dswarm.solver.runtime_credentials import (
+    CredentialProjectionError,
+    CredentialProjector,
 )
 from dswarm.solver.docker import docker_run
 from dswarm.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
@@ -169,83 +172,101 @@ def _worker_container_model_probe(
 
     with tempfile.TemporaryDirectory(prefix="dswarm-model-test-", dir=tmp_base) as td:
         workspace = os.path.join(td, "ws")
-        projection = os.path.join(td, "accounts")
         os.makedirs(workspace, exist_ok=True)
         try:
             os.chmod(workspace, 0o777)
         except OSError:
             pass
+        projection_mode = "custom" if acct.mode == "custom_endpoint" else "direct"
         try:
-            project_account_root(root, projection)
-        except OSError as exc:
+            lease = CredentialProjector(root, td).project(
+                run_id="model-probe",
+                pool_id=str(profile.get("id") or f"{engine}-model-probe"),
+                worker_instance_id="hello",
+                binding_id=effective_account_id,
+                credential_mode=projection_mode,
+            )
+        except CredentialProjectionError as exc:
             return {
                 "ok": False,
-                "detail": f"凭据投影失败: {str(exc)[:120]}",
+                "detail": f"凭据投影失败: {exc.safe_detail}",
                 "engine": engine,
                 "model": model,
                 "backend": "container",
                 "layer": "mount",
             }
 
-        argv = _probe_argv_for_profile(profile, engine, model)
-        if not argv:
-            return {
-                "ok": False,
-                "detail": "该引擎没有可用的容器内模型探针",
-                "engine": engine,
-                "model": model,
-                "backend": "container",
-            }
-
-        env = {**_CONTAINER_BASE_ENV, **resolved.env}
-        prelude = [
-            'if [ -r "$ANTHROPIC_API_KEY_FILE" ]; then '
-            'export ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_API_KEY_FILE")"; fi',
-            'if [ -r "$OPENAI_API_KEY_FILE" ]; then '
-            'export OPENAI_API_KEY="$(cat "$OPENAI_API_KEY_FILE")"; fi',
-        ]
-        timeout_s = max(1, int(getattr(driver_for(profile), "_HELLO_TIMEOUT", 90)))
-        script = (
-            "; ".join(prelude)
-            + f"; exec timeout -s KILL {timeout_s}s {shlex.join(argv)} < /dev/null"
-        )
-
-        network = (os.environ.get("DSWARM_WORKER_NETWORK") or "bridge").strip() or "bridge"
-        run_cmd = [
-            "run", "--rm", "--init",
-            "--network", network,
-            "--user", "kali",
-            "--workdir", CONTAINER_WORKSPACE,
-            "--entrypoint", "bash",
-            "--mount", f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
-            "--mount", f"type=bind,source={_mount_source(projection)},target={CONTAINER_ACCOUNTS_ROOT}",
-        ]
-        if network != "host":
-            run_cmd += ["--add-host", "host.docker.internal:host-gateway"]
-        for k, v in env.items():
-            run_cmd += ["-e", f"{k}={v}"]
-        run_cmd += [WORKER_IMAGE, "-lc", script]
-
         try:
-            run = _docker(*run_cmd, timeout=timeout_s + 30)
-        except FileNotFoundError:
-            return {
-                "ok": False,
-                "detail": "docker 不可用",
-                "engine": engine,
-                "model": model,
-                "backend": "container",
-                "layer": "image",
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "detail": f"worker 容器模型测试超时（>{timeout_s}s）",
-                "engine": engine,
-                "model": model,
-                "backend": "container",
-                "layer": "auth",
-            }
+            if lease.root is None:
+                return {
+                    "ok": False,
+                    "detail": "凭据投影失败: 缺少凭据目录",
+                    "engine": engine,
+                    "model": model,
+                    "backend": "container",
+                    "layer": "mount",
+                }
+            argv = _probe_argv_for_profile(profile, engine, model)
+            if not argv:
+                return {
+                    "ok": False,
+                    "detail": "该引擎没有可用的容器内模型探针",
+                    "engine": engine,
+                    "model": model,
+                    "backend": "container",
+                }
+
+            env = {**_CONTAINER_BASE_ENV, **resolved.env, **lease.env}
+            prelude = [
+                'if [ -r "$ANTHROPIC_API_KEY_FILE" ]; then '
+                'export ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_API_KEY_FILE")"; fi',
+                'if [ -r "$OPENAI_API_KEY_FILE" ]; then '
+                'export OPENAI_API_KEY="$(cat "$OPENAI_API_KEY_FILE")"; fi',
+            ]
+            timeout_s = max(1, int(getattr(driver_for(profile), "_HELLO_TIMEOUT", 90)))
+            script = (
+                "; ".join(prelude)
+                + f"; exec timeout -s KILL {timeout_s}s {shlex.join(argv)} < /dev/null"
+            )
+
+            network = (os.environ.get("DSWARM_WORKER_NETWORK") or "bridge").strip() or "bridge"
+            run_cmd = [
+                "run", "--rm", "--init",
+                "--network", network,
+                "--user", "kali",
+                "--workdir", CONTAINER_WORKSPACE,
+                "--entrypoint", "bash",
+                "--mount", f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
+                "--mount", f"type=bind,source={_mount_source(str(lease.root))},target={CONTAINER_ACCOUNTS_ROOT}",
+            ]
+            if network != "host":
+                run_cmd += ["--add-host", "host.docker.internal:host-gateway"]
+            for k, v in env.items():
+                run_cmd += ["-e", f"{k}={v}"]
+            run_cmd += [WORKER_IMAGE, "-lc", script]
+
+            try:
+                run = _docker(*run_cmd, timeout=timeout_s + 30)
+            except FileNotFoundError:
+                return {
+                    "ok": False,
+                    "detail": "docker 不可用",
+                    "engine": engine,
+                    "model": model,
+                    "backend": "container",
+                    "layer": "image",
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "ok": False,
+                    "detail": f"worker 容器模型测试超时（>{timeout_s}s）",
+                    "engine": engine,
+                    "model": model,
+                    "backend": "container",
+                    "layer": "auth",
+                }
+        finally:
+            lease.close()
 
     ok = _probe_ok(profile, run)
     if ok:

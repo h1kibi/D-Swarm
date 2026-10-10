@@ -12,19 +12,27 @@ import json
 import time
 from typing import Any, Optional
 
-# Event and state constants inline to avoid circular import
-EV_FACT_CHALLENGED = "fact_challenged"
-EV_FACT_REJECTED = "fact_rejected"
-EV_FACT_MERGED = "fact_merged"
-EV_FACT_SUPERSEDED = "fact_superseded"
-EV_FACT_REVALIDATED = "fact_revalidated"
-EV_FACT_VERIFIED = "fact_verified"
-EV_REVIEW_FINDING = "review_finding"
-EV_REVIEW_PROPOSAL = "review_proposal"
-EV_REVIEW_PROPOSAL_DECISION = "review_proposal_decision"
-FACT_STATE_REJECTED = "rejected"
-FACT_STATE_MERGED = "merged"
-FACT_STATE_SUPERSEDED = "superseded"
+from dswarm.swarm.graph_contract import (
+    EV_EVIDENCE_REVIEW_DECISION,
+    EV_FACT_CHALLENGED,
+    EV_FACT_MERGED,
+    EV_FACT_REJECTED,
+    EV_FACT_REVALIDATED,
+    EV_FACT_SUPERSEDED,
+    EV_FACT_VERIFIED,
+    EV_INTENT_QUALITY_DECISION,
+    EV_REVIEWED_CONTEXT,
+    EV_REVIEW_FINDING,
+    EV_REVIEW_PROPOSAL,
+    EV_REVIEW_PROPOSAL_DECISION,
+    EV_WORKER_REPORT_PENDING_REVIEW,
+    FACT_STATE_MERGED,
+    FACT_STATE_REJECTED,
+    FACT_STATE_SUPERSEDED,
+    VALID_EVIDENCE_REVIEW_DECISIONS,
+    VALID_INTENT_QUALITY_DECISIONS,
+    _is_runtime_infra_fact_text,
+)
 
 
 class ReviewLifecycle:
@@ -133,7 +141,301 @@ class ReviewLifecycle:
             EV_REVIEW_PROPOSAL_DECISION, actor, payload,
             dedupe_key=f"review-proposal-decision::{proposal_seq}::{clean_decision}",
         )
+    @staticmethod
+    def _clean_refs(values: Optional[list[str]], *, limit: int = 24) -> list[str]:
+        out: list[str] = []
+        for raw in values or []:
+            value = str(raw or "").strip()
+            if not value or len(value) > 240 or value in out:
+                continue
+            out.append(value)
+            if len(out) >= limit:
+                break
+        return out
 
+    @staticmethod
+    def _clean_evidence_decision(value: str) -> str:
+        decision = (value or "candidate").strip().lower()
+        return decision if decision in VALID_EVIDENCE_REVIEW_DECISIONS else "candidate"
+
+    @staticmethod
+    def _clean_intent_decision(value: str) -> str:
+        decision = (value or "defer").strip().lower()
+        return decision if decision in VALID_INTENT_QUALITY_DECISIONS else "defer"
+
+    def worker_report_pending_review(
+        self, *, actor: str, worker_id: str, intent_id: str = "",
+        fact_seqs: Optional[list[int]] = None, dead_end_seqs: Optional[list[int]] = None,
+        artifact_ids: Optional[list[str]] = None,
+        raw_artifact_ids: Optional[list[str]] = None,
+        report_ref: str = "", runtime_only: bool = False,
+    ) -> int:
+        """Append a report quarantine marker without copying report contents."""
+        clean_facts: list[int] = []
+        for raw in fact_seqs or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0 and value not in clean_facts:
+                self._graph._require_fact_target(value)
+                clean_facts.append(value)
+        clean_dead_ends: list[int] = []
+        for raw in dead_end_seqs or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0 and value not in clean_dead_ends:
+                self._graph._require_dead_end_target(value)
+                clean_dead_ends.append(value)
+        payload = {
+            "worker_id": str(worker_id or actor).strip()[:160],
+            "intent_id": str(intent_id or "").strip()[:160],
+            "fact_seqs": clean_facts[:32],
+            "dead_end_seqs": clean_dead_ends[:32],
+            "artifact_ids": self._clean_refs(artifact_ids),
+            "raw_artifact_ids": self._clean_refs(raw_artifact_ids),
+            "runtime_only": bool(runtime_only),
+            "status": "pending_review",
+        }
+        fingerprint = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return self._graph._append(
+            EV_WORKER_REPORT_PENDING_REVIEW, actor, payload,
+            dedupe_key=f"worker-report-pending::{payload['worker_id']}::{payload['intent_id']}::"
+            f"{hashlib.sha1(fingerprint.encode()).hexdigest()[:16]}",
+        )
+
+    def decide_evidence_review(
+        self, *, actor: str, decision: str, subject_id: str = "",
+        fact_seq: Optional[int] = None, dead_end_seq: Optional[int] = None,
+        intent_id: str = "", evidence_refs: Optional[list[str]] = None,
+        reason: str = "", report_seq: Optional[int] = None, route_hash: str = "",
+    ) -> int:
+        """Record an evidence verdict and publish separate reviewed context.
+
+        Genesis fact/dead-end rows are never updated.  A verified verdict is
+        accepted only when the subject has a durable artifact and the reviewer
+        names at least one bounded provenance reference.
+        """
+        clean_fact: Optional[int] = None
+        clean_dead_end: Optional[int] = None
+        target: Optional[dict[str, Any]] = None
+        if fact_seq is not None:
+            clean_fact = int(fact_seq)
+            target = self._graph._require_fact_target(clean_fact)
+        if dead_end_seq is not None:
+            clean_dead_end = int(dead_end_seq)
+            target = self._graph._require_dead_end_target(clean_dead_end)
+        if clean_fact is not None and clean_dead_end is not None:
+            raise ValueError("evidence review cannot target fact and dead-end together")
+        clean_decision = self._clean_evidence_decision(decision)
+        refs = self._clean_refs(evidence_refs)
+        requested = clean_decision
+        if clean_decision == "verified":
+            artifact = str((target or {}).get("artifact_id") or "").strip()
+            if not artifact or not refs:
+                clean_decision = "candidate"
+                reason = (reason or "").strip()
+                reason = (reason + "; " if reason else "") + (
+                    "verified requires artifact and evidence reference")
+        default_subject = (
+            f"fact:{clean_fact}" if clean_fact is not None else
+            f"dead_end:{clean_dead_end}" if clean_dead_end is not None else ""
+        )
+        payload: dict[str, Any] = {
+            "decision": clean_decision,
+            "requested_decision": requested,
+            "subject_id": str(subject_id or default_subject).strip()[:240],
+            "fact_seq": clean_fact,
+            "dead_end_seq": clean_dead_end,
+            "intent_id": str(intent_id or "").strip()[:160],
+            "evidence_refs": refs,
+            "reason": str(reason or "").strip()[:1000],
+            "report_seq": int(report_seq) if report_seq is not None else None,
+            "route_hash": self._graph.normalize_route_hash(route_hash) if route_hash else "",
+            "reviewer": str(actor or "reviewer").strip()[:160],
+        }
+        fp = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        seq = self._graph._append(
+            EV_EVIDENCE_REVIEW_DECISION, actor, payload,
+            dedupe_key=(f"evidence-review::{payload['subject_id']}::{clean_decision}::"
+                        f"{hashlib.sha1(fp.encode()).hexdigest()[:16]}"),
+        )
+        if seq > 0 and (clean_fact is not None or clean_dead_end is not None):
+            self.publish_reviewed_context(
+                actor=actor,
+                context_type="fact" if clean_fact is not None else "dead_end",
+                subject_id=payload["subject_id"],
+                fact_seqs=[clean_fact] if clean_fact is not None and clean_decision == "verified" else [],
+                dead_end_seqs=[clean_dead_end] if clean_dead_end is not None and clean_decision == "verified" else [],
+                reason=payload["reason"], source_review_seq=seq,
+            )
+        return seq
+
+    def publish_reviewed_context(
+        self, *, actor: str, context_type: str, subject_id: str = "",
+        fact_seqs: Optional[list[int]] = None, dead_end_seqs: Optional[list[int]] = None,
+        intent_ids: Optional[list[str]] = None, reason: str = "",
+        source_review_seq: Optional[int] = None,
+    ) -> int:
+        clean_facts: list[int] = []
+        for raw in fact_seqs or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                self._graph._require_fact_target(value)
+                if value not in clean_facts:
+                    clean_facts.append(value)
+        clean_dead_ends: list[int] = []
+        for raw in dead_end_seqs or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                self._graph._require_dead_end_target(value)
+                if value not in clean_dead_ends:
+                    clean_dead_ends.append(value)
+        payload = {
+            "context_type": str(context_type or "fact").strip()[:80],
+            "subject_id": str(subject_id or "").strip()[:240],
+            "fact_seqs": clean_facts[:32],
+            "dead_end_seqs": clean_dead_ends[:32],
+            "intent_ids": [str(x).strip()[:160] for x in (intent_ids or []) if str(x).strip()][:32],
+            "reason": str(reason or "").strip()[:1000],
+            "source_review_seq": int(source_review_seq) if source_review_seq is not None else None,
+        }
+        fp = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return self._graph._append(
+            EV_REVIEWED_CONTEXT, actor, payload,
+            dedupe_key=f"reviewed-context::{payload['context_type']}::{payload['subject_id']}::"
+            f"{hashlib.sha1(fp.encode()).hexdigest()[:16]}",
+        )
+
+    def decide_intent_quality(
+        self, *, actor: str, intent_id: str, decision: str, reason: str = "",
+        replacement: Optional[dict[str, Any]] = None,
+        evidence_refs: Optional[list[str]] = None, reason_cycle_id: str = "",
+    ) -> int:
+        """Append a Reviewer decision without mutating the proposed Intent."""
+        clean_intent_id = str(intent_id or "").strip()
+        if not clean_intent_id:
+            raise ValueError("intent_id is required")
+        clean_decision = self._clean_intent_decision(decision)
+        clean_replacement = dict(replacement) if isinstance(replacement, dict) else None
+        payload = {
+            "intent_id": clean_intent_id[:160],
+            "decision": clean_decision,
+            "reason": str(reason or "").strip()[:1000],
+            "replacement": clean_replacement,
+            "evidence_refs": self._clean_refs(evidence_refs),
+            "reason_cycle_id": str(reason_cycle_id or "").strip()[:160],
+            "reviewer": str(actor or "reviewer").strip()[:160],
+        }
+        fingerprint = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return self._graph._append(
+            EV_INTENT_QUALITY_DECISION, actor, payload,
+            dedupe_key=(f"intent-quality::{payload['intent_id']}::{clean_decision}::"
+                        f"{hashlib.sha1(fingerprint.encode()).hexdigest()[:16]}"),
+        )
+
+    def evidence_review_decisions(self) -> list[dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for event in self._graph.events():
+            if event.get("kind") != EV_EVIDENCE_REVIEW_DECISION:
+                continue
+            payload = dict(event.get("payload") or {})
+            key = str(payload.get("subject_id") or payload.get("fact_seq") or payload.get("dead_end_seq") or "")
+            if key:
+                latest[key] = {**payload, "seq": int(event.get("seq") or 0),
+                               "actor": str(event.get("actor") or "")}
+        return list(latest.values())
+
+    def intent_quality_decisions(self) -> list[dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for event in self._graph.events():
+            if event.get("kind") != EV_INTENT_QUALITY_DECISION:
+                continue
+            payload = dict(event.get("payload") or {})
+            key = str(payload.get("intent_id") or "")
+            if key:
+                latest[key] = {**payload, "seq": int(event.get("seq") or 0),
+                               "actor": str(event.get("actor") or "")}
+        return list(latest.values())
+
+    def reviewed_context(self) -> dict[str, Any]:
+        """Fold reviewed business context; raw Worker reports stay quarantined."""
+        decisions = self.evidence_review_decisions()
+        by_fact: dict[int, dict[str, Any]] = {}
+        by_dead_end: dict[int, dict[str, Any]] = {}
+        for row in decisions:
+            try:
+                if row.get("fact_seq") is not None:
+                    by_fact[int(row["fact_seq"])] = row
+                if row.get("dead_end_seq") is not None:
+                    by_dead_end[int(row["dead_end_seq"])] = row
+            except (TypeError, ValueError):
+                continue
+        facts: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for item in self._graph.effective_facts(active_only=True):
+            seq = int(item.get("fact_seq") or 0)
+            text = str(item.get("fact_text") or "")
+            if not seq or _is_runtime_infra_fact_text(text):
+                continue
+            required = bool(item.get("review_required"))
+            review = by_fact.get(seq)
+            status = str(review.get("decision") or "") if review else ""
+            if required and not review:
+                candidates.append({"fact_seq": seq, "fact": text,
+                                   "status": "pending_review", "reason": ""})
+                continue
+            if required and status != "verified":
+                row = {"fact_seq": seq, "fact": text,
+                       "status": status or "pending_review",
+                       "reason": str((review or {}).get("reason") or "")}
+                if status in {"candidate", "needs_retest", ""}:
+                    candidates.append(row)
+                elif status == "rejected":
+                    rejected.append(row)
+                continue
+            is_verified = (status == "verified") if required else bool(item.get("verified"))
+            row = {"fact_seq": seq, "fact": text,
+                   "status": "verified" if is_verified else "candidate",
+                   "review_seq": int((review or {}).get("seq") or 0) or None}
+            (facts if is_verified else candidates).append(row)
+        dead_ends: list[dict[str, Any]] = []
+        for event in self._graph.events():
+            if event.get("kind") != "dead_end":
+                continue
+            payload = dict(event.get("payload") or {})
+            seq = int(event.get("seq") or 0)
+            if not seq or _is_runtime_infra_fact_text(payload.get("reason", "")):
+                continue
+            required = bool(payload.get("review_required"))
+            review = by_dead_end.get(seq)
+            status = str(review.get("decision") or "") if review else ""
+            if required and status != "verified":
+                continue
+            if not required and not any(
+                    e.get("payload", {}).get("review_required")
+                    for e in self._graph.events()
+                    if e.get("kind") == "dead_end"):
+                # Legacy direct graph events remain visible for old fixtures.
+                status = "verified"
+            if status == "verified":
+                dead_ends.append({
+                    "dead_end_seq": seq,
+                    "reason": str(payload.get("reason") or ""),
+                    "review_seq": int((review or {}).get("seq") or 0) or None,
+                })
+        return {"facts": facts, "candidates": candidates, "rejected": rejected,
+                "dead_ends": dead_ends,
+                "intent_decisions": self.intent_quality_decisions()}
     def challenge_fact(
         self, *, actor: str, fact_seq: int, reason: str, verification_goal: str
     ) -> dict:

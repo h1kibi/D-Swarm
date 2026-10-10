@@ -14,7 +14,7 @@ import { readKey, writeKey } from "./storage";
 export type ThemeMode = "light" | "dark";
 
 export function useTheme(): { theme: ThemeMode; toggleTheme: () => void } {
-  const [theme, setTheme] = useState<ThemeMode>("light");
+  const [theme, setTheme] = useState<ThemeMode>("dark");
 
   useEffect(() => {
     try {
@@ -25,7 +25,7 @@ export function useTheme(): { theme: ThemeMode; toggleTheme: () => void } {
       }
       if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) setTheme("dark");
     } catch {
-      // keep the default light theme when storage/media is unavailable
+      // keep the default dark command-center theme when storage/media is unavailable
     }
   }, []);
 

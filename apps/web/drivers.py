@@ -11,9 +11,10 @@ Kinds:
 
 from __future__ import annotations
 
-import re
-import os
+import asyncio
 import logging
+import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -115,6 +116,40 @@ def _selected_profiles(engines: list[str], worker_profiles: list[dict]) -> list[
     names = normalize_profile_roster(engines, worker_profiles)
     by_name = {str(p.get("name") or p.get("id")): p for p in worker_profiles if isinstance(p, dict)}
     return [by_name[n] for n in names if n in by_name]
+
+async def preflight_swarm_dispatch(
+    body: dict[str, Any], mgr: RunManager | None,
+) -> None:
+    """Run the same profile-health gate used before a swarm starts.
+
+    Resolve must perform this before publishing ``RUN_REOPENED``; the normal
+    driver path still calls the helper at coroutine start for defense in depth.
+    """
+    if mgr is None:
+        return
+
+
+    challenge = body.get("challenge") if isinstance(body.get("challenge"), dict) else {}
+    category = str(challenge.get("category") or "")
+    wc = mgr.worker_config.resolve(category)
+    engines = body.get("engines") or wc.get("engines") or DEFAULT_ENGINES
+    runtime_profiles = body.get("runtime_profiles") or wc.get("runtime_profiles") or []
+    worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
+    if not worker_profiles:
+        return
+    precheck_profiles = _selected_profiles(engines, worker_profiles) or worker_profiles
+    missing_accounts = await asyncio.to_thread(
+        _missing_profile_accounts,
+        worker_profiles=precheck_profiles,
+        runtime_profiles=runtime_profiles,
+        sessions_root=mgr.sessions_root,
+        llm_providers=body.get("llm_providers") or wc.get("llm_providers") or [],
+    )
+    if missing_accounts:
+        raise RuntimeError(
+            "profile_unhealthy missing credential account(s): "
+            + ", ".join(missing_accounts)
+        )
 
 
 def _planner_llm_credentials(
@@ -448,9 +483,36 @@ def _swarm_driver(
         llm_profiles = body.get("llm_profiles") or wc.get("llm_profiles") or {}
         llm_providers = body.get("llm_providers") or wc.get("llm_providers") or []
         review_policy = body.get("review_policy") or wc.get("review_policy") or {}
+        # RunManager freezes a non-secret Target/Run binding before the driver is
+        # started. Prefer it over mutable workspace defaults for every role so a
+        # resumed Run keeps the exact provider/model selection it was launched
+        # with. Secrets are still resolved from credential accounts/env at the
+        # provider boundary and never copied into this snapshot.
+        binding_snapshot = getattr(run, "binding_snapshot", None)
+        if isinstance(binding_snapshot, dict) and binding_snapshot:
+            snapshot_roles = binding_snapshot.get("roles")
+            if isinstance(snapshot_roles, dict):
+                frozen_profiles = dict(llm_profiles) if isinstance(llm_profiles, dict) else {}
+                reason_binding = snapshot_roles.get("reason") or snapshot_roles.get("planner")
+                worker_binding = snapshot_roles.get("worker")
+                review_binding = snapshot_roles.get("review")
+                titler_binding = snapshot_roles.get("titler")
+                if isinstance(reason_binding, dict) and reason_binding:
+                    frozen_profiles["planner"] = dict(reason_binding)
+                    frozen_profiles["reason"] = dict(reason_binding)
+                if isinstance(worker_binding, dict) and worker_binding:
+                    frozen_profiles["worker"] = dict(worker_binding)
+                if isinstance(review_binding, dict) and review_binding:
+                    frozen_profiles["review"] = dict(review_binding)
+                if isinstance(titler_binding, dict) and titler_binding:
+                    frozen_profiles["titler"] = dict(titler_binding)
+                llm_profiles = frozen_profiles
+            frozen_policy = binding_snapshot.get("review_policy")
+            if isinstance(frozen_policy, dict) and frozen_policy:
+                review_policy = dict(frozen_policy)
         # worker execution backend: "local" (host subprocess) or "container" (each
         # worker in the run's Kali tool container). Request body wins, else config,
-        # else env, else default 鈥?with the container_dockerexec alias, invalid
+        # else env, else default — with the container_dockerexec alias, invalid
         # fallback, and the web-container override all owned by the single resolver
         # so the settings health endpoints resolve the SAME effective backend.
         worker_backend = resolve_worker_backend(
@@ -459,43 +521,26 @@ def _swarm_driver(
             env_backend=os.environ.get("DSWARM_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
-        if mgr is not None and worker_profiles:
-            # The precheck runs a real per-profile health probe (a synchronous
-            # `subprocess.run` that shells the CLI for a one-turn hello) for any
-            # profile that needs an account/endpoint. That can take seconds per
-            # engine, so it MUST run off the event loop 鈥?otherwise a relaunch
-            # (`/resolve`) freezes the whole single-threaded uvicorn loop while it
-            # probes (the "resolve 鈫?backend hangs" symptom). to_thread it.
-            import asyncio
-            precheck_profiles = _selected_profiles(engines, worker_profiles) or worker_profiles
-            missing_accounts = await asyncio.to_thread(
-                _missing_profile_accounts,
-                worker_profiles=precheck_profiles,
-                runtime_profiles=runtime_profiles,
-                sessions_root=mgr.sessions_root,
-                llm_providers=llm_providers,
-            )
-            if missing_accounts:
-                raise RuntimeError(
-                    "profile_unhealthy missing credential account(s): "
-                    + ", ".join(missing_accounts)
-                )
+        # RunManager performs this gate before RUN_REOPENED on /resolve. Normal
+        # starts keep the same in-driver check for direct driver callers and as
+        # defense in depth after scheduler launch.
+        if runtime_operation_kind != "resolve":
+            await preflight_swarm_dispatch(body, mgr)
 
         if mgr is not None:
             root = mgr.workspace_dir(run.run_id)
         else:
             root = Path(tempfile.mkdtemp(prefix="dswarm-web-"))
-        # sbx is the sandbox root 鈥?sandbox.shutdown_all() rmtree's it at run end,
+        # sbx is the sandbox root — sandbox.shutdown_all() rmtree's it at run end,
         # so NOTHING durable may live under it. arts + graph are SIBLINGS of sbx so
         # they persist (the shared_graph.db is the run's queryable fact graph).
         sandbox = SandboxManager(bus=run.bus, root=root / "sbx")
         arts = ArtifactStore(root=root / "arts")
         graph_dir = root / "graph"
-        # worker_root is a SIBLING of sbx (NOT under it) so each CLI worker's cwd 鈥?
-        # staged attachments, agent-extracted files, PoCs 鈥?lives under the run's
-        # sessions/{id}/workspace/ and survives sandbox.shutdown_all()'s rmtree of
-        # sbx. It's cleaned up with the run (RunManager.delete drops sessions/{id}).
+        # worker_root is a SIBLING of sbx (NOT under it) so each CLI worker's cwd —
+        # staged attachments, agent-extracted files, PoCs — survives sandbox cleanup.
         worker_root = root / "workers"
+
 
         if offline_endpoint_profiles:
             from dswarm.core.events import Event, EventType, blackboard_delta_payload
@@ -531,7 +576,10 @@ def _swarm_driver(
         # Reason without requiring a separate DeepSeek env key.
         llm_cm = None
         llm = None
+        review_llm_cm = None
+        review_llm = None
         reason_planner_diagnostic: dict[str, Any] = {}
+        reviewer_diagnostic: dict[str, Any] = {}
         reason_usage_writer = None
         from apps.web.reason_llm import (
             base_url_host,
@@ -578,6 +626,11 @@ def _swarm_driver(
                 llm_cm = LLMClient(
                     api_key=str(resolved.get("api_key") or ""),
                     base_url=str(resolved.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
+                    wire_api=str(resolved.get("wire_api") or planner_profile.get("wire_api") or "auto"),
+                    auth_mode=str(resolved.get("auth_mode") or "bearer"),
+                    auth_header=str(resolved.get("auth_header") or "Authorization"),
+                    auth_prefix=str(resolved.get("auth_prefix") if resolved.get("auth_prefix") is not None else "Bearer"),
+                    reasoning_effort=str(planner_profile.get("effort") or "").strip().lower() or None,
                     timeout=timeout,
                     overall_timeout=max(timeout + 30.0, timeout),
                     cost=run.cost,
@@ -618,21 +671,123 @@ def _swarm_driver(
             }
             llm_cm = None
             llm = None
+        review_profile = dict(llm_profiles.get("review") or {})
+        review_usage_writer = None
+        try:
+            review_resolved = resolve_reason_llm_endpoint(
+                sessions_root=(mgr.sessions_root if mgr is not None else None),
+                worker_profiles=worker_profiles,
+                profile=review_profile,
+                llm_providers=llm_providers,
+            )
+            reviewer_diagnostic = {
+                "code": "ok" if review_resolved.get("has_api_key") else "missing_api_key",
+                "detail": (
+                    "Reviewer LLM endpoint resolved."
+                    if review_resolved.get("has_api_key")
+                    else "Reviewer API key is missing; select a credential account or set DSWARM_DEEPSEEK_API_KEY."
+                ),
+                "reviewer": str(review_resolved.get("model") or review_profile.get("model") or ""),
+                "base_url_host": str(
+                    review_resolved.get("base_url_host")
+                    or base_url_host(str(review_resolved.get("base_url") or ""))
+                ),
+                "credential_source": str(review_resolved.get("credential_source") or "auto"),
+                "credential_account": str(review_resolved.get("credential_account") or ""),
+                "base_url_source": str(review_resolved.get("base_url_source") or ""),
+            }
+            if review_resolved.get("has_api_key") and review_resolved.get("model"):
+                timeout = float(review_profile.get("timeout") or 120)
+                review_usage_writer = (
+                    mgr.internal_usage_writer(
+                        run,
+                        solver_id="reviewer",
+                        profile_id="review",
+                        configured_account_id=(
+                            str(review_resolved.get("credential_account") or "").strip() or None
+                        ),
+                    )
+                    if mgr is not None else None
+                )
+                review_llm_cm = LLMClient(
+                    api_key=str(review_resolved.get("api_key") or ""),
+                    base_url=str(review_resolved.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
+                    wire_api=str(review_resolved.get("wire_api") or review_profile.get("wire_api") or "auto"),
+                    auth_mode=str(review_resolved.get("auth_mode") or "bearer"),
+                    auth_header=str(review_resolved.get("auth_header") or "Authorization"),
+                    auth_prefix=str(review_resolved.get("auth_prefix") if review_resolved.get("auth_prefix") is not None else "Bearer"),
+                    reasoning_effort=str(review_profile.get("effort") or "").strip().lower() or None,
+                    timeout=timeout,
+                    overall_timeout=max(timeout + 30.0, timeout),
+                    cost=run.cost,
+                    bus=run.bus,
+                    usage_writer=review_usage_writer,
+                    usage_context=(
+                        review_usage_writer.context
+                        if review_usage_writer is not None else None
+                    ),
+                )
+                review_llm = await review_llm_cm.__aenter__()
+        except Exception as exc:  # noqa: BLE001
+            diag = classify_llm_exception(exc)
+            reviewer_diagnostic = {
+                "code": str(diag.get("code") or "network_error"),
+                "detail": str(diag.get("detail") or "Reviewer LLM unavailable."),
+                "reviewer": str(review_profile.get("model") or ""),
+                "base_url_host": base_url_host(
+                    str(review_profile.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL)
+                ),
+                "credential_source": str(review_profile.get("credential_source") or "auto"),
+                "credential_account": str(review_profile.get("credential_account") or ""),
+            }
+            review_llm_cm = None
+            review_llm = None
 
-        # 搂16 flywheel store (optional; recall prior + distill on solve)
+        role_client_contexts = []
+
+        async def rebuild_role_client(role: str, binding: dict[str, Any]) -> dict[str, Any]:
+            profile = dict(binding or {})
+            resolved_role = await asyncio.to_thread(
+                resolve_reason_llm_endpoint,
+                sessions_root=(mgr.sessions_root if mgr is not None else None),
+                worker_profiles=worker_profiles,
+                profile=profile,
+                llm_providers=llm_providers,
+            )
+            if not resolved_role.get("has_api_key") or not resolved_role.get("model"):
+                raise RuntimeError(f"{role}_fallback_endpoint_unavailable")
+            timeout = float(profile.get("timeout") or 120)
+            context = LLMClient(
+                api_key=str(resolved_role.get("api_key") or ""),
+                base_url=str(resolved_role.get("base_url") or DEFAULT_DEEPSEEK_BASE_URL),
+                wire_api=str(resolved_role.get("wire_api") or profile.get("wire_api") or "auto"),
+                auth_mode=str(resolved_role.get("auth_mode") or "bearer"),
+                auth_header=str(resolved_role.get("auth_header") or "Authorization"),
+                auth_prefix=str(resolved_role.get("auth_prefix") if resolved_role.get("auth_prefix") is not None else "Bearer"),
+                reasoning_effort=str(profile.get("effort") or "").strip().lower() or None,
+                timeout=timeout, overall_timeout=max(timeout + 30.0, timeout),
+                cost=run.cost, bus=run.bus,
+            )
+            client = await context.__aenter__()
+            role_client_contexts.append(context)
+            return {"reason": client} if role == "reason" else {"review": client}
+
+        # The scheduler owns fallback activation; this factory makes the effective
+        # binding executable rather than merely changing its projection.
+        role_client_factory = rebuild_role_client
+
         from dswarm.learning.distill import TemplateStore
         knowledge = TemplateStore(root=os.environ.get("DSWARM_KNOWLEDGE_DIR", "knowledge"))
-
         fallback_usage_writer = (
             mgr.fallback_usage_writer(run, solver_id="cli-worker", profile_id="worker")
             if mgr is not None else None
         )
         swarm = Swarm(
-            challenge, llm=llm, sandbox=sandbox,
+            challenge, llm=llm, review_llm=review_llm, sandbox=sandbox,
             bus=run.bus, cost=run.cost, artifacts=arts,
             config=SolverConfig(), run_id=run.run_id, knowledge=knowledge,
-            hitl_inbox=run.hitl,  # HITL: human commands reach the solvers
-            worker_cmds=run.worker_cmds,  # operator spawn/kill of specific engines
+            hitl_inbox=run.hitl,
+            worker_cmds=run.worker_cmds,
             executor=executor, cli_engine=cli_engine,
             engines=engines, max_workers=max_workers,
             web_access=web_access, kb=kb,
@@ -643,8 +798,10 @@ def _swarm_driver(
             review_policy=review_policy,
             llm_profiles=llm_profiles,
             llm_providers=llm_providers,
+            binding_snapshot=binding_snapshot if isinstance(binding_snapshot, dict) else None,
             reason_model=(llm_profiles.get("planner") or {}).get("model", "deepseek-v4-pro"),
             reason_planner_diagnostic=reason_planner_diagnostic,
+            reviewer_diagnostic=reviewer_diagnostic,
             worker_backend=worker_backend,
             runtime_profiles=runtime_profiles,
             worker_profiles=worker_profiles,
@@ -656,16 +813,19 @@ def _swarm_driver(
             spawn_guard=getattr(run, "spawn_guard", None),
             budget_gate=getattr(run, "budget_gate", None),
             initial_runtime_operation_kind=runtime_operation_kind,
-            **runtime_context_kwargs(run),
+            role_client_factory=role_client_factory,
         )
         try:
             out = await swarm.run()
             run.flag = out.flag
         finally:
             await sandbox.shutdown_all()
+            if review_llm_cm is not None:
+                await review_llm_cm.__aexit__(None, None, None)
             if llm_cm is not None:
                 await llm_cm.__aexit__(None, None, None)
-
+            for client_context in role_client_contexts:
+                await client_context.__aexit__(None, None, None)
     return drive
 
 
@@ -781,7 +941,6 @@ def _standby_home_label(root: Path, engine: str, session: str) -> str:
 def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -> Driver:
     """A driver that serves ONE post-solve HITL command via a resumed worker."""
     async def drive(run: Run) -> None:
-        import asyncio
         import json
         import uuid
         from pathlib import Path
@@ -874,7 +1033,6 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
             if profile else worker_backend
         )
-        runtime = _runtime_for_profile(profile, runtime_profiles)
         container = None
         worker_env = None
         runtime_lease_factory = None

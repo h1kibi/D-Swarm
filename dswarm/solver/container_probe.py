@@ -14,9 +14,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from dswarm.solver.credential_accounts import (
-    CONTAINER_ACCOUNTS_ROOT,
-    project_account_root,
+from dswarm.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
+from dswarm.solver.runtime_credentials import (
+    CredentialProjectionError,
+    CredentialProjector,
 )
 from dswarm.solver.docker import docker_run
 
@@ -42,7 +43,7 @@ _docker = docker_run
 PROBE_TIMEOUT_S = float(os.environ.get("DSWARM_CONTAINER_PROBE_TIMEOUT", "60"))
 
 
-def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, Any]:
+def _probe_container(*, engine: str, account_id: str, root: Path, image: str = "") -> dict[str, Any]:
     """Real one-shot ``docker run --rm`` test of the container plumbing.
 
     Mounts only the account projection (never the bench tree) + a throwaway empty
@@ -59,15 +60,18 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
         _mount_source,
     )
 
-    image = WORKER_IMAGE
-    try:
-        for cand in _CATEGORY_IMAGES.values():
-            r = _docker("image", "inspect", cand, timeout=20)
-            if r.returncode == 0:
-                image = cand
-                break
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    image = (image or "").strip() or WORKER_IMAGE
+    if not image:
+        try:
+            for cand in _CATEGORY_IMAGES.values():
+                r = _docker("image", "inspect", cand, timeout=20)
+                if r.returncode == 0:
+                    image = cand
+                    break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    if not image:
+        return _result(False, "未配置 worker 镜像", layer="image")
 
     try:
         r = _docker("image", "inspect", image, timeout=20)
@@ -88,39 +92,49 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
             _tmp_base = None
     with tempfile.TemporaryDirectory(prefix="dswarm-acct-test-", dir=_tmp_base) as td:
         workspace = os.path.join(td, "ws")
-        projection = os.path.join(td, "accounts")
         os.makedirs(workspace, exist_ok=True)
         try:
-            project_account_root(root, projection)
-        except OSError as exc:
-            return _result(False, f"凭据投影失败: {str(exc)[:120]}", layer="mount")
+            lease = CredentialProjector(root, td).project(
+                run_id="account-probe",
+                pool_id=f"{engine}-account-probe",
+                worker_instance_id="plumbing",
+                binding_id=account_id,
+                credential_mode="direct",
+            )
+        except CredentialProjectionError as exc:
+            return _result(False, f"凭据投影失败: {exc.safe_detail}", layer="mount")
 
-        bin_path = _CONTAINER_BIN.get(engine, engine)
-        cred_path = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}"
-        script = (
-            f"test -r {cred_path} || {{ echo DSWARM_MOUNT_UNREADABLE; exit 71; }}; "
-            f"{bin_path} --version >/dev/null 2>&1 || {{ echo DSWARM_CLI_FAIL; exit 72; }}; "
-            "echo DSWARM_OK"
-        )
-        run_cmd = [
-            "run", "--rm", "--init",
-            "--network", "none",
-            "--entrypoint", "bash",
-            "--mount",
-            f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
-            "--mount",
-            f"type=bind,source={_mount_source(projection)},target={CONTAINER_ACCOUNTS_ROOT}",
-            image, "-lc", script,
-        ]
         try:
-            run = _docker(*run_cmd, timeout=PROBE_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            return _result(False, f"容器探测超时（>{PROBE_TIMEOUT_S:.0f}s，可调 DSWARM_CONTAINER_PROBE_TIMEOUT）", layer="cli")
-        out = (run.stdout or "") + (run.stderr or "")
-        if "DSWARM_MOUNT_UNREADABLE" in out or run.returncode == 71:
-            return _result(False, "容器内无法读取凭据（uid 不匹配或挂载失败）", layer="mount")
-        if "DSWARM_CLI_FAIL" in out or run.returncode == 72:
-            return _result(False, f"容器内 {engine} CLI 无法启动", layer="cli")
-        if run.returncode != 0:
-            return _result(False, f"容器探测失败: {out.strip()[:160]}", layer="cli")
-        return _result(True, "容器内凭据可读、CLI 可启动（已验证镜像+挂载+HOME隔离）")
+            if lease.root is None:
+                return _result(False, "凭据投影失败: 缺少凭据目录", layer="mount")
+            bin_path = _CONTAINER_BIN.get(engine, engine)
+            cred_path = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}"
+            script = (
+                f"test -r {cred_path} || {{ echo DSWARM_MOUNT_UNREADABLE; exit 71; }}; "
+                f"{bin_path} --version >/dev/null 2>&1 || {{ echo DSWARM_CLI_FAIL; exit 72; }}; "
+                "echo DSWARM_OK"
+            )
+            run_cmd = [
+                "run", "--rm", "--init",
+                "--network", "none",
+                "--entrypoint", "bash",
+                "--mount",
+                f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
+                "--mount",
+                f"type=bind,source={_mount_source(str(lease.root))},target={CONTAINER_ACCOUNTS_ROOT}",
+                image, "-lc", script,
+            ]
+            try:
+                run = _docker(*run_cmd, timeout=PROBE_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                return _result(False, f"容器探测超时（>{PROBE_TIMEOUT_S:.0f}s，可调 DSWARM_CONTAINER_PROBE_TIMEOUT）", layer="cli")
+            out = (run.stdout or "") + (run.stderr or "")
+            if "DSWARM_MOUNT_UNREADABLE" in out or run.returncode == 71:
+                return _result(False, "容器内无法读取凭据（uid 不匹配或挂载失败）", layer="mount")
+            if "DSWARM_CLI_FAIL" in out or run.returncode == 72:
+                return _result(False, f"容器内 {engine} CLI 无法启动", layer="cli")
+            if run.returncode != 0:
+                return _result(False, f"容器探测失败: {out.strip()[:160]}", layer="cli")
+            return _result(True, "容器内凭据可读、CLI 可启动（已验证镜像+挂载+HOME隔离）")
+        finally:
+            lease.close()

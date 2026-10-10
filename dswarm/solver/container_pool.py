@@ -149,7 +149,8 @@ class WorkerRuntimeLease:
                 # The manager release callback relinquishes ownership in its own
                 # finally block, even when credential cleanup reports a residual.
                 self._released = True
-
+                # Never retain a secret-bearing process overlay after release.
+                self.worker_env = MappingProxyType({})
 
 @dataclass
 class _ContainerPoolEntry:
@@ -275,7 +276,17 @@ class ContainerPoolManager:
                     worker_instance_id=worker_instance_id,
                     executor=executor,
                     credential_projection=projection,
-                    worker_env=dict(projection.env),
+                    worker_env={
+                        **dict(getattr(projection, "env", {}) or {}),
+                        **dict(
+                            getattr(
+                                projection,
+                                "process_env",
+                                getattr(projection, "env", {}),
+                            )
+                            or {}
+                        ),
+                    },
                     _release_once=release_once,
                 )
                 lease_holder["lease"] = lease

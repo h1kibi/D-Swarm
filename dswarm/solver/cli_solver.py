@@ -360,11 +360,24 @@ _REVIEW_PROMPT = (
 )
 
 # Worker-output marker regexes and pure parsing helpers live in marker_parser.py.
+# Secret redaction regex: catches API keys, tokens, and credentials at 600-char truncation boundary.
+# Issue: Base64-encoded secrets (e.g., 650+ chars) truncated to 600 chars still contain valid Base64
+# and must be redacted. Patterns below are intentionally aggressive to catch:
+#   - PEM PRIVATE KEY headers (-----BEGIN PRIVATE KEY-----)
+#   - Standard credential fields: api_key=, token=, secret=, password= with 12+ char values
+#   - Cloud provider token prefixes: sk_, api_, AKIA (AWS), ghp_ (GitHub), sv_ (GCP)
+#   - Standalone Base64 blocks 40+ chars (catches truncated Base64 secrets)
+#   - Bearer tokens 20+ chars after "Bearer " keyword
+# This ensures truncated Base64 at boundaries is still caught reliably.
+#
 
 _SECRET_LITERAL_RE = re.compile(
-    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{12,})",
-    re.IGNORECASE,
+    r"(-----BEGIN [A-Z ]*PRIVATE KEY---|"
+    r"(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{12,}|"
+    r"(?:sk[_-]|api[_-]|AKIA|ghp_|sv_)[A-Za-z0-9_\-./+={]+|"
+    r"[A-Za-z0-9+/]{40,}(?:==?)?(?:\n[A-Za-z0-9+/]{40,})*|"
+    r"Bearer\s+[A-Za-z0-9_./+=-]{20,})",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # pi json-mode RPC stream artifacts are protocol envelopes, NOT worker prose. The
@@ -564,19 +577,24 @@ class CliSolver:
         # run finished every time one worker ends (the run-7345 "怎么又结束了" bug).
         # The coordinator emits the single run-level RUN_FINISHED when ITS loop exits.
         self.lifecycle_scope = lifecycle_scope
-        # The live CLI session id for THIS worker's run (claude pre-seeds a uuid;
-        # codex scrapes one after turn 1). Surfaced to the deck via WORKER_STATUS so
-        # the operator can manually attach to a worker mid-solve — `claude -r <id>`
-        # or `codex exec resume <id>`. None until the worker's first turn assigns it.
         self._cli_session: Optional[str] = None
         self._last_runtime_status: dict = {}
+        # Lifecycle telemetry is aggregated across execute/conclude turns. A
+        # conclude turn may finish cleanly after the first turn timed out or was
+        # OOM-killed; the final outcome must retain that earlier fact.
+        self._stalled = False
+        self._runtime_oom_killed = False
+        self._runtime_timed_out = False
+        self._lifecycle_reason = ""
+        self._lifecycle_exited_emitted = False
+        self._worker_error_detail = ""
         # Facts this worker has recorded this run: total (incl. backfilled
-        # candidates) and STRUCTURED only (markers/findings/summary, excluding the
-        # thinking backfill). The backfill gate uses the structured count so a
+        # candidates) and STRUCTURED only (markers/findings/summary, excluding
+        # the thinking backfill). The backfill gate uses the structured count so a
         # worker that already produced rich output is left untouched.
         self._facts_recorded = 0
         self._structured_facts_recorded = 0
-
+        self._worker_feedback_seen = False
         # ── Runtime control channel (live dispatcher control) ─────────────────
         # The CLI worker is a subprocess; these let the swarm/HITL steer it while
         # it runs instead of fire-and-forget. cancel() kills the subprocess (so a
@@ -679,13 +697,13 @@ class CliSolver:
         # A re-bootstrapped worker is seeded with the run's already-found flags so
         # its prompt lists them and it hunts only the rest.
         self._already_found: "set[str]" = set(found_flags or [])
+        self._stream_accepted: list[str] = []
         # flags accepted via the LIVE stream (_stream_markers caught a FOUND_FLAG=
         # in an intermediate/streamed chunk that never reached the terminal result
         # text). run()'s per-turn flag extraction reads res.text only, so the run
         # loops consult this set too to decide solved (run-11189: a clean FOUND_FLAG
         # in cursor's mid-stream assistant text was extracted as a fact but the flag
         # itself was dropped because it wasn't in the terminal `result`).
-        self._stream_accepted: "list[str]" = []
         # ── raw command-output provenance corpus (run-75379) ─────────────────────
         # The FULL, untruncated stdout/stderr of every tool execution this worker ran,
         # captured live from each tool_result StreamStep BEFORE the 600-char deck
@@ -697,9 +715,15 @@ class CliSolver:
         # is gateable here even though it never reaches the truncated chunk or the
         # summarized result envelope. A flag with NO trace in this corpus is surfaced
         # as UNVERIFIED, not auto-promoted to solved. Bounded so a chatty run can't
-        # balloon memory; the per-chunk artifact persist keeps the full transcript.
+        # balloon memory; each tool result is also retained as a durable artifact.
         self._raw_tool_outputs: "list[str]" = []
         self._raw_tool_outputs_chars = 0
+        self._raw_tool_artifact_ids: "list[str]" = []
+        self._worker_stderr_tail = ""
+        self._no_feedback_interruption = False
+        self._worker_fact_seqs: "list[int]" = []
+        self._worker_dead_end_seqs: "list[int]" = []
+        self._final_transcript_id = ""
         # ── submission gate (only meaningful when challenge.verifier_rate_limited) ──
         # _submit_blocked_until: epoch-secs deadline before which a SIBLING holds the
         #   global submit-lock → this worker should HOLD its own submission. Advisory
@@ -892,20 +916,79 @@ class CliSolver:
 
     async def _emit_finished(self, *, flag: Optional[str], solved: bool,
                              flags: Optional[list[str]] = None) -> None:
-        """Emit this solver's terminal lifecycle event, scoped correctly.
-
-        scope="run"    → RUN_FINISHED (this solver IS the run: mock / standby).
-        scope="worker" → WORKER_FINISHED (a swarm sub-worker; the coordinator owns the
-                         single run-level RUN_FINISHED emitted when its loop exits).
-        Payload carries `flag` (first, back-compat) + `flags` (all, multi-flag) +
-        `solved`, so the deck can mark the lane SOLVED and graft the flag node(s)
-        without conflating it with run completion."""
+        """Emit this solver's terminal lifecycle event, scoped correctly."""
         etype = (EventType.RUN_FINISHED if self.lifecycle_scope == "run"
                  else EventType.WORKER_FINISHED)
-        # I: granular lifecycle — the worker has exited (with its final token total).
         await self._emit_lifecycle("exited", solved=solved)
-        await self._emit(etype, flag=flag, flags=list(flags or ([flag] if flag else [])),
-                         solved=solved)
+        await self._emit(
+            etype,
+            flag=flag,
+            flags=list(flags or ([flag] if flag else [])),
+            solved=solved,
+            lifecycle_reason=self._lifecycle_reason_for_outcome(),
+            runtime_status=self._worker_runtime_snapshot(),
+        )
+    @staticmethod
+    def _safe_runtime_status(value: Any) -> dict[str, Any]:
+        """Allowlist runtime metadata before it crosses the event/outcome boundary."""
+        if not isinstance(value, dict):
+            return {}
+        allowed = {
+            "backend", "exec_id", "container", "tag", "driver", "cwd", "argv0",
+            "status", "started_at", "finished_at", "rc", "timed_out", "oom_killed",
+            "cancelled", "steered", "elapsed_s", "failure_code", "error", "worker_id",
+            "pool_id", "pool_instance_id", "generation", "worker_instance_id",
+            "profile_id", "runtime_kind", "operation_kind",
+        }
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if key not in allowed:
+                continue
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                out[key] = item if not isinstance(item, str) else sanitize_public_text(item, limit=500)
+        return out
+
+    def _lifecycle_reason_for_outcome(self) -> str:
+        """Return the highest-priority lifecycle cause seen by this worker."""
+        runtime = self._safe_runtime_status(self._last_runtime_status)
+        status = str(runtime.get("status") or "").strip().lower()
+        if self._runtime_oom_killed or bool(runtime.get("oom_killed")) or status == "oom":
+            return "oom"
+        if self._stalled or status == "stalled":
+            return "stalled"
+        if self._runtime_timed_out or bool(runtime.get("timed_out")) or status == "timeout":
+            return "timeout"
+        if self._worker_stop_reason:
+            return self._worker_stop_reason
+        return "finished"
+
+    def _worker_runtime_snapshot(self) -> dict[str, Any]:
+        """Return bounded, display-only diagnostics without changing evidence."""
+        runtime = self._safe_runtime_status(self._last_runtime_status)
+        stdout = "\n".join(self._raw_tool_outputs)[-12_000:]
+        stderr = str(getattr(self, "_worker_stderr_tail", "") or "")[-4_000:]
+        artifacts = list(dict.fromkeys([
+            *self._raw_tool_artifact_ids[-31:],
+            *([self._final_transcript_artifact()] if self._final_transcript_artifact() else []),
+        ]))[-32:]
+        if stdout:
+            runtime["stdout"] = stdout
+        if stderr:
+            runtime["stderr"] = stderr
+        if artifacts:
+            runtime["artifact_ids"] = artifacts
+        runtime["intent_id"] = (
+            getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or ""
+        )
+        runtime["lifecycle_reason"] = self._lifecycle_reason_for_outcome()
+        runtime["oom_killed"] = bool(runtime.get("oom_killed") or self._runtime_oom_killed)
+        runtime["timed_out"] = bool(runtime.get("timed_out") or self._runtime_timed_out)
+        runtime["stalled"] = bool(self._stalled or runtime.get("status") == "stalled")
+        runtime["no_feedback"] = bool(self._no_feedback_interruption)
+        runtime["real_output_without_flag"] = bool(
+            self._worker_feedback_seen and not self._stream_accepted
+        )
+        return runtime
 
     async def _emit_worker_status(
         self, *, online: bool, reason: str, status: Optional[str] = None,
@@ -919,14 +1002,13 @@ class CliSolver:
                 reason=reason,
                 engine=self.driver.name,
                 session=self._cli_session or "",
-                runtime=self._last_runtime_status if not online else None,
+                runtime=self._worker_runtime_snapshot() if not online else None,
                 worker_role=self.mode,
                 detail=detail,
             ))
 
     def _tokens_spent(self) -> int:
-        """Best-effort running token total for THIS worker (in+out), for the
-        lifecycle telemetry. Reads the cost ledger's per-solver snapshot if present."""
+        """Best-effort running token total for THIS worker (in+out)."""
         try:
             if self.cost is not None and hasattr(self.cost, "snapshot"):
                 snap = self.cost.snapshot() or {}
@@ -937,10 +1019,28 @@ class CliSolver:
             pass
         return 0
 
+    def _outcome_metadata(self) -> dict[str, Any]:
+        return {
+            "lifecycle_reason": self._lifecycle_reason_for_outcome(),
+            "runtime_status": self._worker_runtime_snapshot(),
+        }
+
     async def _emit_lifecycle(self, phase: str, *, paused: bool = False,
                               **extra: Any) -> None:
-        """I: emit a granular worker-lifecycle event (spawned/phase_changed/
-        stalled/exited). Best-effort; never disturbs the solve."""
+        """Emit a granular worker lifecycle transition, exactly once on exit."""
+        if phase == "exited":
+            if self._lifecycle_exited_emitted:
+                return
+            self._lifecycle_exited_emitted = True
+            extra = {
+                "stop_reason": self._worker_stop_reason or "finished",
+                "lifecycle_reason": self._lifecycle_reason_for_outcome(),
+                "stalled": bool(self._stalled),
+                "oom_killed": bool(self._runtime_oom_killed),
+                "timed_out": bool(self._runtime_timed_out),
+                "runtime_status": self._worker_runtime_snapshot(),
+                **extra,
+            }
         try:
             await self._emit(
                 EventType.WORKER_LIFECYCLE,
@@ -951,7 +1051,7 @@ class CliSolver:
                     paused=paused,
                     engine=self.driver.name, worker_role=self.mode, **extra))
         except Exception:
-            pass
+            pass  # K: lifecycle telemetry failure must not alter the Worker outcome.
 
     async def _note_cli_session(self, session: Optional[str]) -> None:
         """Record the worker's live CLI session id and (if it just became known)
@@ -969,9 +1069,35 @@ class CliSolver:
         if reason:
             self._worker_stop_reason = reason
 
+    def _final_transcript_artifact(self) -> str:
+        """Durable full-transcript artifact id recorded at run end, or empty."""
+        return str(getattr(self, "_final_transcript_id", "") or "")
+
+    def _emit_worker_review_summary(self, *, report_ref: str) -> None:
+        """Aggregate one pending-review report for this worker covering every
+        recorded fact and dead-end plus the durable evidence artifacts. The
+        genesis rows stay immutable; this linkage lives in a separate marker."""
+        if self.shared_graph is None:
+            return
+        try:
+            self.shared_graph.worker_report_pending_review(
+                actor=self.solver_id, worker_id=self.solver_id,
+                intent_id=(getattr(self, "intent_id_assigned", "")
+                           or getattr(self, "_intent_id", "")),
+                fact_seqs=self._worker_fact_seqs,
+                dead_end_seqs=self._worker_dead_end_seqs,
+                artifact_ids=[self._final_transcript_artifact()],
+                raw_artifact_ids=self._raw_tool_artifact_ids,
+                report_ref=report_ref)
+        except Exception:
+            pass
+
     def _blackboard_script_path(self) -> str:
-        # Container workers must not trust an image-baked skill: an already-pulled
-        # image can predate a new blackboard CLI option (run-1804: ``--artifact``
+        """Resolve the authoritative blackboard skill for this worker."""
+        # regression: run-1804 — capability drift must degrade to the deployed
+        # blackboard skill path when the source checkout is unavailable.
+        # Container workers use a run-local materialized copy; source workers use
+        # the checked-out skill so the runtime cannot drift from the repository.
         # was rejected by exactly that stale copy).  Materialize the checked-out
         # source into the bind-mounted run workspace and execute that copy instead.
         if self.container is not None:
@@ -1342,12 +1468,12 @@ class CliSolver:
                         getattr(self, "worker_instance_id", "") or self.solver_id),
                     operation_kind=self.runtime_operation_kind or self.mode,
                 )
-                self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+                self._note_runtime_result(res)
                 return res
             res = await asyncio.to_thread(
                 run_cli, self.driver, argv, cwd=cwd, timeout=timeout, env=env,
                 container=self.container)
-            self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+            self._note_runtime_result(res)
             return res
 
         loop = asyncio.get_running_loop()
@@ -1401,7 +1527,9 @@ class CliSolver:
                     beats += 1
                     if beats >= 5 and not stalled_emitted:
                         stalled_emitted = True
-                        await self._emit_lifecycle("stalled")
+                        self._stalled = True
+                        self._lifecycle_reason = "stalled"
+                        await self._emit_lifecycle("stalled", lifecycle_reason="stalled")
                 elif self._paused_event.is_set():
                     await self._emit_lifecycle("phase_changed", paused=True)
 
@@ -1424,7 +1552,7 @@ class CliSolver:
                         getattr(self, "worker_instance_id", "") or self.solver_id),
                     operation_kind=self.runtime_operation_kind or self.mode,
                 )
-                self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+                self._note_runtime_result(res)
                 return res
             res = await asyncio.to_thread(
                 run_cli_streaming, self.driver, argv, cwd=cwd, timeout=timeout,
@@ -1432,7 +1560,7 @@ class CliSolver:
                 on_proc=self._on_proc, steer_event=self._steer_event,
                 paused_event=self._paused_event,
                 container=self.container)
-            self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
+            self._note_runtime_result(res)
             return res
         finally:
             self._turn_active = False  # steers invalid again until the next turn
@@ -1449,21 +1577,57 @@ class CliSolver:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
 
+    def _note_runtime_result(self, res: CliResult) -> None:
+        """Retain bounded runtime status and aggregate lifecycle causes."""
+        self._last_runtime_status = self._safe_runtime_status(
+            getattr(res, "runtime_status", {}) or {})
+        self._worker_stderr_tail = self._stderr_tail(res, max_chars=4000)
+        status = str(self._last_runtime_status.get("status") or "").lower()
+        if (
+            bool(getattr(res, "oom_killed", False))
+            or bool(self._last_runtime_status.get("oom_killed"))
+            or status == "oom"
+        ):
+            self._runtime_oom_killed = True
+            self._lifecycle_reason = "oom"
+        if (
+            bool(getattr(res, "timed_out", False))
+            or bool(self._last_runtime_status.get("timed_out"))
+            or status in {"timeout", "timed_out"}
+        ):
+            self._runtime_timed_out = True
+            if not self._runtime_oom_killed:
+                self._lifecycle_reason = "timeout"
+        if status == "stalled":
+            self._stalled = True
+            self._lifecycle_reason = "stalled"
+
+    @staticmethod
+    def _has_live_cli_output(res: "CliResult") -> bool:
+        if res is None:
+            return False
+        if bool(getattr(res, "output_tokens", None)):
+            return True
+        text = (getattr(res, "text", "") or "").strip()
+        if not text:
+            return False
+        return any(not _is_stream_delta(line) for line in text.splitlines())
+
     def _mark_session_if_live(self, res: "CliResult") -> None:
-        """Record that the engine session is really established — i.e. a turn just
-        produced output or echoed a real session id. Only then is a later
-        `build_resume` against it safe; before it, `-r <sid>` hits "No conversation
-        found" (run-42598 claude spawn-death loop). Cancel/steer don't count (the
-        turn was cut short, but the session was already seated if it ran)."""
+        """Record that the engine session is really established.
+
+        A session id alone is not proof: Pi announces one in its leading protocol
+        envelope even when the turn later fails before creating a resumable file.
+        Only worker output or reported output tokens make a later ``build_resume``
+        safe; interrupted turns never upgrade this guard.
+        """
         if res is None:
             return
         if res.cancelled or res.steered:
             # the turn was interrupted; if it had run at all it already seated the
             # session on a prior call — don't downgrade, just don't upgrade here.
             return
-        produced = bool((res.text or "").strip()) or bool(res.output_tokens) \
-            or bool(res.session)
-        if produced:
+        if self._has_live_cli_output(res):
             self._session_established = True
 
     def _resume_or_execute_argv(self, prompt: str, session: "Optional[str]", *,
@@ -1488,8 +1652,7 @@ class CliSolver:
         self._drain_control()
 
     async def _emit_step(self, step: StreamStep) -> None:
-        """Map one live StreamStep onto the deck's event stream (reasoning bubble /
-        tool bubble / tool-result lane). Best-effort — never raises into the run."""
+        """Map one live StreamStep onto the deck and durable evidence store."""
         try:
             if step.kind == "reasoning" and step.text:
                 await self._emit(EventType.REASONING_DELTA,
@@ -1498,40 +1661,16 @@ class CliSolver:
                 label = f"{step.tool}: {step.text}" if step.text else step.tool
                 await self._emit(EventType.TOOL_CALL_START, tool=label[:200])
             elif step.kind == "tool_result" and step.text:
+                # `condensed` is the deck preview; `raw` (bounded) is the
+                # expandable Worker-detail stdout. The full untruncated output
+                # stays in the provenance corpus + durable artifact — the gate
+                # above already ran on it.
+                raw_tail = (step.raw or step.text)[-4000:]
                 await self._emit(
                     EventType.TOOL_CALL_RESULT,
                     **tool_result_payload(self.driver.name,
-                                          {"condensed": step.text}))
-            # LIVE marker streaming: if this step's text carries a VERIFIED_FACT=/
-            # DEADEND=/FOUND_FLAG= marker, push it to the board NOW (not at end-of-run)
-            # so a teammate racing in parallel sees it mid-solve — the whole point of a
-            # shared board. Deduped: the marker shows up in both the tool echo and
-            # its result.
-            #
-            # Marker sourcing is split by step kind so a flag can ONLY come from real
-            # command output, never from the worker's prose (run-75379 provenance fix):
-            #
-            #  - "tool" (the COMMAND about to run): NEVER scanned. Its text is the
-            #    worker's INTENT, not output. A worker that greps for
-            #    `FOUND_FLAG=bl_...` puts that literal marker in the command string;
-            #    scanning it registered the grep PATTERN as a real flag (run-11550:
-            #    codex ran `grep -E 'FOUND_FLAG=bl_|VERIFIED_FACT=.*L4|...'` → false
-            #    flag `bl_|VERIFIED_FACT=.*L4|...`).
-            #
-            #  - "reasoning" (the worker's own thought): facts/dead-ends ONLY, NEVER a
-            #    flag (allow_flags=False). A worker restating `FOUND_FLAG=flag{x}` in
-            #    its reasoning is a CLAIM; gating that flag against the reasoning chunk
-            #    itself is self-referential (`flag in raw_output` where raw_output IS
-            #    the claim) → trivially true. That is exactly how the hallucinated
-            #    flag02 (run-75379) got laundered through prose. Flags must trace to
-            #    real output, so reasoning can't be their source.
-            #
-            #  - "tool_result" (REAL command output): may source a flag, gated against
-            #    the FULL UNTRUNCATED output (step.raw), not the 600-char deck chunk —
-            #    so a flag past char 600, or in a nested-ssh remote stdout the outer
-            #    ssh forwarded here, is still gateable. The raw output is also persisted
-            #    (see _persist_raw_tool_output) so the end-of-run backstop can gate
-            #    against what commands actually printed, not the summarized envelope.
+                                          {"condensed": step.text, "raw": raw_tail}))
+
             if step.kind == "tool_result":
                 raw = step.raw or step.text
                 if raw:
@@ -1539,8 +1678,7 @@ class CliSolver:
                     from dswarm.solver.gate import is_placeholder_flag
                     for m in _BRACE_FLAG.finditer(raw):
                         cand = m.group(0)
-                        if (is_placeholder_flag(cand)
-                                or not self._is_bare_raw_flag(cand)):
+                        if is_placeholder_flag(cand) or not self._is_bare_raw_flag(cand):
                             continue
                         key = ("FC", cand)
                         if key in self._published_markers:
@@ -1548,22 +1686,17 @@ class CliSolver:
                         self._published_markers.add(key)
                         await self._emit(
                             EventType.REASONING_DELTA,
-                            text=(
-                                f"[{self.driver.name}] live flag candidate in "
-                                f"real output: {cand}"
-                            ),
+                            text=(f"[{self.driver.name}] live flag candidate in "
+                                  f"real output: {cand}"),
                         )
-                        if self._flag_ok(cand, raw):
-                            if await self._accept_flag(cand):
-                                if cand not in self._stream_accepted:
-                                    self._stream_accepted.append(cand)
-                                await self._emit(
-                                    EventType.REASONING_DELTA,
-                                    text=(
-                                        f"[{self.driver.name}] accepted flag from "
-                                        f"real output: {cand}"
-                                    ),
-                                )
+                        if self._flag_ok(cand, raw) and await self._accept_flag(cand):
+                            if cand not in self._stream_accepted:
+                                self._stream_accepted.append(cand)
+                            await self._emit(
+                                EventType.REASONING_DELTA,
+                                text=(f"[{self.driver.name}] accepted flag from "
+                                      f"real output: {cand}"),
+                            )
                 if step.text:
                     await self._stream_markers(
                         step.text, allow_flags=True, flag_provenance=raw)
@@ -1572,33 +1705,29 @@ class CliSolver:
         except Exception:
             pass
 
-    # bound the in-memory raw-output corpus (the per-chunk artifact persist keeps the
-    # full transcript; this buffer only needs to be a searchable provenance haystack).
+    # Bound the in-memory raw-output corpus; durable artifacts retain every chunk.
     _RAW_OUTPUT_CHAR_CAP = 4_000_000
 
     def _persist_raw_tool_output(self, raw: str) -> None:
-        """Append one tool execution's FULL stdout/stderr to the provenance corpus.
-        Called from the LIVE path (_emit_step) for every tool_result, BEFORE any
-        truncation/summarization, so a later flag claim can be checked against what
-        the command actually printed (run-75379)."""
+        """Retain full tool output in memory and as a durable artifact."""
         if not raw:
             return
-        # ring-trim from the front if we'd blow the cap — keep the most recent output,
-        # which is where a just-found flag lives.
+        try:
+            artifact_id = self.artifacts.put(raw, suffix=".tool.txt")
+        except Exception:
+            artifact_id = ""
+        if artifact_id and artifact_id not in self._raw_tool_artifact_ids:
+            self._raw_tool_artifact_ids.append(artifact_id)
         self._raw_tool_outputs.append(raw)
         self._raw_tool_outputs_chars += len(raw)
+        self._worker_feedback_seen = True
         while (self._raw_tool_outputs_chars > self._RAW_OUTPUT_CHAR_CAP
                and len(self._raw_tool_outputs) > 1):
             dropped = self._raw_tool_outputs.pop(0)
             self._raw_tool_outputs_chars -= len(dropped)
 
     def _provenance_corpus(self, *extra: str) -> str:
-        """The authoritative text a flag must trace to: every raw command output this
-        worker captured live, plus any caller-supplied text (the summarized result
-        envelope / transcript). Used by the end-of-run flag gate so a flag that landed
-        only in real command output (past char 600, or in a nested-ssh remote stdout)
-        is still accepted, while a flag that appears NOWHERE in real output — only in
-        the worker's prose — is rejected (run-75379)."""
+        """Return raw tool output plus caller-supplied transcript text."""
         parts = list(self._raw_tool_outputs)
         parts.extend(x for x in extra if x)
         return "\n".join(parts)
@@ -1690,10 +1819,17 @@ class CliSolver:
             dead_end_seq = None
             if self.shared_graph is not None:
                 try:
+                    intent_id = (getattr(self, "intent_id_assigned", "")
+                                 or getattr(self, "_intent_id", ""))
+                    review_required = bool(self.mode in {"bootstrap", "explore"})
                     seq = self.shared_graph.add_dead_end(
-                        actor=self.solver_id, reason=f"[{self.driver.name}] {d_text[:200]}")
+                        actor=self.solver_id, reason=f"[{self.driver.name}] {d_text[:200]}",
+                        review_required=review_required,
+                        intent_id=intent_id or None)
                     if seq > 0:
                         dead_end_seq = seq
+                        if review_required:
+                            self._worker_dead_end_seqs.append(seq)
                 except Exception:
                     pass
             if self.insight is not None:
@@ -2573,22 +2709,25 @@ class CliSolver:
         failures (e.g. ``Unknown provider dswarm-worker``) and can send the swarm down
         a bogus challenge direction.
         """
-        if (res.text or "").strip():
+        if self._has_live_cli_output(res):
             return ""
         tail = self._stderr_tail(res)
-        if not tail:
-            return ""
-        return tail
+        if tail:
+            return tail
+        runtime = getattr(res, "runtime_status", {}) or {}
+        rc = runtime.get("rc") if isinstance(runtime, dict) else None
+        if isinstance(rc, int) and rc != 0:
+            return f"CLI exited with status {rc} before producing worker output"
+        return ""
 
     def _result_text_with_stderr(self, res: CliResult) -> str:
         text = res.text or ""
-        if text.strip():
+        if self._has_live_cli_output(res):
             return text
         tail = self._stderr_tail(res)
-        if not tail:
-            return text
-        return f"[{self.driver.name} stderr]\n{tail}"
-
+        if tail:
+            return f"[{self.driver.name} stderr]\n{tail}"
+        return text
     def _provider_runtime_diagnostic(self, detail: str) -> dict[str, Any]:
         env = dict(getattr(self, "_extra_worker_env", {}) or {})
         provider = (
@@ -2610,10 +2749,7 @@ class CliSolver:
         if not detail:
             return {}
         diag = self._provider_runtime_diagnostic(detail)
-        await self._emit(
-            EventType.PROVIDER_ERROR,
-            **diag,
-        )
+        await self._emit(EventType.PROVIDER_ERROR, **diag)
         retryable = bool(diag.get("retryable"))
         recovery_action = "retry_next_worker" if retryable else "pause_provider_dispatch"
         operator_message = (
@@ -2625,9 +2761,8 @@ class CliSolver:
         )
         await self._emit_bb(
             "worker_runtime_error",
-            severity="error",
-            error=detail[:1200],
-            category=str(diag.get("category") or ""),
+            severity=str(diag.get("severity") or "warning"),
+            error=detail[:1200], category=str(diag.get("category") or ""),
             retryable=retryable,
             should_pause_dispatch=bool(diag.get("should_pause_dispatch")),
             message=(
@@ -2652,7 +2787,7 @@ class CliSolver:
         return diag
 
     async def _emit_empty_stderr_diagnostic(self, res: CliResult) -> None:
-        if (res.text or "").strip():
+        if self._has_live_cli_output(res):
             return
         tail = self._stderr_tail(res, max_chars=1200)
         if tail:
@@ -2663,6 +2798,65 @@ class CliSolver:
 
     def _extract_flags(self, text: str) -> list[str]:
         return _parse_flags(text)
+
+    def _no_output_interruption(self, *, all_text: str, facts: list[str],
+                                deadends: list[str], accepted: Optional[str],
+                                res: CliResult, artifact_id: str) -> bool:
+        """Detect an Intent exit with no meaningful business feedback."""
+        del all_text, artifact_id
+        if self.mode not in {"bootstrap", "explore"}:
+            return False
+        if accepted or facts or deadends:
+            return False
+        if self._raw_tool_outputs or self._structured_facts_recorded or self._worker_feedback_seen:
+            return False
+        # A completed assistant response is meaningful Worker feedback even when
+        # an earlier heartbeat marked the turn stalled. Lifecycle diagnostics must
+        # not erase a real response; only genuinely empty lifecycle failures park.
+        if self._has_live_cli_output(res):
+            return False
+        if getattr(res, "steered", False) or getattr(res, "cancelled", False):
+            return False
+        runtime = getattr(res, "runtime_status", {}) or {}
+        lifecycle = str(runtime.get("lifecycle_reason") or "").lower() if isinstance(runtime, dict) else ""
+        # An explicit lifecycle cause with no business feedback is recoverable,
+        # even when the runtime also supplied stderr or a status snapshot.
+        if (
+            getattr(res, "timed_out", False)
+            or getattr(res, "oom_killed", False)
+            or lifecycle in {"oom", "stalled", "timeout"}
+            or self._stalled
+        ):
+            return True
+        # Unknown CLI/provider stderr and non-zero runtime status are diagnosed
+        # failures, not empty Intent interruptions. Keep them on the provider
+        # diagnostic path so Reason does not park a configured runtime outage.
+        if self._stderr_tail(res) or runtime:
+            return False
+        return not self._has_live_cli_output(res)
+
+    def _mark_intent_awaiting_validation(self, *, reason: str, worker_id: str = "") -> int:
+        graph = self.shared_graph
+        intent_id = str(getattr(self, "_intent_id", "") or self.intent_id_assigned or "")
+        if graph is None or not intent_id:
+            return 0
+        try:
+            previous = 0
+            for event in graph.events():
+                if event.get("kind") != "intent_recovery_required":
+                    continue
+                payload = event.get("payload") or {}
+                if str(payload.get("intent_id") or "") == intent_id:
+                    previous = max(previous, int(payload.get("recovery_attempt") or 0))
+            graph.mark_intent_awaiting_validation(
+                actor=self.solver_id, intent_id=intent_id,
+                worker_id=worker_id or self.solver_id,
+                reason=reason, recovery_attempt=previous + 1,
+            )
+            return previous + 1
+        except Exception as exc:
+            self._note_intent_db_failure("awaiting_validation", exc)
+            return 0
 
     def _extract_structured_facts(self, text: str) -> tuple[list[str], list[str]]:
         return _parse_structured_facts(text)
@@ -3211,6 +3405,10 @@ class CliSolver:
                 _MERGE_KEYS = (
                     "HOME", "PI_CODING_AGENT_DIR",
                     "DSWARM_PI_PROVIDER", "DSWARM_WORKER_MODEL",
+                    "DSWARM_WORKER_WIRE_API", "DSWARM_WORKER_AUTH_MODE",
+                    "DSWARM_WORKER_AUTH_HEADER", "DSWARM_WORKER_AUTH_PREFIX",
+                    "DSWARM_WORKER_PROFILE_ID", "DSWARM_CREDENTIAL_ACCOUNT_ID",
+                    "DSWARM_WORKER_THINKING",
                     "DSWARM_TASK_TOKEN", "DSWARM_GATEWAY_URL",
                     "DSWARM_BLACKBOARD_DB", "DSWARM_CHALLENGE_ID",
                     "DSWARM_BLACKBOARD_URL", "DSWARM_DIRECTION_PROMPT",
@@ -3271,6 +3469,15 @@ class CliSolver:
             if not self._worker_stop_reason:
                 self._note_worker_stop("cancelled" if self._cancel_event.is_set() else "finished")
             try:
+                # Normal result paths already emitted this event through
+                # _emit_finished; the guard makes this the exception/cancellation
+                # fallback without ever duplicating the terminal transition.
+                await self._emit_lifecycle("exited")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            try:
                 await self._emit_worker_status(online=False, reason=self._worker_stop_reason)
             except asyncio.CancelledError:
                 pass
@@ -3283,7 +3490,10 @@ class CliSolver:
                     pass
             self._revoke_gateway_token()
             if runtime_lease is not None:
-                await runtime_lease.release()
+                try:
+                    await runtime_lease.release()
+                finally:
+                    self._extra_worker_env.clear()
 
     async def _run_bootstrap(self) -> SolveOutcome:
         await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())
@@ -3423,8 +3633,38 @@ class CliSolver:
             worker_cancelled = worker_cancelled or res.cancelled
             worker_steered = worker_steered or res.steered
 
-        # persist the agent's full transcript as a provenance artifact.
+        # Persist the transcript before any lifecycle return; the artifact remains
+        # available for Reviewer/operator inspection even when it is empty.
         aid = self.artifacts.put(all_text, suffix=".txt")
+        self._final_transcript_id = aid
+        facts, deadends = self._extract_structured_facts(all_text)
+        if self._no_output_interruption(
+                all_text=all_text, facts=facts, deadends=deadends,
+                accepted=accepted, res=res, artifact_id=aid):
+            self._emit_worker_review_summary(report_ref="worker-run:awaiting_validation")
+            self._note_worker_stop("awaiting_validation")
+            self._no_feedback_interruption = True
+            detail = "Worker interrupted before producing meaningful execution feedback."
+            attempt = self._mark_intent_awaiting_validation(reason=detail)
+            await self._emit_bb(
+                "intent_interrupted", intent_id=self._intent_id,
+                worker=self.solver_id, dispatch_state="awaiting_validation",
+                recovery_attempt=attempt, result_detail=detail,
+                lifecycle_reason=self._lifecycle_reason_for_outcome(),
+            )
+            await self._emit_bb(
+                "intent_recovery_required", intent_id=self._intent_id,
+                worker=self.solver_id, recovery_attempt=attempt,
+                operator_attention=attempt >= 2,
+            )
+            partial_flags = list(self.graph.flags)
+            await self._emit_finished(flag=None, flags=partial_flags, solved=False)
+            return SolveOutcome(
+                False, None, 1, self.graph, detail,
+                session=session, engine=self.driver.name, workdir=str(wd),
+                flags=partial_flags, feedback={"meaningful": False},
+                no_output_interruption=True, **self._outcome_metadata(),
+            )
 
         if worker_steered and not accepted:
             self._note_worker_stop("steered")
@@ -3444,15 +3684,22 @@ class CliSolver:
             detail = f"Worker runtime failed before solver output: {infra_failure_detail[:220]}"
             self._conclude_intent_db(result=RESULT_RUNTIME_FAILURE, result_detail=detail)
             provider_error = await self._emit_worker_runtime_error(infra_failure_detail)
-            await self._emit_bb("intent_concluded", intent_id=self._intent_id,
-                                worker=self.solver_id, result=RESULT_RUNTIME_FAILURE,
-                                result_detail=detail)
+            await self._emit_bb(
+                "intent_concluded", intent_id=self._intent_id,
+                worker=self.solver_id, result=RESULT_RUNTIME_FAILURE,
+                result_detail=detail,
+                lifecycle_reason=self._lifecycle_reason_for_outcome(),
+            )
             partial_flags = list(self.graph.flags)
             await self._emit_finished(flag=None, flags=partial_flags, solved=False)
-            return SolveOutcome(False, None, 1, self.graph,
-                                f"{self.driver.name} CLI: runtime failure",
-                                flags=partial_flags, provider_error=provider_error)
+            return SolveOutcome(
+                False, None, 1, self.graph,
+                f"{self.driver.name} CLI: runtime failure",
+                flags=partial_flags, provider_error=provider_error,
+                **self._outcome_metadata(),
+            )
 
+        self._emit_worker_review_summary(report_ref="worker-run:completed")
         # the coordinator extracts structured facts/dead-ends from the
         # worker's output and writes them to the board (the worker is a stateless
         # executor). Most markers already streamed live to the board mid-solve via
@@ -3518,7 +3765,7 @@ class CliSolver:
             return SolveOutcome(
                 True, accepted, 1, self.graph, f"solved via {self.driver.name} CLI",
                 session=session, engine=self.driver.name, workdir=str(wd),
-                flags=found)
+                flags=found, **self._outcome_metadata())
 
         if worker_cancelled:
             self._note_worker_stop("cancelled")
@@ -3556,13 +3803,13 @@ class CliSolver:
         self._conclude_intent_db(result=result_code, result_detail=detail)
         await self._emit_bb("intent_concluded", intent_id=self._intent_id,
                             worker=self.solver_id, result=result_code,
-                            result_detail=detail)
+                            result_detail=detail,
+                            lifecycle_reason=self._lifecycle_reason_for_outcome())
         partial_flags = list(self.graph.flags)
         await self._emit_finished(flag=None, flags=partial_flags, solved=False)
-        # scratch cleanup is centralized in run()'s finally (M9) via _owned_scratch.
         return SolveOutcome(False, None, 1, self.graph,
                             f"{self.driver.name} CLI: no verified flag",
-                            flags=partial_flags)
+                            flags=partial_flags, **self._outcome_metadata())
 
     async def _run_explore(self) -> SolveOutcome:
         """Explore: claim one intent, explore that direction, report
@@ -3624,14 +3871,15 @@ class CliSolver:
         worker_steered = res.steered
         worker_timed_out = res.timed_out
 
-        # one conclude fallback: timed out OR no structured markers at all → resume
+        # one conclude fallback: timed out OR no structured markers at all -> resume
         # the same session once to force a summary. A cancel skips it (die now).
         if not worker_cancelled and not worker_steered and not infra_failure_detail:
             facts, deadends = self._extract_structured_facts(all_text)
             flag = self._extract_flag(all_text)
             if worker_timed_out or (not facts and not deadends and not flag):
-                await self._emit(EventType.REASONING_DELTA,
-                                 text=f"[{self.driver.name}] explore → one conclude fallback.\n")
+                await self._emit(
+                    EventType.REASONING_DELTA,
+                    text=f"[{self.driver.name}] explore -> one conclude fallback.\n")
                 self._write_board_file(wd)
                 argv = self._resume_or_execute_argv(cli_prompts.EXPLORE_CONCLUDE_PROMPT, session)
                 res = await self._run_streaming(
@@ -3650,16 +3898,44 @@ class CliSolver:
                     await self._stream_markers(result_text)
                 worker_cancelled = worker_cancelled or res.cancelled
                 worker_steered = worker_steered or res.steered
+                worker_timed_out = worker_timed_out or res.timed_out
 
-        # final marker extraction across the whole transcript.
+        # Final marker extraction across the whole transcript.
         facts, deadends = self._extract_structured_facts(all_text)
         flag = self._extract_flag(all_text)
-
-        # provenance: persist full transcript, bind artifact to each fact
         aid = self.artifacts.put(all_text, suffix=".txt")
-        # accept EVERY gate-passing flag (explore is narrow but multi-flag-safe).
+        self._final_transcript_id = aid
         gate_ok = [f for f in self._extract_flags(all_text) if self._flag_ok(f, all_text)]
         accepted = gate_ok[0] if gate_ok else None
+        if self._stream_accepted and accepted is None:
+            accepted = self._stream_accepted[0]
+        if self._no_output_interruption(
+                all_text=all_text, facts=facts, deadends=deadends,
+                accepted=accepted, res=res, artifact_id=aid):
+            self._emit_worker_review_summary(report_ref="worker-run:awaiting_validation")
+            self._note_worker_stop("awaiting_validation")
+            self._no_feedback_interruption = True
+            detail = "Worker interrupted before producing meaningful execution feedback."
+            attempt = self._mark_intent_awaiting_validation(reason=detail)
+            await self._emit_bb(
+                "intent_interrupted", intent_id=self._intent_id,
+                worker=self.solver_id, dispatch_state="awaiting_validation",
+                recovery_attempt=attempt, result_detail=detail,
+                lifecycle_reason=self._lifecycle_reason_for_outcome(),
+            )
+            await self._emit_bb(
+                "intent_recovery_required", intent_id=self._intent_id,
+                worker=self.solver_id, recovery_attempt=attempt,
+                operator_attention=attempt >= 2,
+            )
+            partial_flags = list(self.graph.flags)
+            await self._emit_finished(flag=None, flags=partial_flags, solved=False)
+            return SolveOutcome(
+                False, None, 1, self.graph, detail,
+                session=session, engine=self.driver.name, workdir=str(wd),
+                flags=partial_flags, feedback={"meaningful": False},
+                no_output_interruption=True, **self._outcome_metadata(),
+            )
 
         # write structured facts/dead-ends to the board — deduped against anything
         # already streamed live mid-solve (bug #1). The full combined transcript is
@@ -3681,14 +3957,17 @@ class CliSolver:
             provider_error = await self._emit_worker_runtime_error(infra_failure_detail)
             await self._emit_bb("intent_concluded", intent_id=self._intent_id,
                                 worker=self.solver_id, result=RESULT_RUNTIME_FAILURE,
-                                to_fact_seq=None, result_detail=detail)
+                                to_fact_seq=None, result_detail=detail,
+                                lifecycle_reason=self._lifecycle_reason_for_outcome())
             partial_flags = list(self.graph.flags)
             await self._emit_finished(flag=None, flags=partial_flags, solved=False)
-            return SolveOutcome(False, None, 1, self.graph,
-                                f"{self.driver.name} explore: runtime failure",
-                                session=session, engine=self.driver.name,
-                                workdir=str(wd), flags=partial_flags,
-                                provider_error=provider_error)
+            return SolveOutcome(
+                False, None, 1, self.graph,
+                f"{self.driver.name} explore: runtime failure",
+                session=session, engine=self.driver.name, workdir=str(wd),
+                flags=partial_flags, provider_error=provider_error,
+                **self._outcome_metadata(),
+            )
 
         # if no structured output at all, record the worker's closing WORDS as a
         # candidate fact. With no assistant-authored words (settled envelope
@@ -3701,6 +3980,7 @@ class CliSolver:
                     f"[{self.driver.name}] {summary}",
                     verified=False, artifact_id=aid)
         # backfill thinking-line findings as candidate facts when the worker
+        self._emit_worker_review_summary(report_ref="worker-run:completed")
         # produced no structured markers (recon/explore fact drought).
         await self._backfill_thinking_findings(aid)
 
@@ -3729,7 +4009,7 @@ class CliSolver:
                 True, accepted, 1, self.graph,
                 f"solved via {self.driver.name} explore",
                 session=session, engine=self.driver.name, workdir=str(wd),
-                flags=found)
+                flags=found, **self._outcome_metadata())
 
         if worker_cancelled:
             self._note_worker_stop("cancelled")
@@ -3774,7 +4054,7 @@ class CliSolver:
         # scratch cleanup is centralized in run()'s finally (M9) via _owned_scratch.
         return SolveOutcome(False, None, 1, self.graph,
                             f"{self.driver.name} explore: {result_label}",
-                            flags=partial_flags)
+                            flags=partial_flags, **self._outcome_metadata())
 
     async def _run_review(self) -> SolveOutcome:
         """Review-Arbiter: audit global graph and emit executable control actions.
@@ -3933,6 +4213,7 @@ class CliSolver:
             if self._stream_accepted and accepted is None:
                 accepted = self._stream_accepted[0]
             aid = self.artifacts.put(all_text, suffix=".txt")
+            self._final_transcript_id = aid
             # never let a trailing pi stream delta become the "fact" tail.
             _lines = [ln for ln in all_text.strip().splitlines() if ln.strip()]
             _lines = [ln for ln in _lines if not _is_stream_delta(ln)]
@@ -4064,13 +4345,24 @@ class CliSolver:
         fact_seq = -1
         if self.shared_graph is not None:
             try:
+                intent_id = (getattr(self, "intent_id_assigned", "")
+                             or getattr(self, "_intent_id", ""))
+                review_required = bool(self.mode in {"bootstrap", "explore"} and fact.strip())
                 fact_seq = self.shared_graph.add_evidence(
                     actor=self.solver_id, source=self.driver.name, fact=fact,
                     artifact_id=artifact_id, verified=verified,
                     confidence=1.0 if verified else 0.4,
                     witness=witness or None, verifier=self.driver.name,
-                    intent_id=getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or None,
-                    finding=finding)
+                    intent_id=intent_id or None, finding=finding,
+                    review_required=review_required)
+                if review_required and fact_seq > 0:
+                    self._worker_fact_seqs.append(fact_seq)
+                    self.shared_graph.worker_report_pending_review(
+                        actor=self.solver_id, worker_id=self.solver_id,
+                        intent_id=intent_id, fact_seqs=[fact_seq],
+                        artifact_ids=[artifact_id] if artifact_id else [],
+                        raw_artifact_ids=self._raw_tool_artifact_ids,
+                        report_ref=f"fact:{fact_seq}")
             except Exception as exc:
                 self._note_fact_db_failure(fact, exc)
             if fact_seq <= 0:

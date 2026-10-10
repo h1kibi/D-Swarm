@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, DSwarmEvent, emptyDeck, reduce } from "./events";
@@ -83,14 +83,14 @@ export async function checkAuth(): Promise<{ authenticated: boolean; authRequire
   const res = await apiFetch("/api/auth/me");
   if (res.status === 401) return { authenticated: false, authRequired: true, inContainer: false };
   const data = await res.json().catch(() => ({} as any));
-  // in_container (P2-v3): the control plane runs in a container →the deck must
+  // in_container (P2-v3): the control plane runs in a container 鈫抰he deck must
   // force container mode and disable the "local" worker-isolation toggle.
   return { authenticated: true, authRequired: Boolean(data?.auth_required), inContainer: Boolean(data?.in_container) };
 }
 
 /**
  * Mint a one-time ticket for opening an SSE/WS connection (no header possible).
- * Returns "" when auth is disabled or the mint fails —callers append it as a
+ * Returns "" when auth is disabled or the mint fails 鈥攃allers append it as a
  * query param only when non-empty.
  */
 export async function authTicket(): Promise<string> {
@@ -104,7 +104,7 @@ export async function authTicket(): Promise<string> {
   }
 }
 
-export type RunStatus = "draft" | "queued" | "running" | "paused" | "solved" | "finished" | "failed" | "cancelled";
+export type RunStatus = "draft" | "queued" | "running" | "paused" | "reason_blocked" | "degraded" | "fallback_active" | "solved" | "finished" | "failed" | "cancelled";
 
 export const isDraftRunId = (id: string) => id.startsWith("draft-");
 
@@ -200,6 +200,149 @@ export async function fetchRuntimePools(runId: string, signal?: AbortSignal): Pr
   return data as RuntimePoolsSnapshot;
 }
 
+export interface RunRoleUsage {
+  calls: number;
+  tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  usd: number;
+  unknown_calls: number;
+  estimated_calls: number;
+  last_call_at?: number | null;
+}
+
+export interface RunRoleObservability {
+  role: "reason" | "worker" | "review" | "observer" | "titler" | string;
+  configured: RunBindingRef;
+  frozen: RunBindingRef;
+  effective: RunBindingRef;
+  configured_source?: string;
+  effective_source: string;
+  fallback_candidate?: RunBindingRef | string;
+  fallback?: RunBindingRef;
+  recovery?: Array<{
+    kind: string;
+    attempt: number;
+    window_s: number;
+    probe?: { ok?: boolean; error_layer?: string; detail?: string };
+    blocked?: boolean;
+    blocked_reason?: string;
+    reason?: string;
+    ts?: number;
+  }>;
+  operator_attention?: boolean;
+  status: "active" | "ready" | "degraded" | "fallback_active" | "blocked" | "unconfigured" | string;
+  usage: RunRoleUsage;
+  issues: RunHealthIssue[];
+}
+
+export interface RunHealthIssue {
+  kind: string;
+  role?: string;
+  category: string;
+  severity: string;
+  retryable: boolean;
+  provider?: string;
+  message?: string;
+  suggested_action?: string;
+  ts?: number;
+}
+
+/** Host-owned Reason health (docs/17 §5.4/§5.5). Counts and thresholds only —
+ *  never provider exception text. */
+export interface RunReasonHealth {
+  state: "healthy" | "degraded" | "retrying" | "circuit_open" | "reason_blocked" | "waiting_for_operator" | "unknown" | string;
+  failures: number;
+  max_failures: number;
+  request_failures: number;
+  request_limit: number;
+  retry_window_s: number;
+  operator_attention: boolean;
+  immediate: boolean;
+  fallback_active: boolean;
+  blocked_reason: string;
+  ts: number;
+  retry_not_before?: number;
+}
+
+export interface RunObservabilitySnapshot {
+  run_id: string;
+  generated_at: number;
+  lifecycle: {
+    status: string;
+    started_at?: number | null;
+    finished_at?: number | null;
+    elapsed_ms: number;
+    updated_at?: number | null;
+  };
+  knowledge: {
+    inherited: Array<{
+      fact_id: string;
+      fact: string;
+      provenance_status: string;
+      source_run_id?: string;
+      fact_seq?: number;
+      artifact_id?: string;
+    }>;
+    source: string;
+    read_only: boolean;
+  };
+  binding: {
+    version?: number | null;
+    frozen: boolean;
+    source: string;
+    roles: RunRoleObservability[];
+    review_policy?: RunBindingRef;
+  };
+  usage: RunRoleUsage;
+  health: {
+    status: string;
+    issues: RunHealthIssue[];
+    degraded: Array<{ role?: string; engine?: string; reason?: string; ts?: number }>;
+    reason?: RunReasonHealth;
+  };
+}
+
+export async function fetchRunObservability(runId: string, signal?: AbortSignal): Promise<RunObservabilitySnapshot> {
+  const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/observability`, { signal });
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) throw new Error(String(data?.detail || `observability request failed (${res.status})`));
+  return data as RunObservabilitySnapshot;
+}
+
+export function useRunObservability(runId: string, pollMs = 4000) {
+  const [snapshot, setSnapshot] = useState<RunObservabilitySnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    if (!runId || isDraftRunId(runId)) return null;
+    setLoading(true);
+    try {
+      const next = await fetchRunObservability(runId, signal);
+      if (!signal?.aborted) { setSnapshot(next); setError(null); }
+      return next;
+    } catch (err) {
+      if (!signal?.aborted) setError(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, [runId]);
+
+  useEffect(() => {
+    if (!runId || isDraftRunId(runId)) {
+      setSnapshot(null); setError(null); setLoading(false); return;
+    }
+    const controller = new AbortController();
+    let alive = true;
+    const poll = async () => { if (alive) await refresh(controller.signal); };
+    void poll();
+    const timer = window.setInterval(() => void poll(), Math.max(1000, pollMs));
+    return () => { alive = false; controller.abort(); window.clearInterval(timer); };
+  }, [runId, pollMs, refresh]);
+
+  return { snapshot, loading, error, refresh };
+}
 export function useRuntimePools(runId: string, pollMs = 4000) {
   const [snapshot, setSnapshot] = useState<RuntimePoolsSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
@@ -247,30 +390,84 @@ export function useRuntimePools(runId: string, pollMs = 4000) {
   return { snapshot, loading, error, refresh };
 }
 
+/**
+ * Public, non-secret binding metadata frozen when a Run is launched.
+ *
+ * The backend deliberately returns references (provider/model/profile) rather
+ * than credentials. Keep this type permissive because old Runs may have no
+ * snapshot and newer adapters can add display-only fields without breaking the
+ * deck.
+ */
+export type RunBindingRef = Record<string, unknown>;
+
+export interface RunBindingSnapshot {
+  version?: number;
+  worker_profile?: RunBindingRef;
+  worker_profiles?: RunBindingRef[];
+  roles?: {
+    reason?: RunBindingRef;
+    worker?: RunBindingRef;
+    review?: RunBindingRef;
+    observer?: RunBindingRef;
+    titler?: RunBindingRef;
+    [key: string]: RunBindingRef | undefined;
+  };
+  llm_mode?: "settings_default" | "per_run_override" | string;
+  role_sources?: Record<string, string>;
+  effective_sources?: Record<string, string>;
+  fallback_candidates?: Record<string, RunBindingRef | string>;
+  fallback?: Record<string, RunBindingRef>;
+  review_policy?: RunBindingRef;
+  [key: string]: unknown;
+}
+
 /** One run as the thread rail lists it (matches RunManager.Run.summary()). */
 export interface RunSummary {
   run_id: string;
   name: string;
   category: string;
+  target_id?: string | null;
+  target_name?: string | null;
+  target_category?: string | null;
+  direction_id?: string | null;
+  direction?: string | null;
+  inherited_verified_facts?: Array<{
+    fact_id: string;
+    fact: string;
+    provenance_status: string;
+    source_run_id?: string;
+    fact_seq?: number;
+    artifact_id?: string;
+  }>;
+  inherited_verified_fact_count?: number;
+  /** Immutable launch configuration; never contains API keys or tokens. */
+  binding_snapshot?: RunBindingSnapshot | null;
+  /** Non-secret integrity diagnostics for legacy/imported Target relationships. */
+  dispatch_diagnostics?: string[];
   started: boolean;
   finished: boolean;
   solved: boolean;
   paused: boolean;
   status: RunStatus;
+  reason_blocked?: boolean;
+  reason_blocked_reason?: string;
+  degraded?: boolean;
+  degraded_reason?: string;
+  fallback_active?: boolean;
+  fallback_reason?: string;
   queued?: boolean;
   queue_position?: number | null;
   cancelled?: boolean;
   flag?: string | null;
   // multi-flag progress (backend summary already sends these; the Run Fleet
   // rows render "flags x/y" from them). Unauthenticated list responses REDACT
-  // the values (containment) — flag_count carries the count instead.
+  // the values (contain flag_count instead).
   flag_count?: number;
   flags?: string[];
   expected_flags?: number;
   multi_flag?: boolean;
-  // HITL attention signal: a worker is waiting on an operator answer. Drives the
-  // Fleet "Needs Attention" filter + badge (docs/07 §5.2).
   awaiting_help?: boolean;
+  failure_reason?: string | null;
   help_text?: string;
   pinned: boolean;
   pinned_at?: number | null;
@@ -279,6 +476,12 @@ export interface RunSummary {
   order: number;
   updated: number;
   updated_at?: number;
+}
+
+export function hasTargetDispatchMismatch(run?: Pick<RunSummary, "dispatch_diagnostics"> | null): boolean {
+  return Boolean(run?.dispatch_diagnostics?.some((code) =>
+    code === "target_challenge_mismatch" || code === "target_binding_mismatch"
+  ));
 }
 
 /** An operator-created rail folder (sessions/_folders.json). */
@@ -292,7 +495,7 @@ export interface Folder {
  * Subscribe to a run's SSE event stream and fold it into DeckState. Reconnects
  * with Last-Event-ID (the browser EventSource sets this automatically on
  * reconnect, and our backend honors it). The conversation-first deck swaps
- * `runId` when the operator opens a new solve —the stream re-subscribes and the
+ * `runId` when the operator opens a new solve 鈥攖he stream re-subscribes and the
  * deck resets. Returns the live deck + controls.
  */
 export function useRun(runId: string) {
@@ -306,7 +509,7 @@ export function useRun(runId: string) {
     setDeck(emptyDeck(runId));
     setConnected(false);
     // runId is briefly "" on first mount (the page mints the real draft id in a
-    // post-hydration effect to avoid an SSR/client random-id mismatch). No id →
+    // post-hydration effect to avoid an SSR/client random-id mismatch). No id 鈫?
     // no stream to open; the next runId change re-runs this.
     //
     // Draft ids are local UI placeholders. Opening an EventSource for them creates
@@ -326,7 +529,7 @@ export function useRun(runId: string) {
 
     // EventSource can't send an Authorization header, so when auth is on we mint
     // a one-time ticket first and pass it as ?ticket=. authTicket() returns ""
-    // when auth is disabled (or on failure) —then we open the stream plainly,
+    // when auth is disabled (or on failure) 鈥攖hen we open the stream plainly,
     // exactly as before. `cancelled` guards the await: if runId changes (or the
     // component unmounts) before the ticket resolves, we must not open a now-
     // orphaned EventSource.
@@ -340,7 +543,7 @@ export function useRun(runId: string) {
       es.onopen = () => setConnected(true);
       es.onerror = () => setConnected(false);
       // listen to all known event names plus the default. Derived directly from
-      // the EventType enum (single source of truth) —a hand-copied list silently
+      // the EventType enum (single source of truth) 鈥攁 hand-copied list silently
       // dropped any newly-added SSE event whose name was forgotten.
       Object.values(EventType).forEach((name) => es.addEventListener(name, handler as EventListener));
       es.onmessage = handler;
@@ -384,44 +587,53 @@ export function useRun(runId: string) {
   );
 
   const sendHitl = useCallback(
-    async (target: string, action: string, text: string, opts?: { preemption?: string }) => {
-      // A redirect can carry a NEW target URL ("the challenge moved here") —pull
-      // the first URL out of the text and send it as `url` so the worker retargets
-      // its next turn. A message prefixed with "standing:" (or 常驻:) is persistent
-      // background guidance (VPS/SSH creds) injected into every future worker.
-      const body: Record<string, unknown> = { target, action, text };
-      // B: an explicit directive carries a preemption policy (how aggressively it
-      // overrides in-flight work). Default soft_rebind (rebind next batch, no kill).
+    async (
+      target: string,
+      action: string,
+      text: string,
+      opts?: { preemption?: string; recipients?: string[]; clientRequestId?: string },
+    ): Promise<boolean> => {
+      // A command is always scoped to this Run.  Keep the legacy `target`
+      // spelling for older servers, while new servers receive an explicit
+      // recipient list and idempotency key.
+      const normalizedRecipients = (opts?.recipients?.length
+        ? opts.recipients
+        : target.split(",").map((item) => item.trim()).filter(Boolean))
+        .map((item) => item === "global" ? "all" : item);
+      const body: Record<string, unknown> = {
+        run_id: runId,
+        target: target || "global",
+        recipients: normalizedRecipients.length ? normalizedRecipients : ["all"],
+        action,
+        text,
+        client_request_id: opts?.clientRequestId
+          || (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID() : `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+      };
       if (opts?.preemption) body.preempt_policy = opts.preemption;
-      if (action === "directive" && !opts?.preemption) body.preempt_policy = "soft_rebind";
       const m = text.match(/https?:\/\/[^\s"'<>]+/);
       if ((action === "redirect" || action === "directive") && m) body.url = m[0].replace(/[.,;)]+$/, "");
-      // Explicit "standing:" / "常驻:" prefix →persistent guidance.
       const sm = text.match(/^\s*(standing|常驻|standing guidance)\s*[:：]\s*(.*)$/i);
       if (sm) { body.standing = true; body.text = sm[2]; }
-      if (action === "mark_false" && text.trim()) {
-        body.flag = text.trim();
-      }
-      // Auto-detect: a hint that hands over a RESOURCE (VPS / SSH / creds / a
-      // reverse-shell host) is almost always meant to apply to ALL workers for the
-      // rest of the run, not just the one turn —mark it standing so late-spawned
-      // workers inherit it too (operators kept forgetting the "standing:" prefix and
-      // the VPS hint never reached new workers). Heuristic, conservative: only fires
-      // on clear resource-handover signals.
-      else if (action === "hint" &&
-               /\b(ssh|vps|鍙嶅脊|reverse[- ]?shell|root@|绔彛杞彂|port[- ]?forward|credential|鍑瘉|璐﹀彿|瀵嗙爜|password|璺虫澘|涓浆)\b/i.test(text)) {
+      else if (action === "hint" && /\b(ssh|vps|reverse[- ]?shell|root@|port[- ]?forward|credential|password)\b/i.test(text)) {
         body.standing = true;
       }
-      await apiFetch(`/api/runs/${runId}/hitl`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      if (action === "mark_false" && text.trim()) body.flag = text.trim();
+      try {
+        const response = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/hitl`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return response.ok;
+      } catch {
+        return false;
+      }
     },
     [runId]
   );
 
-  // "缁х画鍋氶": relaunch the FULL swarm on a finished run (reuses its workspace so
+  // "缂佈呯敾閸嬫岸顣?: relaunch the FULL swarm on a finished run (reuses its workspace so
   // verified facts carry over). Optional `text` folds an operator hint into the
   // re-solve's challenge description.
   const resolve = useCallback(
@@ -462,13 +674,13 @@ export function useRunList(pollMs = 4000, bump = 0) {
       const timeout = window.setTimeout(() => ctrl.abort(), Math.max(3000, Math.min(10000, pollMs * 2)));
       try {
         // ?archived=1 returns ALL runs (archived + active) so the rail can render
-        // its Archived section —without it the backend hides archived rows and
+        // its Archived section 鈥攚ithout it the backend hides archived rows and
         // the section is always empty (the archive-view bug).
         const r = await apiFetch(`/api/runs?archived=1`, { signal: ctrl.signal });
         const j = await r.json();
         if (alive) setRuns(j.runs ?? []);
       } catch {
-        /* offline —keep last list */
+        /* offline 鈥攌eep last list */
       } finally {
         window.clearTimeout(timeout);
         if (inFlight === ctrl) inFlight = null;
@@ -496,7 +708,7 @@ export interface SavedFile {
 
 /**
  * Upload challenge files into a run's folder (sessions/{runId}/uploads/). Posts
- * multipart/form-data —do NOT set Content-Type, the browser adds the boundary.
+ * multipart/form-data 鈥攄o NOT set Content-Type, the browser adds the boundary.
  * The form field name ("files") MUST match the endpoint's `files` param. Returns
  * the saved files (with absolute paths) to thread into challenge.attachments at
  * dispatch. Returns [] on any failure (the deck just shows no chips).
@@ -619,8 +831,8 @@ export async function startStartupTest(options: StartupTestOptions = {}): Promis
   return j.test_id;
 }
 
-/** Operator rail mutations —pin/unpin, archive/unarchive, rename, move to a
- *  folder (folder_id=null →top-level), drag-order. */
+/** Operator rail mutations 鈥攑in/unpin, archive/unarchive, rename, move to a
+ *  folder (folder_id=null 鈫抰op-level), drag-order. */
 export async function patchRun(
   runId: string,
   patch: { pinned?: boolean; archived?: boolean; name?: string; folder_id?: string | null; order?: number }
@@ -637,21 +849,22 @@ export async function patchRun(
   }
 }
 
-/** Hard-delete a run (irreversible —the caller confirms first). */
+/** Hard-delete a Run (irreversible — the caller confirms first). */
 export async function deleteRun(runId: string): Promise<boolean> {
   try {
-    const r = await apiFetch(`/api/runs/${runId}`, { method: "DELETE" });
-    return r.ok;
+    const response = await apiFetch(`/api/runs/${runId}`, { method: "DELETE" });
+    const payload = await response.json().catch(() => ({} as { ok?: boolean }));
+    return response.ok && payload.ok === true;
   } catch {
     return false;
   }
 }
 
-/** Re-apply the rail naming rule ({category}-{url|attachment|题目}) to an
- *  EXISTING run from its remembered dispatch. Deterministic rule hits (web→URL
- *  host, rev/crypto/forensics/misc→attachment) return the new name immediately;
- *  anything else (pwn → 题目名) is named by the background titler LLM and comes
- *  back pending —the rail poll picks the rename up when it lands. */
+/** Re-apply the rail naming rule ({category}-{url|attachment|棰樼洰}) to an
+ *  EXISTING run from its remembered dispatch. Deterministic rule hits (web鈫扷RL
+ *  host, rev/crypto/forensics/misc鈫抋ttachment) return the new name immediately;
+ *  anything else (pwn 鈫?棰樼洰鍚? is named by the background titler LLM and comes
+ *  back pending 鈥攖he rail poll picks the rename up when it lands. */
 export async function retitleRun(
   runId: string,
 ): Promise<{ ok: boolean; name: string | null; pending: boolean; detail?: string }> {
@@ -665,7 +878,7 @@ export async function retitleRun(
   }
 }
 
-// ── engine status ────────────────────────────────────────────────────────────
+// 鈹€鈹€ engine status 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /** Deep per-engine self-check result (FE-healthcheck-page). */
 export interface EngineHealth {
@@ -676,13 +889,13 @@ export interface EngineHealth {
   detail: string;
   backend?: string;
   /** Where the bin path came from: "env" (pinned via DSWARM_<E>_BIN), "known-good",
-   *  "path" (auto-discovered on PATH —may be the wrong version), or "fallback". */
+   *  "path" (auto-discovered on PATH 鈥攎ay be the wrong version), or "fallback". */
   bin_source?: "env" | "known-good" | "path" | "fallback";
   /** The env var that pins this engine's bin (e.g. DSWARM_PI_BIN). */
   bin_env?: string;
 }
 
-/** Run the DEEP self-check (slow —exercises auth). `backend` picks local (host
+/** Run the DEEP self-check (slow 鈥攅xercises auth). `backend` picks local (host
  *  CLI + auth) vs container (docker run --rm: image + CLI launchable inside the
  *  worker image). On-demand, not polled. */
 export async function getEngineHealth(backend: "local" | "container" = "local"): Promise<EngineHealth[]> {
@@ -696,7 +909,7 @@ export async function getEngineHealth(backend: "local" | "container" = "local"):
 }
 
 
-// ── rail folders (FE-session-folder) ────────────────────────────────────────
+// 鈹€鈹€ rail folders (FE-session-folder) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 export async function listFolders(): Promise<Folder[]> {
   try {
@@ -762,7 +975,7 @@ export function useFolders(pollMs = 8000, bump = 0): Folder[] {
   return folders;
 }
 
-// ── worker-roster management (BE-worker-management) ─────────────────────────
+// 鈹€鈹€ worker-roster management (BE-worker-management) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /** The default worker roster the dispatch path falls back to. Mirrors the
  *  backend WorkerConfigStore (apps/web/worker_config.py). */
@@ -775,7 +988,7 @@ export type ReasonLlmProfile = {
   timeout?: number;
   credential_source?: "auto" | "env" | "account" | string;
   credential_account?: string;
-  wire_api?: "auto" | "openai" | "openai-chat" | "openai-responses" | string;
+  wire_api?: "auto" | "openai" | "openai-chat" | "openai-responses" | "anthropic" | string;
 };
 
 export interface ReasonLlmProbe {
@@ -860,6 +1073,12 @@ export interface WorkerSettings {
   llm_providers: LLMProvider[];
   llm_profiles: {
     planner: ReasonLlmProfile;
+    /** Product-facing alias; backend mirrors this into planner for compatibility. */
+    reason?: ReasonLlmProfile;
+    worker?: ReasonLlmProfile;
+    review?: ReasonLlmProfile;
+    observer?: ReasonLlmProfile;
+    observer_fallback?: ReasonLlmProfile;
     titler: ReasonLlmProfile;
   };
   runtime_profiles: {
@@ -1070,7 +1289,7 @@ export async function probeWorkerEndpoint(
       signal: AbortSignal.timeout(60_000),
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) return { ok: false, detail: String(j?.detail ?? "连接测试失败。"), models: [] };
+    if (!r.ok) return { ok: false, detail: String(j?.detail ?? "Connection test failed."), models: [] };
     return {
       ok: Boolean(j?.ok),
       detail: String(j?.detail ?? ""),
@@ -1084,7 +1303,7 @@ export async function probeWorkerEndpoint(
       model_probe: j?.model_probe,
     };
   } catch (error) {
-    return { ok: false, detail: `连接测试失败：${String(error)}`, models: [] };
+    return { ok: false, detail: `Connection test failed: ${String(error)}`, models: [] };
   }
 }
 
@@ -1102,7 +1321,7 @@ export async function getWorkerModelOptions(): Promise<WorkerModelOptions> {
   }
 }
 
-// ── P2-v3: worker image health (daemon / pulled / version) ──────────────────
+// 鈹€鈹€ P2-v3: worker image health (daemon / pulled / version) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 export type WorkerImageStatus = {
   image: string;
   daemon: { ok: boolean; detail: string };
@@ -1154,7 +1373,7 @@ export async function testWorkerProfileModel(
   }
 }
 
-// ── per-profile health (single source of truth shared with the dispatch precheck) ──
+// 鈹€鈹€ per-profile health (single source of truth shared with the dispatch precheck) 鈹€鈹€
 export type ProfileHealth = {
   profile_id: string;
   engine: string;
@@ -1165,17 +1384,17 @@ export type ProfileHealth = {
   detail: string;
   model: string;
   account_id: string;
-  // SINGLE SOURCE OF TRUTH for "bound?" —read these instead of the literal
-  // credential_account field (which caused the "鏈粦瀹?vs 宸茬粦瀹? contradiction).
-  // explicit = profile named the account; inherited = empty →fell back to the
-  // default/host login (show "鑷姩: <id>", NOT "鏈粦瀹?); missing = no credential.
+  // SINGLE SOURCE OF TRUTH for "bound?" 鈥攔ead these instead of the literal
+  // credential_account field (which caused the "閺堫亞绮︾€?vs 瀹歌尙绮︾€? contradiction).
+  // explicit = profile named the account; inherited = empty 鈫抐ell back to the
+  // default/host login (show "閼奉亜濮? <id>", NOT "閺堫亞绮︾€?); missing = no credential.
   binding_kind?: "explicit" | "inherited" | "missing";
   effective_credential_id?: string;
 };
 
 /** Batch readiness for every profile at the CHEAP binding depth (zero network /
- *  zero docker) —drives the settings badge + account rows. Backend is resolved
- *  server-side (same per-profile runtime→backend mapping dispatch uses). */
+ *  zero docker) 鈥攄rives the settings badge + account rows. Backend is resolved
+ *  server-side (same per-profile runtime鈫抌ackend mapping dispatch uses). */
 export async function fetchProfilesHealth(): Promise<ProfileHealth[]> {
   try {
     const r = await apiFetch(`/api/settings/profiles/health`);
@@ -1187,13 +1406,13 @@ export async function fetchProfilesHealth(): Promise<ProfileHealth[]> {
   }
 }
 
-/** DEEP probe for one profile ("测试连通): binding + (container) plumbing + a real
+/** DEEP probe for one profile ("娴嬭瘯杩為€?: binding + (container) plumbing + a real
  *  auth hello with the profile's pinned model. A green here matches the dispatch
  *  precheck, so the run won't die on profile_unhealthy. */
 export async function testProfileHealth(profileId: string): Promise<ProfileHealth | null> {
   try {
     // A container deep-probe (docker run + real one-turn hello) can take ~60-120s
-    // on a cold container start; cap it so "测试中… can't hang forever (no
+    // on a cold container start; cap it so "娴嬭瘯涓€?can't hang forever (no
     // client timeout was the reason the button spun indefinitely on a slow probe).
     const r = await apiFetch(`/api/settings/profiles/${encodeURIComponent(profileId)}/health`, {
       method: "POST",
@@ -1228,7 +1447,7 @@ export async function putCredentialAccount(
       body: JSON.stringify(body),
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) return { ok: false, detail: String(j?.detail ?? "save failed") };
+    if (!r.ok) return { ok: false, detail: String(j?.detail ?? "Save failed.") };
     return { ok: true, account: (j.account ?? null) as CredentialAccount | undefined };
   } catch {
     return { ok: false, detail: "save failed" };
@@ -1278,7 +1497,7 @@ export async function probeLlmProvider(
       signal: AbortSignal.timeout(60_000),
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) return { ok: false, detail: String(j?.detail ?? "连接测试失败。"), models: [] };
+    if (!r.ok) return { ok: false, detail: String(j?.detail ?? "Connection test failed."), models: [] };
     return {
       ok: Boolean(j?.ok),
       detail: String(j?.detail ?? ""),
@@ -1292,12 +1511,12 @@ export async function probeLlmProvider(
       model_probe: j?.model_probe,
     };
   } catch (error) {
-    return { ok: false, detail: `连接测试失败：${String(error)}`, models: [] };
+    return { ok: false, detail: `Connection test failed: ${String(error)}`, models: [] };
   }
 }
 
 export async function testLlmEndpoint(
-  which: "planner" | "titler",
+  which: "planner" | "review" | "observer" | "observer_fallback" | "titler",
   profile: ReasonLlmProfile
 ): Promise<ReasonLlmProbe> {
   const model = String(profile.model || "");
@@ -1330,13 +1549,13 @@ export async function testLlmEndpoint(
       layers: Array.isArray(j.layers) ? j.layers : [],
     };
   } catch (e) {
-    const msg = (e as Error)?.name === "TimeoutError" ? "测试超时（120s）" : String(e);
+    const msg = (e as Error)?.name === "TimeoutError" ? "Test timed out (120s)" : String(e);
     return { ok: false, code: "client_error", detail: msg, model, layers: [] };
   }
 }
 
-/** Test a registered credential account. local →host probe with the account's
- *  env; container →real `docker run --rm` plumbing test. Never host-fallback. */
+/** Test a registered credential account. local 鈫抙ost probe with the account's
+ *  env; container 鈫抮eal `docker run --rm` plumbing test. Never host-fallback. */
 export async function testCredentialAccount(
   accountId: string,
   engine: string,
@@ -1349,17 +1568,15 @@ export async function testCredentialAccount(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ engine, backend }),
-        // cap the wait —a container probe + cold hello can be slow, but the
-        // button must never spin forever (the "测试中… hang).
+        // cap the wait 鈥攁 container probe + cold hello can be slow, but the
+        // button must never spin forever (the "娴嬭瘯涓€?hang).
         signal: AbortSignal.timeout(180_000),
       }
     );
     const j = await r.json().catch(() => ({}));
     return { ok: !!j.ok, detail: String(j.detail ?? ""), layer: j.layer };
   } catch (e) {
-    const msg = (e as Error)?.name === "TimeoutError"
-      ? "测试超时（180s）——容器探测或冷启动较慢，请重试或检查引擎状态"
-      : String(e);
+    const msg = (e as Error)?.name === "TimeoutError" ? "Test timed out (180s); container probe or cold start may be slow. Retry or check engine status." : String(e);
     return { ok: false, detail: msg };
   }
 }
@@ -1384,7 +1601,7 @@ export async function putRuntimeEnvironment(
 }
 
 /** Operator runtime control: add a worker for an engine to a LIVE run
- *  (omit engine →the backend planner picks). */
+ *  (omit engine 鈫抰he backend planner picks). */
 export async function spawnWorker(runId: string, engine?: string): Promise<boolean> {
   try {
     const r = await apiFetch(`/api/runs/${runId}/workers`, {
@@ -1414,22 +1631,31 @@ export async function killWorker(runId: string, solverId: string): Promise<boole
   }
 }
 
-/**
- * Run-id-parametrized HITL post —the batch Fleet controls (pause / resume /
- * stop across a selection) fan out through this, one call per run, reusing the
- * existing single-run API (docs/07 §5.2: no API change for batch ops).
- */
+/** Run-id-parametrized HITL post for fleet controls. */
 export async function sendRunHitl(
   runId: string,
   action: string,
   text = "",
   target = "global",
+  recipients?: string[],
 ): Promise<boolean> {
   try {
-    const r = await apiFetch(`/api/runs/${runId}/hitl`, {
+    const normalizedRecipients = (recipients?.length
+      ? recipients
+      : target.split(",").map((item) => item.trim()).filter(Boolean))
+      .map((item) => item === "global" ? "all" : item);
+    const r = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/hitl`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target, action, text }),
+      body: JSON.stringify({
+        run_id: runId,
+        target: target || "global",
+        recipients: normalizedRecipients.length ? normalizedRecipients : ["all"],
+        action,
+        text,
+        client_request_id: typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID() : `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      }),
     });
     return r.ok;
   } catch {

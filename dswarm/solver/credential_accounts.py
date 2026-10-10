@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import warnings
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -536,79 +536,3 @@ def ensure_pi_account_from_env(
         store.upsert_secret(account_id=account_id, engine="pi", secret=key)
         created = True
     return created
-
-
-# Filenames whose containing dir must be WRITABLE inside the container so the CLI
-# can refresh state in place. pi's key file is read-only for the worker.
-_WRITABLE_STATE_DIRS = ()
-
-
-def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:
-    """Stage a container-READABLE projection of the account store (#14, #15).
-
-    The host account store holds 0600 files owned by the host user; a container
-    worker runs as a different uid ('kali') and cannot read them through a plain
-    read-only bind mount (#15).
-
-    This copies the store into `dest_root` (a per-run, gitignored, ephemeral dir
-    under the run workspace) with permissions the container user can use:
-      - static secret files (API keys) → 0644 (readable, not writable by the
-        worker — the worker only reads them).
-    The HOST store is never modified and never made world-writable; this projection
-    is the only thing the container sees. Returns dest_root.
-    """
-    warnings.warn(
-        "legacy broad credential projection; use CredentialProjector",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    src = Path(src_root)
-    dest = Path(dest_root)
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    dest.mkdir(parents=True, exist_ok=True)
-    # This projection is intentionally container-readable. On native Windows,
-    # chmod is best-effort and host staging is not a security boundary.
-    try:
-        os.chmod(dest, 0o755)
-    except OSError:
-        pass
-    if not src.exists():
-        return dest
-    for account_dir in sorted(p for p in src.iterdir() if p.is_dir()):
-        if not valid_account_id(account_dir.name):
-            continue
-        out_account = dest / account_dir.name
-        out_account.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(out_account, 0o755)
-        except OSError:
-            pass
-        for item in account_dir.iterdir():
-            target = out_account / item.name
-            if item.is_dir():
-                writable = item.name in _WRITABLE_STATE_DIRS
-                shutil.copytree(item, target, dirs_exist_ok=True)
-                _chmod_tree(target, dir_mode=0o777 if writable else 0o755,
-                            file_mode=0o666 if writable else 0o644)
-            elif item.is_file():
-                shutil.copy2(item, target)
-                try:
-                    os.chmod(target, 0o644)
-                except OSError:
-                    pass
-    return dest
-
-
-def _chmod_tree(root: Path, *, dir_mode: int, file_mode: int) -> None:
-    # Permission modes remain functional metadata for the Linux container;
-    # native Windows hosts cannot provide equivalent owner/group isolation.
-    for p in root.rglob("*"):
-        try:
-            os.chmod(p, dir_mode if p.is_dir() else file_mode)
-        except OSError:
-            pass
-    try:
-        os.chmod(root, dir_mode)
-    except OSError:
-        pass

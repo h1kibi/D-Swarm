@@ -21,12 +21,14 @@ import secrets
 import shutil
 import tarfile
 import time
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from apps.web.provider_errors import ProviderErrorAggregator, classify_provider_error
 from apps.web.run_meta import FolderStore, RunMetaStore
+from apps.web.targets import TargetStore
 from apps.web.worker_config import WorkerConfigStore, resolve_worker_backend
 from dswarm.core.cost import CostController
 from dswarm.core.event_bus import EventBus
@@ -54,6 +56,18 @@ from dswarm.solver.worker_profiles import normalize_profile_roster, profile_uses
 from dswarm.swarm.poc_verification import sanitize_public_text
 
 LOG = logging.getLogger(__name__)
+
+
+class TargetDispatchMismatchError(ValueError):
+    """A historical Run cannot be resumed under its current Target card."""
+
+    code = "target_dispatch_mismatch"
+    safe_detail = "historical dispatch binding does not match the current Target; create a new Target Run"
+
+    def __init__(self, diagnostics: Sequence[str] = ()) -> None:
+        self.diagnostics = tuple(str(item) for item in diagnostics if str(item))
+        super().__init__(self.code)
+
 
 
 _SECRET_ASSIGNMENT_RE = re.compile(
@@ -99,6 +113,337 @@ def _selected_roster(engines: Any, worker_profiles: list[dict]) -> list[dict]:
     return [by_name[n] for n in names if n in by_name]
 
 
+def _binding_scalar(value: Any) -> Any:
+    """Keep binding snapshots JSON-safe and free of credential material."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _safe_transport_url(value: Any) -> str:
+    """Keep only a routable, non-secret provider endpoint in a Run snapshot.
+
+    Query strings/fragments and URL userinfo are excluded because operators
+    occasionally paste signed or key-bearing URLs into custom relay settings.
+    The path is retained (for example ``/v1``) because it is part of routing,
+    not credential material.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        # Accessing .port validates malformed/out-of-range ports. Rebuild the
+        # authority from hostname/port instead of reusing parsed.netloc: the
+        # latter includes URL userinfo and could persist a pasted credential.
+        port = parsed.port
+        hostname = parsed.hostname
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        safe_netloc = hostname if port is None else f"{hostname}:{port}"
+        path = parsed.path.rstrip("/") or "/"
+        return urlunsplit((parsed.scheme, safe_netloc, path, "", "")).rstrip("/")
+    except ValueError:
+        return ""
+
+
+def _public_binding(value: Any, key: str = "") -> Any:
+    """Redact a provider/profile binding without losing operator-visible shape."""
+    lowered = key.lower().replace("-", "_")
+    secret_words = ("api_key", "apikey", "access_token", "refresh_token", "secret", "password", "passwd", "authorization", "private_key")
+    # Bare/qualified token keys are credential material too; do not mistake
+    # descriptive fields such as ``token_budget`` for a secret.
+    if (
+        lowered == "token"
+        or lowered.endswith("_token")
+        or any(word in lowered for word in secret_words)
+    ):
+        return None
+    if lowered in {"base_url", "endpoint", "url"}:
+        safe_url = _safe_transport_url(value)
+        return safe_url or None
+    if isinstance(value, Mapping):
+        out = {}
+        for raw_key, raw_value in value.items():
+            clean_value = _public_binding(raw_value, str(raw_key))
+            if clean_value is not None:
+                out[str(raw_key)] = clean_value
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_public_binding(item, key) for item in value]
+    return _binding_scalar(value)
+
+
+def _binding_fields(profile: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project one configured profile to the immutable, non-secret Run DTO."""
+    if not isinstance(profile, Mapping):
+        return {}
+    keys = (
+        "id", "name", "label", "engine", "transport", "runtime", "image",
+        "provider_ref", "provider", "model", "base_url", "wire_api",
+        "auth_mode", "auth_header", "auth_prefix", "effort",
+        "credential_account",
+    )
+    out: dict[str, Any] = {}
+    for key in keys:
+        if profile.get(key) in (None, ""):
+            continue
+        value = _safe_transport_url(profile[key]) if key == "base_url" else _binding_scalar(profile[key])
+        if value not in (None, ""):
+            out[key] = value
+    return out
+
+
+def _role_binding(raw: Any, *, fallback: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    value = dict(raw) if isinstance(raw, Mapping) else {}
+    if fallback:
+        merged = dict(fallback)
+        merged.update(value)
+        value = merged
+    allowed = (
+        "provider", "provider_ref", "model", "base_url", "wire_api",
+        "auth_mode", "auth_header", "auth_prefix", "effort", "timeout",
+        "credential_source", "credential_account",
+    )
+    out: dict[str, Any] = {}
+    for key in allowed:
+        if key not in value or value[key] in (None, ""):
+            continue
+        clean = (
+            _safe_transport_url(value[key])
+            if key == "base_url"
+            else _binding_scalar(value[key])
+        )
+        if clean not in (None, ""):
+            out[key] = clean
+    return out
+
+
+def _provider_transport_descriptor(provider_ref: Any, providers: Any) -> dict[str, Any]:
+    """Copy only non-secret transport metadata into a Run binding snapshot.
+
+    A provider id alone is not enough to recover a Run after the settings entry
+    is edited or deleted.  The endpoint/protocol are safe display metadata; the
+    credential remains exclusively in the provider secret store and is resolved
+    only when a new worker token is minted.
+    """
+    ref = str(provider_ref or "").strip()
+    if not ref or not isinstance(providers, (list, tuple)):
+        return {}
+    provider = next((item for item in providers
+                     if isinstance(item, Mapping) and str(item.get("id") or "").strip() == ref), None)
+    if provider is None:
+        return {}
+    allowed = ("base_url", "wire_api", "auth_mode", "auth_header", "auth_prefix")
+    out: dict[str, Any] = {}
+    for key in allowed:
+        if provider.get(key) in (None, ""):
+            continue
+        clean = _safe_transport_url(provider[key]) if key == "base_url" else _binding_scalar(provider[key])
+        if clean not in (None, ""):
+            out[key] = clean
+    return out
+
+
+def _freeze_role_transport(binding: dict[str, Any], providers: Any) -> dict[str, Any]:
+    """Enrich a redacted role binding without ever resolving or copying a key."""
+    if not isinstance(binding, dict):
+        return {}
+    ref = binding.get("provider_ref")
+    transport = _provider_transport_descriptor(ref, providers)
+    # Explicit role/profile values win, while registry metadata fills omitted
+    # fields.  This makes restart deterministic without changing legacy inputs.
+    return {**transport, **binding}
+def _runtime_credential_mode(profile: Mapping[str, Any]) -> str:
+    """Return the non-secret credential transport mode for a runtime profile."""
+    if profile.get("base_url"):
+        return "custom"
+    if profile.get("api_key_ref"):
+        return "direct"
+    return "gateway"
+
+
+def _runtime_worker_binding_fields(profile: Mapping[str, Any]) -> dict[str, Any]:
+    binding = _binding_fields(profile)
+    binding["runtime_credential_mode"] = _runtime_credential_mode(profile)
+    return binding
+
+
+def _runtime_provider_descriptors(
+    profiles: Sequence[Mapping[str, Any]], providers: Any,
+) -> list[dict[str, Any]]:
+    refs = dict.fromkeys(
+        str(profile.get("provider_ref") or "").strip()
+        for profile in profiles
+        if str(profile.get("provider_ref") or "").strip()
+    )
+    return [
+        {"id": provider_id, **_provider_transport_descriptor(provider_id, providers)}
+        for provider_id in refs
+    ]
+
+
+def build_binding_snapshot(body: Mapping[str, Any] | None, worker_config: Any) -> dict[str, Any]:
+    """Freeze effective role/profile references for one Run without secrets.
+
+    New launches use an explicit ``llm_mode`` plus ``llm_overrides`` contract.
+    The old ``llm_profiles`` request shape remains readable for imported/older
+    clients, but Titler is never a per-Run override and Observer is settings-only.
+    """
+    request = dict(body or {})
+    challenge = request.get("challenge") if isinstance(request.get("challenge"), Mapping) else {}
+    category = str(challenge.get("category") or "")
+    try:
+        config = worker_config.resolve(category) if category else worker_config.get()
+    except Exception:
+        config = worker_config.get() if worker_config is not None else {}
+    config = config if isinstance(config, Mapping) else {}
+    profiles = [p for p in (config.get("worker_profiles") or []) if isinstance(p, Mapping)]
+    requested = request.get("engines")
+    if not isinstance(requested, (list, tuple)):
+        requested = [request.get("worker_profile_id")] if request.get("worker_profile_id") else []
+    selected = _selected_roster(requested, [dict(p) for p in profiles])
+    selected_names = {str(p.get("name") or p.get("id")) for p in selected}
+    selected_profiles = [p for p in profiles if str(p.get("name") or p.get("id")) in selected_names]
+    if not selected_profiles:
+        selected_profiles = [p for p in profiles if p.get("enabled", True)][:1]
+    worker = selected_profiles[0] if selected_profiles else {}
+
+    configured_llm = config.get("llm_profiles") if isinstance(config.get("llm_profiles"), Mapping) else {}
+    configured_llm = dict(configured_llm)
+    mode_raw = request.get("llm_mode")
+    explicit_contract = mode_raw is not None or isinstance(request.get("llm_overrides"), Mapping)
+    mode = str(mode_raw or "settings_default").strip().lower()
+    if mode not in {"settings_default", "per_run_override"}:
+        mode = "settings_default"
+    overrides = request.get("llm_overrides") if isinstance(request.get("llm_overrides"), Mapping) else {}
+    # Compatibility: old callers sent all roles in llm_profiles. Treat those
+    # values as overrides only when the new explicit mode is absent.
+    if not explicit_contract:
+        legacy = request.get("llm_profiles") if isinstance(request.get("llm_profiles"), Mapping) else {}
+        overrides = dict(legacy)
+        mode = "per_run_override" if overrides else "settings_default"
+    else:
+        overrides = dict(overrides)
+
+    def _profile(key: str, *aliases: str) -> Mapping[str, Any]:
+        for candidate in (key, *aliases):
+            value = configured_llm.get(candidate)
+            if isinstance(value, Mapping):
+                return value
+        return {}
+
+    def _override(key: str, *aliases: str) -> Mapping[str, Any] | None:
+        if mode != "per_run_override":
+            return None
+        for candidate in (key, *aliases):
+            value = overrides.get(candidate)
+            if isinstance(value, Mapping):
+                return value
+        return None
+
+    def _effective(key: str, *aliases: str) -> tuple[dict[str, Any], str]:
+        default = _profile(key, *aliases)
+        override = _override(key, *aliases)
+        if override is not None:
+            return dict(override), "run_override"
+        return dict(default), "settings_default"
+
+    reason, reason_source = _effective("reason", "planner")
+    worker_llm, worker_source = _effective("worker")
+    # ``reviewer`` is the proposal spelling; ``review`` remains the persisted
+    # spelling used by existing settings and historical Runs.
+    review_llm, review_source = _effective("review", "reviewer")
+    # Observer and Titler are settings-only and can never be Run overrides.
+    observer_llm = dict(_profile("observer"))
+
+    titler_llm = dict(_profile("titler"))
+    observer_source = "settings_default"
+    titler_source = "settings_default"
+
+    review_policy = request.get("review_policy") if isinstance(request.get("review_policy"), Mapping) else config.get("review_policy") or {}
+    review_ref = str(review_policy.get("engine") or "").strip() if isinstance(review_policy, Mapping) else ""
+    review_profile = next(
+        (
+            p for p in profiles
+            if review_ref and review_ref in {
+                str(p.get("id") or ""), str(p.get("name") or ""), str(p.get("label") or "")
+            }
+        ),
+        None,
+    )
+    if not review_profile and selected_profiles:
+        review_profile = selected_profiles[0]
+    worker_binding = _freeze_role_transport(
+        _role_binding(worker_llm, fallback=_binding_fields(worker)), config.get("llm_providers"))
+    review_binding = _freeze_role_transport(
+        _role_binding(review_llm, fallback=_binding_fields(review_profile)), config.get("llm_providers"))
+    reason_binding = _freeze_role_transport(
+        _role_binding(reason), config.get("llm_providers"))
+    observer_binding = _freeze_role_transport(
+        _role_binding(observer_llm), config.get("llm_providers"))
+    titler_binding = _freeze_role_transport(
+        _role_binding(titler_llm), config.get("llm_providers"))
+    snapshot: dict[str, Any] = {
+        "version": 2 if explicit_contract else 1,
+        "worker_profile": _binding_fields(worker),
+        "worker_profiles": [_binding_fields(p) for p in selected_profiles],
+        "runtime_worker_profiles": [
+            _runtime_worker_binding_fields(p) for p in profiles
+        ],
+        "runtime_providers": _runtime_provider_descriptors(
+            profiles, config.get("llm_providers")
+        ),
+        "roles": {
+            "reason": reason_binding,
+            "worker": worker_binding,
+            "review": review_binding,
+            "observer": observer_binding,
+            "titler": titler_binding,
+        },
+        "review_policy": _public_binding(dict(review_policy)) if isinstance(review_policy, Mapping) else {},
+    }
+    # Keep settings-default transport bindings separate from configured/effective
+    # role bindings. Observer's fallback candidate is the explicit lightweight
+    # Observer binding, never Titler or Reason.
+    default_worker = _binding_fields(worker)
+    default_reason = _role_binding(_profile("reason", "planner"))
+    default_review = _role_binding(_profile("review"), fallback=_binding_fields(review_profile))
+    default_observer_fallback = _role_binding(_profile("observer_fallback"))
+    defaults = {
+        "reason": _freeze_role_transport(default_reason, config.get("llm_providers")),
+        "worker": _freeze_role_transport(
+            _role_binding(_profile("worker"), fallback=default_worker),
+            config.get("llm_providers"),
+        ),
+        "review": _freeze_role_transport(default_review, config.get("llm_providers")),
+        "observer": _freeze_role_transport(default_observer_fallback, config.get("llm_providers")),
+    }
+    snapshot.update({
+        "llm_mode": mode,
+        "role_sources": {
+            "reason": reason_source,
+            "worker": worker_source,
+            "review": review_source,
+            "observer": observer_source,
+            "titler": titler_source,
+        },
+        "effective_sources": {
+            "reason": reason_source,
+            "worker": worker_source,
+            "review": review_source,
+            "observer": observer_source,
+            "titler": titler_source,
+        },
+        "fallback_candidates": {
+            role: dict(binding) for role, binding in defaults.items()
+        },
+        "fallback": defaults,
+    })
+
+    return snapshot
 def merge_resolve_dispatch(
     saved: dict[str, Any] | None,
     body: dict[str, Any] | None,
@@ -133,6 +478,15 @@ def merge_resolve_dispatch(
     else:
         challenge.pop("direction", None)
     merged = {**saved_body, **request_body, "challenge": challenge}
+    # A Run is an execution snapshot, not a live view of global settings. Once
+    # the first launch captured bindings, /resolve may update the operator
+    # prompt/direction but must reuse the original worker/provider/runtime seats.
+    if isinstance(saved_body.get("binding_snapshot"), dict):
+        for key in ("engines", "worker_profile_id", "llm_profiles", "llm_mode",
+                    "llm_overrides", "review_policy", "worker_backend",
+                    "runtime_profiles"):
+            if key in saved_body:
+                merged[key] = saved_body[key]
     return merged
 
 
@@ -188,6 +542,12 @@ class Run:
     # — independent of `paused` (the swarm may keep running with one hand up).
     awaiting_help: bool = False
     help_text: str = ""
+    reason_blocked: bool = False
+    reason_blocked_reason: str = ""
+    degraded: bool = False
+    degraded_reason: str = ""
+    fallback_active: bool = False
+    fallback_reason: str = ""
     created_seq: int = 0
     updated_seq: int = 0  # bumped on every event — exposed as activity metadata
     updated_at: float = 0.0  # epoch seconds of the latest event, for rail "x ago"
@@ -215,6 +575,21 @@ class Run:
     # falling back to a different global worker roster/backend. Secrets are
     # redacted before this is stored (see remember_dispatch).
     dispatch_body: dict[str, Any] = field(default_factory=dict)
+    # Immutable, non-secret role/profile snapshot captured on first launch.
+    binding_snapshot: dict[str, Any] = field(default_factory=dict)
+    # Operator-visible integrity diagnostics for legacy/imported relationships.
+    # These are derived metadata, never evidence and never an event-log rewrite.
+    dispatch_diagnostics: list[str] = field(default_factory=list)
+    # Target-centric metadata. These are relationship/context snapshots only;
+    # execution truth remains in the run event log and provenance gate.
+    target_id: Optional[str] = None
+    target_name: str = ""
+    target_category: str = ""
+    direction_id: Optional[str] = None
+    direction: Optional[str] = None
+    # Explicit, read-only Target knowledge copied at Run creation. Each item
+    # retains source provenance and is context only, never accepted evidence.
+    inherited_verified_facts: list[dict[str, Any]] = field(default_factory=list)
 
     def merge_flags(self, flags: Any) -> None:
         """Accumulate flags from an event payload (dedup, keep order); keep the
@@ -228,32 +603,43 @@ class Run:
             self.flag = self.flags[0]
 
     def status(self) -> str:
-        """Single derived lifecycle status the rail renders an icon for.
+        """Return the single lifecycle/health status exposed to the deck.
 
-        draft → never started. queued → started but waiting for a scheduler
-        slot. running → started, not finished, not paused. paused → operator
-        paused a live run (or held a queued one). solved/finished/failed are
-        terminal; cancelled is a terminal operator abort.
+        Terminal outcomes always win over transient Reason/provider health. A
+        live Run then exposes the narrowest operator action: Reason blocked,
+        settings fallback active, generic degradation, pause, or running.
         """
         if self.cancelled:
             return "cancelled"
         if not self.started:
-            # A preflight failure is terminal even though no worker was started;
-            # keep it visible to the fleet's `failed` filter instead of relabeling
-            # it as a draft.
             return "failed" if self.finished and self.failure_reason == "runtime_failure" else "draft"
+        if self.finished:
+            if self.solved:
+                return "solved"
+            if self.failure_reason == "runtime_failure":
+                return "failed"
+            return "finished"
         if self.queued:
             return "paused" if self.paused else "queued"
-        if not self.finished:
-            return "paused" if self.paused else "running"
-        if self.solved:
-            return "solved"
-        if self.failure_reason == "runtime_failure":
-            return "failed"
-        return "finished"
+        if self.reason_blocked:
+            return "reason_blocked"
+        if self.fallback_active:
+            return "fallback_active"
+        if self.degraded:
+            return "degraded"
+        return "paused" if self.paused else "running"
 
     def summary(self) -> dict[str, Any]:
-        """The shape the deck's thread rail consumes (one row per run)."""
+        """The shape the deck's thread rail consumes (one row per run).
+
+        ``binding_snapshot`` is persisted as a non-secret launch snapshot, but
+        older sessions and test/import paths may still contain an accidental
+        credential-shaped key. Apply the same public allowlist used by the
+        observability endpoint at this final DTO boundary. This is defense in
+        depth: a future API route must not leak a raw snapshot merely by
+        calling ``run.summary()``.
+        """
+        binding = _public_binding_snapshot(self.binding_snapshot)
         return {
             "run_id": self.run_id,
             # custom_name (operator rename) wins; else the auto/challenge name.
@@ -261,13 +647,26 @@ class Run:
             # do NOT leak the bare run id as a display name.
             "name": self.custom_name or self.name,
             "category": self.category or "",
+            "target_id": self.target_id,
+            "target_name": self.target_name or None,
+            "target_category": self.target_category or None,
+            "direction_id": self.direction_id,
+            "direction": self.direction,
+            "inherited_verified_facts": list(self.inherited_verified_facts),
+            "inherited_verified_fact_count": len(self.inherited_verified_facts),
+            "binding_snapshot": binding or None,
+            "dispatch_diagnostics": list(self.dispatch_diagnostics),
             "started": self.started,
             "finished": self.finished,
             "solved": self.solved,
             "failure_reason": self.failure_reason,
+            "reason_blocked": self.reason_blocked,
+            "reason_blocked_reason": self.reason_blocked_reason,
+            "degraded": self.degraded,
+            "degraded_reason": self.degraded_reason,
+            "fallback_active": self.fallback_active,
+            "fallback_reason": self.fallback_reason,
             "paused": self.paused,
-            "awaiting_help": self.awaiting_help,
-            "help_text": self.help_text,
             "status": self.status(),
             "queued": self.queued,
             "queue_position": self.queue_position,
@@ -287,6 +686,73 @@ class Run:
         }
 
 
+def _public_binding_snapshot(value: Any) -> dict[str, Any]:
+    """Return a secret-free projection of a Run binding snapshot.
+
+    The snapshot shape is intentionally kept stable for the UI (roles, selected
+    worker profiles, and review policy), while each leaf is passed through the
+    observability allowlist. Unknown nested keys are dropped rather than
+    recursively copied, so a legacy ``api_key``/token cannot escape through a
+    new summary consumer.
+    """
+    if not isinstance(value, Mapping):
+        return {}
+
+    def leaf(raw: Any) -> dict[str, Any]:
+        from apps.web.run_observability import public_binding
+        return public_binding(raw)
+
+    out: dict[str, Any] = {}
+    version = value.get("version")
+    if isinstance(version, (int, float)) and not isinstance(version, bool):
+        out["version"] = int(version)
+    mode = value.get("llm_mode")
+    if mode in {"settings_default", "per_run_override"}:
+        out["llm_mode"] = mode
+    def source_map(raw: Any) -> dict[str, str]:
+        if not isinstance(raw, Mapping):
+            return {}
+        return {
+            str(role): str(source)
+            for role, source in raw.items()
+            if isinstance(source, str) and source in {"settings_default", "run_override", "fallback", "frozen_snapshot", "unavailable"}
+        }
+
+    for key in ("role_sources", "effective_sources"):
+        projected = source_map(value.get(key))
+        if projected:
+            out[key] = projected
+    raw_candidates = value.get("fallback_candidates")
+    if isinstance(raw_candidates, Mapping):
+        out["fallback_candidates"] = {
+            str(role): (leaf(binding) if isinstance(binding, Mapping) else str(binding))
+            for role, binding in raw_candidates.items()
+            if isinstance(binding, Mapping) or isinstance(binding, str)
+        }
+    fallback = value.get("fallback")
+    if isinstance(fallback, Mapping):
+        out["fallback"] = {
+            str(role): leaf(binding)
+            for role, binding in fallback.items()
+            if isinstance(binding, Mapping)
+        }
+    for key in ("worker_profile", "review_policy"):
+        raw = value.get(key)
+        if isinstance(raw, Mapping):
+            out[key] = leaf(raw)
+    raw_profiles = value.get("worker_profiles")
+    if isinstance(raw_profiles, (list, tuple)):
+        out["worker_profiles"] = [leaf(item) for item in raw_profiles if isinstance(item, Mapping)]
+    raw_roles = value.get("roles")
+    if isinstance(raw_roles, Mapping):
+        out["roles"] = {
+            str(role): leaf(binding)
+            for role, binding in raw_roles.items()
+            if isinstance(binding, Mapping)
+        }
+    return out
+
+
 # A driver is any coroutine fn(run) that emits onto run.bus and returns.
 Driver = Callable[[Run], Awaitable[None]]
 
@@ -304,14 +770,49 @@ def _apply_blackboard_meta(run: "Run", ev: Event) -> None:
         it (RUN_FINISHED already clears paused on its own)."""
     if ev.event_type is not EventType.BLACKBOARD_DELTA:
         return
-    kind = (ev.payload or {}).get("kind")
-    if kind == "flag_found":
-        run.merge_flags((ev.payload or {}).get("flag"))
+    payload = ev.payload or {}
+    kind = payload.get("kind")
+    if kind == "reason_blocked":
+        # A blocked ordinary Intent at the Reviewer quality gate is not a
+        # Reason circuit failure. Keep the Intent diagnostic visible, but only
+        # pause the whole Run for a run-level Reason block.
+        intent_id = str(payload.get("intent_id") or "").strip()
+        stage = str(payload.get("stage") or "").strip().lower()
+        if intent_id and stage != "reason":
+            return
+        run.reason_blocked = True
+        run.reason_blocked_reason = str(payload.get("reason") or "Reason planner unavailable")[:240]
+        run.paused = True
+    elif kind in ("reason_recovered", "operator_resumed"):
+        run.reason_blocked = False
+        run.reason_blocked_reason = ""
+        run.paused = False
+    elif kind in ("runtime_degraded", "worker_backend_degraded", "engine_degraded"):
+        # Runtime degradation is observational and never changes terminal
+        # verdicts. Preserve the latest bounded public reason for the rail.
+        run.degraded = True
+        run.degraded_reason = str(payload.get("reason") or payload.get("backend") or kind)[:240]
+    elif kind in ("provider_recovery_activated", "binding_effective_changed"):
+        run.fallback_active = True
+        run.fallback_reason = str(payload.get("reason") or payload.get("category") or "provider fallback active")[:240]
+        run.degraded = False
+        run.degraded_reason = ""
+    elif kind == "provider_recovery_blocked":
+        role = str(payload.get("role") or payload.get("binding_role") or payload.get("component") or "").strip().lower()
+        reason = str(payload.get("blocked_reason") or payload.get("reason") or "provider recovery blocked")[:240]
+        if role in {"reason", "planner"}:
+            run.reason_blocked = True
+            run.reason_blocked_reason = reason
+            run.paused = True
+        else:
+            run.degraded = True
+            run.degraded_reason = reason
+    elif kind == "flag_found":
+        run.merge_flags(payload.get("flag"))
     elif kind in ("awaiting_operator", "collect_idle"):
         run.paused = True
-    elif kind in ("operator_resumed", "operator_stopped"):
+    elif kind == "operator_stopped":
         run.paused = False
-
 
 class RunManager:
     def __init__(
@@ -351,6 +852,7 @@ class RunManager:
         self.provider_errors = ProviderErrorAggregator()
         self._seq = 0
         self.meta = RunMetaStore(root=self.sessions_root)
+        self.target_store = TargetStore(root=self.sessions_root)
         # operator-created rail folders (id → name); runs reference one via meta.
         self.folders = FolderStore(root=self.sessions_root)
         # default worker-roster config (which engines launch per challenge); the
@@ -394,12 +896,19 @@ class RunManager:
         # summaries() is newest-first; create() stamps created_seq in CALL order,
         # and the rail sorts by created_seq DESC — so feed oldest-first to keep the
         # newest conversation on top of the rail.
+        target_by_run: dict[str, dict[str, Any]] = {}
+        for target in self.target_store.list(include_archived=True):
+            for target_run_id in target.get("run_ids") or []:
+                target_by_run.setdefault(str(target_run_id), target)
+
         for s in reversed(store.summaries()):
             rid = s["run_id"]
-            # Skip never-dispatched drafts: a run that opened an SSE stream but was
-            # never /start-ed has a JSONL with no run.started — it's an empty stub,
-            # not a conversation. Don't let those clutter the rail on restart.
-            if not s.get("started"):
+            # A never-dispatched run is normally only an empty SSE stub and must
+            # stay hidden after restart. Target-bound drafts are the deliberate
+            # exception: the Target card owns their durable relationship, so they
+            # must be rehydrated as selectable drafts instead of disappearing.
+            target = target_by_run.get(rid)
+            if not s.get("started") and target is None:
                 m0 = re.match(r"run-(\d+)$", rid)
                 if m0:
                     max_seq = max(max_seq, int(m0.group(1)))
@@ -409,6 +918,26 @@ class RunManager:
             # the rail renders its placeholder instead of leaking the bare id.
             run.name = "" if s.get("name") in (None, "", rid) else s["name"]
             run.category = s.get("category", "") or ""
+            run.target_id = s.get("target_id") or None
+            run.target_name = s.get("target_name", "") or ""
+            run.target_category = s.get("target_category", "") or ""
+            run.direction_id = s.get("direction_id") or None
+            run.direction = s.get("direction") or None
+            run.inherited_verified_facts = [item for item in (s.get("inherited_verified_facts") or []) if isinstance(item, dict)]
+            if not run.inherited_verified_facts:
+                saved_facts = run.dispatch_body.get("inherited_verified_facts") if isinstance(run.dispatch_body, dict) else []
+                run.inherited_verified_facts = [item for item in (saved_facts or []) if isinstance(item, dict)]
+            # Older event logs do not contain Target fields. Recover the
+            # relationship from the durable Target card without touching the
+            # append-only run log. This also restores Target-bound drafts.
+            if run.target_id is None and target is not None:
+                run.target_id = target.get("id")
+                run.target_name = target.get("name", "") or ""
+                run.target_category = target.get("category", "") or ""
+            if target is not None:
+                run.dispatch_diagnostics = list(dict.fromkeys(
+                    [*run.dispatch_diagnostics, *self._target_dispatch_diagnostics(run)]
+                ))
             run.started = bool(s.get("started"))
             # a rehydrated run has NO live task (the swarm coroutine died with the
             # previous server). So a started run is necessarily finished — even if
@@ -422,6 +951,12 @@ class RunManager:
                 if s.get("reason") == "runtime_failure"
                 else None
             )
+            run.reason_blocked = bool(s.get("reason_blocked"))
+            run.reason_blocked_reason = str(s.get("reason_blocked_reason") or "")[:240]
+            run.degraded = bool(s.get("degraded"))
+            run.degraded_reason = str(s.get("degraded_reason") or "")[:240]
+            run.fallback_active = bool(s.get("fallback_active"))
+            run.fallback_reason = str(s.get("fallback_reason") or "")[:240]
             run.flag = s.get("flag")
             run.flags = list(s.get("flags") or ([run.flag] if run.flag else []))
             run.expected_flags = int(s.get("expected_flags") or 1)
@@ -439,6 +974,36 @@ class RunManager:
             m = re.match(r"run-(\d+)$", rid)
             if m:
                 max_seq = max(max_seq, int(m.group(1)))
+
+        # Target cards can own a newly-created draft before its first event is
+        # appended. There is no SessionStore summary to iterate in that case,
+        # so reconstruct only those explicitly referenced handles. This keeps
+        # ordinary abandoned SSE stubs hidden while preserving Target -> Run
+        # relationships across a backend restart.
+        for rid, target in target_by_run.items():
+            if rid in self.runs:
+                continue
+            run = self.create(rid, _defer_runtime_manager=True)
+            run.started = False
+            run.finished = False
+            run.target_id = target.get("id")
+            run.target_name = target.get("name", "") or ""
+            run.target_category = target.get("category", "") or ""
+            if target is not None:
+                run.dispatch_diagnostics = list(dict.fromkeys(
+                    [*run.dispatch_diagnostics, *self._target_dispatch_diagnostics(run)]
+                ))
+            run.direction_id = target.get("primary_direction_id") or None
+            primary = next(
+                (item for item in target.get("directions") or []
+                 if item.get("id") == run.direction_id),
+                None,
+            )
+            run.direction = (primary or {}).get("label") or None
+            m = re.match(r"run-(\d+)$", rid)
+            if m:
+                max_seq = max(max_seq, int(m.group(1)))
+
         # advance the id counter past every persisted run-NNNN so create_new()
         # never re-mints an id that already has history on disk.
         self._seq = max(self._seq, max_seq)
@@ -557,7 +1122,8 @@ class RunManager:
         """Hard-delete a run: cancel its task(s), drop the handle + JSONL + meta."""
         run = self.runs.pop(run_id, None)
         if run is None:
-            # still scrub any orphaned on-disk artifacts / meta
+            # still scrub any orphaned on-disk artifacts / meta and stale Target links
+            self.target_store.detach_run_everywhere(run_id)
             self._delete_artifacts(run_id)
             return False
         # P4: a queued run has no task to cancel — drop it from the FIFO first
@@ -581,6 +1147,9 @@ class RunManager:
             except Exception:
                 LOG.warning("runtime pool close failed while deleting run %s", run_id, exc_info=True)
         await run.bus.close()
+        # Remove the relationship from every Target card. This also repairs
+        # legacy duplicate/stale links without touching the deleted Run log.
+        self.target_store.detach_run_everywhere(run_id)
         self._drop_board_schema(run_id)
         self._delete_artifacts(run_id)
         return True
@@ -677,6 +1246,13 @@ class RunManager:
         lowered = key.lower().replace("-", "_")
         if any(word in lowered for word in secret_words):
             return None
+        # Provider endpoints are operator configuration, not challenge input.
+        # Strip query/fragment/userinfo before writing the dispatch sidecar so a
+        # pasted signed relay URL cannot survive under a non-secret key such as
+        # ``base_url``. Challenge target URLs use the separate ``target`` key and
+        # are intentionally left untouched.
+        if lowered in {"base_url", "endpoint_url", "api_base_url"}:
+            return _safe_transport_url(value)
         if isinstance(value, dict):
             return {
                 str(k): v
@@ -689,6 +1265,35 @@ class RunManager:
             return value
         return str(value)
 
+    def remember_run_context(self, run_id: str, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist non-secret pre-launch Run context without freezing bindings.
+
+        Target knowledge is selected before /start. Keeping it in the same
+        atomic sidecar makes a target-bound draft restart-safe while leaving
+        provider/model bindings unfrozen until the real launch.
+        """
+        run = self.runs.get(run_id) or self.create(run_id)
+        previous = self._load_dispatch(run_id)
+        safe = self._redact_dispatch_value(dict(values or {}))
+        config = dict(previous) if isinstance(previous, dict) else {}
+        if isinstance(safe, dict):
+            config.update(safe)
+        run.dispatch_body = config
+        if "inherited_verified_facts" in config:
+            run.inherited_verified_facts = [
+                item for item in (config.get("inherited_verified_facts") or [])
+                if isinstance(item, dict)
+            ]
+        path = self.workspace_dir(run_id) / ".dswarm_dispatch.json"
+        try:
+            import json
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            LOG.exception("could not persist run context for %s", run_id)
+        return config
+
     def remember_dispatch(self, run_id: str, body: dict[str, Any] | None) -> dict[str, Any]:
         """Persist the non-secret dispatch settings needed by ``resolve``.
 
@@ -697,8 +1302,33 @@ class RunManager:
         cannot leave a partially-written config that makes recovery ambiguous.
         """
         run = self.runs.get(run_id) or self.create(run_id)
+        previous = self._load_dispatch(run_id)
         safe = self._redact_dispatch_value(dict(body or {}))
         config = safe if isinstance(safe, dict) else {}
+        # Write once: continuations reuse the original binding even if globals changed.
+        existing_binding = run.binding_snapshot or (
+            previous.get("binding_snapshot")
+            if isinstance(previous, dict)
+            else None
+        )
+        binding = (
+            existing_binding
+            if isinstance(existing_binding, dict) and existing_binding
+            else build_binding_snapshot(body, self.worker_config)
+        )
+        run.binding_snapshot = binding
+        # Keep the original effective launch inputs alongside the snapshot. This
+        # makes a later resolve deterministic even when this method is called
+        # again with a UI form containing changed global/provider selections.
+        if isinstance(existing_binding, dict) and existing_binding:
+            for key in (
+                "engines", "worker_profile_id", "worker_profiles",
+                "llm_profiles", "llm_mode", "llm_overrides", "review_policy",
+                "worker_backend", "runtime_profiles",
+            ):
+                if key in previous:
+                    config[key] = previous[key]
+        config["binding_snapshot"] = binding
         run.dispatch_body = config
         path = self.workspace_dir(run_id) / ".dswarm_dispatch.json"
         try:
@@ -726,6 +1356,52 @@ class RunManager:
         """Public read of a run's remembered (redacted) dispatch body — the
         non-secret prompt/challenge settings retitle needs to re-derive a name."""
         return self._load_dispatch(run_id)
+
+    def _target_dispatch_diagnostics(self, run: Run, dispatch: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+        """Compare immutable dispatch identity with the current Target card.
+
+        This is metadata validation only. It never edits the sidecar or event log;
+        a conflicting historical Run must be replaced with a new Target Run.
+        """
+        if not run.target_id:
+            return ()
+        target = self.target_store.get(run.target_id)
+        if not isinstance(target, dict):
+            return ()
+        body = dispatch if isinstance(dispatch, Mapping) else self._load_dispatch(run.run_id)
+        challenge = body.get("challenge") if isinstance(body, Mapping) else None
+        if not isinstance(challenge, Mapping):
+            return ()
+        diagnostics: list[str] = []
+        stored_target_id = str(
+            challenge.get("target_id") or body.get("target_id") or ""
+        ).strip()
+        if stored_target_id and stored_target_id != str(run.target_id).strip():
+            diagnostics.append("target_binding_mismatch")
+        stored_category = str(challenge.get("category") or "").strip().casefold()
+        target_category = str(target.get("category") or "").strip().casefold()
+        if stored_category and target_category and stored_category != target_category:
+            diagnostics.append("target_challenge_mismatch")
+        stored_name = " ".join(str(challenge.get("name") or "").split()).casefold()
+        target_name = " ".join(str(target.get("name") or "").split()).casefold()
+        # The startup controller uses this fixed challenge name and intentionally
+        # has no Target binding. Keep the generic mismatch code as the public
+        # contract; the UI copy explains that it is not resumable.
+        if stored_name and target_name and stored_name != target_name:
+            diagnostics.append("target_challenge_mismatch")
+        stored_address = str(challenge.get("target") or "").strip()
+        target_address = str(target.get("target_address") or "").strip()
+        if stored_address and target_address and stored_address != target_address:
+            diagnostics.append("target_challenge_mismatch")
+        return tuple(dict.fromkeys(diagnostics))
+
+    def _reject_target_dispatch_mismatch(self, run: Run, dispatch: Mapping[str, Any] | None = None) -> None:
+        diagnostics = tuple(dict.fromkeys(
+            [*run.dispatch_diagnostics, *self._target_dispatch_diagnostics(run, dispatch)]
+        ))
+        if diagnostics:
+            run.dispatch_diagnostics = list(diagnostics)
+            raise TargetDispatchMismatchError(diagnostics)
 
     def workspace_dir(self, run_id: str) -> Path:
         """Per-run persistent workspace: sessions/{id}/workspace/.
@@ -977,6 +1653,10 @@ class RunManager:
         # after a backend restart. The helper is intentionally best-effort: old
         # runs simply have no sidecar and resolve falls back to their challenge.
         run.dispatch_body = self._load_dispatch(run_id)
+        run.inherited_verified_facts = [item for item in (run.dispatch_body.get("inherited_verified_facts") or []) if isinstance(item, dict)]
+        saved_binding = run.dispatch_body.get("binding_snapshot")
+        if isinstance(saved_binding, dict):
+            run.binding_snapshot = saved_binding
         # sniff run.started / run.finished off the bus to keep rail metadata fresh
         # without making the run anything but a dumb event source.
         async def _meta_sink(ev: Event) -> None:
@@ -1016,25 +1696,19 @@ class RunManager:
                 title = ev.payload.get("title") or ""
                 if title and (not run.name or run.name_is_slug):
                     run.name = self.unique_title(run.run_id, title)
-                    run.name_is_slug = False
             elif ev.event_type is EventType.HITL_RESPONSE:
-                # reflect pause/resume into the rail status icon. The driver still
-                # owns the real halt; this is just the displayed state.
+                # Reflect pause/resume and clear an operator hand after response.
                 action = ev.payload.get("action")
                 if action == "pause":
                     run.paused = True
                 elif action == "resume":
                     run.paused = False
-                # ANY operator response lowers a raised hand. This MUST live in the
-                # same branch: an if/elif chain only matches ONE HITL_RESPONSE arm,
-                # so a separate `elif ev.event_type is HITL_RESPONSE` below was dead
-                # code and the rail showed "需要输入" forever after a hint/answer.
                 run.awaiting_help = False
                 run.help_text = ""
             elif ev.event_type is EventType.RUN_REOPENED:
-                # The run is solving again. Resolve/continue keeps all prior flags
-                # visible; false-positive payloads carry the one invalid flag to
-                # drop. Legacy false-positive payloads with no flag still clear all.
+                # Resolve/continue reopens the planner without retaining blocked state.
+                run.reason_blocked = False
+                run.reason_blocked_reason = ""
                 run.finished = False
                 run.failure_reason = None
                 run.solved = False
@@ -1092,6 +1766,17 @@ class RunManager:
                 run.cancelled = True
             else:
                 _apply_blackboard_meta(run, ev)
+            # Target activity is a bounded UI index. Raw execution events remain
+            # authoritative in the Run SessionStore and are never copied here.
+            if run.target_id:
+                try:
+                    self.target_store.record_run_event(
+                        run.target_id, run.run_id, ev.event_type, source_seq=ev.seq,
+                        timestamp=ev.ts, status=run.status(), solved=run.solved,
+                        reason=str((ev.payload or {}).get("reason") or ""),
+                    )
+                except Exception as exc:
+                    LOG.debug("target activity index failed for %s (%s)", run.run_id, type(exc).__name__)
 
         bus.add_sink(_meta_sink)
         self.runs[run_id] = run
@@ -1120,6 +1805,7 @@ class RunManager:
         gateway.account_root = str(account_store_root(self.sessions_root))
         gateway.sessions_root = str(self.sessions_root)
         gateway.upstream_key = self._resolve_worker_provider_key()
+        gateway.upstream_binding_resolver = self._resolve_worker_provider_binding
         gateway.configure_usage_bridge(bus=run.bus, loop=loop, run_id=run.run_id)
 
     def install_gateway_key_resolver(self) -> None:
@@ -1131,6 +1817,43 @@ class RunManager:
         from dswarm.solver.modelgateway import ModelGateway
 
         ModelGateway.set_upstream_key_resolver(self._resolve_worker_provider_key)
+        ModelGateway.set_upstream_binding_resolver(self._resolve_worker_provider_binding)
+
+    def _resolve_worker_provider_binding(self, provider_ref: str):
+        """Resolve one provider into the gateway's host-private token binding.
+
+        The returned object is intentionally never a public DTO. It lets a strict
+        container worker use its selected native transport (including Anthropic
+        Messages) while only receiving a revocable gateway task token.
+        """
+        ref = str(provider_ref or "").strip()
+        if not ref:
+            return None
+        try:
+            cfg = self.worker_config.get()
+            providers = cfg.get("llm_providers") or []
+            from dswarm.solver.llm_providers import LLMProviderSecretStore, provider_secret_root, resolve_llm_provider
+            from dswarm.solver.modelgateway import GatewayUpstreamBinding
+
+            resolved = resolve_llm_provider(
+                ref, providers,
+                secret_store=LLMProviderSecretStore(provider_secret_root(self.sessions_root)),
+            )
+            if resolved is None or not resolved.base_url or not resolved.api_key:
+                return None
+            return GatewayUpstreamBinding(
+                base_url=resolved.base_url,
+                api_key=resolved.api_key,
+                wire_api=resolved.wire_api,
+                auth_mode=resolved.auth_mode,
+                auth_header=resolved.auth_header,
+                auth_prefix=resolved.auth_prefix,
+                provider_id=resolved.provider_id,
+            )
+        except Exception:
+            # This is called in a preflight/token path. Do not expose secrets,
+            # endpoints, or provider library exceptions to a worker.
+            return None
 
     def _resolve_worker_provider_key(self) -> str:
         """The gateway's upstream key: the secret of the provider the ENABLED
@@ -1388,7 +2111,8 @@ class RunManager:
         return build_pool_manager_for_run(
             run_id=run_id,
             snapshot=snapshot,
-            worker_profiles=self._run_worker_profiles(run),
+            worker_profiles=self._run_frozen_worker_profiles(run),
+            llm_providers=self._run_frozen_provider_registry(run),
             sessions_root=self.sessions_root,
             bus=getattr(run, "bus", None),
             budget_gate=getattr(run, "budget_gate", None) or ProfileBudgetGate(),
@@ -1401,6 +2125,60 @@ class RunManager:
         )
         profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
         return [p for p in profiles if isinstance(p, dict)]
+
+    def _run_frozen_worker_profiles(self, run: Run | None) -> list[dict[str, Any]]:
+        """Return safe launch-time worker identity/configuration for pool setup."""
+        binding = getattr(run, "binding_snapshot", {}) if run is not None else {}
+        frozen = (
+            binding.get("runtime_worker_profiles")
+            if isinstance(binding, Mapping)
+            else None
+        )
+        if isinstance(frozen, list):
+            profiles = [dict(profile) for profile in frozen if isinstance(profile, Mapping)]
+            if profiles:
+                return profiles
+        return self._run_worker_profiles(run)
+
+    def _run_frozen_provider_registry(self, run: Run | None) -> list[dict[str, Any]]:
+        """Rebuild provider transport metadata from the immutable Run snapshot."""
+        binding = getattr(run, "binding_snapshot", {}) if run is not None else {}
+        if not isinstance(binding, Mapping):
+            return []
+        fields = ("base_url", "wire_api", "auth_mode", "auth_header", "auth_prefix")
+        providers: dict[str, dict[str, Any]] = {}
+
+        def add_provider(raw: Mapping[str, Any]) -> None:
+            provider_id = str(
+                raw.get("id") or raw.get("provider_ref") or ""
+            ).strip()
+            if not provider_id or provider_id in providers:
+                return
+            descriptor: dict[str, Any] = {"id": provider_id}
+            for transport_field in fields:
+                value = raw.get(transport_field)
+                if value in (None, ""):
+                    continue
+                clean = (
+                    _safe_transport_url(value)
+                    if transport_field == "base_url"
+                    else _binding_scalar(value)
+                )
+                if clean not in (None, ""):
+                    descriptor[transport_field] = clean
+            providers[provider_id] = descriptor
+
+        frozen_registry = binding.get("runtime_providers")
+        if isinstance(frozen_registry, list):
+            for provider in frozen_registry:
+                if isinstance(provider, Mapping):
+                    add_provider(provider)
+        roles = binding.get("roles")
+        if isinstance(roles, Mapping):
+            for role in roles.values():
+                if isinstance(role, Mapping):
+                    add_provider(role)
+        return list(providers.values())
 
     def _freeze_dispatch_runtime(self, run: Run) -> None:
         """Freeze exactly one immutable runtime context before first dispatch.
@@ -1828,105 +2606,137 @@ class RunManager:
         """Give the scheduler a chance to fill slots (limit raise / resume)."""
         await self._fill_slots()
 
-    # actions a standby (post-solve) worker can serve. pause/resume/submit only
-    # make sense against a LIVE run, so they never trigger a standby.
+    # Actions that may start a standby worker after a terminal Run. Review is
+    # deliberately excluded: the Target review API owns its read-only snapshot.
     _STANDBY_ACTIONS = {"ask", "hint", "mark_false", "writeup", "redirect", "focus"}
-    async def post_hitl(self, run_id: str, target: str, action: str, **fields: Any) -> bool:
-        """Route a human command into the run + echo it on the event stream.
+    _LEGACY_ACTIONS = {
+        "ask", "hint", "writeup", "pause", "redirect", "focus", "mark_false",
+    }
+    _COMMAND_ALIASES = {"prompt": "hint"}
+    _PUBLIC_COMMANDS = {"prompt", "stop", "resume", "review"}
+    @staticmethod
+    def _run_recipient_ids(run: Run) -> set[str]:
+        """Return recipient ids observed on this Run without inventing lanes."""
+        ids: set[str] = {"all", "global", "reason"}
+        try:
+            for event in run.store.read_events(run.run_id):
+                if event.event_type in {EventType.WORKER_STATUS, EventType.WORKER_LIFECYCLE}:
+                    payload = event.payload or {}
+                    worker = str(payload.get("worker") or event.solver_id or "").strip()
+                    if worker:
+                        ids.update({worker, f"solver:{worker}"})
+                elif event.event_type is EventType.BLACKBOARD_DELTA:
+                    payload = event.payload or {}
+                    worker = str(payload.get("worker") or payload.get("worker_id") or "").strip()
+                    if worker:
+                        ids.update({worker, f"solver:{worker}"})
+        except Exception:
+            pass
+        for attr in ("deck_workers", "worker_ids"):
+            values = getattr(run, attr, None)
+            if isinstance(values, (list, tuple, set)):
+                for value in values:
+                    worker = str(value or "").strip()
+                    if worker:
+                        ids.update({worker, f"solver:{worker}"})
+        return ids
 
-        While the run is LIVE, the command flows to the running swarm via run.hitl
-        (pause/resume act on the subprocess; hints reach workers). Once the run has
-        FINISHED — or the server restarted and there's no live task — a follow-up
-        would otherwise vanish: nothing drains run.hitl. So we COLD-START a standby
-        worker (resume the winner's session) to actually respond."""
+    async def post_hitl(self, run_id: str, target: str, action: str, **fields: Any) -> bool:
+        """Route one command to the selected Run.
+
+        New callers send ``recipients`` and ``client_request_id``.  Those
+        recipients are checked against this Run's observed worker identities;
+        legacy callers retain the old target spelling for compatibility.
+        STOP and RESUME are always Run-wide regardless of selected recipients.
+        """
+        requested_action = str(action or "").strip().lower()
+        if requested_action not in self._PUBLIC_COMMANDS | self._LEGACY_ACTIONS:
+            return False
+        action = self._COMMAND_ALIASES.get(requested_action, requested_action)
         run = self.runs.get(run_id)
         if run is None:
             return False
-        # stop: gracefully END a run. A LIVE run: cancel run.task → the swarm's
-        # finally-block _cancel_solver + killpg every worker, the driver's finally
-        # closes the bus → the run reaches `finished` (RUN_FINISHED), JSONL + board
-        # PRESERVED (unlike DELETE). A GHOST run (no live task but the deck still
-        # shows "running" because its event stream ended mid-flight without a
-        # terminating RUN_FINISHED — e.g. a relaunch killed when the server died,
-        # run-4305): we FORCE it finished here + broadcast RUN_FINISHED so the deck
-        # settles and shows the finished controls. Stop must never leave a run stuck.
+
+        supplied = fields.get("recipients")
+        strict_recipients = isinstance(supplied, (list, tuple, set))
+        if strict_recipients and requested_action not in self._PUBLIC_COMMANDS:
+            return False
+        raw_targets: list[str] = []
+        if strict_recipients:
+            raw_targets.extend(str(item).strip() for item in supplied if str(item).strip())
+        if not raw_targets:
+            raw_targets = [str(target or "global").strip()]
+            if "," in raw_targets[0]:
+                raw_targets = [part.strip() for part in raw_targets[0].split(",") if part.strip()]
+        raw_targets = ["all" if item == "global" else item for item in raw_targets] or ["all"]
+        if action in {"stop", "resume", "review"}:
+            raw_targets = ["all"]
+        if "all" in raw_targets and len(raw_targets) > 1:
+            return False
+        if strict_recipients:
+            allowed = self._run_recipient_ids(run)
+            if any(item not in allowed for item in raw_targets):
+                return False
+        fields = {key: value for key, value in fields.items()
+                  if key not in {"recipients", "run_id", "client_request_id"}}
+        if action == "review":
+            # Review never queues HITL, starts standby, or mutates Target state.
+            return bool(run.finished or run.status() in {"finished", "solved", "failed", "cancelled"})
+        if action == "resume" and (run.task is None or run.task.done()):
+            if not run.dispatch_body and run.runtime_snapshot is None and not run.started:
+                return False
+            return await self.resolve(run_id, {"operator_resume": True})
+        if action == "writeup" and run.task is not None and not run.task.done():
+            return False
+        if len(raw_targets) > 1:
+            results = [await self.post_hitl(run_id, item, action, **fields) for item in raw_targets]
+            return all(results)
+        target = raw_targets[0]
         if action == "stop":
             await run.bus.emit(Event(
                 event_type=EventType.HITL_RESPONSE, run_id=run_id,
-                payload=hitl_response_payload(target, action, **fields)))
+                payload=hitl_response_payload("global", action, **fields)))
             if run.task is not None and not run.task.done():
-                # ⑤ Route stop THROUGH the hitl queue first so the swarm's _drain_hitl
-                # sets _operator_stop=True and the scheduler finalizes as
-                # "operator_stop" — NOT "runtime_failure". A bare task.cancel() (the old
-                # path) skipped that flag, so finalize mislabeled an operator stop as a
-                # crash and parked every in-flight intent as resume noise (run-75377: 53
-                # stranded intents). Give the scheduler a brief window to drain + exit
-                # cleanly on its own; cancel only as a backstop if it doesn't.
                 try:
-                    run.hitl.put_nowait({"action": "stop", "target": target})
+                    run.hitl.put_nowait({"action": "stop", "target": "global", **fields})
                 except Exception:
                     pass
-                for _ in range(40):  # ~4s: _drain_hitl runs each scheduler tick
+                for _ in range(40):
                     await asyncio.sleep(0.1)
                     if run.task.done():
                         break
                 if not run.task.done():
                     run.task.cancel()
             else:
-                # ghost / already-dead task → settle the state ourselves.
                 run.finished = True
                 run.paused = False
                 await run.bus.emit(Event(
                     event_type=EventType.RUN_FINISHED, run_id=run_id,
                     payload={"flag": run.flag, "flags": list(run.flags),
                              "expected_flags": run.expected_flags,
-                             "multi_flag": run.multi_flag,
-                             "solved": run.solved,
+                             "multi_flag": run.multi_flag, "solved": run.solved,
                              "reason": "operator_stop"}))
             return True
-        # M2: drop an identical back-to-back resend (same target/action/text/url).
-        # The UI has no client throttle, and an operator hammering the SAME hint at a
-        # busy single-shot worker (run-0011: 11×) otherwise queues 11 items + 11
-        # events + 11 downstream _drain_hitl sweeps. A genuinely new command (changed
-        # text, or a different action) still goes through.
         sig = (target, action, str(fields.get("text") or fields.get("hint") or ""),
                str(fields.get("url") or fields.get("target_url") or ""),
                str(fields.get("flag") or ""))
-        # `writeup` is an idempotent-looking no-arg command from the UI, but each
-        # click is a real request to run a fresh post-solve standby turn. If we
-        # dedupe it here, the second "生成复盘" click only echoes a duplicate
-        # HITL_RESPONSE and never starts a worker, which reads as a stuck button.
         if action != "writeup" and getattr(run, "_last_hitl_sig", None) == sig:
             await run.bus.emit(Event(
                 event_type=EventType.HITL_RESPONSE, run_id=run_id,
-                payload=hitl_response_payload(target, action, delivery="duplicate",
-                                              **fields)))
+                payload=hitl_response_payload(target, action, delivery="duplicate", **fields)))
             return True
         run._last_hitl_sig = sig
-
         live = run.task is not None and not run.task.done()
-        # M4: tell the operator WHERE the command went, so they stop re-sending a hint
-        # that already landed. A non-standing hint can't steer a live single-shot
-        # worker mid-turn (it's folded into the NEXT spawn), and a finished run routes
-        # to a cold-start standby — both look identical without this status.
-        if live:
-            delivery = "queued_for_next_worker" if action in ("hint", "focus") else "applied_live"
-        elif action in self._STANDBY_ACTIONS:
-            delivery = "standby"
-        else:
-            delivery = "no_live_workers"
-
+        delivery = "queued_for_next_worker" if live and action in ("hint", "focus") else (
+            "applied_live" if live else "standby" if action in self._STANDBY_ACTIONS else "no_live_workers")
         await run.hitl.put({"target": target, "action": action, **fields})
-        await run.bus.emit(
-            Event(
-                event_type=EventType.HITL_RESPONSE,
-                run_id=run_id,
-                payload=hitl_response_payload(target, action, delivery=delivery, **fields),
-            )
-        )
+        await run.bus.emit(Event(
+            event_type=EventType.HITL_RESPONSE, run_id=run_id,
+            payload=hitl_response_payload(target, action, delivery=delivery, **fields)))
         if not live and action in self._STANDBY_ACTIONS:
             self._ensure_standby(run_id, {"target": target, "action": action, **fields})
         return True
+
 
     async def post_worker_cmd(self, run_id: str, action: str, *,
                               engine: Optional[str] = None,
@@ -1964,24 +2774,6 @@ class RunManager:
             return False
         if run.task is not None and not run.task.done():
             return False  # already live - nothing to relaunch (use HITL instead)
-        # A previous failed recovery must not leave a scheduler slot or queue entry
-        # that makes the next click look successful but never dispatch.
-        if self.scheduler.is_active(run_id) or self.scheduler.is_queued(run_id):
-            return False
-
-        # A finished run may still have a post-solve standby worker serving a
-        # previous HITL command. Do not reopen the same run concurrently: both
-        # tasks would write to the same evidence graph and race the lifecycle
-        # projection. The UI can retry once the standby task settles.
-        if run.standby_task is not None and not run.standby_task.done():
-            return False
-
-        # Rehydrated/finished runs normally have a closed bus. Rebuild it before
-        # ledger reconciliation and pool composition so usage writers and runtime
-        # diagnostics bind to the live bus rather than a permanently closed one.
-        # Reconstruct the challenge from the durable winner/event history, then
-        # layer the saved dispatch body underneath it. Historical worker events
-        # are evidence for replay only; they are never a source of live roster or
         # backend configuration.
         ch: dict[str, Any] = {}
         try:
@@ -2002,6 +2794,10 @@ class RunManager:
             except Exception:
                 ch = {}
         saved = self._load_dispatch(run_id)
+        # A Target relationship is durable, while this dispatch sidecar records
+        # the immutable historical challenge binding. Never reinterpret a smoke
+        # test or another old Run as the current Target's challenge.
+        self._reject_target_dispatch_mismatch(run, saved)
         request_body = dict(body or {})
         # Retired swarm fields must fail closed before any runtime cleanup,
         # reopening, or scheduler submission. A historical sidecar is read-only
@@ -2026,25 +2822,35 @@ class RunManager:
         try:
             # Reopen only after all read-only reconstruction and validation that
             # can fail without touching runtime state. If this preflight fails,
-            # the old closed bus remains intact and the retry path can rebuild it.
+            # no RUN_REOPENED marker is emitted and the old terminal state stays
+            # authoritative. The normal /start path freezes this context before
+            # scheduler submission; resolve must do the same or the Swarm
+            # constructor rejects a historical local/container binding only after
+            # the run has already been marked reopened.
             self._fresh_bus(run)
             await self._reconcile_ledger(run)
             if run.runtime_snapshot is not None:
                 await self._cleanup_before_reopen(run)
-            self._ensure_runtime_pool_manager(run)
-            if run.spawn_guard is not None:
-                await run.spawn_guard.ensure_ready(run_id)
 
-            self.configure_budget(run_id, merged)
-            # Build synchronously before changing lifecycle state. Configuration
-            # errors should be returned by /resolve, not recorded as a misleading
-            # reopen.
-            from apps.web.drivers import build_driver
+            from apps.web.drivers import build_driver, preflight_swarm_dispatch
             driver = build_driver(
                 merged,
                 mgr=self,
                 runtime_operation_kind="resolve",
             )
+            if getattr(driver, "dispatch_kind", None) == "swarm":
+                # A real driver is tagged. Legacy runs without a dispatch sidecar
+                # or frozen runtime must not reinterpret the current global roster
+                # as their historical execution binding.
+                self._freeze_dispatch_runtime(run)
+                if run.runtime_policy is None:
+                    raise RuntimePolicyError("runtime_policy_required")
+                await preflight_swarm_dispatch(merged, self)
+            self._ensure_runtime_pool_manager(run)
+            if run.spawn_guard is not None:
+                await run.spawn_guard.ensure_ready(run_id)
+
+            self.configure_budget(run_id, merged)
             self.remember_dispatch(run_id, merged)
         except BaseException:
             # A failed recovery may have composed a fresh pool manager and bus
@@ -2197,10 +3003,14 @@ class RunManager:
                 if run.spawn_guard is not None:
                     run.spawn_guard.mark_failed(str(exc))
             if ev.event_type is EventType.RUN_REOPENED:
+                run.reason_blocked = False
+                run.reason_blocked_reason = ""
                 run.finished = False
                 run.failure_reason = None
                 run.solved = False
                 run.paused = False
+                # Reopening clears a transient Reason block only. Do not invent
+                # a provider recovery event or silently clear fallback history.
                 if ev.payload.get("reason") == "resolve":
                     return
                 bad = ev.payload.get("flag")

@@ -973,8 +973,11 @@ function StatusIcon({ status, t }: { status: RunStatus; t: (k: string) => string
   }
   const icon: Record<Exclude<RunStatus, "running">, IconName> = {
     draft: "dot",
-    queued: "clock",       // waiting for a scheduler slot (P4)
+    queued: "clock",
     paused: "pause",
+    reason_blocked: "alert",
+    degraded: "alert",
+    fallback_active: "refresh",
     solved: "flag",
     finished: "check",
     failed: "alert",

@@ -16,13 +16,14 @@ async def test_llm_endpoint(
     which: str,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
-    sessions_root: str | Path | None = None,
-    worker_profiles: list[dict[str, Any]] | None = None,
-    llm_providers: list[dict[str, Any]] | None = None,
+    sessions_root: Optional[str | Path] = None,
+    worker_profiles: Optional[list[dict[str, Any]]] = None,
+    llm_providers: Optional[list[dict[str, Any]]] = None,
     provider_ref: Optional[str] = None,
     credential_account: Optional[str] = None,
     credential_source: Optional[str] = None,
     wire_api: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> dict[str, Any]:
     """Make one minimal chat against the edited endpoint. Never raises.
 
@@ -44,4 +45,5 @@ async def test_llm_endpoint(
         credential_account=credential_account,
         credential_source=credential_source,
         wire_api=wire_api,
+        effort=effort,
     )

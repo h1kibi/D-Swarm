@@ -8,17 +8,19 @@
  * comparable (operator feedback: "为什么都挤在一个页面，不能新开页面吗").
  */
 
-/** The artifact/detail views promoted to routes. Order = inspector 面板 tab order. */
+/** Run investigation views. Order drives the workspace navigation. */
 export const DETAIL_VIEWS = [
-  "evidence",
   "workers",
-  "graph",
+  "intents",
+  "evidence",
+  "routes",
   "timeline",
+  "ledger",
+  "graph",
   "blackboard",
   "findings",
   "credentials",
   "pocs",
-  "routes",
   "directives",
   "btw",
 ] as const;

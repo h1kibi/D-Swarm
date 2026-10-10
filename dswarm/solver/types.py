@@ -59,3 +59,12 @@ class SolveOutcome:
     # This is telemetry for recovery/dispatch management only; it never influences
     # flag acceptance or provenance.
     provider_error: dict[str, Any] = field(default_factory=dict)
+    # Feedback classification for recovery. Kept after provider_error so existing
+    # positional SolveOutcome constructors remain compatible.
+    feedback: dict[str, Any] = field(default_factory=dict)
+    no_output_interruption: bool = False
+    # Structured lifecycle classification and bounded runtime diagnostics. These
+    # fields are appended for positional-constructor compatibility; provenance
+    # remains owned by the hardcoded flag gate and never reads either field.
+    lifecycle_reason: str = ""
+    runtime_status: dict[str, Any] = field(default_factory=dict)

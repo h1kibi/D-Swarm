@@ -23,12 +23,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from dswarm.models.solve_graph import SolveGraph
 from dswarm.solver.direction_rules import (
     DEFAULT_DIRECTION_REGISTRY,
     sanitize_raw_direction,
 )
-from dswarm.solver.worker_profiles import canonical_direction
 
 
 @dataclass

@@ -19,9 +19,10 @@ _WIRE_ALIASES = {
     "": "auto", "auto": "auto", "openai": "auto", "chat": "openai-chat",
     "openai-chat": "openai-chat", "openai-completions": "openai-chat",
     "responses": "openai-responses", "openai-responses": "openai-responses",
+    "anthropic": "anthropic", "anthropic-messages": "anthropic", "messages": "anthropic",
 }
 _AUTH_MODES = {"bearer", "x-api-key", "custom"}
-_KNOWN_SUFFIXES = ("/chat/completions", "/responses", "/models")
+_KNOWN_SUFFIXES = ("/chat/completions", "/responses", "/messages", "/models")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _PROTOCOL_FALLBACK_STATUSES = {404, 405, 415, 501}
 
@@ -66,9 +67,18 @@ def normalize_auth(body: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def auth_headers(body: dict[str, Any], api_key: str) -> dict[str, str]:
+    """Build provider auth headers without ever returning the key in diagnostics.
+
+    Anthropic's native Messages API requires the version header in addition to
+    ``x-api-key``. Custom relays can still override the auth mode/header while
+    retaining the protocol marker.
+    """
     _, header, prefix = normalize_auth(body)
     value = f"{prefix} {api_key}".strip() if prefix else api_key
-    return {header: value}
+    headers = {header: value}
+    if normalize_wire_api(body.get("wire_api")) == "anthropic":
+        headers.setdefault("anthropic-version", "2023-06-01")
+    return headers
 
 
 def _http_json(method: str, url: str, *, headers: dict[str, str],
@@ -139,13 +149,26 @@ def protocol_mismatch(status: int, payload: Any, text: str) -> bool:
     ))
 
 
-def model_request(protocol: WireAPI, model: str) -> tuple[str, dict[str, Any]]:
+def model_request(protocol: WireAPI, model: str, *, reasoning_effort: Any = None) -> tuple[str, dict[str, Any]]:
+    effort = str(reasoning_effort or "").strip().lower() or None
     if protocol == "openai-responses":
-        return "responses", {"model": model, "input": "Reply with OK", "max_output_tokens": 1}
-    return "chat/completions", {
+        body: dict[str, Any] = {"model": model, "input": "Reply with OK", "max_output_tokens": 1}
+        if effort:
+            body["reasoning_effort"] = effort
+        return "responses", body
+    if protocol == "anthropic":
+        return "messages", {
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "Reply with OK"}],
+        }
+    body = {
         "model": model, "messages": [{"role": "user", "content": "Reply with OK"}],
         "max_tokens": 1, "stream": False,
     }
+    if effort:
+        body["reasoning_effort"] = effort
+    return "chat/completions", body
 
 
 def probe_endpoint(draft: dict[str, Any], *, api_key: str, validate_model: bool = False,
@@ -167,13 +190,20 @@ def probe_endpoint(draft: dict[str, Any], *, api_key: str, validate_model: bool 
         "model_probe": {"attempted": False, "ok": False},
         "detected_wire_api": None, "models": [],
     }
-    try:
-        status, payload, text = request_json("GET", endpoint_url(base_url, "models"),
-                                             headers=headers, body=None, timeout=20.0)
-    except Exception as exc:  # noqa: BLE001
-        layer, detail = error_message(None, str(exc))
-        result.update(detail=detail, error_layer=layer)
-        return result
+    configured = normalize_wire_api(draft.get("wire_api"))
+    # Native Anthropic does not expose an OpenAI-style /models catalogue. Model
+    # validation is performed by /messages; discovery remains explicitly
+    # optional so the settings UI can still show a useful connection state.
+    if configured == "anthropic":
+        status, payload, text = 404, None, ""
+    else:
+        try:
+            status, payload, text = request_json("GET", endpoint_url(base_url, "models"),
+                                                 headers=headers, body=None, timeout=20.0)
+        except Exception as exc:  # noqa: BLE001
+            layer, detail = error_message(None, str(exc))
+            result.update(detail=detail, error_layer=layer)
+            return result
     result["connectivity"] = {"ok": True, "status": status}
     auth_ok = status not in {401, 403}
     result["authentication"] = {"ok": auth_ok, "status": status}
@@ -189,6 +219,8 @@ def probe_endpoint(draft: dict[str, Any], *, api_key: str, validate_model: bool 
     if not validate_model:
         if discovery_ok:
             result.update(ok=True, detail=f"连接成功，获取到 {len(discovered)} 个模型。")
+        elif configured == "anthropic":
+            result.update(ok=True, detail="Anthropic 连接配置已就绪；原生 Messages API 不提供 /models 列表。")
         else:
             layer, detail = error_message(status, text)
             result.update(detail=detail, error_layer=layer)
@@ -197,11 +229,10 @@ def probe_endpoint(draft: dict[str, Any], *, api_key: str, validate_model: bool 
     if not model:
         result.update(detail="请先选择或手动填写模型 ID。", error_layer="model")
         return result
-    configured = normalize_wire_api(draft.get("wire_api"))
     protocols = [configured] if configured != "auto" else ["openai-chat", "openai-responses"]
     last: tuple[int | None, Any, str] = (None, None, "")
     for index, protocol in enumerate(protocols):
-        path, body = model_request(protocol, model)
+        path, body = model_request(protocol, model, reasoning_effort=draft.get("effort"))
         try:
             status2, payload2, text2 = request_json(
                 "POST", endpoint_url(base_url, path),

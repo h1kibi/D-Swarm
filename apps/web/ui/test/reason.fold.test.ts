@@ -221,6 +221,46 @@ describe("foldReasonEvent — robustness", () => {
   });
 });
 
+describe("foldReasonEvent — health state", () => {
+  it("projects degraded, retrying, circuit open, and recovery states", () => {
+    let loop = foldAll([
+      bb("reason_health_changed", { health_state: "degraded", failures: 1 }),
+      bb("reason_health_changed", { health_state: "retrying", failures: 3 }),
+      bb("reason_health_changed", { health_state: "circuit_open", failures: 6 }),
+    ]);
+    expect(loop.healthState).toBe("circuit_open");
+    expect(loop.healthFailures).toBe(6);
+    loop = foldReasonEvent(loop, bb("reason_recovered", {}));
+    expect(loop.healthState).toBe("healthy");
+    expect(loop.healthFailures).toBe(0);
+  });
+
+  it("carries the failure/request thresholds and the operator block reason", () => {
+    let loop = foldAll([
+      bb("reason_health_changed", {
+        health_state: "degraded", failures: 1, max_failures: 6,
+        request_failures: 1, request_limit: 3,
+      }),
+    ]);
+    expect(loop.healthMaxFailures).toBe(6);
+    expect(loop.healthRequestFailures).toBe(1);
+    expect(loop.healthRequestLimit).toBe(3);
+
+    loop = foldReasonEvent(loop, bb("reason_health_changed", {
+      health_state: "waiting_for_operator", failures: 2, max_failures: 6,
+      request_failures: 3, request_limit: 3,
+      blocked_reason: "default_provider_probe_failed",
+    }));
+    expect(loop.healthState).toBe("waiting_for_operator");
+    expect(loop.healthRequestFailures).toBe(3);
+    expect(loop.healthBlockedReason).toBe("default_provider_probe_failed");
+
+    // A recovered planner clears the block reason along with the failures.
+    loop = foldReasonEvent(loop, bb("reason_recovered", {}));
+    expect(loop.healthBlockedReason).toBeUndefined();
+  });
+});
+
 describe("legacy session replay — reasonLoop stays empty", () => {
   function loadFixture(name: string): DSwarmEvent[] {
     const path = fileURLToPath(new URL(`../test/fixtures/${name}`, import.meta.url));

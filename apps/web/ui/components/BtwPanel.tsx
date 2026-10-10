@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/Icon";
 import { useT } from "@/lib/i18n";
-import { useBtwChat } from "@/lib/btwChat";
+import { observerSourceLabel, useBtwChat } from "@/lib/btwChat";
+import { detailUrlForRun } from "@/lib/runRoute";
 import { BtwMessageBody } from "@/components/btwMarkdown";
 
 /**\n * BTW side-query worker — a right-side drawer for read-only Q&A over a run.\n *\n * The operator asks quick questions (summarize progress, which worker is on\n * which line, ...) and gets a bounded read-only answer. Normal turns do not\n * start a shell worker; explicit deep-audit turns may use the isolated one-shot\n * worker path. BTW never joins the swarm, consumes no max-worker slot, or writes\n * graph/cost state.\n *\n * Multi-turn: the transcript lives ONLY in this component's local state and is\n * sent with each request so the fixed observer model can retain conversational\n * context. Closing the drawer (Esc / backdrop / button) drops the whole\n * transcript — nothing is persisted server-side. Switching runs clears it\n * (different runs' contexts must not mix).\n *\n * Open/close is OWNED by page.tsx (same pattern as CommandPalette) so a single\n * global Esc handler arbitrates layering. This component is a pure modal: it\n * renders nothing when `open` is false.\n */
@@ -108,13 +109,16 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
                   streaming={streaming}
                 />
               </div>
+              {turn.role === "assistant" && (turn.observerSource || turn.evidenceRefs?.length || turn.uncertainties?.length) ? (
+                <div className="btw-turn-meta">
+                  {turn.observerSource && <span className="btw-source-label">{observerSourceLabel(turn.observerSource)}</span>}
+                  {turn.fallbackUsed && <span className="btw-source-note">configured lightweight fallback</span>}
+                  {turn.evidenceRefs?.length ? <div className="btw-refs"><span className="btw-refs-label">{t("btw.evidenceRefs")}</span>{turn.evidenceRefs.map((ref) => <a key={ref} className="evi-link" href={`${detailUrlForRun(runId, "evidence")}?fact=${encodeURIComponent(ref)}`}>{ref}</a>)}</div> : null}
+                  {turn.uncertainties?.length ? <div className="btw-unknowns"><span className="btw-refs-label">{t("btw.uncertainties")}</span><ul>{turn.uncertainties.map((u, j) => <li key={j}>{u}</li>)}</ul></div> : null}
+                </div>
+              ) : null}
             </div>
           ))}
-          {workerStatus && <div className="btw-status" role="status">{workerStatus}</div>}
-          {error && <div className="btw-error" role="alert">{error}</div>}
-          {overCap && (
-            <div className="btw-error">transcript 过长，建议关闭抽屉重新开始。</div>
-          )}
         </div>
 
         <div className="btw-input-row">

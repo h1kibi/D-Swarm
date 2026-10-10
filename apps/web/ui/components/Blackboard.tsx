@@ -335,7 +335,7 @@ function owningIntent(
     if (exact) return exact;
   }
   const within = (it: BlackboardView["intents"][number]) => {
-    const lo = it.claimedTs ?? it.proposedTs;
+    const lo = it.claimedTs ?? it.proposedTs ?? 0;
     const hi = it.concludedTs ?? Infinity;
     return fact.ts >= lo - 1 && fact.ts <= hi + 1;
   };
@@ -349,7 +349,7 @@ function owningIntentForDead(
   dead: BlackboardView["deadEnds"][number],
 ): BlackboardView["intents"][number] | undefined {
   const within = (it: BlackboardView["intents"][number]) => {
-    const lo = it.claimedTs ?? it.proposedTs;
+    const lo = it.claimedTs ?? it.proposedTs ?? 0;
     const hi = it.concludedTs ?? Infinity;
     return dead.ts >= lo - 1 && dead.ts <= hi + 1;
   };
@@ -481,7 +481,7 @@ function flattenToFlow(rawBb: BlackboardView, opts: FlowOpts): { nodes: Node<Nod
     looseN += 1;
   }
 
-  const orderedIntents = [...bb.intents].sort((a, b) => a.proposedTs - b.proposedTs);
+  const orderedIntents = [...bb.intents].sort((a, b) => (a.proposedTs ?? 0) - (b.proposedTs ?? 0));
   // pre-compute each intent's group size. Children flow in a fixed 3-column grid
   // inside the group (CHILD_COLS), so height is a clean function of child count —
   // see estimateGroupH. (depth is no longer used for layout; masonry packs by

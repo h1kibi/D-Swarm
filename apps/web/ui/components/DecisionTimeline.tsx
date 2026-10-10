@@ -94,7 +94,7 @@ function CycleCard({
         <span className={`tl-chip cycle-${cycle.status}`}>{t(`timeline.cycleStatus.${cycle.status}`)}</span>
         {cycle.durationMs != null && <span className="tl-duration">{fmtDurationMs(cycle.durationMs)}</span>}
       </button>
-      {cycle.trigger && <div className="tl-sub">{t("timeline.cycle.trigger", { reason: cycle.trigger })}</div>}
+      {cycle.trigger && <div className="tl-cycle-detail tl-sub">{t("timeline.cycle.trigger", { reason: cycle.trigger })}</div>}
       {open && (
         <div className="tl-cycle-body">
           {cycle.audits.length > 0 && (
@@ -117,6 +117,26 @@ function CycleCard({
   );
 }
 
+function TimelineBody({
+  main,
+  detail,
+  action,
+}: {
+  main: React.ReactNode;
+  detail?: React.ReactNode;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="tl-content">
+      <div className="tl-main">
+        <div className="tl-main-content">{main}</div>
+        {action && <div className="tl-action">{action}</div>}
+      </div>
+      {detail && <div className="tl-detail">{detail}</div>}
+    </div>
+  );
+}
+
 function TimelineRow({
   item,
   anchorId,
@@ -135,15 +155,15 @@ function TimelineRow({
   switch (item.kind) {
     case "recon":
       body = (
-        <>
-          <span className="tl-item-title">
+        <TimelineBody
+          main={<span className="tl-item-title">
             {t(item.recon.status === "running" ? "timeline.recon.running" : "timeline.recon.done")}
-          </span>
-          <span className="tl-sub">
+          </span>}
+          detail={<span className="tl-sub">
             {item.recon.newFindings != null && t("timeline.recon.findings", { n: item.recon.newFindings })}
             {item.recon.durationMs != null && ` · ${fmtDurationMs(item.recon.durationMs)}`}
-          </span>
-        </>
+          </span>}
+        />
       );
       break;
     case "cycle":
@@ -151,35 +171,41 @@ function TimelineRow({
       return null;
     case "dispatch":
       body = (
-        <>
-          <span className="tl-item-title">{t("timeline.dispatch")}</span>
-          <span className="tl-dispatch-line">
-            {item.intent.id} →{" "}
-            {item.intent.workerId ? (
-              <button type="button" className="evi-link" title={t("evidence.viewWorker")}
-                onClick={() => onOpenWorker(item.intent.workerId!)}><b>{item.intent.workerId}</b></button>
-            ) : <b>?</b>}
-            {item.intent.priority != null && <span className="tl-priority">P{item.intent.priority.toFixed(2)}</span>}
-          </span>
-          <span className="tl-sub">
-            {item.intent.profile && <span>{item.intent.profile} · </span>}
-            {item.intent.goal}
-          </span>
-          {item.intent.dispatchReason && (
-            <span className="tl-sub tl-muted">{t("timeline.dispatch.reason")}: {item.intent.dispatchReason}</span>
-          )}
-        </>
+        <TimelineBody
+          main={<>
+            <span className="tl-item-title">{t("timeline.dispatch")}</span>
+            <span className="tl-dispatch-line">
+              {item.intent.id} →{" "}
+              {item.intent.workerId ? (
+                <button type="button" className="evi-link" title={t("evidence.viewWorker")}
+                  onClick={() => onOpenWorker(item.intent.workerId!)}><b>{item.intent.workerId}</b></button>
+              ) : <b>?</b>}
+              {item.intent.priority != null && <span className="tl-priority">P{item.intent.priority.toFixed(2)}</span>}
+            </span>
+          </>}
+          detail={<>
+            <span className="tl-sub">
+              {item.intent.profile && <span>{item.intent.profile} · </span>}
+              {item.intent.goal}
+            </span>
+            {item.intent.dispatchReason && (
+              <span className="tl-sub tl-muted">{t("timeline.dispatch.reason")}: {item.intent.dispatchReason}</span>
+            )}
+          </>}
+        />
       );
       break;
     case "fact":
       body = (
-        <>
-          <span className={`tl-chip ${item.fact.verified ? "ok" : "candidate"}`}>
-            {t(item.fact.verified ? "timeline.fact.verified" : "timeline.fact.candidate")}
-          </span>
-          <span className="tl-fact-text">{item.fact.summary || item.fact.fact}</span>
-          <span className="tl-sub tl-muted">
-            {t("timeline.fact.provenance")}:{" "}
+        <TimelineBody
+          main={<>
+            <span className={`tl-chip ${item.fact.verified ? "ok" : "candidate"}`}>
+              {t(item.fact.verified ? "timeline.fact.verified" : "timeline.fact.candidate")}
+            </span>
+            <span className="tl-fact-text">{item.fact.summary || item.fact.fact}</span>
+          </>}
+          detail={<span className="tl-sub tl-muted">
+            {t("timeline.fact.provenance")}: {" "}
             <button type="button" className="evi-link" title={t("evidence.viewWorker")}
               onClick={() => onOpenWorker(item.fact.actor)}>{item.fact.actor}</button>
             {item.fact.factSeq != null && (
@@ -189,38 +215,46 @@ function TimelineRow({
                   onClick={() => onOpenEvidence?.()}>#{item.fact.factSeq}</button>
               </>
             )}
-          </span>
-        </>
+          </span>}
+        />
       );
       break;
     case "flag":
       body = (
-        <>
-          <span className="tl-item-title">{t("timeline.flag")}</span>
-          <span className="tl-flag">{item.flag}</span>
-          {item.actor && <span className="tl-sub tl-muted">{item.actor}</span>}
-        </>
+        <TimelineBody
+          main={<>
+            <span className="tl-item-title">{t("timeline.flag")}</span>
+            <span className="tl-flag">{item.flag}</span>
+          </>}
+          detail={item.actor && <span className="tl-sub tl-muted">{item.actor}</span>}
+        />
       );
       break;
     case "hitl":
       body = (
-        <>
-          <span className="tl-chip warn">{t("timeline.hitl")}</span>
-          <span className="tl-fact-text">{item.req.promptZh || item.req.prompt}</span>
-          {item.req.worker && <span className="tl-sub tl-muted">{item.req.worker}</span>}
-        </>
+        <TimelineBody
+          main={<>
+            <span className="tl-chip warn">{t("timeline.hitl")}</span>
+            <span className="tl-fact-text">{item.req.promptZh || item.req.prompt}</span>
+          </>}
+          detail={item.req.worker && <span className="tl-sub tl-muted">{item.req.worker}</span>}
+        />
       );
       break;
     case "directive":
       body = (
-        <>
-          <span className="tl-item-title">{t("timeline.directive")}</span>
-          <span className={`tl-chip dir-${item.lifecycle}`}>{t(`directive.lifecycle.${item.lifecycle}`)}</span>
-          <span className="tl-fact-text">{item.directive.action}: {item.directive.text}</span>
-          {item.directive.boundWorker && (
-            <span className="tl-sub tl-muted">→ {item.directive.boundWorker}</span>
-          )}
-        </>
+        <TimelineBody
+          main={<>
+            <span className="tl-item-title">{t("timeline.directive")}</span>
+            <span className={`tl-chip dir-${item.lifecycle}`}>{t(`directive.lifecycle.${item.lifecycle}`)}</span>
+          </>}
+          detail={<>
+            <span className="tl-fact-text">{item.directive.action}: {item.directive.text}</span>
+            {item.directive.boundWorker && (
+              <span className="tl-sub tl-muted">→ {item.directive.boundWorker}</span>
+            )}
+          </>}
+        />
       );
       break;
     case "worker": {
@@ -228,28 +262,30 @@ function TimelineRow({
       const label = workerShortLabel(lane.solverId, lane.engine);
       const color = workerColor(lane.solverId, lane.engine);
       body = (
-        <>
-          <span className="tl-avatar" style={{ background: color }} aria-hidden="true">
-            {workerInitial(lane.solverId)}
-          </span>
-          <span className="tl-item-title">{t("timeline.workerOutput")} · {label}</span>
-          <span className="tl-sub">
+        <TimelineBody
+          main={<>
+            <span className="tl-avatar" style={{ background: color }} aria-hidden="true">
+              {workerInitial(lane.solverId)}
+            </span>
+            <span className="tl-item-title">{t("timeline.workerOutput")} · {label}</span>
+          </>}
+          detail={<span className="tl-sub">
             {t("timeline.toolCalls", { n: lane.toolLines.length })}
             {lane.status && ` · ${lane.status}`}
-          </span>
-          <button type="button" className="tl-open" onClick={() => onOpenWorker(lane.solverId)}>
+          </span>}
+          action={<button type="button" className="tl-open" onClick={() => onOpenWorker(lane.solverId)}>
             {t("timeline.openWorker")}
-          </button>
-        </>
+          </button>}
+        />
       );
       break;
     }
     case "legacy":
       body = (
-        <>
-          <span className="tl-chip legacy">{t(item.i18nKey)}</span>
-          {item.label && <span className="tl-sub tl-muted">{item.label}</span>}
-        </>
+        <TimelineBody
+          main={<span className="tl-chip legacy">{t(item.i18nKey)}</span>}
+          detail={item.label && <span className="tl-sub tl-muted">{item.label}</span>}
+        />
       );
       break;
     case "chat": {
@@ -261,10 +297,12 @@ function TimelineRow({
           : (m.solverId || "");
       const text = m.i18nKey ? t(m.i18nKey, m.i18nVars) : m.content;
       body = (
-        <>
-          <span className={`tl-chip chat-${m.role}`}>{who}</span>
-          <span className="tl-fact-text">{text}</span>
-        </>
+        <TimelineBody
+          main={<>
+            <span className={`tl-chip chat-${m.role}`}>{who}</span>
+            <span className="tl-fact-text">{text}</span>
+          </>}
+        />
       );
       break;
     }

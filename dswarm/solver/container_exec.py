@@ -45,11 +45,16 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Any
 
 from dswarm.solver.cli_driver import CliDriver, CliResult, StreamStep
 from dswarm.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
+from dswarm.solver.runtime_credentials import (
+    CredentialProjectionError,
+    CredentialProjector,
+)
 from dswarm.solver.docker import docker_run
 from dswarm.solver.runtime_policy import RuntimePolicy
 from dswarm.solver.worker_profiles import DEFAULT_WORKER_IMAGE, direction_image
@@ -343,7 +348,14 @@ class ContainerHandle:
     memory: Optional[str] = None
     cpus: Optional[str] = None
     pids_limit: Optional[int] = None
+    # ``account_root`` is the projected root mounted in the container. The
+    # source store is retained separately so recovery can create a fresh lease.
     account_root: Optional[str] = None
+    credential_source_root: Optional[str] = None
+    credential_sessions_root: Optional[str] = None
+    credential_binding_id: Optional[str] = None
+    credential_mode: str = "direct"
+    credential_lease: Any = field(default=None, repr=False)
     # rcp control plane (mode == "rcp"): REVERSE-CONNECT — the supervisor dials the
     # host ControlReceiver and is routed by run_id, so the host side just needs the
     # run_id (above) to find the link. control_dir carries the token into the
@@ -481,197 +493,230 @@ def runtime_execs_for_run(run_id: str) -> list[dict[str, Any]]:
 # that made all worker turns 0.02s rc=1 empty exits). The lock + a created-state
 # aware path (start, don't blindly remove) fixes it.
 _ENSURE_LOCK = threading.Lock()
+_LEGACY_HANDLES: dict[str, ContainerHandle] = {}
 
 
-def _ensure_container_legacy_impl(run_id: str, host_workspace: str, *,
-                     image: str = WORKER_IMAGE, network: str = "bridge",
-                     memory: Optional[str] = None,
-                     cpus: Optional[str] = None,
-                     pids_limit: Optional[int] = None,
-                     account_root: Optional[str] = None) -> ContainerHandle:
-    """Idempotently bring up the run's ONE long-lived worker container and return a
-    handle. The first caller `docker run -d`s it (ENTRYPOINT = supervisor in rcp
-    mode; `sleep infinity` in legacy dockerexec mode); later callers (other workers)
-    find it running and reuse it. Only the run workspace is bind-mounted (plus the
-    control-socket dir and the account projection)."""
+def _adopt_handle(target: ContainerHandle, source: ContainerHandle) -> None:
+    if target is source:
+        return
+    for name in (
+        "container", "image", "network", "memory", "cpus", "pids_limit",
+        "account_root", "credential_source_root", "credential_sessions_root",
+        "credential_binding_id", "credential_mode", "credential_lease", "mode",
+        "control_dir", "token",
+    ):
+        setattr(target, name, getattr(source, name))
+    source.credential_lease = None
+    _LEGACY_HANDLES[target.run_id] = target
+
+
+def _release_credential_lease(lease: Any) -> None:
+    if lease is None:
+        return
+    try:
+        lease.close()
+    except Exception:
+        # K: credential-lease local cleanup 失败(可重试)不得阻断容器 teardown;
+        # operation root 未删净留给后续回收,容器必须照常移除。
+        pass
+
+
+def _release_legacy_credential_lease(handle: ContainerHandle) -> None:
+    lease = handle.credential_lease
+    handle.credential_lease = None
+    handle.account_root = None
+    _release_credential_lease(lease)
+
+
+def _ensure_container_legacy_impl(
+    run_id: str,
+    host_workspace: str,
+    *,
+    image: str = WORKER_IMAGE,
+    network: str = "bridge",
+    memory: Optional[str] = None,
+    cpus: Optional[str] = None,
+    pids_limit: Optional[int] = None,
+    account_root: Optional[str] = None,
+    credential_account_id: Optional[str] = None,
+    credential_mode: str = "direct",
+    credential_sessions_root: Optional[str] = None,
+) -> ContainerHandle:
+    """Start a policy-gated legacy container with at most one binding.
+
+    ``account_root`` is only a source store. Docker receives an operation-scoped
+    projection containing ``credential_account_id``; projection failure is fatal.
+    """
+    if credential_account_id and not account_root:
+        raise RuntimeError("legacy_credential_source_required")
+    if account_root and not credential_account_id:
+        raise RuntimeError("legacy_credential_binding_required")
+    if credential_mode not in {"direct", "custom"}:
+        raise RuntimeError("legacy_credential_mode_invalid")
+
     _raise_if_container_stopping(run_id)
     os.makedirs(host_workspace, exist_ok=True)
-    # Make the shared workspace (incl. the already-created graph/shared_graph.db
-    # team board) writable by the kali worker uid — it's created root-owned here
-    # and bind-mounted into the worker, which runs as kali. Without this the board
-    # is read-only to workers (sqlite "attempt to write a readonly database").
-    # This runs before the FIRST worker spawns; the DB is created earlier (swarm
-    # bootstrap), so a recursive chown of the tree covers it. Best-effort.
     _chown_tree_to_worker(host_workspace, image=image)
     _raise_if_container_stopping(run_id)
-    mount_account_root = account_root
-    if account_root:
-        os.makedirs(account_root, exist_ok=True)
-        # Mount a container-READABLE projection of the account store, NOT the raw
-        # 0600 host store (#15: the container 'kali' user's uid differs from the
-        # host owner so it can't read 0600 files; #14: codex needs CODEX_HOME/
-        # auth.json WRITABLE to refresh its token). project_account_root copies the
-        # store under the (gitignored, ephemeral) run workspace with container-
-        # readable perms + a writable codex-home, leaving the host store untouched
-        # and read-only. The projection — not the raw store — is what's mounted.
-        from dswarm.solver.credential_accounts import project_account_root
-        projection = os.path.join(host_workspace, ".dswarm_accounts")
-        try:
-            project_account_root(account_root, projection)
-            mount_account_root = projection
-        except OSError:
-            mount_account_root = account_root  # fall back to raw store mount
-    _raise_if_container_stopping(run_id)
-    r = _docker("image", "inspect", image, timeout=20)
-    if r.returncode != 0:
+    image_result = _docker("image", "inspect", image, timeout=20)
+    if image_result.returncode != 0:
         raise RuntimeError(
-            f"worker image {image!r} not found — build it first "
-            f"(./docker/worker/build.sh)")
+            f"worker image {image!r} not found - build it first "
+            f"(./docker/worker/build.sh)"
+        )
     name = _run_container_name(run_id)
-
-    mode = "dockerexec" if _USE_DOCKEREXEC else "rcp"
-    # The rcp supervisor must DIAL OUT to the host receiver, which needs outbound
-    # networking — impossible with `--network none`. Offline-ness is NOT enforced by
-    # network isolation anyway; it's the CLI flags (claude --disallowed-tools Web*,
-    # codex --no-search) that deny the agent web access. So in rcp mode upgrade
-    # `none` → `bridge`: the supervisor can reach host.docker.internal and the worker
-    # is still offline at the engine layer.
-    if mode == "rcp" and str(network).strip() == "none":
-        network = "bridge"
-    # P2-v3 BLOCKER-b: in the compose layout the coordinator runs inside the web
-    # container and workers are SIBLING containers; the supervisor reaches the
-    # receiver by the web service's network alias (DSWARM_CONTROL_HOST=web), which
-    # only resolves if the worker joins the SAME compose network. DSWARM_WORKER_NETWORK
-    # names that network (e.g. "dswarm_net"); when set it overrides the per-profile
-    # network (the bridge/host/none UI control is meaningless across the socket). It
-    # does NOT override an explicit "host" request (offline/host-target runtimes).
-    _net_override = (os.environ.get("DSWARM_WORKER_NETWORK") or "").strip()
-    if mode == "rcp" and _net_override and str(network).strip() != "host":
-        network = _net_override
-    host_net = str(network).strip() == "host"
-    control_dir: Optional[str] = None
-    token = ""
-    if mode == "rcp":
-        # REVERSE-CONNECT control plane: the supervisor does NOT listen — it DIALS the
-        # host's ControlReceiver (host.docker.internal:<port>) and sends a Hello with
-        # {run_id, token}. So here we just (a) register the expected token with the
-        # receiver BEFORE the container starts (it may dial in immediately), and (b)
-        # ferry that token into the container via a tiny bind-mounted control dir. No
-        # port publish, no per-run host port — N runs all dial the receiver's one
-        # port and are routed by run_id. (This sidesteps both the UDS-across-VM
-        # problem and the "supervisor as open network service" problem.)
-        from dswarm.solver.control_receiver import ControlReceiver
-        control_dir = os.path.join(host_workspace, ".dswarm_control")
-        # Recreate the dir from scratch on the creation path: a leftover container
-        # from a killed run may have been bind-mounting THIS path, and Docker
-        # Desktop's file-sharing daemon can serve stale file contents for a
-        # re-created path (the supervisor then Hello's with an OLD token and the
-        # receiver rejects it — "host rejected hello: unauthorized", the whole run
-        # degrading before any worker starts). A fresh dir on a fresh container
-        # gets a fresh read of the fresh token.
-        try:
-            shutil.rmtree(control_dir, ignore_errors=True)
-        except OSError:
-            pass
-        os.makedirs(control_dir, exist_ok=True)
-        token = secrets.token_hex(16)
-        try:
-            with open(os.path.join(control_dir, "token"), "w") as f:
-                f.write(token)
-            # Windows mode bits are best-effort; the production boundary is
-            # the Docker/Linux runtime, not this host-side staging directory.
-            os.chmod(os.path.join(control_dir, "token"), 0o600)
-        except OSError:
-            pass
-        ControlReceiver.instance().expect(run_id, token)
-
-    handle = ContainerHandle(run_id=run_id, host_workspace=host_workspace,
-                             container=name, image=image, network=network,
-                             memory=memory, cpus=cpus, pids_limit=pids_limit,
-                             account_root=mount_account_root,
-                             mode=mode, control_dir=control_dir, token=token)
+    lease = None
+    created_by_this_call = False
     with _ENSURE_LOCK:
         _raise_if_container_stopping(run_id)
-        state = _container_state(name)
-        if state == "running":
+        existing = _LEGACY_HANDLES.get(run_id)
+        if existing is not None:
+            same_binding = (
+                existing.credential_source_root == account_root
+                and existing.credential_binding_id == credential_account_id
+                and existing.credential_mode == credential_mode
+            )
+            if not same_binding:
+                raise RuntimeError("legacy_container_credentials_already_bound")
+            if _container_state(existing.container) in {"running", "created", "restarting", "paused"}:
+                return existing
+            _LEGACY_HANDLES.pop(run_id, None)
+            _release_legacy_credential_lease(existing)
+
+        mount_account_root: Optional[str] = None
+        sessions_root = credential_sessions_root or str(Path(host_workspace).parent)
+        if account_root:
+            try:
+                lease = CredentialProjector(account_root, sessions_root).project(
+                    run_id=run_id,
+                    pool_id="legacy-container",
+                    worker_instance_id="run-container",
+                    binding_id=str(credential_account_id),
+                    credential_mode=credential_mode,
+                )
+            except CredentialProjectionError as exc:
+                raise RuntimeError(
+                    f"legacy_credential_projection_failed:{exc.code}"
+                ) from exc
+            if lease.root is None:
+                _release_credential_lease(lease)
+                raise RuntimeError("legacy_credential_projection_missing_root")
+            mount_account_root = str(lease.root)
+
+        mode = "dockerexec" if _USE_DOCKEREXEC else "rcp"
+        if mode == "rcp" and str(network).strip() == "none":
+            network = "bridge"
+        network_override = (os.environ.get("DSWARM_WORKER_NETWORK") or "").strip()
+        if mode == "rcp" and network_override and str(network).strip() != "host":
+            network = network_override
+        host_net = str(network).strip() == "host"
+        control_dir: Optional[str] = None
+        token = ""
+        if mode == "rcp":
+            from dswarm.solver.control_receiver import ControlReceiver
+
+            control_dir = os.path.join(host_workspace, ".dswarm_control")
+            shutil.rmtree(control_dir, ignore_errors=True)
+            os.makedirs(control_dir, exist_ok=True)
+            token = secrets.token_hex(16)
+            try:
+                with open(os.path.join(control_dir, "token"), "w", encoding="utf-8") as handle:
+                    handle.write(token)
+                os.chmod(os.path.join(control_dir, "token"), 0o600)
+            except OSError:
+                pass
+            ControlReceiver.instance().expect(run_id, token)
+
+        handle = ContainerHandle(
+            run_id=run_id,
+            host_workspace=host_workspace,
+            container=name,
+            image=image,
+            network=network,
+            memory=memory,
+            cpus=cpus,
+            pids_limit=pids_limit,
+            account_root=mount_account_root,
+            credential_source_root=account_root,
+            credential_sessions_root=sessions_root if account_root else None,
+            credential_binding_id=credential_account_id,
+            credential_mode=credential_mode,
+            credential_lease=lease,
+            mode=mode,
+            control_dir=control_dir,
+            token=token,
+        )
+        try:
+            state = _container_state(name)
+            if state in {"running", "created", "restarting", "paused"}:
+                # A process-restarted host cannot prove which credential root an
+                # unregistered legacy container mounted. Reusing it would risk
+                # cross-binding credentials, so require explicit teardown first.
+                raise RuntimeError("legacy_container_unowned")
+            if state is not None:
+                _docker("rm", "-f", name, timeout=20)
+
+            run_cmd = [
+                "run", "-d", "--init", "--name", name,
+                "--network", network,
+                "--tmpfs", "/tmp:rw,exec,size=2g",
+                "--mount",
+                f"type=bind,source={_mount_source(host_workspace)},target={CONTAINER_WORKSPACE}",
+            ]
+            if mode == "rcp" and control_dir:
+                run_cmd += [
+                    "--mount",
+                    f"type=bind,source={_mount_source(control_dir)},target={CONTAINER_CONTROL_DIR}",
+                ]
+                if not host_net:
+                    run_cmd += ["--add-host", "host.docker.internal:host-gateway"]
+            if memory:
+                run_cmd += ["--memory", str(memory)]
+            if cpus:
+                run_cmd += ["--cpus", str(cpus)]
+            if pids_limit and int(pids_limit) > 0:
+                run_cmd += ["--pids-limit", str(int(pids_limit))]
+            if mount_account_root:
+                run_cmd += [
+                    "--mount",
+                    f"type=bind,source={_mount_source(mount_account_root)},target={CONTAINER_ACCOUNTS_ROOT}",
+                ]
+            _raise_if_container_stopping(run_id)
+            if mode == "dockerexec":
+                result = _docker(*run_cmd, image, "sleep", "infinity", timeout=60)
+            else:
+                from dswarm.solver.control_receiver import (
+                    CONTROL_HOST_FROM_CONTAINER,
+                    DEFAULT_CONTROL_PORT,
+                )
+
+                result = _docker(
+                    *run_cmd,
+                    image,
+                    "--connect",
+                    f"{CONTROL_HOST_FROM_CONTAINER}:{DEFAULT_CONTROL_PORT}",
+                    "--run-id",
+                    run_id,
+                    timeout=60,
+                )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"failed to start run container {name}: {result.stderr.strip()[:300]}"
+                )
+            created_by_this_call = True
             if mode == "rcp":
                 _await_supervisor(handle)
+            _LEGACY_HANDLES[run_id] = handle
             return handle
-        if state in ("created", "restarting", "paused"):
-            # mid-creation or transient — start it, DON'T remove (removing would kill
-            # a sibling's in-flight container). start is a no-op if already running.
-            _docker("start", name, timeout=20)
-            if _container_state(name) in ("running", "created", "restarting"):
-                if mode == "rcp":
-                    _await_supervisor(handle)
-                return handle
-        if state is not None:
-            # genuinely dead (exited/dead) leftover — remove and recreate clean.
-            _docker("rm", "-f", name, timeout=20)
-        # --mount (key=value) NOT -v: the workspace path has run_id ("nyu:KEY") whose
-        # colon makes `-v host:ctr:rw` mis-parse → silent bind-mount failure. `--init`
-        # reaps zombie trees. In rcp mode the ENTRYPOINT (supervisor) is the keepalive
-        # (no `sleep infinity`); in legacy mode we append `sleep infinity`.
-        run_cmd = [
-            "run", "-d", "--init", "--name", name,
-            "--network", network,
-            "--tmpfs", "/tmp:rw,exec,size=2g",
-            "--mount",
-            f"type=bind,source={_mount_source(host_workspace)},target={CONTAINER_WORKSPACE}",
-        ]
-        if mode == "rcp" and control_dir:
-            run_cmd += [
-                "--mount",
-                f"type=bind,source={_mount_source(control_dir)},target={CONTAINER_CONTROL_DIR}",
-            ]
-            # The supervisor dials OUT to host.docker.internal. On Docker Desktop that
-            # DNS resolves to the host automatically; on a Linux host it does NOT, so
-            # add it explicitly mapped to the gateway. (Harmless on Docker Desktop —
-            # the explicit entry just shadows the built-in with the same target.)
-            if not host_net:
-                run_cmd += ["--add-host", "host.docker.internal:host-gateway"]
-        if memory:
-            run_cmd += ["--memory", str(memory)]
-        if cpus:
-            run_cmd += ["--cpus", str(cpus)]
-        if pids_limit and int(pids_limit) > 0:
-            run_cmd += ["--pids-limit", str(int(pids_limit))]
-        if account_root:
-            # Mount the container-readable PROJECTION (handle.account_root, set to
-            # the projected dir above), NOT read-only: codex needs CODEX_HOME/
-            # auth.json writable to refresh its token (#14). Per-file perms in the
-            # projection keep the static secrets effectively read-only (0644) while
-            # only codex-home is writable; the HOST store stays untouched. NOTE:
-            # the raw host store is NEVER mounted here — only its projection is.
-            run_cmd += [
-                "--mount",
-                f"type=bind,source={_mount_source(handle.account_root)},target={CONTAINER_ACCOUNTS_ROOT}",
-            ]
-        _raise_if_container_stopping(run_id)
-        if mode == "dockerexec":
-            run = _docker(*run_cmd, image, "sleep", "infinity", timeout=60)
-        else:
-            # ENTRYPOINT (supervisor) runs; append the reverse-connect args so it DIALS
-            # the host receiver and identifies as this run. These append to the exec-
-            # form ENTRYPOINT; the supervisor ignores the baked --sock/--workspace and
-            # uses --connect/--run-id (token comes from the bind-mounted control file).
-            from dswarm.solver.control_receiver import (
-                CONTROL_HOST_FROM_CONTAINER, DEFAULT_CONTROL_PORT)
-            run = _docker(*run_cmd, image,
-                          "--connect", f"{CONTROL_HOST_FROM_CONTAINER}:{DEFAULT_CONTROL_PORT}",
-                          "--run-id", run_id,
-                          timeout=60)
-        if run.returncode != 0:
-            # lost a create race (name conflict) → reuse whoever won if it's up.
-            st = _container_state(name)
-            if st in ("running", "created"):
-                if mode == "rcp":
-                    _await_supervisor(handle)
-                return handle
-            raise RuntimeError(f"failed to start run container {name}: {run.stderr.strip()[:300]}")
-        if mode == "rcp":
-            _await_supervisor(handle)
-        return handle
+        except BaseException:
+            if created_by_this_call:
+                try:
+                    _docker("rm", "-f", name, timeout=20)
+                except Exception:
+                    pass
+            if lease is not None:
+                _release_credential_lease(lease)
+            raise
 
 
 # The old one-container-per-run constructor remains only as an explicitly gated
@@ -772,29 +817,29 @@ def _oom_kill_count(container: str) -> Optional[int]:
 
 
 def teardown_container(run_id: str, *, remove: bool = True) -> None:
-    """Tear down the run's single container — its PID namespace takes the supervisor
-    + every worker with it. Also sweeps any stray per-worker containers from the OLD
-    per-worker design, so a mixed-version state never leaks. Filters are end-anchored
-    on the run's safe name to avoid the substring误杀 that killed live targets under
-    the old fixed-name scheme."""
+    """Tear down a legacy run container and release its credential projection."""
     _mark_container_stopping(run_id)
-    # drop the run's control link + registered token from the receiver first (the
-    # supervisor goes away with the container, but free the host-side registry).
+    handle = _LEGACY_HANDLES.pop(run_id, None)
     try:
-        from dswarm.solver.control_receiver import ControlReceiver
-        ControlReceiver.instance().forget(run_id)
-    except Exception:
-        pass
-    name = _run_container_name(run_id)
-    _docker("rm", "-f", name, timeout=20)
-    # legacy sweep: old design left dswarm-w-<safe>-<uuid> containers; clean any.
-    safe = _safe(run_id)
-    r = _docker("ps", "-aq", "--filter", f"name=dswarm-w-{safe}-", timeout=15)
-    for cid in [x for x in (r.stdout or "").split() if x]:
-        _docker("rm", "-f", cid, timeout=15)
+        try:
+            from dswarm.solver.control_receiver import ControlReceiver
 
+            ControlReceiver.instance().forget(run_id)
+        except Exception:
+            pass
+        if remove:
+            name = _run_container_name(run_id)
+            _docker("rm", "-f", name, timeout=20)
+            safe = _safe(run_id)
+            result = _docker(
+                "ps", "-aq", "--filter", f"name=dswarm-w-{safe}-", timeout=15
+            )
+            for cid in [x for x in (result.stdout or "").split() if x]:
+                _docker("rm", "-f", cid, timeout=15)
+    finally:
+        if handle is not None:
+            _release_legacy_credential_lease(handle)
 
-# ── argv translation (shared by both backends) ───────────────────────────────
 
 def _containerize_argv(driver_name: str, argv: list[str]) -> list[str]:
     if not argv:
@@ -808,55 +853,59 @@ def _containerize_argv(driver_name: str, argv: list[str]) -> list[str]:
 # ── public entry points (mirror cli_driver.run_cli / run_cli_streaming) ───────
 
 def _ensure_alive(handle: ContainerHandle) -> None:
-    """Guarantee the run container is up right before a worker starts. If a teardown
-    / crash / race removed it, lazily recreate it (same name + mounts) so this worker
-    doesn't die "No such container". Cheap when it's already running (one inspect).
-    Re-syncs the handle's rcp token (+ receiver registration) if it had to recreate."""
+    """Recreate a stopped legacy container with its original binding."""
     _raise_if_container_stopping(handle.run_id)
     if _container_state(handle.container) == "running":
         return
-    fresh = ensure_container(handle.run_id, handle.host_workspace,
-                             image=handle.image, network=handle.network,
-                             memory=handle.memory, cpus=handle.cpus,
-                             pids_limit=handle.pids_limit,
-                             account_root=handle.account_root)
-    # a recreate regenerates the token (+ re-registers it with the receiver) — adopt
-    # it so this worker's link resolves.
-    handle.mode = fresh.mode
-    handle.control_dir = fresh.control_dir
-    handle.token = fresh.token
+    fresh = _ensure_container_legacy_impl(
+        handle.run_id,
+        handle.host_workspace,
+        image=handle.image,
+        network=handle.network,
+        memory=handle.memory,
+        cpus=handle.cpus,
+        pids_limit=handle.pids_limit,
+        account_root=handle.credential_source_root,
+        credential_account_id=handle.credential_binding_id,
+        credential_mode=handle.credential_mode,
+        credential_sessions_root=handle.credential_sessions_root,
+    )
+    _adopt_handle(handle, fresh)
 
 
 def _recover_run_container(handle: ContainerHandle) -> None:
-    """Force-recreate the run container after its supervisor/link died (crash or
-    the supervisor's host-link-loss exit), so a fresh supervisor dials back in.
-    Forgets the stale receiver link and adopts the recreated handle's token."""
+    """Force-recreate a legacy container while preserving its binding."""
     _raise_if_container_stopping(handle.run_id)
     from dswarm.solver.control_receiver import ControlReceiver
+
     try:
         ControlReceiver.instance().forget(handle.run_id)
     except Exception:
-        pass
-    name = _run_container_name(handle.run_id)
+        pass  # K: receiver 链路登记清理失败不得阻断恢复重建
     try:
-        _docker("rm", "-f", name, timeout=20)
+        _docker("rm", "-f", _run_container_name(handle.run_id), timeout=20)
     except Exception:
-        pass
-    fresh = ensure_container(handle.run_id, handle.host_workspace,
-                             image=handle.image, network=handle.network,
-                             memory=handle.memory, cpus=handle.cpus,
-                             pids_limit=handle.pids_limit,
-                             account_root=handle.account_root)
-    handle.mode = fresh.mode
-    handle.control_dir = fresh.control_dir
-    handle.token = fresh.token
+        pass  # K: 旧容器强制移除失败由 recreate 路径兜底,不得阻断恢复
+    fresh = _ensure_container_legacy_impl(
+        handle.run_id,
+        handle.host_workspace,
+        image=handle.image,
+        network=handle.network,
+        memory=handle.memory,
+        cpus=handle.cpus,
+        pids_limit=handle.pids_limit,
+        account_root=handle.credential_source_root,
+        credential_account_id=handle.credential_binding_id,
+        credential_mode=handle.credential_mode,
+        credential_sessions_root=handle.credential_sessions_root,
+    )
+    _adopt_handle(handle, fresh)
 
 
 def _run_rcp_with_recover(fn, *args, handle: ContainerHandle, **kwargs) -> "CliResult":
-    """Call an rcp transport function; on a dead supervisor/link (ControlError),
-    recreate the run container (fresh supervisor) and retry ONCE. The retry's
-    `_resolve_link` waits for the new supervisor to dial back in."""
+    """Retry one RCP call after recreating a dead legacy supervisor."""
     from dswarm.solver.control_client import ControlError
+
     try:
         return fn(*args, **kwargs)
     except ControlError:
