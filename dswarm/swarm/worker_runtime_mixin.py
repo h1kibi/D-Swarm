@@ -454,7 +454,13 @@ class WorkerRuntimeMixin:
                 env["DSWARM_WORKER_MODEL"] = str(profile["model"])
             if profile.get("effort"):
                 env["DSWARM_WORKER_THINKING"] = str(profile["effort"])
-            if explicit_custom_endpoint and not provider_ref:
+            if explicit_custom_endpoint and not provider_ref and not home_and_gateway_only:
+                # Strict lease (container) workers own NO raw key and NO custom
+                # endpoint: their provider is the gateway block below. Taking this
+                # branch there selected `dswarm-worker`, whose provider extension
+                # never registers without the account env that the lease path
+                # deliberately omits — pi then died with
+                # "Unknown provider \"dswarm-worker\"" before its first call.
                 env["DSWARM_PI_PROVIDER"] = "dswarm-worker"
                 base_url = str(profile.get("base_url") or "").strip().rstrip("/")
                 if base_url:
