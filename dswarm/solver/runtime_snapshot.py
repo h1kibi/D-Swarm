@@ -307,7 +307,16 @@ class RuntimeSnapshotBuilder:
                 )
             if profile.get("enabled", True) is False:
                 continue
-            profile_id = str(profile.get("name") or profile.get("id") or "").strip()
+            # Identity used by the frozen pool contract is the route-profile
+            # NAME — label first, then name/id. Seat-based configs (the deck's
+            # stable-seat editor) store the seat id in ``name`` and the route
+            # label ("pi-web") in ``label``; the runtime route matcher compares
+            # against direction_profile_name(route), so the label is the key
+            # that must be recorded here. Legacy configs where name==label are
+            # unchanged.
+            profile_id = str(
+                profile.get("label") or profile.get("name") or profile.get("id") or ""
+            ).strip()
             if not profile_id:
                 raise RuntimeSnapshotBuildError(
                     "invalid_worker_profile", "worker profile identity is missing"

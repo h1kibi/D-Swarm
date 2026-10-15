@@ -814,6 +814,13 @@ def _swarm_driver(
             budget_gate=getattr(run, "budget_gate", None),
             initial_runtime_operation_kind=runtime_operation_kind,
             role_client_factory=role_client_factory,
+            # The frozen M9 runtime context (policy + snapshot + pool manager)
+            # MUST reach the Swarm: without it every container-backend spawn
+            # fails closed with runtime_policy_required while the run rail
+            # keeps polling (observed live: intent dispatch died in ~20ms with
+            # runtime_failure, zero containers ever created). This helper is
+            # the single source for every driver path.
+            **runtime_context_kwargs(run),
         )
         try:
             out = await swarm.run()

@@ -373,12 +373,18 @@ class RuntimeProbe:
             gateway = ModelGateway.instance()
             provider_id = str(pool_spec.provider_binding_id or "")
             resolver = self.gateway_binding_resolver
+            upstream = None
             if callable(resolver):
                 try:
                     upstream = resolver(provider_id)
                 except (OSError, TypeError, ValueError, RuntimeError) as exc:
                     raise RuntimeProbeError("provider_binding_unavailable") from exc
-            else:
+            if upstream is None:
+                # The run-frozen provider registry is a *transport* snapshot, not
+                # the credential authority (the secret always comes from the
+                # host-side store). A snapshot that dropped the pool's
+                # provider_ref must not deadlock pool readiness: fall back to the
+                # live registry the control plane installed on the gateway.
                 upstream = gateway.resolve_upstream_binding(provider_id)
             if upstream is None:
                 raise RuntimeProbeError("provider_binding_unavailable")

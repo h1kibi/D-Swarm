@@ -1123,7 +1123,7 @@ class Swarm(
             try:
                 resp = await self.review_llm.chat(
                     model=str(profile.get("model")), messages=messages,
-                    temperature=0.0, max_tokens=1500, stream=False,
+                    temperature=0.0, max_tokens=None, stream=False,
                     run_id=self.run_id, challenge_id=self.challenge.id,
                     solver_id="reviewer",
                 )
@@ -1216,7 +1216,7 @@ class Swarm(
         ]
         response = await self.review_llm.chat(
             model=str(profile.get("model")), messages=messages,
-            temperature=0.0, max_tokens=1000, stream=False,
+            temperature=0.0, max_tokens=None, stream=False,
             run_id=self.run_id, challenge_id=self.challenge.id,
             solver_id="reviewer",
         )

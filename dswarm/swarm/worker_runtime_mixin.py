@@ -393,10 +393,14 @@ class WorkerRuntimeMixin:
         config (Unknown provider ctf-gateway).
         """
 
-        explicit_credential = bool(
-            (profile or {}).get("base_url")
-            or (profile or {}).get("api_key_ref")
-        )
+        # Only an explicit key REFERENCE is an explicit credential. A bare
+        # base_url is just an endpoint preference — the deck's role bindings
+        # always carry the resolved endpoint (base_url) alongside the
+        # provider_ref, and treating that as "owns its own key" silently
+        # disabled BOTH the gateway task token and the account-file injection,
+        # leaving the worker with no credential at all ("No API key found for
+        # deepseek" inside the container).
+        explicit_credential = bool((profile or {}).get("api_key_ref"))
         explicit_custom_endpoint = bool((profile or {}).get("base_url"))
         # provider_ref is NOT an explicit endpoint for container workers: a
         # provider binding owns its secret on the relay/gateway side, so the
@@ -685,8 +689,12 @@ class WorkerRuntimeMixin:
         runtime_policy = getattr(self, "runtime_policy", None)
         runtime_lease_factory = None
         strict_docker = runtime_policy is not None and runtime_policy.mode == "docker"
+        # Must mirror the snapshot builder's pool identity (label → name → id):
+        # the frozen pool is keyed by the route-profile NAME, and a seat config
+        # stores that in ``label`` with the stable seat id in ``name``.
         runtime_profile_id = str(
-            (profile or {}).get("name")
+            (profile or {}).get("label")
+            or (profile or {}).get("name")
             or (profile or {}).get("id")
             or engine
         )
@@ -792,10 +800,10 @@ class WorkerRuntimeMixin:
             raise RuntimePolicyError("runtime_policy_required")
         container = None
         gateway_token = None
-        explicit_credential = bool(
-            (profile or {}).get("base_url")
-            or (profile or {}).get("api_key_ref")
-        )
+        # Mirror _runtime_env_for: only an explicit api_key_ref owns its key.
+        # The role binding's base_url must NOT suppress token minting (a
+        # provider-bound profile delegates its secret to the gateway).
+        explicit_credential = bool((profile or {}).get("api_key_ref"))
         # provider_ref binds the profile to a relay whose secret stays host-side:
         # container workers authenticate with a gateway task token, so a
         # provider_ref alone must NOT suppress token minting.

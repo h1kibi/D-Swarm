@@ -2149,8 +2149,12 @@ class RunManager:
         providers: dict[str, dict[str, Any]] = {}
 
         def add_provider(raw: Mapping[str, Any]) -> None:
+            # provider_ref is the binding id the pool/worker contract uses; the
+            # profile `id` (a stable seat id like seat_pi_147fcb) is NOT a
+            # provider. Prefer provider_ref so provider-bound profiles and roles
+            # are actually discoverable by the probe/gateway lookup.
             provider_id = str(
-                raw.get("id") or raw.get("provider_ref") or ""
+                raw.get("provider_ref") or raw.get("id") or ""
             ).strip()
             if not provider_id or provider_id in providers:
                 return
@@ -2178,6 +2182,14 @@ class RunManager:
             for role in roles.values():
                 if isinstance(role, Mapping):
                     add_provider(role)
+        # The full profile list preserves provider_ref/base_url even when the
+        # per-role binding (roles.worker) froze only the model.
+        for key in ("runtime_worker_profiles", "worker_profiles"):
+            profiles = binding.get(key)
+            if isinstance(profiles, list):
+                for profile in profiles:
+                    if isinstance(profile, Mapping):
+                        add_provider(profile)
         return list(providers.values())
 
     def _freeze_dispatch_runtime(self, run: Run) -> None:
