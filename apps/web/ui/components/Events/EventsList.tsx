@@ -1,16 +1,23 @@
 "use client";
 
 import { useState } from "react";
-import { useEvents, createEvent, updateEvent, deleteEvent } from "@/lib/useEventsApi";
+import { useEvents, createEvent, deleteEvent } from "@/lib/useEventsApi";
+import { useT } from "@/lib/i18n";
 import Link from "next/link";
-import styles from "./EventsList.module.css";
 
 interface FormData {
   name: string;
   description: string;
 }
 
+const STATUS_CLASS: Record<string, string> = {
+  active: "ds-badge--green",
+  draft: "ds-badge--amber",
+  archived: "ds-badge--muted",
+};
+
 export function EventsList() {
+  const t = useT();
   const { events, loading, error, refresh } = useEvents();
   const [showForm, setShowForm] = useState(false);
   const [formData, setFormData] = useState<FormData>({ name: "", description: "" });
@@ -19,12 +26,19 @@ export function EventsList() {
   const [filter, setFilter] = useState<"all" | "active" | "draft" | "archived">("all");
 
   const filteredEvents =
-    filter === "all" ? events : events.filter((e) => e.status === filter);
+    filter === "all" ? events : events.filter((event) => event.status === filter);
+
+  const statusLabel = (status: string): string => {
+    if (status === "active") return t("events.statusActive");
+    if (status === "draft") return t("events.statusDraft");
+    if (status === "archived") return t("events.statusArchived");
+    return status;
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name.trim()) {
-      setFormError("Event name is required");
+      setFormError(t("events.nameRequired"));
       return;
     }
 
@@ -41,114 +55,134 @@ export function EventsList() {
       setShowForm(false);
       void refresh();
     } else {
-      setFormError(result.error || "Failed to create event");
+      setFormError(result.error || t("events.createFailed"));
     }
     setSubmitting(false);
   };
 
   const handleDelete = async (id: string) => {
-    if (!window.confirm("Are you sure you want to delete this event?")) return;
+    if (!window.confirm(t("events.deleteConfirm"))) return;
 
     const result = await deleteEvent(id);
     if (result.ok) {
       void refresh();
     } else {
-      alert(result.error || "Failed to delete event");
+      alert(result.error || t("events.deleteFailed"));
     }
   };
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1>Events</h1>
-        <button onClick={() => setShowForm(!showForm)} className={styles.createBtn}>
-          + New Event
-        </button>
+    <div className="ds-page">
+      <div className="ds-head">
+        <div>
+          <h1 className="ds-title">{t("events.title")}</h1>
+        </div>
+        <div className="ds-actions">
+          <button type="button" onClick={() => setShowForm(!showForm)} className="ds-btn">
+            {t("events.new")}
+          </button>
+        </div>
       </div>
 
       {showForm && (
-        <form onSubmit={handleCreate} className={styles.form}>
-          <div className={styles.formGroup}>
-            <label htmlFor="name">Event Name</label>
+        <form onSubmit={handleCreate} className="ds-card ds-card--stack">
+          <div className="ds-field">
+            <label htmlFor="event-name">{t("events.name")}</label>
             <input
-              id="name"
+              id="event-name"
               type="text"
+              className="ds-input"
               value={formData.name}
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              placeholder="e.g., CTF 2026"
+              placeholder={t("events.namePh")}
               disabled={submitting}
             />
           </div>
 
-          <div className={styles.formGroup}>
-            <label htmlFor="description">Description</label>
+          <div className="ds-field">
+            <label htmlFor="event-desc">{t("events.desc")}</label>
             <textarea
-              id="description"
+              id="event-desc"
+              className="ds-textarea"
               value={formData.description}
               onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-              placeholder="Event description..."
-              rows={4}
+              placeholder={t("events.descPh")}
+              rows={3}
               disabled={submitting}
             />
           </div>
 
-          {formError && <div className={styles.error}>{formError}</div>}
+          {formError && <div className="ds-banner ds-banner--error">{formError}</div>}
 
-          <div className={styles.formActions}>
-            <button type="submit" disabled={submitting}>
-              {submitting ? "Creating..." : "Create"}
+          <div className="ds-actions">
+            <button type="submit" className="ds-btn ds-btn--primary" disabled={submitting}>
+              {submitting ? t("common.creating") : t("common.create")}
             </button>
-            <button type="button" onClick={() => setShowForm(false)} disabled={submitting}>
-              Cancel
+            <button
+              type="button"
+              className="ds-btn ds-btn--ghost"
+              onClick={() => setShowForm(false)}
+              disabled={submitting}
+            >
+              {t("common.cancel")}
             </button>
           </div>
         </form>
       )}
 
-      <div className={styles.filters}>
-        {(["all", "active", "draft", "archived"] as const).map((f) => (
+      <div className="ds-toolbar">
+        {(["all", "active", "draft", "archived"] as const).map((option) => (
           <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className={filter === f ? styles.filterActive : styles.filter}
+            key={option}
+            type="button"
+            onClick={() => setFilter(option)}
+            className={"ds-chip" + (filter === option ? " ds-chip--on" : "")}
           >
-            {f.charAt(0).toUpperCase() + f.slice(1)}
+            {option === "all" ? t("common.all") : statusLabel(option)}
           </button>
         ))}
       </div>
 
-      {loading && <div className={styles.loading}>Loading events...</div>}
-      {error && <div className={styles.error}>Error: {error}</div>}
+      {loading && <div className="ds-loading">{t("common.loading")}</div>}
+      {error && <div className="ds-banner ds-banner--error">{t("common.error")}: {error}</div>}
 
       {!loading && filteredEvents.length === 0 && (
-        <div className={styles.empty}>No events found</div>
+        <div className="ds-empty">{t("events.empty")}</div>
       )}
 
-      <div className={styles.list}>
+      <div className="ds-grid">
         {filteredEvents.map((event) => (
-          <div key={event.id} className={styles.card}>
-            <div className={styles.cardHeader}>
-              <h3>{event.name}</h3>
-              <span className={styles.status + " " + styles[`status_${event.status}`]}>
-                {event.status}
+          <article key={event.id} className="ds-card">
+            <div className="ds-card-head">
+              <h3 className="ds-card-title">{event.name}</h3>
+              <span className={"ds-badge " + (STATUS_CLASS[event.status] || "ds-badge--muted")}>
+                {statusLabel(event.status)}
               </span>
             </div>
 
-            <p className={styles.description}>{event.description}</p>
+            {event.description && (
+              <p className="ds-muted" style={{ margin: "0 0 12px", fontSize: 12.5 }}>
+                {event.description}
+              </p>
+            )}
 
-            <div className={styles.meta}>
-              <span>by {event.created_by}</span>
-            </div>
+            <p className="ds-dim" style={{ margin: "0 0 14px", fontSize: 11.5 }}>
+              {t("events.by", { name: event.created_by })}
+            </p>
 
-            <div className={styles.actions}>
-              <Link href={`/events/${event.id}`} className={styles.link}>
-                View
+            <div className="ds-actions" style={{ justifyContent: "space-between" }}>
+              <Link href={`/events/${event.id}`} className="ds-btn ds-btn--sm">
+                {t("common.view")}
               </Link>
-              <button onClick={() => handleDelete(event.id)} className={styles.delete}>
-                Delete
+              <button
+                type="button"
+                onClick={() => handleDelete(event.id)}
+                className="ds-btn ds-btn--sm ds-btn--danger"
+              >
+                {t("common.delete")}
               </button>
             </div>
-          </div>
+          </article>
         ))}
       </div>
     </div>

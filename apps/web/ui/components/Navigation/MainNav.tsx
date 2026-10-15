@@ -3,10 +3,26 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useUser, logout } from "@/lib/useUser";
-import styles from "./MainNav.module.css";
+import { useT, useLang } from "@/lib/i18n";
+import { useTheme } from "@/lib/theme";
+
+const NAV: { href: string; key: string; admin?: boolean }[] = [
+  { href: "/", key: "nav.dashboard" },
+  { href: "/deck", key: "nav.deck" },
+  { href: "/events", key: "nav.events" },
+  { href: "/targets", key: "nav.targets" },
+  { href: "/runs", key: "nav.runs" },
+  { href: "/analytics", key: "nav.analytics" },
+  { href: "/admin/accounts", key: "nav.accounts", admin: true },
+  { href: "/admin/audit", key: "nav.audit", admin: true },
+  { href: "/settings", key: "nav.settings" },
+];
 
 export function MainNav() {
   const pathname = usePathname();
+  const t = useT();
+  const { lang, setLang } = useLang();
+  const { theme, toggleTheme } = useTheme();
   const { user, isAdmin } = useUser();
 
   const handleLogout = async () => {
@@ -14,77 +30,59 @@ export function MainNav() {
     window.location.href = "/";
   };
 
-  const isActive = (path: string) => pathname === path || pathname?.startsWith(path + "/");
+  const isActive = (path: string) =>
+    path === "/" ? pathname === "/" : pathname === path || pathname?.startsWith(path + "/");
 
   return (
-    <nav className={styles.navbar}>
-      <div className={styles.container}>
-        <div className={styles.brand}>
-          <Link href="/">D-Swarm</Link>
-        </div>
+    <nav className="ds-nav">
+      <Link href="/" className="ds-nav-brand">
+        <span className="ds-led ds-led--cyan" aria-hidden />
+        D-SWARM
+      </Link>
 
-        <ul className={styles.menu}>
-          <li>
-            <Link href="/" className={isActive("/") ? styles.active : ""}>
-              Dashboard
-            </Link>
-          </li>
-          <li>
-            <Link href="/events" className={isActive("/events") ? styles.active : ""}>
-              Events
-            </Link>
-          </li>
-          <li>
-            <Link href="/targets" className={isActive("/targets") ? styles.active : ""}>
-              Targets
-            </Link>
-          </li>
-          <li>
-            <Link href="/deck" className={isActive("/deck") ? styles.active : ""}>
-              Deck
-            </Link>
-          </li>
-          <li>
-            <Link href="/runs" className={isActive("/runs") ? styles.active : ""}>
-              Runs
-            </Link>
-          </li>
-          <li>
-            <Link href="/analytics" className={isActive("/analytics") ? styles.active : ""}>
-              Analytics
-            </Link>
-          </li>
-          {isAdmin && (
-            <>
-              <li>
-                <Link href="/admin/accounts" className={isActive("/admin/accounts") ? styles.active : ""}>
-                  Accounts
-                </Link>
-              </li>
-              <li>
-                <Link href="/admin/audit" className={isActive("/admin/audit") ? styles.active : ""}>
-                  Audit
-                </Link>
-              </li>
-            </>
-          )}
-        </ul>
+      {NAV.filter((item) => !item.admin || isAdmin).map((item) => (
+        <Link
+          key={item.href}
+          href={item.href}
+          className={"ds-nav-link" + (isActive(item.href) ? " ds-nav-link--on" : "")}
+        >
+          {t(item.key)}
+        </Link>
+      ))}
 
-        <div className={styles.userMenu}>
-          {user && (
-            <>
-              <span className={styles.username}>{user.display_name}</span>
-              <span className={styles.badge}>{user.role === "admin" ? "Admin" : "Member"}</span>
-              <Link href="/settings" className={styles.settings}>
-                Settings
-              </Link>
-              <button onClick={handleLogout} className={styles.logout}>
-                Logout
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+      <span className="ds-nav-spacer" />
+
+      <span className="ds-nav-side">
+        <button
+          type="button"
+          className="ds-nav-btn"
+          onClick={toggleTheme}
+          title={t("nav.theme")}
+          aria-label={t("nav.theme")}
+        >
+          {theme === "dark" ? "◐ light" : "◑ dark"}
+        </button>
+        <button
+          type="button"
+          className="ds-nav-btn"
+          onClick={() => setLang(lang === "zh" ? "en" : "zh")}
+          title={t("nav.lang")}
+          aria-label={t("nav.lang")}
+        >
+          {lang === "zh" ? "EN" : "中"}
+        </button>
+        {user && (
+          <>
+            <span className="ds-nav-user">{user.display_name || user.username}</span>
+            <span className={"ds-badge " + (isAdmin ? "ds-badge--red" : "ds-badge--accent")}>
+              {isAdmin ? t("role.admin") : t("role.member")}
+            </span>
+            <button type="button" className="ds-nav-btn" onClick={handleLogout}>
+              {t("nav.logout")}
+            </button>
+          </>
+        )}
+      </span>
     </nav>
   );
 }

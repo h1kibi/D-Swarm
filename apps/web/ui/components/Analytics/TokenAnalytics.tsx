@@ -1,87 +1,97 @@
 "use client";
 
 import { useTokenAnalytics } from "@/lib/useTokenAnalytics";
-import styles from "./TokenAnalytics.module.css";
+import { useT } from "@/lib/i18n";
 
 export function TokenAnalytics() {
+  const t = useT();
   const { stats, totalTokens, totalCost, loading, error } = useTokenAnalytics();
 
   if (loading) {
-    return <div className={styles.loading}>Loading analytics...</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-loading">{t("common.loading")}</div>
+      </div>
+    );
   }
 
   if (error) {
-    return <div className={styles.error}>Error: {error}</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-banner ds-banner--error">{t("common.error")}: {error}</div>
+      </div>
+    );
   }
 
+  const avgPerRun =
+    stats.length > 0
+      ? Math.round(stats.reduce((sum, stat) => sum + stat.avg_per_run, 0) / stats.length)
+      : 0;
+
+  const trendClass = (trend: number): string => {
+    if (trend > 0) return "ds-badge--red";
+    if (trend < 0) return "ds-badge--green";
+    return "ds-badge--muted";
+  };
+
+  const trendArrow = (trend: number): string => (trend > 0 ? "↑" : trend < 0 ? "↓" : "→");
+
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1>Token Analytics</h1>
-        <p>Monitor your token usage and costs</p>
+    <div className="ds-page">
+      <div className="ds-head">
+        <div>
+          <h1 className="ds-title">{t("analytics.title")}</h1>
+          <p className="ds-sub">{t("analytics.sub")}</p>
+        </div>
       </div>
 
-      <div className={styles.summary}>
-        <div className={styles.summaryCard}>
-          <div className={styles.label}>Total Tokens Used</div>
-          <div className={styles.value}>{totalTokens.toLocaleString()}</div>
+      <div className="ds-grid--stats">
+        <div className="ds-stat">
+          <div className="ds-stat-num">{totalTokens.toLocaleString()}</div>
+          <span className="ds-stat-label">{t("analytics.total")}</span>
         </div>
-        <div className={styles.summaryCard}>
-          <div className={styles.label}>Estimated Cost</div>
-          <div className={styles.value}>${totalCost.toFixed(2)}</div>
+        <div className="ds-stat">
+          <div className="ds-stat-num">${totalCost.toFixed(2)}</div>
+          <span className="ds-stat-label">{t("analytics.cost")}</span>
         </div>
-        <div className={styles.summaryCard}>
-          <div className={styles.label}>Providers</div>
-          <div className={styles.value}>{stats.length}</div>
+        <div className="ds-stat">
+          <div className="ds-stat-num">{stats.length}</div>
+          <span className="ds-stat-label">{t("analytics.providers")}</span>
         </div>
-        <div className={styles.summaryCard}>
-          <div className={styles.label}>Avg per Run</div>
-          <div className={styles.value}>
-            {stats.length > 0
-              ? Math.round(
-                  stats.reduce((sum, s) => sum + s.avg_per_run, 0) / stats.length
-                )
-              : 0}
-          </div>
+        <div className="ds-stat">
+          <div className="ds-stat-num">{avgPerRun.toLocaleString()}</div>
+          <span className="ds-stat-label">{t("analytics.avgAll")}</span>
         </div>
       </div>
 
       {stats.length === 0 ? (
-        <div className={styles.empty}>No token usage data available</div>
+        <div className="ds-empty">{t("analytics.empty")}</div>
       ) : (
-        <div className={styles.table}>
-          <div className={styles.tableHeader}>
-            <div className={styles.col_provider}>Provider</div>
-            <div className={styles.col_tokens}>Tokens Used</div>
-            <div className={styles.col_runs}>Runs</div>
-            <div className={styles.col_avg}>Avg per Run</div>
-            <div className={styles.col_cost}>Estimated Cost</div>
-            <div className={styles.col_trend}>Trend</div>
+        <div
+          className="ds-table"
+          style={{ "--cols": "1fr 140px 80px 110px 120px 100px" } as React.CSSProperties}
+        >
+          <div className="ds-table-head">
+            <span>{t("analytics.colProvider")}</span>
+            <span className="ds-cell-right">{t("analytics.colUsed")}</span>
+            <span className="ds-cell-right">{t("analytics.colRuns")}</span>
+            <span className="ds-cell-right">{t("analytics.colAvg")}</span>
+            <span className="ds-cell-right">{t("analytics.colCost")}</span>
+            <span className="ds-cell-center">{t("analytics.colTrend")}</span>
           </div>
 
           {stats.map((stat) => (
-            <div key={stat.provider} className={styles.tableRow}>
-              <div className={styles.col_provider}>
-                <strong>{stat.provider}</strong>
-              </div>
-              <div className={styles.col_tokens}>{stat.total_tokens.toLocaleString()}</div>
-              <div className={styles.col_runs}>{stat.runs_count}</div>
-              <div className={styles.col_avg}>{Math.round(stat.avg_per_run)}</div>
-              <div className={styles.col_cost}>${stat.total_cost.toFixed(4)}</div>
-              <div className={styles.col_trend}>
-                <span
-                  className={
-                    stat.trend > 0
-                      ? styles.trendUp
-                      : stat.trend < 0
-                        ? styles.trendDown
-                        : styles.trendNeutral
-                  }
-                >
-                  {stat.trend > 0 ? "↑" : stat.trend < 0 ? "↓" : "→"}
-                  {Math.abs(stat.trend).toFixed(1)}%
+            <div key={stat.provider} className="ds-row">
+              <span className="ds-bright">{stat.provider}</span>
+              <span className="ds-cell-right ds-muted">{stat.total_tokens.toLocaleString()}</span>
+              <span className="ds-cell-right ds-muted">{stat.runs_count}</span>
+              <span className="ds-cell-right ds-muted">{Math.round(stat.avg_per_run).toLocaleString()}</span>
+              <span className="ds-cell-right ds-muted">${stat.total_cost.toFixed(4)}</span>
+              <span className="ds-cell-center">
+                <span className={"ds-badge " + trendClass(stat.trend)}>
+                  {trendArrow(stat.trend)}{Math.abs(stat.trend).toFixed(1)}%
                 </span>
-              </div>
+              </span>
             </div>
           ))}
         </div>

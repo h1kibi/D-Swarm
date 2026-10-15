@@ -1,20 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useTargets, updateTarget } from "@/lib/useTargetsApi";
 import { useRuns } from "@/lib/useRunsApi";
+import { useT } from "@/lib/i18n";
 import Link from "next/link";
-import styles from "./TargetDetails.module.css";
 
 interface TargetDetailsProps {
   targetId: string;
 }
 
 export function TargetDetails({ targetId }: TargetDetailsProps) {
+  const t = useT();
   const { targets, loading: targetsLoading } = useTargets();
-  const target = targets.find((t) => t.id === targetId);
+  const target = targets.find((tgt) => tgt.id === targetId);
   const { runs } = useRuns();
-  const targetRuns = runs.filter((r) => r.target_id === targetId);
+  const targetRuns = runs.filter((run) => run.target_id === targetId);
 
   const [editing, setEditing] = useState(false);
   const [formData, setFormData] = useState({
@@ -51,50 +52,62 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
       setEditing(false);
       setTimeout(() => setSuccess(false), 3000);
     } else {
-      setError(result.error || "Failed to update target");
+      setError(result.error || t("targets.editFailed"));
     }
 
     setUpdating(false);
   };
 
   if (targetsLoading) {
-    return <div className={styles.loading}>Loading target...</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-loading">{t("common.loading")}</div>
+      </div>
+    );
   }
 
   if (!target) {
-    return <div className={styles.error}>Target not found</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-empty">{t("targets.notFound")}</div>
+      </div>
+    );
   }
 
-  const solvedRuns = targetRuns.filter((r) => r.solved).length;
+  const solvedRuns = targetRuns.filter((run) => run.solved).length;
   const totalFlags = target.flags.length;
   const totalFacts = target.facts_count;
+  const flagCountFor = (run: { flag_count?: number; flags?: string[] }): number =>
+    run.flag_count ?? run.flags?.length ?? 0;
 
   return (
-    <div className={styles.container}>
-      <Link href="/targets" className={styles.backLink}>
-        ← Back to Targets
-      </Link>
+    <div className="ds-page">
+      <p style={{ margin: "0 0 18px" }}>
+        <Link href="/targets" className="ds-link">{t("targets.back")}</Link>
+      </p>
 
-      <div className={styles.header}>
+      <div className="ds-card ds-card--stack">
         {editing ? (
-          <form onSubmit={handleSave} className={styles.editForm}>
-            <div className={styles.row}>
-              <div className={styles.formGroup}>
-                <label htmlFor="name">Target Name</label>
+          <form onSubmit={handleSave}>
+            <div className="ds-field-row">
+              <div className="ds-field">
+                <label htmlFor="target-name">{t("targets.name")}</label>
                 <input
-                  id="name"
+                  id="target-name"
                   type="text"
+                  className="ds-input"
                   value={formData.name}
                   onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                   disabled={updating}
                 />
               </div>
 
-              <div className={styles.formGroup}>
-                <label htmlFor="category">Category</label>
+              <div className="ds-field">
+                <label htmlFor="target-category">{t("targets.category")}</label>
                 <input
-                  id="category"
+                  id="target-category"
                   type="text"
+                  className="ds-input"
                   value={formData.category}
                   onChange={(e) => setFormData({ ...formData, category: e.target.value })}
                   disabled={updating}
@@ -102,10 +115,11 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
               </div>
             </div>
 
-            <div className={styles.formGroup}>
-              <label htmlFor="description">Description</label>
+            <div className="ds-field">
+              <label htmlFor="target-desc">{t("targets.desc")}</label>
               <textarea
-                id="description"
+                id="target-desc"
+                className="ds-textarea"
                 value={formData.description}
                 onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                 disabled={updating}
@@ -113,99 +127,109 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
               />
             </div>
 
-            {error && <div className={styles.error}>{error}</div>}
-            {success && <div className={styles.success}>Target updated successfully!</div>}
+            {error && <div className="ds-banner ds-banner--error">{error}</div>}
+            {success && <div className="ds-banner ds-banner--ok">{t("targets.saved")}</div>}
 
-            <div className={styles.formActions}>
-              <button type="submit" disabled={updating}>
-                {updating ? "Saving..." : "Save"}
+            <div className="ds-actions">
+              <button type="submit" className="ds-btn ds-btn--primary" disabled={updating}>
+                {updating ? t("common.saving") : t("common.save")}
               </button>
-              <button type="button" onClick={() => setEditing(false)} disabled={updating}>
-                Cancel
+              <button
+                type="button"
+                className="ds-btn ds-btn--ghost"
+                onClick={() => setEditing(false)}
+                disabled={updating}
+              >
+                {t("common.cancel")}
               </button>
             </div>
           </form>
         ) : (
-          <div>
-            <h1>{target.name}</h1>
-            <div className={styles.meta}>
-              <span className={styles.category}>{target.category}</span>
-              <span>
-                {target.is_solved ? (
-                  <span className={styles.solved}>✓ Solved</span>
-                ) : (
-                  <span className={styles.unsolved}>○ Unsolved</span>
-                )}
-              </span>
+          <div className="ds-head" style={{ margin: 0 }}>
+            <div>
+              <h1 className="ds-title">{target.name}</h1>
+              {target.description && (
+                <p className="ds-sub" style={{ marginTop: 8 }}>{target.description}</p>
+              )}
             </div>
-            <p className={styles.description}>{target.description}</p>
-            <button onClick={() => setEditing(true)} className={styles.editBtn}>
-              Edit Target
-            </button>
+            <div className="ds-actions">
+              {target.category && <span className="ds-badge ds-badge--accent">{target.category}</span>}
+              <span className={"ds-badge " + (target.is_solved ? "ds-badge--green" : "ds-badge--amber")}>
+                {target.is_solved ? t("targets.solved") : t("targets.unsolved")}
+              </span>
+              <button type="button" className="ds-btn" onClick={() => setEditing(true)}>
+                {t("common.edit")}
+              </button>
+            </div>
           </div>
         )}
       </div>
 
-      <div className={styles.grid}>
-        <div className={styles.card}>
-          <h2>🚩 Flags</h2>
-          <div className={styles.bigStat}>
-            <div className={styles.statValue}>{totalFlags}</div>
-            <div className={styles.statLabel}>Total Flags</div>
+      <div className="ds-grid">
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("targets.flagCount")}</h2>
+          <div className="ds-stat">
+            <div className="ds-stat-num">{totalFlags}</div>
+            <span className="ds-stat-label">flags</span>
           </div>
-        </div>
+        </section>
 
-        <div className={styles.card}>
-          <h2>💡 Facts</h2>
-          <div className={styles.bigStat}>
-            <div className={styles.statValue}>{totalFacts}</div>
-            <div className={styles.statLabel}>Total Facts</div>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("targets.factCount")}</h2>
+          <div className="ds-stat">
+            <div className="ds-stat-num">{totalFacts}</div>
+            <span className="ds-stat-label">facts</span>
           </div>
-        </div>
+        </section>
 
-        <div className={styles.card}>
-          <h2>⚙️ Runs</h2>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{targetRuns.length}</div>
-              <div className={styles.statLabel}>Total</div>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("targets.totalRuns")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{targetRuns.length}</div>
+              <span className="ds-stat-label">{t("events.total")}</span>
             </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{solvedRuns}</div>
-              <div className={styles.statLabel}>Solved</div>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{solvedRuns}</div>
+              <span className="ds-stat-label">{t("targets.solvedRuns")}</span>
             </div>
           </div>
-          <Link href="/runs" className={styles.link}>
-            View Runs
-          </Link>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/runs" className="ds-btn ds-btn--sm">{t("events.viewRuns")}</Link>
+          </div>
+        </section>
       </div>
 
       {targetRuns.length > 0 && (
-        <div className={styles.section}>
-          <h2>Recent Runs</h2>
-          <div className={styles.runsList}>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("targets.recentRuns")}</h2>
+          <div className="ds-table" style={{ "--cols": "110px 1fr 120px 90px" } as React.CSSProperties}>
             {targetRuns.slice(0, 5).map((run) => (
-              <Link key={run.run_id} href={`/run/${encodeURIComponent(run.run_id)}`} className={styles.runItem}>
-                <div className={styles.runStatus + " " + styles[`status_${run.status}`]}>
-                  {run.status}
-                </div>
-                <div className={styles.runDate}>
+              <Link
+                key={run.run_id}
+                href={`/run/${encodeURIComponent(run.run_id)}`}
+                className="ds-row"
+                style={{ textDecoration: "none", color: "inherit" }}
+              >
+                <span className="ds-code">{run.run_id.substring(0, 8)}</span>
+                <span className="ds-muted">{run.name || "—"}</span>
+                <span className="ds-dim" style={{ fontSize: 11.5 }}>
                   {run.updated_at ? new Date(run.updated_at * 1000).toLocaleDateString() : "—"}
-                </div>
-                <div className={styles.runFlags}>
-                  {run.flag_count ?? run.flags?.length ?? 0} flag
-                  {(run.flag_count ?? run.flags?.length ?? 0) !== 1 ? "s" : ""}
-                </div>
+                </span>
+                <span className="ds-muted" style={{ fontSize: 11.5 }}>
+                  {flagCountFor(run)} {t("targets.flagsWord")}
+                </span>
               </Link>
             ))}
           </div>
           {targetRuns.length > 5 && (
-            <Link href="/runs" className={styles.seeMore}>
-              See all {targetRuns.length} runs →
-            </Link>
+            <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 12 }}>
+              <Link href="/runs" className="ds-link" style={{ fontSize: 12 }}>
+                {t("targets.seeAllRuns", { n: targetRuns.length })}
+              </Link>
+            </div>
           )}
-        </div>
+        </section>
       )}
     </div>
   );

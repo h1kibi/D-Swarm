@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
-import { MainNav } from "@/components/Navigation/MainNav";
-import { LoginGate } from "@/components/LoginGate";
 import "./globals.css";
+import "./shell.css";
+import { I18nProvider } from "@/lib/i18n";
+import { LoginGate } from "@/components/LoginGate";
+import { NavShell } from "@/components/Navigation/NavShell";
 
 export const metadata: Metadata = {
   title: "D-Swarm",
@@ -12,10 +14,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="zh-CN" data-theme="dark">
       <body>
-        <LoginGate>
-          <MainNav />
-          <main>{children}</main>
-        </LoginGate>
+        <I18nProvider>
+          <LoginGate>
+            <NavShell>{children}</NavShell>
+          </LoginGate>
+        </I18nProvider>
       </body>
     </html>
   );

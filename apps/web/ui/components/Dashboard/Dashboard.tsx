@@ -4,208 +4,211 @@ import { useUser } from "@/lib/useUser";
 import { useEvents } from "@/lib/useEventsApi";
 import { useTargets } from "@/lib/useTargetsApi";
 import { useRuns } from "@/lib/useRunsApi";
+import { useT } from "@/lib/i18n";
 import Link from "next/link";
-import styles from "./Dashboard.module.css";
 
 function MemberDashboard() {
-  const { events, loading: eventsLoading, error: eventsError } = useEvents();
-  const { targets, loading: targetsLoading, error: targetsError } = useTargets();
-  const { runs, loading: runsLoading, error: runsError } = useRuns();
+  const t = useT();
+  const { events, loading: eventsLoading } = useEvents();
+  const { targets } = useTargets();
+  const { runs } = useRuns();
 
-  const unsolvedTargets = targets.filter((t) => !t.is_solved);
-  const solvedTargets = targets.filter((t) => t.is_solved);
-  const activeRuns = runs.filter((r) => r.status === "running");
-  const completedRuns = runs.filter((r) => r.solved === true || r.finished === true);
+  const activeEvents = events.filter((event) => event.status === "active");
+  const unsolvedTargets = targets.filter((tgt) => !tgt.is_solved);
+  const solvedTargets = targets.filter((tgt) => tgt.is_solved);
+  const activeRuns = runs.filter((run) => run.status === "running");
+  const completedRuns = runs.filter((run) => run.solved === true || run.finished === true);
 
   return (
-    <div className={styles.dashboard}>
-      <div className={styles.header}>
-        <h1>Welcome to D-Swarm</h1>
-        <p>Your CTF solving platform</p>
+    <div className="ds-page">
+      <div className="ds-head">
+        <div>
+          <h1 className="ds-title">{t("dash.title")}</h1>
+          <p className="ds-sub">{t("dash.sub")}</p>
+        </div>
       </div>
 
-      <div className={styles.grid}>
-        <div className={styles.card}>
-          <div className={styles.cardHeader}>
-            <h2>📌 Active Events</h2>
-            {eventsError && <span className={styles.error}>{eventsError}</span>}
-          </div>
+      <div className="ds-grid">
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.activeEvents")}</h2>
           {eventsLoading ? (
-            <p className={styles.loading}>Loading...</p>
-          ) : events.length === 0 ? (
-            <p className={styles.empty}>No events available</p>
+            <div className="ds-loading">{t("common.loading")}</div>
+          ) : activeEvents.length === 0 ? (
+            <p className="ds-muted" style={{ margin: 0 }}>{t("dash.noEvents")}</p>
           ) : (
-            <ul className={styles.list}>
-              {events.filter((e) => e.status === "active").map((event) => (
-                <li key={event.id}>
-                  <Link href={`/events/${event.id}`}>{event.name}</Link>
-                </li>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {activeEvents.map((event) => (
+                <Link key={event.id} href={`/events/${event.id}`} className="ds-link">
+                  {event.name}
+                </Link>
               ))}
-            </ul>
+            </div>
           )}
-        </div>
+        </section>
 
-        <div className={styles.card}>
-          <div className={styles.cardHeader}>
-            <h2>🎯 Targets</h2>
-          </div>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{unsolvedTargets.length}</div>
-              <div className={styles.statLabel}>Unsolved</div>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.targets")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{unsolvedTargets.length}</div>
+              <span className="ds-stat-label">{t("dash.unsolved")}</span>
             </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{solvedTargets.length}</div>
-              <div className={styles.statLabel}>Solved</div>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{solvedTargets.length}</div>
+              <span className="ds-stat-label">{t("dash.solved")}</span>
             </div>
           </div>
-          <Link href="/targets" className={styles.button}>
-            View All
-          </Link>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/targets" className="ds-btn ds-btn--sm">{t("dash.viewAll")}</Link>
+          </div>
+        </section>
 
-        <div className={styles.card}>
-          <div className={styles.cardHeader}>
-            <h2>⚙️ Runs</h2>
-          </div>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{activeRuns.length}</div>
-              <div className={styles.statLabel}>Active</div>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.runs")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{activeRuns.length}</div>
+              <span className="ds-stat-label">{t("dash.activeRuns")}</span>
             </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{completedRuns.length}</div>
-              <div className={styles.statLabel}>Completed</div>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{completedRuns.length}</div>
+              <span className="ds-stat-label">{t("dash.completedRuns")}</span>
             </div>
           </div>
-          <Link href="/runs" className={styles.button}>
-            View All
-          </Link>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/runs" className="ds-btn ds-btn--sm">{t("dash.viewAll")}</Link>
+          </div>
+        </section>
 
-        <div className={styles.card}>
-          <div className={styles.cardHeader}>
-            <h2>🚀 Quick Actions</h2>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.quick")}</h2>
+          <div className="ds-actions" style={{ flexDirection: "column", alignItems: "stretch" }}>
+            <Link href="/runs" className="ds-btn">{t("dash.startRun")}</Link>
+            <Link href="/targets" className="ds-btn">{t("dash.createTarget")}</Link>
+            <Link href="/events" className="ds-btn">{t("dash.createEvent")}</Link>
           </div>
-          <div className={styles.actions}>
-            <Link href="/runs?mode=launch" className={styles.actionButton}>
-              Start New Run
-            </Link>
-            <Link href="/targets?mode=create" className={styles.actionButton}>
-              Create Target
-            </Link>
-            <Link href="/events?mode=create" className={styles.actionButton}>
-              Create Event
-            </Link>
-          </div>
-        </div>
+        </section>
       </div>
     </div>
   );
 }
 
 function AdminDashboard() {
-  const { events, loading: eventsLoading } = useEvents();
-  const { runs, loading: runsLoading } = useRuns();
+  const t = useT();
+  const { user } = useUser();
+  const { events } = useEvents();
+  const { runs } = useRuns();
 
   const totalEvents = events.length;
-  const activeEvents = events.filter((e) => e.status === "active").length;
+  const activeEvents = events.filter((event) => event.status === "active").length;
   const totalRuns = runs.length;
-  const runningRuns = runs.filter((r) => r.status === "running").length;
+  const runningRuns = runs.filter((run) => run.status === "running").length;
+  const online = Boolean(user?.id);
 
   return (
-    <div className={styles.dashboard}>
-      <div className={styles.header}>
-        <h1>Admin Dashboard</h1>
-        <p>Manage events, accounts, and system resources</p>
+    <div className="ds-page">
+      <div className="ds-head">
+        <div>
+          <h1 className="ds-title">{t("dash.adminTitle")}</h1>
+          <p className="ds-sub">{t("dash.adminSub")}</p>
+        </div>
       </div>
 
-      <div className={styles.grid}>
-        <div className={styles.card}>
-          <h2>📅 Events Overview</h2>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{totalEvents}</div>
-              <div className={styles.statLabel}>Total</div>
+      <div className="ds-grid">
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("events.title")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{totalEvents}</div>
+              <span className="ds-stat-label">{t("dash.eventsTotal")}</span>
             </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{activeEvents}</div>
-              <div className={styles.statLabel}>Active</div>
-            </div>
-          </div>
-          <Link href="/admin/events" className={styles.button}>
-            Manage Events
-          </Link>
-        </div>
-
-        <div className={styles.card}>
-          <h2>⚙️ Runs Overview</h2>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{totalRuns}</div>
-              <div className={styles.statLabel}>Total</div>
-            </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{runningRuns}</div>
-              <div className={styles.statLabel}>Running</div>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{activeEvents}</div>
+              <span className="ds-stat-label">{t("dash.eventsActive")}</span>
             </div>
           </div>
-          <Link href="/runs" className={styles.button}>
-            View All Runs
-          </Link>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/events" className="ds-btn ds-btn--sm">{t("dash.manageEvents")}</Link>
+          </div>
+        </section>
 
-        <div className={styles.card}>
-          <h2>👥 Account Management</h2>
-          <p className={styles.description}>Manage team members and permissions</p>
-          <Link href="/admin/accounts" className={styles.button}>
-            Manage Accounts
-          </Link>
-        </div>
-
-        <div className={styles.card}>
-          <h2>📋 Audit Log</h2>
-          <p className={styles.description}>Track system activity and changes</p>
-          <Link href="/admin/audit" className={styles.button}>
-            View Audit Log
-          </Link>
-        </div>
-
-        <div className={styles.card}>
-          <h2>🎯 Event Management</h2>
-          <p className={styles.description}>Create and manage CTF events</p>
-          <Link href="/events?mode=create" className={styles.button}>
-            New Event
-          </Link>
-        </div>
-
-        <div className={styles.card}>
-          <h2>⚡ System Status</h2>
-          <div className={styles.status}>
-            <div className={styles.statusItem}>
-              <span className={styles.statusDot + " " + styles.online}></span>
-              <span>Backend: Online</span>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("runs.title")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{totalRuns}</div>
+              <span className="ds-stat-label">{t("dash.runsTotal")}</span>
             </div>
-            <div className={styles.statusItem}>
-              <span className={styles.statusDot + " " + styles.online}></span>
-              <span>Database: Online</span>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{runningRuns}</div>
+              <span className="ds-stat-label">{t("dash.runsRunning")}</span>
             </div>
           </div>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/runs" className="ds-btn ds-btn--sm">{t("dash.viewAll")}</Link>
+          </div>
+        </section>
+
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.accounts")}</h2>
+          <p className="ds-sub" style={{ margin: "0 0 14px" }}>{t("dash.accountsHint")}</p>
+          <div className="ds-actions" style={{ justifyContent: "flex-start" }}>
+            <Link href="/admin/accounts" className="ds-btn ds-btn--sm">{t("dash.accounts")}</Link>
+          </div>
+        </section>
+
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.audit")}</h2>
+          <p className="ds-sub" style={{ margin: "0 0 14px" }}>{t("dash.auditHint")}</p>
+          <div className="ds-actions" style={{ justifyContent: "flex-start" }}>
+            <Link href="/admin/audit" className="ds-btn ds-btn--sm">{t("dash.audit")}</Link>
+          </div>
+        </section>
+
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.systemStatus")}</h2>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("dash.backend")}</span>
+            <span>
+              <span
+                className={"ds-led " + (online ? "ds-led--green" : "ds-led--red")}
+                aria-hidden
+              />{" "}
+              {online ? t("dash.online") : t("dash.offline")}
+            </span>
+          </div>
+        </section>
+
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("dash.quick")}</h2>
+          <div className="ds-actions" style={{ flexDirection: "column", alignItems: "stretch" }}>
+            <Link href="/events" className="ds-btn">{t("dash.createEvent")}</Link>
+            <Link href="/deck" className="ds-btn">{t("nav.deck")}</Link>
+          </div>
+        </section>
       </div>
     </div>
   );
 }
 
 export function Dashboard() {
+  const t = useT();
   const { user, loading, isAdmin } = useUser();
 
   if (loading) {
-    return <div className={styles.loading}>Loading dashboard...</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-loading">{t("common.loading")}</div>
+      </div>
+    );
   }
 
   if (!user) {
-    return <div className={styles.error}>Please log in to continue</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-empty">{t("dash.notLoggedIn")}</div>
+      </div>
+    );
   }
 
   return isAdmin ? <AdminDashboard /> : <MemberDashboard />;

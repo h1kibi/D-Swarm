@@ -2,13 +2,12 @@
 
 import { useState } from "react";
 import { useUser, changePassword, logout } from "@/lib/useUser";
-import styles from "./Settings.module.css";
+import { useT } from "@/lib/i18n";
 
 export function Settings() {
-  const { user } = useUser();
-  const [activeTab, setActiveTab] = useState<"password" | "api">("password");
+  const t = useT();
+  const { user, isAdmin } = useUser();
 
-  // Password form state
   const [passwordForm, setPasswordForm] = useState({
     oldPassword: "",
     newPassword: "",
@@ -22,12 +21,12 @@ export function Settings() {
     e.preventDefault();
 
     if (passwordForm.newPassword !== passwordForm.confirmPassword) {
-      setPasswordError("New passwords do not match");
+      setPasswordError(t("settings.pwMismatch"));
       return;
     }
 
     if (passwordForm.newPassword.length < 8) {
-      setPasswordError("Password must be at least 8 characters");
+      setPasswordError(t("settings.pwShort"));
       return;
     }
 
@@ -42,134 +41,124 @@ export function Settings() {
       setPasswordForm({ oldPassword: "", newPassword: "", confirmPassword: "" });
       setTimeout(() => setPasswordSuccess(false), 3000);
     } else {
-      setPasswordError(result.error || "Failed to change password");
+      setPasswordError(result.error || t("settings.pwFailed"));
     }
 
     setPasswordLoading(false);
   };
 
   const handleLogout = async () => {
-    if (!window.confirm("Are you sure you want to log out?")) return;
+    if (!window.confirm(t("settings.logoutConfirm"))) return;
     await logout();
     window.location.href = "/";
   };
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1>Settings</h1>
+    <div className="ds-page ds-page--narrow">
+      <div className="ds-head">
+        <div>
+          <h1 className="ds-title">{t("settings.pageTitle")}</h1>
+        </div>
       </div>
 
       {user && (
-        <div className={styles.userInfo}>
-          <div className={styles.infoCard}>
-            <label>Username</label>
-            <div className={styles.value}>{user.username}</div>
+        <section className="ds-card ds-card--stack">
+          <h2 className="ds-card-title">{t("settings.username")}</h2>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("settings.username")}</span>
+            <span className="ds-code">{user.username}</span>
           </div>
-          <div className={styles.infoCard}>
-            <label>Display Name</label>
-            <div className={styles.value}>{user.display_name}</div>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("settings.displayName")}</span>
+            <span>{user.display_name || "—"}</span>
           </div>
-          <div className={styles.infoCard}>
-            <label>Role</label>
-            <div className={styles.value}>
-              <span className={styles.badge + " " + styles[user.role]}>
-                {user.role === "admin" ? "Administrator" : "Member"}
-              </span>
-            </div>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("settings.role")}</span>
+            <span className={"ds-badge " + (isAdmin ? "ds-badge--red" : "ds-badge--accent")}>
+              {isAdmin ? t("role.admin") : t("role.member")}
+            </span>
           </div>
-        </div>
+        </section>
       )}
 
-      <div className={styles.tabs}>
-        <button
-          onClick={() => setActiveTab("password")}
-          className={activeTab === "password" ? styles.active : ""}
-        >
-          Password
-        </button>
-        <button onClick={() => setActiveTab("api")} className={activeTab === "api" ? styles.active : ""}>
-          API Keys
-        </button>
-      </div>
+      <section className="ds-card ds-card--stack">
+        <h2 className="ds-card-title">{t("settings.pwTitle")}</h2>
 
-      {activeTab === "password" && (
-        <div className={styles.section}>
-          <h2>Change Password</h2>
+        <form onSubmit={handlePasswordChange}>
+          <div className="ds-field">
+            <label htmlFor="old-password">{t("settings.currentPw")}</label>
+            <input
+              id="old-password"
+              type="password"
+              className="ds-input"
+              value={passwordForm.oldPassword}
+              onChange={(e) => setPasswordForm({ ...passwordForm, oldPassword: e.target.value })}
+              disabled={passwordLoading}
+              required
+            />
+          </div>
 
-          <form onSubmit={handlePasswordChange} className={styles.form}>
-            <div className={styles.formGroup}>
-              <label htmlFor="old-password">Current Password</label>
-              <input
-                id="old-password"
-                type="password"
-                value={passwordForm.oldPassword}
-                onChange={(e) =>
-                  setPasswordForm({ ...passwordForm, oldPassword: e.target.value })
-                }
-                disabled={passwordLoading}
-                required
-              />
-            </div>
+          <div className="ds-field">
+            <label htmlFor="new-password">{t("settings.newPw")}</label>
+            <input
+              id="new-password"
+              type="password"
+              className="ds-input"
+              value={passwordForm.newPassword}
+              onChange={(e) => setPasswordForm({ ...passwordForm, newPassword: e.target.value })}
+              disabled={passwordLoading}
+              required
+            />
+            <small>{t("settings.pwRule")}</small>
+          </div>
 
-            <div className={styles.formGroup}>
-              <label htmlFor="new-password">New Password</label>
-              <input
-                id="new-password"
-                type="password"
-                value={passwordForm.newPassword}
-                onChange={(e) =>
-                  setPasswordForm({ ...passwordForm, newPassword: e.target.value })
-                }
-                disabled={passwordLoading}
-                required
-              />
-              <small>At least 8 characters</small>
-            </div>
+          <div className="ds-field">
+            <label htmlFor="confirm-password">{t("settings.confirmPw")}</label>
+            <input
+              id="confirm-password"
+              type="password"
+              className="ds-input"
+              value={passwordForm.confirmPassword}
+              onChange={(e) => setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })}
+              disabled={passwordLoading}
+              required
+            />
+          </div>
 
-            <div className={styles.formGroup}>
-              <label htmlFor="confirm-password">Confirm New Password</label>
-              <input
-                id="confirm-password"
-                type="password"
-                value={passwordForm.confirmPassword}
-                onChange={(e) =>
-                  setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })
-                }
-                disabled={passwordLoading}
-                required
-              />
-            </div>
+          {passwordError && <div className="ds-banner ds-banner--error">{passwordError}</div>}
+          {passwordSuccess && <div className="ds-banner ds-banner--ok">{t("settings.pwChanged")}</div>}
 
-            {passwordError && <div className={styles.error}>{passwordError}</div>}
-            {passwordSuccess && (
-              <div className={styles.success}>Password changed successfully!</div>
-            )}
-
-            <button type="submit" disabled={passwordLoading} className={styles.submitBtn}>
-              {passwordLoading ? "Changing..." : "Change Password"}
+          <div className="ds-actions">
+            <button type="submit" className="ds-btn ds-btn--primary" disabled={passwordLoading}>
+              {passwordLoading ? t("settings.changing") : t("settings.changePw")}
             </button>
-          </form>
-        </div>
-      )}
+          </div>
+        </form>
+      </section>
 
-      {activeTab === "api" && (
-        <div className={styles.section}>
-          <h2>API Keys</h2>
-          <p className={styles.info}>
-            API keys allow you to access D-Swarm programmatically. Keep them secret!
-          </p>
-          <p className={styles.notImplemented}>API key management coming soon...</p>
-        </div>
-      )}
+      <section className="ds-card ds-card--stack">
+        <h2 className="ds-card-title">{t("settings.apiTitle")}</h2>
+        <p className="ds-muted" style={{ margin: "0 0 10px", fontSize: 12.5 }}>
+          {t("settings.apiHint")}
+        </p>
+        <p className="ds-dim" style={{ margin: 0, fontSize: 12 }}>
+          {t("settings.apiSoon")}
+        </p>
+      </section>
 
-      <div className={styles.section + " " + styles.danger}>
-        <h2>Logout</h2>
-        <p>End your current session and return to the login page.</p>
-        <button onClick={handleLogout} className={styles.logoutBtn}>
-          Logout
-        </button>
-      </div>
+      <section className="ds-card">
+        <h2 className="ds-card-title" style={{ color: "var(--red)" }}>
+          {t("settings.logoutTitle")}
+        </h2>
+        <p className="ds-muted" style={{ margin: "0 0 14px", fontSize: 12.5 }}>
+          {t("settings.logoutHint")}
+        </p>
+        <div className="ds-actions" style={{ justifyContent: "flex-start" }}>
+          <button type="button" onClick={handleLogout} className="ds-btn ds-btn--danger">
+            {t("nav.logout")}
+          </button>
+        </div>
+      </section>
     </div>
   );
 }

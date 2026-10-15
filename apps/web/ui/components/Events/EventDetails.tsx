@@ -4,14 +4,15 @@ import { useState, useEffect } from "react";
 import { useEvents, updateEvent } from "@/lib/useEventsApi";
 import { useTargets } from "@/lib/useTargetsApi";
 import { useRuns } from "@/lib/useRunsApi";
+import { useT } from "@/lib/i18n";
 import Link from "next/link";
-import styles from "./EventDetails.module.css";
 
 interface EventDetailsProps {
   eventId: string;
 }
 
 export function EventDetails({ eventId }: EventDetailsProps) {
+  const t = useT();
   const { events, loading: eventsLoading } = useEvents();
   const { targets } = useTargets(eventId);
   const { runs } = useRuns();
@@ -19,20 +20,14 @@ export function EventDetails({ eventId }: EventDetailsProps) {
   const event = events.find((e) => e.id === eventId);
 
   const [editing, setEditing] = useState(false);
-  const [formData, setFormData] = useState({
-    name: "",
-    description: "",
-  });
+  const [formData, setFormData] = useState({ name: "", description: "" });
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
 
   useEffect(() => {
     if (event) {
-      setFormData({
-        name: event.name,
-        description: event.description,
-      });
+      setFormData({ name: event.name, description: event.description });
     }
   }, [event]);
 
@@ -51,51 +46,62 @@ export function EventDetails({ eventId }: EventDetailsProps) {
       setEditing(false);
       setTimeout(() => setSuccess(false), 3000);
     } else {
-      setError(result.error || "Failed to update event");
+      setError(result.error || t("events.editFailed"));
     }
 
     setUpdating(false);
   };
 
   if (eventsLoading) {
-    return <div className={styles.loading}>Loading event...</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-loading">{t("common.loading")}</div>
+      </div>
+    );
   }
 
   if (!event) {
-    return <div className={styles.error}>Event not found</div>;
+    return (
+      <div className="ds-page">
+        <div className="ds-empty">{t("events.notFound")}</div>
+      </div>
+    );
   }
 
-  const eventTargetIds = new Set(targets.map((t) => t.id));
-  const eventRuns = runs.filter((r) => r.target_id && eventTargetIds.has(r.target_id));
-  const solvedTargets = targets.filter((t) => t.is_solved).length;
-  const totalTargets = targets.length;
-  const activeRuns = eventRuns.filter((r) => r.status === "running").length;
-  const completedRuns = eventRuns.filter((r) => r.solved === true || r.finished === true).length;
+  const eventTargetIds = new Set(targets.map((tgt) => tgt.id));
+  const eventRuns = runs.filter((run) => run.target_id && eventTargetIds.has(run.target_id));
+  const solvedTargets = targets.filter((tgt) => tgt.is_solved).length;
+  const activeRuns = eventRuns.filter((run) => run.status === "running").length;
+  const completedRuns = eventRuns.filter(
+    (run) => run.solved === true || run.finished === true,
+  ).length;
 
   return (
-    <div className={styles.container}>
-      <Link href="/events" className={styles.backLink}>
-        ← Back to Events
-      </Link>
+    <div className="ds-page">
+      <p style={{ margin: "0 0 18px" }}>
+        <Link href="/events" className="ds-link">{t("events.back")}</Link>
+      </p>
 
-      <div className={styles.header}>
+      <div className="ds-card ds-card--stack">
         {editing ? (
-          <form onSubmit={handleSave} className={styles.editForm}>
-            <div className={styles.formGroup}>
-              <label htmlFor="name">Event Name</label>
+          <form onSubmit={handleSave}>
+            <div className="ds-field">
+              <label htmlFor="event-name">{t("events.name")}</label>
               <input
-                id="name"
+                id="event-name"
                 type="text"
+                className="ds-input"
                 value={formData.name}
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                 disabled={updating}
               />
             </div>
 
-            <div className={styles.formGroup}>
-              <label htmlFor="description">Description</label>
+            <div className="ds-field">
+              <label htmlFor="event-desc">{t("events.desc")}</label>
               <textarea
-                id="description"
+                id="event-desc"
+                className="ds-textarea"
                 value={formData.description}
                 onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                 disabled={updating}
@@ -103,104 +109,114 @@ export function EventDetails({ eventId }: EventDetailsProps) {
               />
             </div>
 
-            {error && <div className={styles.error}>{error}</div>}
-            {success && <div className={styles.success}>Event updated successfully!</div>}
+            {error && <div className="ds-banner ds-banner--error">{error}</div>}
+            {success && <div className="ds-banner ds-banner--ok">{t("events.saved")}</div>}
 
-            <div className={styles.formActions}>
-              <button type="submit" disabled={updating}>
-                {updating ? "Saving..." : "Save"}
+            <div className="ds-actions">
+              <button type="submit" className="ds-btn ds-btn--primary" disabled={updating}>
+                {updating ? t("common.saving") : t("common.save")}
               </button>
-              <button type="button" onClick={() => setEditing(false)} disabled={updating}>
-                Cancel
+              <button
+                type="button"
+                className="ds-btn ds-btn--ghost"
+                onClick={() => setEditing(false)}
+                disabled={updating}
+              >
+                {t("common.cancel")}
               </button>
             </div>
           </form>
         ) : (
-          <div>
-            <h1>{event.name}</h1>
-            <p className={styles.description}>{event.description}</p>
-            <div className={styles.meta}>
-              <span>Created by {event.created_by}</span>
-              <span>Status: {event.status}</span>
+          <>
+            <div className="ds-head" style={{ margin: 0 }}>
+              <div>
+                <h1 className="ds-title">{event.name}</h1>
+                {event.description && (
+                  <p className="ds-sub" style={{ marginTop: 8 }}>{event.description}</p>
+                )}
+              </div>
+              <div className="ds-actions">
+                <span className={"ds-badge " + (event.status === "active" ? "ds-badge--green" : "ds-badge--muted")}>
+                  {event.status}
+                </span>
+                <button type="button" className="ds-btn" onClick={() => setEditing(true)}>
+                  {t("events.edit")}
+                </button>
+              </div>
             </div>
-            <button onClick={() => setEditing(true)} className={styles.editBtn}>
-              Edit Event
-            </button>
-          </div>
+          </>
         )}
       </div>
 
-      <div className={styles.grid}>
-        <div className={styles.card}>
-          <h2>📋 Targets</h2>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{totalTargets}</div>
-              <div className={styles.statLabel}>Total</div>
+      <div className="ds-grid">
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("events.targetsCount")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{targets.length}</div>
+              <span className="ds-stat-label">{t("events.total")}</span>
             </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{solvedTargets}</div>
-              <div className={styles.statLabel}>Solved</div>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{solvedTargets}</div>
+              <span className="ds-stat-label">{t("events.solvedCount")}</span>
             </div>
           </div>
-          <Link href="/targets" className={styles.link}>
-            View Targets
-          </Link>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/targets" className="ds-btn ds-btn--sm">{t("events.viewTargets")}</Link>
+          </div>
+        </section>
 
-        <div className={styles.card}>
-          <h2>⚙️ Runs</h2>
-          <div className={styles.stats}>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{activeRuns}</div>
-              <div className={styles.statLabel}>Active</div>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("events.runsCount")}</h2>
+          <div className="ds-grid--stats" style={{ marginBottom: 0 }}>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{activeRuns}</div>
+              <span className="ds-stat-label">{t("events.runsActive")}</span>
             </div>
-            <div className={styles.stat}>
-              <div className={styles.statValue}>{completedRuns}</div>
-              <div className={styles.statLabel}>Completed</div>
+            <div className="ds-stat">
+              <div className="ds-stat-num">{completedRuns}</div>
+              <span className="ds-stat-label">{t("events.runsDone")}</span>
             </div>
           </div>
-          <Link href="/runs" className={styles.link}>
-            View Runs
-          </Link>
-        </div>
+          <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
+            <Link href="/runs" className="ds-btn ds-btn--sm">{t("events.viewRuns")}</Link>
+          </div>
+        </section>
 
-        <div className={styles.card}>
-          <h2>📊 Event Info</h2>
-          <div className={styles.infoList}>
-            <div className={styles.infoItem}>
-              <span className={styles.label}>Status</span>
-              <span className={styles.value}>{event.status}</span>
-            </div>
-            <div className={styles.infoItem}>
-              <span className={styles.label}>Created</span>
-              <span className={styles.value}>
-                {new Date(event.created_at * 1000).toLocaleDateString()}
-              </span>
-            </div>
-            <div className={styles.infoItem}>
-              <span className={styles.label}>Created By</span>
-              <span className={styles.value}>{event.created_by}</span>
-            </div>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("events.info")}</h2>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("events.infoStatus")}</span>
+            <span>{event.status}</span>
           </div>
-        </div>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("events.infoCreated")}</span>
+            <span>{new Date(event.created_at * 1000).toLocaleDateString()}</span>
+          </div>
+          <div className="ds-kv">
+            <span className="ds-muted">{t("events.infoCreator")}</span>
+            <span>{event.created_by}</span>
+          </div>
+        </section>
       </div>
 
       {targets.length > 0 && (
-        <div className={styles.section}>
-          <h2>Targets in this Event</h2>
-          <div className={styles.targetList}>
+        <section className="ds-card">
+          <h2 className="ds-card-title">{t("events.targetsIn")}</h2>
+          <div className="ds-table" style={{ "--cols": "1fr 120px 130px" } as React.CSSProperties}>
             {targets.map((target) => (
-              <div key={target.id} className={styles.targetItem}>
-                <div className={styles.targetName}>{target.name}</div>
-                <div className={styles.targetCategory}>{target.category}</div>
-                <div className={styles.targetStatus}>
-                  {target.is_solved ? "✓ Solved" : "Unsolved"}
-                </div>
+              <div key={target.id} className="ds-row">
+                <span className="ds-bright">{target.name}</span>
+                <span className="ds-accent" style={{ fontSize: 11.5 }}>{target.category}</span>
+                <span>
+                  <span className={"ds-badge " + (target.is_solved ? "ds-badge--green" : "ds-badge--amber")}>
+                    {target.is_solved ? t("events.solvedTag") : t("events.unsolvedTag")}
+                  </span>
+                </span>
               </div>
             ))}
           </div>
-        </div>
+        </section>
       )}
     </div>
   );

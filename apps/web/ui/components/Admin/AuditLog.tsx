@@ -2,9 +2,17 @@
 
 import { useState } from "react";
 import { useAudit, exportAuditLogs, type AuditFilters } from "@/lib/useAuditApi";
-import styles from "./AuditLog.module.css";
+import { useT } from "@/lib/i18n";
+
+const ACTION_TONE: Record<string, string> = {
+  create: "ds-badge--green",
+  update: "ds-badge--accent",
+  delete: "ds-badge--red",
+  login: "ds-badge--amber",
+};
 
 export function AuditLog() {
+  const t = useT();
   const [filters, setFilters] = useState<AuditFilters>({
     limit: 50,
     skip: 0,
@@ -16,11 +24,7 @@ export function AuditLog() {
   const [exporting, setExporting] = useState(false);
 
   const handleFilterApply = () => {
-    const newFilters: AuditFilters = {
-      limit: 50,
-      skip: 0,
-    };
-
+    const newFilters: AuditFilters = { limit: 50, skip: 0 };
     if (actionFilter) newFilters.action = actionFilter;
     if (statusFilter) newFilters.status_filter = statusFilter;
 
@@ -46,7 +50,7 @@ export function AuditLog() {
       link.click();
       URL.revokeObjectURL(url);
     } else {
-      alert(result.error || "Failed to export logs");
+      alert(result.error || t("audit.exportFailed"));
     }
     setExporting(false);
   };
@@ -73,104 +77,128 @@ export function AuditLog() {
   const totalPages = Math.max(1, Math.ceil(total / (filters.limit || 50)));
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1>Audit Log</h1>
-        <button onClick={handleExport} disabled={exporting} className={styles.exportBtn}>
-          📥 Export
+    <div className="ds-page ds-page--wide">
+      <div className="ds-head">
+        <div>
+          <h1 className="ds-title">{t("audit.title")}</h1>
+        </div>
+        <div className="ds-actions">
+          <button type="button" onClick={handleExport} disabled={exporting} className="ds-btn">
+            {t("audit.export")}
+          </button>
+        </div>
+      </div>
+
+      <div className="ds-toolbar">
+        <label className="ds-label" htmlFor="audit-action" style={{ marginRight: 4 }}>
+          {t("audit.filterAction")}
+        </label>
+        <select
+          id="audit-action"
+          className="ds-select"
+          style={{ width: "auto", minWidth: 130 }}
+          value={actionFilter}
+          onChange={(e) => setActionFilter(e.target.value)}
+        >
+          <option value="">{t("common.all")}</option>
+          <option value="create">create</option>
+          <option value="update">update</option>
+          <option value="delete">delete</option>
+          <option value="login">login</option>
+        </select>
+
+        <span style={{ width: 8 }} />
+
+        <label className="ds-label" htmlFor="audit-status" style={{ marginRight: 4 }}>
+          {t("audit.filterStatus")}
+        </label>
+        <select
+          id="audit-status"
+          className="ds-select"
+          style={{ width: "auto", minWidth: 120 }}
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as "" | "success" | "failure")}
+        >
+          <option value="">{t("common.all")}</option>
+          <option value="success">{t("audit.filterSuccess")}</option>
+          <option value="failure">{t("audit.filterFailure")}</option>
+        </select>
+
+        <span style={{ flex: 1 }} />
+
+        <button type="button" onClick={handleFilterApply} className="ds-btn ds-btn--sm">
+          {t("common.apply")}
+        </button>
+        <button type="button" onClick={handleClearFilters} className="ds-btn ds-btn--sm ds-btn--ghost">
+          {t("common.clear")}
         </button>
       </div>
 
-      <div className={styles.filters}>
-        <div className={styles.filterGroup}>
-          <label htmlFor="action">Action</label>
-          <select value={actionFilter} onChange={(e) => setActionFilter(e.target.value)}>
-            <option value="">All</option>
-            <option value="create">Create</option>
-            <option value="update">Update</option>
-            <option value="delete">Delete</option>
-            <option value="login">Login</option>
-          </select>
-        </div>
+      {loading && <div className="ds-loading">{t("common.loading")}</div>}
+      {error && <div className="ds-banner ds-banner--error">{t("common.error")}: {error}</div>}
 
-        <div className={styles.filterGroup}>
-          <label htmlFor="status">Status</label>
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as "" | "success" | "failure")}
+      {!loading && logs.length === 0 && <div className="ds-empty">{t("audit.empty")}</div>}
+
+      {logs.length > 0 && (
+        <>
+          <div
+            className="ds-table"
+            style={{ "--cols": "170px 110px 140px 1fr 100px 130px" } as React.CSSProperties}
           >
-            <option value="">All</option>
-            <option value="success">Success</option>
-            <option value="failure">Failure</option>
-          </select>
-        </div>
-
-        <div className={styles.filterActions}>
-          <button onClick={handleFilterApply} className={styles.applyBtn}>
-            Apply
-          </button>
-          <button onClick={handleClearFilters} className={styles.clearBtn}>
-            Clear
-          </button>
-        </div>
-      </div>
-
-      {loading && <div className={styles.loading}>Loading audit logs...</div>}
-      {error && <div className={styles.error}>Error: {error}</div>}
-
-      {!loading && logs.length === 0 && <div className={styles.empty}>No audit logs found</div>}
-
-      <div className={styles.table}>
-        <div className={styles.tableHeader}>
-          <div className={styles.col_time}>Timestamp</div>
-          <div className={styles.col_action}>Action</div>
-          <div className={styles.col_actor}>Actor</div>
-          <div className={styles.col_resource}>Resource</div>
-          <div className={styles.col_status}>Status</div>
-          <div className={styles.col_ip}>IP Address</div>
-        </div>
-
-        {logs.map((log) => (
-          <div key={log.id} className={styles.tableRow} title={JSON.stringify(log.details, null, 2)}>
-            <div className={styles.col_time}>
-              {new Date(log.timestamp * 1000).toLocaleString()}
+            <div className="ds-table-head">
+              <span>{t("audit.colTime")}</span>
+              <span>{t("audit.filterAction")}</span>
+              <span>{t("audit.colActor")}</span>
+              <span>{t("audit.colResource")}</span>
+              <span>{t("audit.colStatus")}</span>
+              <span>{t("audit.colIp")}</span>
             </div>
-            <div className={styles.col_action}>
-              <span className={styles.action + " " + styles[`action_${log.action}`]}>
-                {log.action}
-              </span>
-            </div>
-            <div className={styles.col_actor}>
-              <code>{log.actor}</code>
-            </div>
-            <div className={styles.col_resource}>
-              <span className={styles.resource}>
-                {log.resource_type}
-                <br />
-                <code>{log.resource_id.substring(0, 12)}</code>
-              </span>
-            </div>
-            <div className={styles.col_status}>
-              <span className={styles.status + " " + styles[`status_${log.status}`]}>
-                {log.status}
-              </span>
-            </div>
-            <div className={styles.col_ip}>{log.ip_address}</div>
+
+            {logs.map((log) => (
+              <div key={log.id} className="ds-row" title={JSON.stringify(log.details, null, 2)}>
+                <span className="ds-dim" style={{ fontSize: 11.5 }}>
+                  {new Date(log.timestamp * 1000).toLocaleString()}
+                </span>
+                <span>
+                  <span className={"ds-badge " + (ACTION_TONE[log.action] || "ds-badge--muted")}>
+                    {log.action}
+                  </span>
+                </span>
+                <span className="ds-code">{log.actor}</span>
+                <span className="ds-muted" style={{ fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {log.resource_type} · {log.resource_id.substring(0, 12)}
+                </span>
+                <span>
+                  <span className={"ds-badge " + (log.status === "success" ? "ds-badge--green" : "ds-badge--red")}>
+                    {log.status}
+                  </span>
+                </span>
+                <span className="ds-dim" style={{ fontSize: 11.5 }}>{log.ip_address}</span>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
 
-      <div className={styles.pagination}>
-        <button onClick={handlePreviousPage} disabled={currentPage === 1}>
-          ← Previous
-        </button>
-        <span>
-          Page {currentPage} of {totalPages} ({total} total)
-        </span>
-        <button onClick={handleNextPage} disabled={currentPage >= totalPages}>
-          Next →
-        </button>
-      </div>
+          <div className="ds-pager">
+            <button
+              type="button"
+              onClick={handlePreviousPage}
+              disabled={currentPage === 1}
+              className="ds-btn ds-btn--sm ds-btn--ghost"
+            >
+              {t("audit.prev")}
+            </button>
+            <span>{t("audit.pager", { page: currentPage, pages: totalPages, total })}</span>
+            <button
+              type="button"
+              onClick={handleNextPage}
+              disabled={currentPage >= totalPages}
+              className="ds-btn ds-btn--sm ds-btn--ghost"
+            >
+              {t("audit.next")}
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
