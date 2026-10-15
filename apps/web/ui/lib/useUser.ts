@@ -144,3 +144,32 @@ export async function changePassword(
     return { ok: false, error: err instanceof Error ? err.message : "An error occurred" };
   }
 }
+
+/** Update the caller's own display name (role/activation stay admin-only). */
+export async function updateProfile(
+  displayName: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await apiFetch("/api/accounts/me", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: displayName }),
+    });
+
+    if (!res.ok) {
+      const body = (await res.json()) as unknown;
+      const detail =
+        body && typeof body === "object" && "detail" in body
+          ? String((body as Record<string, unknown>).detail)
+          : "Failed to update profile";
+      return { ok: false, error: detail };
+    }
+
+    // Refresh the shared user cache so every mounted view sees the new name.
+    const refreshed = await fetchCurrentUser();
+    if (refreshed) notifyUserChange(refreshed);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "An error occurred" };
+  }
+}

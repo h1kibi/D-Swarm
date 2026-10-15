@@ -72,6 +72,15 @@ class UpdateAccountRequest(BaseModel):
     display_name: Optional[str] = Field(None, min_length=1, max_length=255)
 
 
+class SelfUpdateRequest(BaseModel):
+    """Self-service profile update — display name only.
+
+    Role and activation state deliberately stay admin-only
+    (``PATCH /api/accounts/{id}``).
+    """
+    display_name: str = Field(min_length=1, max_length=80)
+
+
 class ChangePasswordRequest(BaseModel):
     """User request to change their password."""
     old_password: str

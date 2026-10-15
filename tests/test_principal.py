@@ -323,3 +323,70 @@ def test_health_endpoint_is_public_and_reports_db(monkeypatch, tmp_path):
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True and body["db"] == "up"
+
+
+# ── self-service profile ─────────────────────────────────────────────────────
+
+def test_member_can_rename_self_only(monkeypatch, tmp_path):
+    """PATCH /api/accounts/me edits display_name; role/activation stay admin-only."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from apps.web.accounts import dependencies as DEPS
+    from apps.web.accounts.db_service import DbAccountService
+    from apps.web.accounts.models import AccountRole
+    from apps.web.db.models import Base
+    from apps.web.db.session import get_db
+
+    monkeypatch.setenv(A.PASSWORD_ENV, "letmein")
+    monkeypatch.delenv(A.BIND_ENV, raising=False)
+    app = create_app(RunManager(sessions_root=str(tmp_path / "s")))
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'self.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    service = DbAccountService(session)
+    account = service.create_account(
+        username="self",
+        display_name="Old Name",
+        password="secret123",
+        role=AccountRole.MEMBER,
+    )
+    app.dependency_overrides[DEPS.get_account_service] = lambda: DbAccountService(session)
+    app.dependency_overrides[get_db] = lambda: session
+
+    monkeypatch.setattr(
+        P,
+        "load_account",
+        lambda account_id: SimpleNamespace(
+            id=account.id, is_active=True, role=SimpleNamespace(value="member"),
+        ),
+    )
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {_account_token(account_id=account.id)}"}
+
+    try:
+        res = client.patch("/api/accounts/me", json={"display_name": "  New Name  "}, headers=headers)
+        assert res.status_code == 200
+        assert res.json()["display_name"] == "New Name"
+        assert service.get_account_by_id(account.id).display_name == "New Name"
+
+        # role/activation cannot be smuggled through the self-service door
+        res = client.patch(
+            "/api/accounts/me",
+            json={"display_name": "Renamed", "role": "admin", "is_active": False},
+            headers=headers,
+        )
+        assert res.status_code == 200
+        refreshed = service.get_account_by_id(account.id)
+        assert getattr(refreshed.role, "value", refreshed.role) == "member"
+        assert refreshed.is_active is True
+
+        # blank names are rejected (schema floor + strip guard)
+        assert client.patch("/api/accounts/me", json={"display_name": ""}, headers=headers).status_code == 422
+        assert client.patch("/api/accounts/me", json={"display_name": "   "}, headers=headers).status_code == 400
+    finally:
+        session.close()

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { useUser, changePassword, logout } from "@/lib/useUser";
+import { useUser, changePassword, logout, updateProfile } from "@/lib/useUser";
 import { useT } from "@/lib/i18n";
 import { createApiKey, fetchApiKeys, revokeApiKey, type ApiKeyInfo } from "@/lib/apiKeys";
 
@@ -17,6 +17,11 @@ export function Settings() {
   const [passwordLoading, setPasswordLoading] = useState(false);
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [passwordSuccess, setPasswordSuccess] = useState(false);
+
+  const [profileName, setProfileName] = useState("");
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileSaved, setProfileSaved] = useState(false);
 
   const [keys, setKeys] = useState<ApiKeyInfo[]>([]);
   const [keysLoading, setKeysLoading] = useState(true);
@@ -35,6 +40,30 @@ export function Settings() {
   useEffect(() => {
     void loadKeys();
   }, [loadKeys]);
+
+  useEffect(() => {
+    if (user) setProfileName(user.display_name ?? "");
+  }, [user]);
+
+  const handleProfileSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const name = profileName.trim();
+    if (!name) return;
+
+    setProfileLoading(true);
+    setProfileError(null);
+    setProfileSaved(false);
+
+    const result = await updateProfile(name);
+
+    setProfileLoading(false);
+    if (result.ok) {
+      setProfileSaved(true);
+      setTimeout(() => setProfileSaved(false), 2500);
+    } else {
+      setProfileError(result.error || t("settings.apiFailed"));
+    }
+  };
 
   const handlePasswordChange = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -134,6 +163,38 @@ export function Settings() {
               {isAdmin ? t("role.admin") : t("role.member")}
             </span>
           </div>
+          <form onSubmit={handleProfileSave}>
+            <div className="ds-field">
+              <label htmlFor="display-name">{t("settings.displayName")}</label>
+              <input
+                id="display-name"
+                className="ds-input"
+                value={profileName}
+                onChange={(e) => setProfileName(e.target.value)}
+                maxLength={80}
+                disabled={profileLoading}
+              />
+            </div>
+
+            {profileError && <div className="ds-banner ds-banner--error">{profileError}</div>}
+            {profileSaved && (
+              <div className="ds-banner ds-banner--ok">{t("settings.profileSaved")}</div>
+            )}
+
+            <div className="ds-actions">
+              <button
+                type="submit"
+                className="ds-btn ds-btn--primary"
+                disabled={
+                  profileLoading ||
+                  !profileName.trim() ||
+                  profileName.trim() === (user.display_name ?? "")
+                }
+              >
+                {profileLoading ? t("settings.profileSaving") : t("settings.profileSave")}
+              </button>
+            </div>
+          </form>
         </section>
       )}
 

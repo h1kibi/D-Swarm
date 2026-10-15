@@ -17,7 +17,7 @@ from apps.web.accounts.models import Account, AccountRole
 from apps.web.accounts.schemas import (
     LoginRequest, AccountResponse, CreateAccountRequest,
     CreateAccountResponse, UpdateAccountRequest, ChangePasswordRequest,
-    AccountListResponse, ApiKeyResponse
+    AccountListResponse, ApiKeyResponse, SelfUpdateRequest
 )
 from apps.web.accounts.db_service import DbAccountService
 from apps.web.auth import AuthConfig, check_password, issue_token, verify_token
@@ -259,6 +259,37 @@ async def create_account(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@accounts_router.patch("/me", response_model=AccountResponse)
+async def update_own_profile(
+    req: SelfUpdateRequest,
+    current_account: Account = Depends(get_current_account),
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
+):
+    """Update the caller's own profile (display name).
+
+    Self-service is deliberately narrow: role and activation stay admin-only
+    (``PATCH /api/accounts/{id}``). Registered before ``/{account_id}`` so
+    ``me`` is never captured as an account id.
+    """
+    display_name = req.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=400, detail="display_name must not be blank")
+
+    account = service.update_account(current_account.id, display_name=display_name)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    AuditService(db).log_action(
+        action="update",
+        actor_id=current_account.id,
+        resource_type="account",
+        resource_id=current_account.id,
+        details={"field": "display_name", "self": True},
+    )
+    return AccountResponse(**account.to_dict())
 
 
 @accounts_router.get("/{account_id}", response_model=AccountResponse)
