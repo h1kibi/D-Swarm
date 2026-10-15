@@ -1,6 +1,8 @@
 """Database connection and session management."""
 
 import os
+from pathlib import Path
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import StaticPool
@@ -37,9 +39,46 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def init_db():
-    """Initialize database with all tables."""
-    Base.metadata.create_all(bind=engine)
+def ensure_schema(bind_engine, url: str, *, alembic_ini: Path, migrations_dir: Path) -> None:
+    """Bring one database to the current schema.
+
+    Alembic owns the schema: an empty database is upgraded from the baseline; a
+    pre-Alembic database that already has the app tables is adopted (stamped)
+    first. ``create_all`` remains only as the fallback when the migrations
+    directory is not shipped with this checkout.
+    """
+    if not (alembic_ini.is_file() and migrations_dir.is_dir()):
+        Base.metadata.create_all(bind=bind_engine)
+        return
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import inspect as sa_inspect
+
+    cfg = Config(str(alembic_ini))
+    cfg.set_main_option("script_location", str(migrations_dir))
+    cfg.set_main_option("sqlalchemy.url", url)
+
+    inspector = sa_inspect(bind_engine)
+    has_version = inspector.has_table("alembic_version")
+    existing_app_tables = [
+        name for name in inspector.get_table_names() if name in Base.metadata.tables
+    ]
+    if not has_version and existing_app_tables:
+        # A database created before Alembic landed: it matches the baseline.
+        command.stamp(cfg, "head")
+    command.upgrade(cfg, "head")
+
+
+def init_db() -> None:
+    """Initialize/upgrade the database schema (see ensure_schema)."""
+    repo_root = Path(__file__).resolve().parents[3]
+    ensure_schema(
+        engine,
+        DATABASE_URL,
+        alembic_ini=repo_root / "alembic.ini",
+        migrations_dir=repo_root / "migrations",
+    )
 
 
 def get_db() -> Generator[Session, None, None]:

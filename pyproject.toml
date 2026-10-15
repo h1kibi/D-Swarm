@@ -39,6 +39,7 @@ dependencies = [
     "passlib>=1.7.4",
     "cryptography>=50.0.2",
     "sqlalchemy>=2.1.4",
+    "alembic>=1.20.0",
 ]
 
 [project.optional-dependencies]
