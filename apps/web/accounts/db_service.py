@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 from apps.web.db.models import AccountModel, AccountApiKeyModel, AccountRole
 from apps.web.accounts.models import Account, AccountApiKey
+from apps.web.accounts.runtime import jwt_secret
 
 
 # Password hashing uses the bcrypt package directly: passlib 1.7.4 is
@@ -29,7 +30,7 @@ class DbAccountService:
         self.db = db
         
         # JWT configuration
-        self.jwt_secret = os.getenv("DSWARM_JWT_SECRET", "dev-secret-change-in-production")
+        self.jwt_secret = jwt_secret()
         self.jwt_algorithm = os.getenv("DSWARM_JWT_ALGORITHM", "HS256")
         self.session_ttl = int(os.getenv("DSWARM_WEB_SESSION_TTL", "43200"))  # 12 hours
         self.api_token_ttl = int(os.getenv("DSWARM_API_TOKEN_TTL", "31536000"))  # 365 days

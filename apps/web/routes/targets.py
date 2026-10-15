@@ -14,12 +14,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from apps.web.http_utils import _require_dict_body
+from apps.web.principal import require_operator
 from apps.web.routes.runs import _redact_summary, _request_authenticated
 
-router = APIRouter(prefix="/api/targets", tags=["targets"])
+router = APIRouter(
+    prefix="/api/targets", tags=["targets"], dependencies=[Depends(require_operator)]
+)
 
 
 def _manager(request: Request) -> Any:

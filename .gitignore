@@ -104,3 +104,8 @@ docs/assets/wechat-promo/
 # Codex/pi local agent state and generated worker homes; never publish runtime data.
 /.zcode/
 /workspace/
+
+# Local runtime database (contains account hashes + run state) — never commit
+dswarm.db
+dswarm.db-wal
+dswarm.db-shm

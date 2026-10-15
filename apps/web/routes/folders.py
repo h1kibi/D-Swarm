@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
 from apps.web.http_utils import _require_dict_body
+from apps.web.principal import require_operator
 
-router = APIRouter(prefix="/api/folders", tags=["folders"])
+router = APIRouter(
+    prefix="/api/folders", tags=["folders"], dependencies=[Depends(require_operator)]
+)
 
 
 @router.get("")

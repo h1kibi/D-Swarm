@@ -87,7 +87,7 @@ describe("Worker settings system policy toggle markup", () => {
 });
 
 describe("main deck layout regression guards", () => {
-  const page = readFileSync(join(process.cwd(), "app", "page.tsx"), "utf8");
+  const page = readFileSync(join(process.cwd(), "app", "deck.tsx"), "utf8");
   const inspector = readFileSync(join(process.cwd(), "components", "SwarmInspector.tsx"), "utf8");
 
   it("keeps the desktop command deck tight below the native title bar", () => {

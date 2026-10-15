@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from apps.web.http_utils import _require_dict_body, project_probe_result
+from apps.web.principal import require_admin
 from dswarm.solver.credential_accounts import CredentialAccountStore, account_store_root
 
-router = APIRouter(prefix="/api/settings/workers", tags=["worker-settings"])
+router = APIRouter(
+    prefix="/api/settings/workers", tags=["worker-settings"], dependencies=[Depends(require_admin)]
+)
 
 _PROFILE_HEALTH_FIELDS = (
     "profile_id",

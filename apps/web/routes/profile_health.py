@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from apps.web.http_utils import project_probe_result
+from apps.web.principal import require_admin
 
-router = APIRouter(prefix="/api/settings/profiles", tags=["profile-health"])
+router = APIRouter(
+    prefix="/api/settings/profiles", tags=["profile-health"], dependencies=[Depends(require_admin)]
+)
 
 _PROFILE_HEALTH_FIELDS = (
     "profile_id",

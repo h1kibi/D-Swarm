@@ -39,6 +39,7 @@ from apps.web.auth import (
     verify_token,
 )
 from apps.web.run_manager import RunManager
+from apps.web.accounts.runtime import require_jwt_secret_for_public_bind
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
 from apps.web.routes.accounts import router as accounts_auth_router, accounts_router
@@ -167,6 +168,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # loopback, auth is disabled and the deck behaves exactly as before.
     auth = AuthConfig.from_env()
     auth.fail_fast_check()
+    # Account JWTs must not be signed with the public dev default once the
+    # backend leaves loopback (see apps/web/accounts/runtime.py).
+    require_jwt_secret_for_public_bind()
     app.state.auth = auth
     app.state.tickets = TicketStore()
 
@@ -212,20 +216,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         return resp
 
     def _account_token_valid(token: Optional[str]) -> bool:
-        """Multi-account JWTs (account system) are also valid credentials."""
-        if not token:
-            return False
-        try:
-            from apps.web.accounts.db_service import DbAccountService
-            from apps.web.db.session import SessionLocal
+        """Multi-account JWTs are valid credentials while the account is active."""
+        from apps.web.principal import account_token_is_active
 
-            db = SessionLocal()
-            try:
-                return DbAccountService(db).verify_access_token(token, "access") is not None
-            finally:
-                db.close()
-        except Exception:
-            return False
+        return account_token_is_active(token)
 
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):
@@ -242,6 +236,11 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # SSE events stream authenticates via one-time ticket query param, not a
         # header (EventSource can't set headers); let the handler enforce it.
         if path.endswith("/events"):
+            return await call_next(request)
+        # Worker blackboard bridge: workers carry the per-run X-Blackboard-Token
+        # (enforced in the handler), not the operator bearer — the gate must not
+        # 401 them when the password gate is on.
+        if path.startswith("/api/blackboard/"):
             return await call_next(request)
         token = bearer_from_header(request.headers.get("Authorization"))
         if not verify_token(cfg, token) and not _account_token_valid(token):

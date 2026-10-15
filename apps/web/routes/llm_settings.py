@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from apps.web.http_utils import _require_dict_body
+from apps.web.principal import require_admin
 
-router = APIRouter(prefix="/api/settings", tags=["llm-settings"])
+router = APIRouter(
+    prefix="/api/settings", tags=["llm-settings"], dependencies=[Depends(require_admin)]
+)
 
 
 @router.post("/llm-providers/probe")

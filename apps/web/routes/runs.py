@@ -6,9 +6,9 @@ import asyncio
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
@@ -20,6 +20,7 @@ from apps.web.http_utils import (
     _require_dict_body,
 )
 from apps.web.run_manager import Run, RunManager
+from apps.web.principal import Principal, require_admin, require_operator
 from dswarm.core.events import Event, EventType
 from dswarm.solver.runtime_policy import RuntimePolicyError
 from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuildError
@@ -63,10 +64,18 @@ async def list_runs(request: Request, archived: int = 0) -> Any:
 
 
 def _request_authenticated(request: Request) -> bool:
+    """True for the P3 operator token OR an active account JWT.
+
+    Account tokens are operator-equivalent: the console and the deck share one
+    auth system, and a deactivated account's token stops working immediately.
+    """
     cfg: AuthConfig = request.app.state.auth
-    if not cfg.enabled:
-        return False  # passwordless: nothing proves an operator is asking
-    return verify_token(cfg, bearer_from_header(request.headers.get("Authorization")))
+    token = bearer_from_header(request.headers.get("Authorization"))
+    if cfg.enabled and verify_token(cfg, token):
+        return True
+    from apps.web.principal import account_token_is_active
+
+    return account_token_is_active(token)
 
 
 def _redact_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -123,7 +132,11 @@ async def budget_snapshot(run_id: str, request: Request) -> Any:
 
 
 @router.post("/{run_id}/budget/rebuild")
-async def rebuild_budget(run_id: str, request: Request) -> Any:
+async def rebuild_budget(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_operator),
+) -> Any:
     """Replay the run ledger and recover journal-only usage records."""
     manager = request.app.state.manager
     if manager.get(run_id) is None:
@@ -143,7 +156,11 @@ async def rebuild_budget(run_id: str, request: Request) -> Any:
 
 
 @router.patch("/{run_id}")
-async def update_run(run_id: str, request: Request) -> Any:
+async def update_run(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_admin),
+) -> Any:
     body = await _require_dict_body(request)
     mgr = request.app.state.manager
     ok = True
@@ -170,7 +187,11 @@ async def update_run(run_id: str, request: Request) -> Any:
 
 
 @router.post("/{run_id}/retitle")
-async def retitle_run(run_id: str, request: Request) -> Any:
+async def retitle_run(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_admin),
+) -> Any:
     """Re-apply the rail naming rule (`方向-标识`: the identifier is the 题目名
     → URL host[:port] → attachment filename, whatever independently pins down
     the challenge) to an EXISTING run, using its remembered dispatch body.
@@ -266,19 +287,31 @@ async def retitle_run(run_id: str, request: Request) -> Any:
 
 
 @router.delete("/{run_id}")
-async def delete_run(run_id: str, request: Request) -> Any:
+async def delete_run(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_admin),
+) -> Any:
     ok = await request.app.state.manager.delete(run_id)
     return {"ok": ok}
 
 
 @router.post("/{run_id}/open")
-async def open_run_workspace(run_id: str, request: Request) -> Any:
+async def open_run_workspace(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_operator),
+) -> Any:
     ok = request.app.state.manager.open_workspace(run_id)
     return {"ok": ok}
 
 
 @router.get("/{run_id}/credentials")
-async def run_credentials(run_id: str, request: Request) -> Any:
+async def run_credentials(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_operator),
+) -> Any:
     from dswarm.models.solve_graph import Challenge
     from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
@@ -788,7 +821,11 @@ async def terminal(ws: WebSocket, run_id: str) -> None:
         return
 
 @router.post("/{run_id}/resolve")
-async def resolve_run(run_id: str, request: Request) -> Any:
+async def resolve_run(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_operator),
+) -> Any:
     """"继续做题": continue a finished ReasonSwarm run through the current
     scheduler (reuses its workspace so verified facts carry over). Distinct from
     /hitl which, on a finished run, starts a single standby worker for follow-up."""
@@ -813,7 +850,11 @@ async def resolve_run(run_id: str, request: Request) -> Any:
             "position": run.queue_position if run and run.queued else None}
 
 @router.post("/{run_id}/workers")
-async def spawn_worker(run_id: str, request: Request) -> Any:
+async def spawn_worker(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_admin),
+) -> Any:
     # Operator runtime control: add a worker to a live ReasonSwarm scheduler.
     # Body {"engine": "pi"} is optional; omitted lets the scheduler select from
     # the configured healthy Pi worker profiles.
@@ -823,7 +864,11 @@ async def spawn_worker(run_id: str, request: Request) -> Any:
     return {"ok": ok}
 
 @router.delete("/{run_id}/workers")
-async def kill_worker(run_id: str, request: Request) -> Any:
+async def kill_worker(
+    run_id: str,
+    request: Request,
+    _guard: Optional[Principal] = Depends(require_admin),
+) -> Any:
     # operator runtime control: stop a specific worker by its solver_id.
     body = await _require_dict_body(request, allow_empty=True)
     ok = await request.app.state.manager.post_worker_cmd(

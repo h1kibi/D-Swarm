@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
-router = APIRouter(prefix="/api/settings", tags=["worker-image"])
+from apps.web.principal import require_admin
+
+router = APIRouter(
+    prefix="/api/settings", tags=["worker-image"], dependencies=[Depends(require_admin)]
+)
 
 
 @router.get("/worker-image")
