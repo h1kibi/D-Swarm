@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from pathlib import Path
@@ -27,6 +28,8 @@ from dswarm.solver.runtime_snapshot import RuntimeSnapshotBuildError
 from dswarm.swarm.poc_verification import sanitize_public_text
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
+
+LOG = logging.getLogger(__name__)
 
 
 def _safe_dispatch_detail(exc: BaseException) -> str:
@@ -76,6 +79,38 @@ def _request_authenticated(request: Request) -> bool:
     from apps.web.principal import account_token_is_active
 
     return account_token_is_active(token)
+
+
+def _audit_operator_action(
+    principal: Optional[Principal],
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    details: Optional[dict[str, Any]] = None,
+) -> None:
+    """Best-effort audit write for deck actions (never blocks the action)."""
+    try:
+        from apps.web.db.session import SessionLocal
+        from apps.web.services.audit_service import AuditService
+
+        db = SessionLocal()
+        try:
+            AuditService(db).log_action(
+                action=action,
+                actor_id=(
+                    principal.account_id
+                    if principal is not None and principal.account_id
+                    else "operator"
+                ),
+                resource_type=resource_type,
+                resource_id=resource_id,
+                details=details or {},
+            )
+        finally:
+            db.close()
+    except Exception:
+        LOG.exception("audit write failed for %s %s", action, resource_id)
 
 
 def _redact_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -293,6 +328,7 @@ async def delete_run(
     _guard: Optional[Principal] = Depends(require_admin),
 ) -> Any:
     ok = await request.app.state.manager.delete(run_id)
+    _audit_operator_action(_guard, action="delete", resource_type="run", resource_id=run_id, details={"ok": bool(ok)})
     return {"ok": ok}
 
 

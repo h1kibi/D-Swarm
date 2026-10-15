@@ -226,6 +226,7 @@ class DbAccountService:
             id=api_key_model.id,
             account_id=account_id,
             provider=api_key_model.provider,
+            encrypted_key=api_key_model.encrypted_key,
             created_at=api_key_model.created_at.timestamp(),
             revoked_at=None
         )
@@ -268,6 +269,25 @@ class DbAccountService:
         key_model.revoked_at = datetime.utcnow()
         self.db.commit()
         return True
+    
+    def list_api_keys(self, account_id: str) -> list[dict]:
+        """API-key metadata for one account (never the plaintext token)."""
+        rows = (
+            self.db.query(AccountApiKeyModel)
+            .filter_by(account_id=account_id)
+            .order_by(AccountApiKeyModel.created_at.desc())
+            .all()
+        )
+        return [
+            {
+                "key_id": row.id,
+                "provider": row.provider,
+                "created_at": row.created_at.timestamp() if row.created_at else None,
+                "revoked_at": row.revoked_at.timestamp() if row.revoked_at else None,
+                "is_active": row.revoked_at is None,
+            }
+            for row in rows
+        ]
     
     # Private helpers
     

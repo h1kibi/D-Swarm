@@ -93,3 +93,137 @@ def test_p3_operator_token_is_admin(gated_client):
     token = gated_client.post("/api/auth/login", json={"password": "letmein"}).json()["token"]
     headers = {"Authorization": f"Bearer {token}"}
     assert gated_client.get("/api/settings/credential-accounts", headers=headers).status_code == 200
+
+
+# ── login throttle ───────────────────────────────────────────────────────────
+
+def test_login_throttle_returns_429_after_repeated_failures(monkeypatch, tmp_path):
+    monkeypatch.setenv(A.PASSWORD_ENV, "letmein")
+    monkeypatch.delenv(A.BIND_ENV, raising=False)
+    monkeypatch.setenv("DSWARM_LOGIN_MAX_FAILS", "3")
+    monkeypatch.setenv("DSWARM_LOGIN_WINDOW_S", "60")
+    client = TestClient(create_app(RunManager(sessions_root=str(tmp_path / "s"))))
+
+    for _ in range(3):
+        assert client.post("/api/auth/login", json={"password": "nope"}).status_code == 401
+    assert client.post("/api/auth/login", json={"password": "nope"}).status_code == 429
+    # the correct password also waits out the window (lockout, not per-guess)
+    assert client.post("/api/auth/login", json={"password": "letmein"}).status_code == 429
+
+
+def test_login_throttle_resets_after_success(monkeypatch, tmp_path):
+    monkeypatch.setenv(A.PASSWORD_ENV, "letmein")
+    monkeypatch.delenv(A.BIND_ENV, raising=False)
+    monkeypatch.setenv("DSWARM_LOGIN_MAX_FAILS", "3")
+    monkeypatch.setenv("DSWARM_LOGIN_WINDOW_S", "60")
+    client = TestClient(create_app(RunManager(sessions_root=str(tmp_path / "s"))))
+
+    assert client.post("/api/auth/login", json={"password": "nope"}).status_code == 401
+    assert client.post("/api/auth/login", json={"password": "nope"}).status_code == 401
+    assert client.post("/api/auth/login", json={"password": "letmein"}).status_code == 200
+    # a success clears the bucket: the next failures start from zero again
+    assert client.post("/api/auth/login", json={"password": "nope"}).status_code == 401
+    assert client.post("/api/auth/login", json={"password": "nope"}).status_code == 401
+
+
+# ── audit writes ─────────────────────────────────────────────────────────────
+
+def test_login_writes_audit_rows(monkeypatch, tmp_path):
+    monkeypatch.setenv(A.PASSWORD_ENV, "letmein")
+    monkeypatch.delenv(A.BIND_ENV, raising=False)
+    client = TestClient(create_app(RunManager(sessions_root=str(tmp_path / "s"))))
+
+    assert client.post("/api/auth/login", json={"password": "letmein"}).status_code == 200
+    assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
+
+    from apps.web.db.models import AuditLogModel
+    from apps.web.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        success = (
+            db.query(AuditLogModel)
+            .filter_by(action="login", actor="operator")
+            .all()
+        )
+        assert any(row.status == "success" and row.ip_address == "testclient" for row in success)
+        failures = (
+            db.query(AuditLogModel)
+            .filter_by(action="login", actor="unknown", status="failure")
+            .filter(AuditLogModel.ip_address == "testclient")
+            .all()
+        )
+        assert failures
+    finally:
+        db.close()
+
+
+# ── account secret policy (extended) ─────────────────────────────────────────
+
+def test_account_secrets_required_on_public_bind(monkeypatch):
+    monkeypatch.delenv(AR.JWT_SECRET_ENV, raising=False)
+    monkeypatch.delenv(AR.ENCRYPTION_KEY_ENV, raising=False)
+    monkeypatch.setenv(A.BIND_ENV, "0.0.0.0")
+    with pytest.raises(RuntimeError, match="DSWARM_JWT_SECRET"):
+        AR.require_account_secrets_for_public_bind()
+    monkeypatch.setenv(AR.JWT_SECRET_ENV, "x" * 32)
+    with pytest.raises(RuntimeError, match="DSWARM_ENCRYPTION_KEY"):
+        AR.require_account_secrets_for_public_bind()
+    monkeypatch.setenv(AR.ENCRYPTION_KEY_ENV, "fernet-placeholder")
+    AR.require_account_secrets_for_public_bind()  # both present → fine
+
+
+# ── api keys ─────────────────────────────────────────────────────────────────
+
+def test_api_key_create_verify_revoke_roundtrip(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from apps.web.accounts.db_service import DbAccountService
+    from apps.web.accounts.models import AccountRole
+    from apps.web.db.models import Base
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'accounts.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        service = DbAccountService(db)
+        account = service.create_account(
+            username="key-owner", display_name="Key Owner", password="secret123",
+            role=AccountRole.MEMBER,
+        )
+        token, key = service.create_api_key(account.id)
+        assert token
+        verified = service.verify_api_token(token)
+        assert verified is not None and verified["account_id"] == account.id
+        listed = service.list_api_keys(account.id)
+        assert listed and listed[0]["is_active"] is True
+        assert service.revoke_api_key(key.id) is True
+        assert service.verify_api_token(token) is None
+        assert service.list_api_keys(account.id)[0]["is_active"] is False
+    finally:
+        db.close()
+
+
+def test_api_key_authenticates_http_with_account_role(monkeypatch, gated_client):
+    monkeypatch.setattr(P, "load_account", lambda account_id: _fake_account("member"))
+    monkeypatch.setattr(
+        "apps.web.accounts.db_service.DbAccountService.verify_api_token",
+        lambda self, token: {"account_id": "acc-1"} if token == "key-sentinel" else None,
+    )
+
+    headers = {"Authorization": "Bearer key-sentinel"}
+    # the API key passes the gate and acts as the member account
+    assert gated_client.get("/api/folders", headers=headers).status_code == 200
+    # …and is held to the same role policy as the account
+    assert gated_client.get("/api/settings/credential-accounts", headers=headers).status_code == 403
+
+    # a revoked key resolves to nobody → the gate 401s it
+    monkeypatch.setattr(
+        "apps.web.accounts.db_service.DbAccountService.verify_api_token",
+        lambda self, token: None,
+    )
+    assert gated_client.get("/api/folders", headers=headers).status_code == 401

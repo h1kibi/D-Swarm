@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from typing import Optional
 
+from sqlalchemy.orm import Session
+
+from apps.web.accounts import login_guard
 from apps.web.accounts.dependencies import (
     get_account_service, get_current_account, require_admin
 )
+from apps.web.db.session import get_db
+from apps.web.services.audit_service import AuditService
 from apps.web.accounts.models import Account, AccountRole
 from apps.web.accounts.schemas import (
     LoginRequest, AccountResponse, CreateAccountRequest,
@@ -29,7 +34,9 @@ accounts_router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 @router.post("/login")
 async def login(
     req: LoginRequest,
-    service: DbAccountService = Depends(get_account_service)
+    request: Request,
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
 ):
     """Login: account credentials, or the operator password (P3 gate).
 
@@ -37,12 +44,24 @@ async def login(
     - account credentials (username optional; the password identifies the
       account) → account JWT, returned as both ``access_token`` and ``token``
     - operator password (DSWARM_WEB_PASSWORD, gate enabled) → P3 session token
+
+    Throttled per client host: repeated failures answer 429 until the window
+    frees; every attempt lands in the audit trail.
     """
     cfg = AuthConfig.from_env()
+    host = (request.client.host if request.client else "") or "unknown"
+
+    wait = login_guard.blocked_for(request.app, host)
+    if wait > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"too many failed attempts; retry in {int(wait) + 1}s",
+        )
 
     if not req.password:
         if not cfg.enabled:
             return {"ok": True, "token": "", "auth_required": False}
+        login_guard.record_failure(request.app, host)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid password"
         )
@@ -62,7 +81,16 @@ async def login(
     if username:
         account = service.authenticate(username, req.password)
         if account:
+            login_guard.record_success(request.app, host)
             access_token, ttl = service.create_access_token(account.id, token_type="access")
+            AuditService(db).log_action(
+                action="login",
+                actor_id=account.id,
+                resource_type="account",
+                resource_id=account.id,
+                ip_address=host,
+                details={"username": account.username, "role": account.role.value},
+            )
             return {
                 "access_token": access_token,
                 "token": access_token,  # legacy deck field
@@ -78,7 +106,16 @@ async def login(
 
     # Operator-password fallback (P3 single-password gate).
     if cfg.enabled and check_password(cfg, req.password):
+        login_guard.record_success(request.app, host)
         token = issue_token(cfg)
+        AuditService(db).log_action(
+            action="login",
+            actor_id="operator",
+            resource_type="auth",
+            resource_id="operator",
+            ip_address=host,
+            details={"mode": "operator-password"},
+        )
         return {
             "token": token,
             "access_token": token,
@@ -90,6 +127,16 @@ async def login(
             "ok": True,
         }
 
+    login_guard.record_failure(request.app, host)
+    AuditService(db).log_action(
+        action="login",
+        actor_id="unknown",
+        resource_type="auth",
+        resource_id=str(req.username or "?"),
+        ip_address=host,
+        status="failure",
+        details={"username": req.username or ""},
+    )
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password"
     )
@@ -172,7 +219,8 @@ async def list_accounts(
 async def create_account(
     req: CreateAccountRequest,
     admin: Account = Depends(require_admin),
-    service: DbAccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
 ):
     """Create new account (Admin only)."""
     try:
@@ -182,6 +230,13 @@ async def create_account(
             password=req.password,
             role=AccountRole(req.role),
             created_by=admin.id
+        )
+        AuditService(db).log_action(
+            action="create",
+            actor_id=admin.id,
+            resource_type="account",
+            resource_id=account.id,
+            details={"username": account.username, "role": account.role.value},
         )
         
         return CreateAccountResponse(
@@ -215,7 +270,8 @@ async def update_account(
     account_id: str,
     req: UpdateAccountRequest,
     admin: Account = Depends(require_admin),
-    service: DbAccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
 ):
     """Update account (Admin only)."""
     account = service.update_account(
@@ -227,6 +283,13 @@ async def update_account(
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     
+    AuditService(db).log_action(
+        action="update",
+        actor_id=admin.id,
+        resource_type="account",
+        resource_id=account_id,
+        details={k: v for k, v in {"is_active": req.is_active, "display_name": req.display_name}.items() if v is not None},
+    )
     return AccountResponse(**account.to_dict())
 
 
@@ -234,7 +297,8 @@ async def update_account(
 async def delete_account(
     account_id: str,
     admin: Account = Depends(require_admin),
-    service: DbAccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
 ):
     """Delete account (Admin only - soft delete by deactivating)."""
     account = service.get_account_by_id(account_id)
@@ -245,6 +309,13 @@ async def delete_account(
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
     
     service.update_account(account_id, is_active=False)
+    AuditService(db).log_action(
+        action="delete",
+        actor_id=admin.id,
+        resource_type="account",
+        resource_id=account_id,
+        details={"soft": True},
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -255,7 +326,8 @@ async def delete_account(
 async def change_password(
     req: ChangePasswordRequest,
     current_account: Account = Depends(get_current_account),
-    service: DbAccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
 ):
     """Change password for current user."""
     if not service.change_password(
@@ -265,6 +337,13 @@ async def change_password(
     ):
         raise HTTPException(status_code=401, detail="Incorrect old password")
     
+    AuditService(db).log_action(
+        action="update",
+        actor_id=current_account.id,
+        resource_type="account",
+        resource_id=current_account.id,
+        details={"field": "password"},
+    )
     return {"status": "ok"}
 
 
@@ -275,26 +354,58 @@ async def change_password(
 @accounts_router.post("/me/api-keys", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)
 async def generate_api_key(
     current_account: Account = Depends(get_current_account),
-    service: DbAccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
 ):
-    """Generate new API key for external integrations.
-    
-    Returns: {
-        "key_id": "xxx",
-        "provider": "local_agent",
-        "created_at": 1234567890,
-        "is_active": true,
-        "api_token": "secret_token_only_shown_once"  # Not included in response
-    }
-    
-    Note: The api_token should be displayed once and stored by the client.
+    """Generate a new API key for external integrations.
+
+    The plaintext ``api_token`` is included in THIS response only — store it
+    now; it can never be retrieved again (revoke + recreate to rotate).
     """
     plain_token, api_key = service.create_api_key(current_account.id)
-    
-    # Return response (token NOT included in normal response)
+    AuditService(db).log_action(
+        action="create",
+        actor_id=current_account.id,
+        resource_type="api_key",
+        resource_id=api_key.id,
+    )
     return ApiKeyResponse(
         key_id=api_key.id,
         provider=api_key.provider,
         created_at=api_key.created_at,
-        is_active=api_key.is_active
+        is_active=api_key.is_active,
+        api_token=plain_token,
     )
+
+
+@accounts_router.get("/me/api-keys")
+async def list_my_api_keys(
+    current_account: Account = Depends(get_current_account),
+    service: DbAccountService = Depends(get_account_service),
+):
+    """List the current user's API keys (metadata only, never plaintext)."""
+    return {"keys": service.list_api_keys(current_account.id)}
+
+
+@accounts_router.delete("/me/api-keys/{key_id}")
+async def revoke_my_api_key(
+    key_id: str,
+    current_account: Account = Depends(get_current_account),
+    service: DbAccountService = Depends(get_account_service),
+    db: Session = Depends(get_db),
+):
+    """Revoke one of the current user's API keys."""
+    from apps.web.db.models import AccountApiKeyModel
+
+    key = service.db.query(AccountApiKeyModel).filter_by(id=key_id).first()
+    if key is None or key.account_id != current_account.id:
+        raise HTTPException(status_code=404, detail="API key not found")
+    ok = service.revoke_api_key(key_id)
+    AuditService(db).log_action(
+        action="delete",
+        actor_id=current_account.id,
+        resource_type="api_key",
+        resource_id=key_id,
+        status="success" if ok else "failure",
+    )
+    return {"ok": ok}

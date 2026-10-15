@@ -9,6 +9,7 @@ from typing import Optional
 from apps.web.db.session import get_db
 from apps.web.db.models import AccountModel
 from apps.web.services.event_service import EventService
+from apps.web.services.audit_service import AuditService
 from apps.web.accounts.db_service import DbAccountService
 from pydantic import BaseModel
 
@@ -86,6 +87,13 @@ async def create_event(
             name=event.name,
             creator_id=admin.id,
             description=event.description
+        )
+        AuditService(db).log_action(
+            action="create",
+            actor_id=admin.id,
+            resource_type="event",
+            resource_id=created.id,
+            details={"name": created.name},
         )
         
         return EventResponse(
@@ -172,6 +180,13 @@ async def update_event(
     try:
         updates = {k: v for k, v in update.dict().items() if v is not None}
         updated = service.update_event(event_id, admin.id, **updates)
+        AuditService(db).log_action(
+            action="update",
+            actor_id=admin.id,
+            resource_type="event",
+            resource_id=event_id,
+            details={key: str(value) for key, value in updates.items()},
+        )
         
         return EventResponse(
             id=updated.id,
@@ -200,6 +215,12 @@ async def delete_event(
     
     try:
         service.delete_event(event_id, admin.id)
+        AuditService(db).log_action(
+            action="delete",
+            actor_id=admin.id,
+            resource_type="event",
+            resource_id=event_id,
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except PermissionError as e:

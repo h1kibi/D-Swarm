@@ -79,11 +79,17 @@ class ChangePasswordRequest(BaseModel):
 
 
 class ApiKeyResponse(BaseModel):
-    """API key response."""
+    """API key response.
+
+    ``api_token`` is present ONLY in the creation response — the plaintext is
+    never retrievable again; the client must store it at that moment.
+    """
     key_id: str
     provider: str
     created_at: float
     is_active: bool
+    api_token: Optional[str] = None
+    revoked_at: Optional[float] = None
 
 
 class RefreshTokenRequest(BaseModel):

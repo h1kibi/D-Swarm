@@ -79,11 +79,29 @@ def _target_status(summaries: list[dict[str, Any]], archived_at: Any) -> str:
     return "idle"
 
 
+_FACTS_CACHE: dict[tuple[str, int], list[dict[str, Any]]] = {}
+_FACTS_CACHE_MAX = 64
+
+
 def _facts_for_run(mgr: Any, run_id: str) -> list[dict[str, Any]]:
-    """Verified facts projected read-only from one run's shared graph."""
+    """Verified facts projected read-only from one run's shared graph.
+
+    Memoized by (graph path, mtime): the deck polls /api/targets every few
+    seconds and the list projection would otherwise reopen every attached
+    run's SQLite graph on every poll.
+    """
     db_path = mgr.workspace_dir(run_id) / "graph" / "shared_graph.db"
     if not db_path.exists():
         return []
+    try:
+        stamp = db_path.stat().st_mtime_ns
+    except OSError:
+        return []
+    cache_key = (str(db_path), stamp)
+    cached = _FACTS_CACHE.get(cache_key)
+    if cached is not None:
+        return [dict(item) for item in cached]
+
     from dswarm.models.solve_graph import Challenge
     from dswarm.swarm.shared_graph import SQLiteSharedGraph
 
@@ -118,6 +136,10 @@ def _facts_for_run(mgr: Any, run_id: str) -> list[dict[str, Any]]:
                 "provenance_status": "verified",
             }
         )
+    _FACTS_CACHE[cache_key] = [dict(item) for item in facts]
+    if len(_FACTS_CACHE) > _FACTS_CACHE_MAX:
+        # Bounded memory: drop the oldest inserted entry (dicts keep order).
+        _FACTS_CACHE.pop(next(iter(_FACTS_CACHE)))
     return facts
 
 

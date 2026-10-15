@@ -39,7 +39,7 @@ from apps.web.auth import (
     verify_token,
 )
 from apps.web.run_manager import RunManager
-from apps.web.accounts.runtime import require_jwt_secret_for_public_bind
+from apps.web.accounts.runtime import require_account_secrets_for_public_bind
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
 from apps.web.routes.accounts import router as accounts_auth_router, accounts_router
@@ -168,9 +168,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # loopback, auth is disabled and the deck behaves exactly as before.
     auth = AuthConfig.from_env()
     auth.fail_fast_check()
-    # Account JWTs must not be signed with the public dev default once the
-    # backend leaves loopback (see apps/web/accounts/runtime.py).
-    require_jwt_secret_for_public_bind()
+    # Account JWTs must not be signed with the public dev default and API keys
+    # must not use a throwaway key once the backend leaves loopback.
+    # See apps/web/accounts/runtime.py.
+    require_account_secrets_for_public_bind()
     app.state.auth = auth
     app.state.tickets = TicketStore()
 

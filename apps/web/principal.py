@@ -53,7 +53,12 @@ def _role_of(account: Any) -> str:
 
 
 def resolve_account_from_token(token: Optional[str]) -> Optional[Any]:
-    """The active account behind an account JWT, else None. Signature + type + DB."""
+    """The active account behind an account JWT or API key, else None.
+
+    JWTs verify by signature; anything else is tried as an API key (a decrypt
+    scan over that account's keys — fine at team scale, and only reached for
+    non-JWT bearers).
+    """
     if not token:
         return None
     from apps.web.accounts.db_service import DbAccountService
@@ -61,12 +66,17 @@ def resolve_account_from_token(token: Optional[str]) -> Optional[Any]:
 
     db = SessionLocal()
     try:
-        payload = DbAccountService(db).verify_access_token(token, "access")
+        service = DbAccountService(db)
+        payload = service.verify_access_token(token, "access")
+        account_id = str((payload or {}).get("account_id") or "")
+        if not account_id:
+            api_payload = service.verify_api_token(token)
+            account_id = str((api_payload or {}).get("account_id") or "")
     finally:
         db.close()
-    if not payload:
+    if not account_id:
         return None
-    account = load_account(str(payload.get("account_id") or ""))
+    account = load_account(account_id)
     if account is None or not getattr(account, "is_active", False):
         return None
     return account
