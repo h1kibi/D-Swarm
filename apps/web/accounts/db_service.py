@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import secrets
 import time
+import uuid
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 
@@ -13,7 +14,7 @@ import jwt
 from sqlalchemy.orm import Session
 from cryptography.fernet import Fernet
 
-from apps.web.db.models import AccountModel, AccountApiKeyModel, AccountRole
+from apps.web.db.models import AccountModel, AccountApiKeyModel, AccountRole, RevokedTokenModel
 from apps.web.accounts.models import Account, AccountApiKey
 from apps.web.accounts.runtime import jwt_secret
 
@@ -179,6 +180,7 @@ class DbAccountService:
             "username": account.username,
             "role": account.role.value,
             "type": token_type,
+            "jti": uuid.uuid4().hex,
             "iat": now,
             "exp": now + ttl
         }
@@ -289,6 +291,53 @@ class DbAccountService:
             for row in rows
         ]
     
+    def revoke_token(
+        self,
+        jti: str,
+        *,
+        account_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
+    ) -> bool:
+        """Denylist one account-JWT id (idempotent; opportunistically pruned)."""
+        clean = str(jti or "").strip()[:64]
+        if not clean:
+            return False
+        now = datetime.utcnow()
+        self.db.query(RevokedTokenModel).filter(
+            RevokedTokenModel.expires_at.isnot(None),
+            RevokedTokenModel.expires_at < now,
+        ).delete(synchronize_session=False)
+        if self.db.query(RevokedTokenModel).filter_by(jti=clean).first() is None:
+            self.db.add(
+                RevokedTokenModel(
+                    jti=clean,
+                    account_id=(str(account_id) if account_id else None),
+                    expires_at=(
+                        datetime.utcfromtimestamp(float(expires_at))
+                        if expires_at
+                        else None
+                    ),
+                )
+            )
+        self.db.commit()
+        return True
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """True when this token id was denylisted (logout / rotation)."""
+        clean = str(jti or "").strip()[:64]
+        if not clean:
+            return False
+        return self.db.query(RevokedTokenModel).filter_by(jti=clean).first() is not None
+
+    def bump_token_valid_after(self, account_id: str) -> bool:
+        """Reject every token issued before now (called on password change)."""
+        model = self.db.query(AccountModel).filter_by(id=account_id).first()
+        if model is None:
+            return False
+        model.token_valid_after = datetime.utcnow()
+        self.db.commit()
+        return True
+
     # Private helpers
     
     def _model_to_account(self, model: AccountModel) -> Account:
@@ -303,5 +352,8 @@ class DbAccountService:
             created_by=model.created_by,
             created_at=model.created_at.timestamp(),
             updated_at=model.updated_at.timestamp(),
-            last_login=model.last_login.timestamp() if model.last_login else None
+            last_login=model.last_login.timestamp() if model.last_login else None,
+            token_valid_after=(
+                model.token_valid_after.timestamp() if model.token_valid_after else None
+            ),
         )

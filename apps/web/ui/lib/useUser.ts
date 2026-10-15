@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { apiFetch } from "./useRun";
+import { apiFetch, setToken } from "./useRun";
 
 export interface User {
   id: string;
@@ -135,6 +135,10 @@ export async function changePassword(
       return { ok: false, error: detail };
     }
 
+    // The backend rotates tokens on password change: it returns a replacement
+    // so this session survives while every older token is rejected.
+    const body = (await res.json().catch(() => ({}))) as { access_token?: string };
+    if (body.access_token) setToken(String(body.access_token));
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "An error occurred" };

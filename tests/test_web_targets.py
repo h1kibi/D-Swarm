@@ -1060,3 +1060,41 @@ async def test_target_hint_selection_uses_stable_ids(tmp_path, monkeypatch):
     assert "OPERATOR HINTS FROM TARGET CARD" not in captured["body"]["prompt"]
     assert "first lead" not in captured["body"]["prompt"]
     assert "second lead" not in captured["body"]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_target_review_snapshot_aggregates_real_data(tmp_path):
+    """The deck's review modal gets all nine fields from actual run data."""
+    manager = RunManager(sessions_root=tmp_path)
+    app = create_app(manager)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        target = (
+            await client.post("/api/targets", json={"name": "Review target", "category": "web"})
+        ).json()["target"]
+        run_resp = await client.post(
+            f"/api/targets/{target['id']}/runs", json={"direction": "Auth"}
+        )
+        assert run_resp.status_code == 200
+        run_id = run_resp.json()["run"]["run_id"]
+
+        response = await client.get(f"/api/targets/{target['id']}/review")
+        assert response.status_code == 200
+        snapshot = response.json()
+        assert set(snapshot) == {
+            "summary",
+            "known_facts",
+            "attempted_routes",
+            "failures_runtime",
+            "evidence_refs",
+            "intent_decisions",
+            "usage_ledger",
+            "provenance_chain",
+        }
+        assert snapshot["summary"]["target_id"] == target["id"]
+        assert snapshot["summary"]["run_count"] == 1
+        assert snapshot["summary"]["terminal_run_count"] == 0
+        ledger_row = next(item for item in snapshot["usage_ledger"] if item["run_id"] == run_id)
+        assert ledger_row["status"] in ("draft", "queued", "running", "paused")
+        route_texts = {item["text"] for item in snapshot["attempted_routes"]}
+        assert "Auth" in route_texts

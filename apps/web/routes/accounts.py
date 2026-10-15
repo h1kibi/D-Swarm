@@ -144,9 +144,19 @@ async def login(
 
 @router.post("/logout")
 async def logout(
-    current_account: Account = Depends(get_current_account)
+    current_account: Account = Depends(get_current_account),
+    service: DbAccountService = Depends(get_account_service),
+    authorization: Optional[str] = Header(None),
 ):
-    """Logout (client should discard token)."""
+    """Logout. Denylists this token's jti so it stops working immediately."""
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+    payload = service.verify_access_token(token, "access") if token else None
+    if payload and payload.get("jti"):
+        service.revoke_token(
+            str(payload["jti"]),
+            account_id=current_account.id,
+            expires_at=payload.get("exp"),
+        )
     return {"status": "ok"}
 
 
@@ -344,7 +354,11 @@ async def change_password(
         resource_id=current_account.id,
         details={"field": "password"},
     )
-    return {"status": "ok"}
+    # Password change rotates credentials: every token issued earlier stops
+    # working, and the caller gets a fresh one so this session continues.
+    service.bump_token_valid_after(current_account.id)
+    access_token, ttl = service.create_access_token(current_account.id, token_type="access")
+    return {"status": "ok", "access_token": access_token, "expires_in": ttl}
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -18,25 +18,19 @@ def get_account_service(db: Session = Depends(get_db)) -> DbAccountService:
 
 async def get_current_account(
     authorization: str = Header(...),
-    service: DbAccountService = Depends(get_account_service)
 ) -> Account:
-    """Get current authenticated account from Authorization header.
+    """Current account from the bearer token (account JWT or API key).
 
-    Expects: Authorization: Bearer <token>
+    Resolves through the shared principal path, so revocation (logout denylist)
+    and password-rotation checks apply here exactly like in the middleware and
+    the role policy.
     """
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    from apps.web.principal import resolve_account_from_token
 
-    token = authorization[7:]  # Remove "Bearer " prefix
-    payload = service.verify_access_token(token, expected_type="access")
-
-    if not payload:
+    token = authorization[7:] if authorization.startswith("Bearer ") else ""
+    account = resolve_account_from_token(token)
+    if account is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    account = service.get_account_by_id(payload["account_id"])
-    if not account or not account.is_active:
-        raise HTTPException(status_code=401, detail="Account not found or inactive")
-
     return account
 
 
@@ -51,20 +45,10 @@ async def require_admin(
 
 async def get_current_account_optional(
     authorization: Optional[str] = Header(None),
-    service: DbAccountService = Depends(get_account_service)
 ) -> Optional[Account]:
     """Get current account if authenticated, otherwise None."""
+    from apps.web.principal import resolve_account_from_token
+
     if not authorization or not authorization.startswith("Bearer "):
         return None
-
-    token = authorization[7:]
-    payload = service.verify_access_token(token, expected_type="access")
-
-    if not payload:
-        return None
-
-    account = service.get_account_by_id(payload["account_id"])
-    if account and account.is_active:
-        return account
-
-    return None
+    return resolve_account_from_token(authorization[7:])

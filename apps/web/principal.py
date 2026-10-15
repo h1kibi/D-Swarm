@@ -55,9 +55,10 @@ def _role_of(account: Any) -> str:
 def resolve_account_from_token(token: Optional[str]) -> Optional[Any]:
     """The active account behind an account JWT or API key, else None.
 
-    JWTs verify by signature; anything else is tried as an API key (a decrypt
-    scan over that account's keys — fine at team scale, and only reached for
-    non-JWT bearers).
+    JWTs verify by signature, then by revocation (jti denylist) and rotation
+    (issued before ``token_valid_after``); anything else is tried as an API key
+    (a decrypt scan over that account's keys — fine at team scale, and only
+    reached for non-JWT bearers).
     """
     if not token:
         return None
@@ -65,11 +66,17 @@ def resolve_account_from_token(token: Optional[str]) -> Optional[Any]:
     from apps.web.db.session import SessionLocal
 
     db = SessionLocal()
+    issued_at: Optional[float] = None
     try:
         service = DbAccountService(db)
         payload = service.verify_access_token(token, "access")
         account_id = str((payload or {}).get("account_id") or "")
-        if not account_id:
+        if account_id:
+            issued_at = float((payload or {}).get("iat") or 0.0) or None
+            jti = str((payload or {}).get("jti") or "")
+            if jti and service.is_token_revoked(jti):
+                return None
+        else:
             api_payload = service.verify_api_token(token)
             account_id = str((api_payload or {}).get("account_id") or "")
     finally:
@@ -78,6 +85,9 @@ def resolve_account_from_token(token: Optional[str]) -> Optional[Any]:
         return None
     account = load_account(account_id)
     if account is None or not getattr(account, "is_active", False):
+        return None
+    valid_after = getattr(account, "token_valid_after", None)
+    if issued_at and valid_after and issued_at < float(valid_after):
         return None
     return account
 

@@ -38,6 +38,8 @@ class AccountModel(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login = Column(DateTime, nullable=True)
+    # Tokens issued before this instant are rejected (set on password change).
+    token_valid_after = Column(DateTime, nullable=True)
     
     # Relationships
     api_keys = relationship("AccountApiKeyModel", back_populates="account", cascade="all, delete-orphan")
@@ -73,10 +75,27 @@ class AccountApiKeyModel(Base):
         return f"<ApiKey {self.id[:8]}... for {self.account_id[:8]}>"
 
 
+class RevokedTokenModel(Base):
+    """Denylisted account-JWT ids (logout / rotation).
+
+    Rows are appended on logout and opportunistically pruned once their token's
+    expiry has passed; the table stays small at team scale.
+    """
+    __tablename__ = "revoked_tokens"
+
+    jti = Column(String(64), primary_key=True)
+    account_id = Column(String(36), ForeignKey("accounts.id"), nullable=True, index=True)
+    revoked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<RevokedToken {self.jti[:8]}...>"
+
+
 class EventModel(Base):
     """CTF competition event."""
     __tablename__ = "ctf_events"
-    
+
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(255), nullable=False, index=True)
     description = Column(Text, nullable=True)

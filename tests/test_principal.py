@@ -227,3 +227,99 @@ def test_api_key_authenticates_http_with_account_role(monkeypatch, gated_client)
         lambda self, token: None,
     )
     assert gated_client.get("/api/folders", headers=headers).status_code == 401
+
+
+# ── token lifecycle: jti, revocation, rotation ───────────────────────────────
+
+def _jti_token(jti: str, *, iat_offset: int = 0) -> str:
+    now = int(time.time())
+    payload = {
+        "account_id": "acc-1",
+        "username": "tester",
+        "role": "member",
+        "type": "access",
+        "jti": jti,
+        "iat": now + iat_offset,
+        "exp": now + 3600,
+    }
+    return pyjwt.encode(payload, AR.jwt_secret(), algorithm="HS256")
+
+
+def test_logout_revokes_the_token_end_to_end(monkeypatch, gated_client):
+    jti = f"test-jti-{int(time.time() * 1000)}"
+    monkeypatch.setattr(P, "load_account", lambda account_id: _fake_account("member"))
+    headers = {"Authorization": f"Bearer {_jti_token(jti)}"}
+
+    assert gated_client.get("/api/folders", headers=headers).status_code == 200
+    assert gated_client.post("/api/auth/logout", headers=headers).status_code == 200
+    # the denylist now rejects the very same token at the gate
+    assert gated_client.get("/api/folders", headers=headers).status_code == 401
+
+    from apps.web.db.models import RevokedTokenModel
+    from apps.web.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        db.query(RevokedTokenModel).filter_by(jti=jti).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_password_rotation_rejects_older_tokens(monkeypatch):
+    token = _jti_token(f"rot-{int(time.time() * 1000)}", iat_offset=-600)
+
+    monkeypatch.setattr(P, "load_account", lambda account_id: _fake_account("member"))
+    assert P.resolve_account_from_token(token) is not None
+
+    rotated = _fake_account("member")
+    rotated.token_valid_after = time.time() - 60  # issued 10min ago < rotated 1min ago
+    monkeypatch.setattr(P, "load_account", lambda account_id: rotated)
+    assert P.resolve_account_from_token(token) is None
+
+
+def test_token_payload_carries_jti_and_revoke_roundtrip(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from apps.web.accounts.db_service import DbAccountService
+    from apps.web.accounts.models import AccountRole
+    from apps.web.db.models import Base
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'tokens.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        service = DbAccountService(db)
+        account = service.create_account(
+            username="tok", display_name="Tok", password="secret123",
+            role=AccountRole.MEMBER,
+        )
+        token, _ = service.create_access_token(account.id, token_type="access")
+        payload = pyjwt.decode(token, AR.jwt_secret(), algorithms=["HS256"])
+        jti = str(payload.get("jti") or "")
+        assert jti and service.is_token_revoked(jti) is False
+
+        assert service.revoke_token(jti, account_id=account.id, expires_at=payload["exp"]) is True
+        assert service.is_token_revoked(jti) is True
+
+        assert service.bump_token_valid_after(account.id) is True
+        refreshed = service.get_account_by_id(account.id)
+        assert refreshed is not None and refreshed.token_valid_after
+    finally:
+        db.close()
+
+
+# ── health ───────────────────────────────────────────────────────────────────
+
+def test_health_endpoint_is_public_and_reports_db(monkeypatch, tmp_path):
+    monkeypatch.delenv(A.PASSWORD_ENV, raising=False)
+    monkeypatch.delenv(A.BIND_ENV, raising=False)
+    client = TestClient(create_app(RunManager(sessions_root=str(tmp_path / "s"))))
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True and body["db"] == "up"

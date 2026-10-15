@@ -40,6 +40,7 @@ class Account:
     created_at: float = 0.0
     updated_at: float = 0.0
     last_login: Optional[float] = None
+    token_valid_after: Optional[float] = None
     
     @staticmethod
     def new(username: str, display_name: str, password_hash: str, 

@@ -270,6 +270,24 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # no bus.emit, no CostController, no CliSolver, no scheduler/max_worker slot.
     # Normal turns use a bounded read-only evidence package plus one fixed model
     # call. Explicit deep-audit turns retain the isolated CLI worker path below.
+    @app.get("/api/health")
+    async def health() -> Any:
+        """Liveness + database probe (public; see auth.PUBLIC_API_PATHS)."""
+        db_state = "up"
+        try:
+            from sqlalchemy import text as _sql_text
+
+            from apps.web.db.session import SessionLocal as _SessionLocal
+
+            db = _SessionLocal()
+            try:
+                db.execute(_sql_text("SELECT 1"))
+            finally:
+                db.close()
+        except Exception:
+            db_state = "down"
+        return {"ok": db_state == "up", "db": db_state}
+
     # static UI: the deck is the Next.js app (run `./run.sh web` 鈫?:3001, which
     # talks to this backend's /api). If a Next.js static export ever drops an
     # index.html into ui/, serve it at / too; otherwise / is unused (the bare

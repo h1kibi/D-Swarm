@@ -47,6 +47,30 @@ Treat the machine running D-Swarm as you would treat a machine you are pointing
 offensive tooling *from*: assume any challenge could attempt to execute code through
 the worker, and isolate accordingly.
 
+### Web platform authorization & data visibility
+
+The web platform (accounts, events, targets, runs, audit) has one explicit
+authorization model:
+
+- **Login**: account credentials (username/password) or the operator password
+  (`DSWARM_WEB_PASSWORD`). Failures are throttled per client host (HTTP 429) and
+  every attempt is written to the audit trail. Session tokens carry a `jti`;
+  **logout denylists it**, and a **password change invalidates every previously
+  issued token** (the caller receives a fresh one).
+- **Gate**: with `DSWARM_WEB_PASSWORD` set, every `/api` route requires an
+  authenticated principal (operator token, account JWT, or API key); anonymous
+  requests are rejected. Non-loopback binds additionally require
+  `DSWARM_JWT_SECRET` and `DSWARM_ENCRYPTION_KEY` at startup.
+- **Roles**: admin accounts (and the operator token) own the settings surface —
+  credential accounts, LLM providers/probes, worker image/settings, profiles.
+  A member token gets 403 there. Runs, folders, targets, events, and the run
+  rail are a **shared team board**: every authenticated member can see and work
+  on them. This is a deliberate divergence from the archived design doc's
+  per-member isolation — revisit with a real owner model if the team grows or
+  per-member privacy becomes a requirement.
+- **API keys**: per-account bearer credentials; they inherit the account's role
+  and stop working when revoked or when the account is deactivated.
+
 ### Other things to be aware of
 
 - **Flag verification trust assumption.** The provenance gate (`dswarm/solver/gate.py`)

@@ -421,6 +421,170 @@ def _auditable_facts_for_run(mgr: Any, run_id: str) -> dict[int, dict[str, Any]]
     }
 
 
+def _intent_decisions_for_run(mgr: Any, run_id: str) -> list[dict[str, Any]]:
+    """Reviewer intent-quality decisions from one run's shared graph."""
+    db_path = mgr.workspace_dir(run_id) / "graph" / "shared_graph.db"
+    if not db_path.exists():
+        return []
+    from dswarm.models.solve_graph import Challenge
+    from dswarm.swarm.shared_graph import SQLiteSharedGraph
+
+    run = mgr.get(run_id)
+    challenge = Challenge(
+        id=run_id,
+        name=((run.name if run is not None else "") or run_id),
+        category=((run.category if run is not None else "") or "misc"),
+    )
+    graph = None
+    try:
+        graph = SQLiteSharedGraph.open(db_path=db_path, challenge=challenge)
+        decisions = graph.intent_quality_decisions()
+    except Exception:
+        return []
+    finally:
+        if graph is not None:
+            graph.close()
+    return [
+        {**decision, "run_id": run_id}
+        for decision in (decisions or [])
+        if isinstance(decision, dict)
+    ]
+
+
+@router.get("/{target_id}/review")
+async def target_review(target_id: str, request: Request) -> dict[str, Any]:
+    """Read-only review snapshot for the deck's target-details modal.
+
+    Everything here comes from what actually exists: verified facts and audit
+    records from the card, runtime failures and directions from the run
+    summaries, and reviewer intent decisions from each run's shared graph.
+    Nothing is invented — empty sections simply mean "no data recorded".
+    """
+    card = _get_card_or_404(request, target_id)
+    mgr = _manager(request)
+    summaries = _run_summaries(request, card)
+    facts = _all_facts(request, card)
+    terminal = [
+        item for item in summaries if item.get("finished") or item.get("solved")
+    ]
+
+    def flag_count(summary: dict[str, Any]) -> int:
+        if summary.get("flags_redacted"):
+            return int(summary.get("flag_count") or 0)
+        return len(summary.get("flags") or [])
+
+    known_facts = [
+        {
+            "item_type": "fact",
+            "source_run_id": item["source_run_id"],
+            "fact_seq": item["fact_seq"],
+            "text": item["fact"],
+            "status": item["provenance_status"],
+            "artifact_ids": [item["artifact_id"]] if item.get("artifact_id") else [],
+        }
+        for item in facts
+    ]
+    evidence_refs = [
+        {
+            "item_type": "fact",
+            "source_run_id": item["source_run_id"],
+            "fact_seq": item["fact_seq"],
+            "text": f"artifact:{item['artifact_id']}",
+            "artifact_ids": [item["artifact_id"]],
+        }
+        for item in facts
+        if item.get("artifact_id")
+    ]
+    attempted_routes = [
+        {
+            "item_type": "route_constraint",
+            "source_run_id": item["run_id"],
+            "text": str(item.get("direction") or "General"),
+            "status": str(item.get("status") or ""),
+        }
+        for item in summaries
+    ]
+    failures_runtime = [
+        {
+            "item_type": "summary",
+            "source_run_id": item["run_id"],
+            "text": str(
+                item.get("failure_reason")
+                or item.get("degraded_reason")
+                or item.get("reason_blocked_reason")
+                or item.get("status")
+                or ""
+            ),
+            "status": str(item.get("status") or ""),
+        }
+        for item in summaries
+        if item.get("failure_reason")
+        or item.get("degraded_reason")
+        or item.get("reason_blocked_reason")
+        or item.get("status") in ("failed", "reason_blocked", "degraded", "fallback_active")
+    ]
+    usage_ledger = [
+        {
+            "run_id": item["run_id"],
+            "name": item.get("name") or "",
+            "status": item.get("status") or "",
+            "solved": bool(item.get("solved")),
+            "flag_count": flag_count(item),
+            "updated_at": item.get("updated_at"),
+        }
+        for item in summaries
+    ]
+    provenance_chain: list[dict[str, Any]] = [
+        {
+            "fact_id": item["fact_id"],
+            "source_run_id": item["source_run_id"],
+            "fact_seq": item["fact_seq"],
+            "artifact_id": item.get("artifact_id"),
+            "inherited_by_run_ids": item.get("inherited_by_run_ids") or [],
+        }
+        for item in facts
+    ]
+    for record in card.get("audit_records") or []:
+        if isinstance(record, dict):
+            provenance_chain.append(
+                {
+                    "item_type": "audit",
+                    "source_run_id": record.get("source_run_id"),
+                    "fact_seq": record.get("fact_seq"),
+                    "evidence_refs": record.get("evidence_refs") or [],
+                    "auditor": record.get("auditor"),
+                    "audited_at": record.get("audited_at"),
+                }
+            )
+
+    intent_decisions: list[dict[str, Any]] = []
+    for run_id in card.get("run_ids") or []:
+        intent_decisions.extend(_intent_decisions_for_run(mgr, str(run_id)))
+
+    return {
+        "summary": {
+            "item_type": "summary",
+            "source_run_id": "",
+            "text": str(card.get("name") or ""),
+            "status": _target_status(summaries, card.get("archived_at")),
+            "target_id": target_id,
+            "run_count": len(summaries),
+            "terminal_run_count": len(terminal),
+            "terminal_statuses": [
+                {"run_id": item["run_id"], "status": item.get("status")}
+                for item in terminal
+            ],
+        },
+        "known_facts": known_facts,
+        "attempted_routes": attempted_routes,
+        "failures_runtime": failures_runtime,
+        "evidence_refs": evidence_refs,
+        "intent_decisions": intent_decisions,
+        "usage_ledger": usage_ledger,
+        "provenance_chain": provenance_chain,
+    }
+
+
 @router.post("/{target_id}/audit-review")
 async def audit_review(target_id: str, request: Request) -> dict[str, Any]:
     """Persist operator-approved provenance records for a terminal run.
