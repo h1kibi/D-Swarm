@@ -994,6 +994,23 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
   padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2);
 }
 .rail-actions { display: flex; gap: 8px; padding: 0 12px 10px; }
+
+/* global app navigation inside the run rail — the deck's door back to the
+   console (dashboard / events / targets / runs / analytics / admin / settings).
+   Additive: the rail's own run list, folders and filters are untouched. */
+.rail-nav { padding: 0 12px 10px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+.rail-nav-label {
+  font-size: var(--fs-label); letter-spacing: var(--ls-label); text-transform: uppercase;
+  color: var(--muted); font-weight: 600; padding: 0 2px 6px;
+}
+.rail-nav-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.rail-nav-link {
+  display: flex; align-items: center; padding: 5px 8px; border-radius: var(--r-chip);
+  color: var(--muted); text-decoration: none; font-size: var(--fs-caption); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border: 1px solid transparent;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.rail-nav-link:hover { color: var(--text); background: var(--panel2); border-color: var(--border); }
 .startup-test-summary.good, .startup-test-worker.good { border-color: var(--green); }
 .startup-test-summary.bad, .startup-test-error, .startup-test-worker.bad { border-color: var(--red); color: var(--red); }
 .startup-test-workers { display: grid; gap: 8px; }

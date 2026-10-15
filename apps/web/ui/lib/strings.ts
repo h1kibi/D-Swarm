@@ -1167,6 +1167,7 @@ export const STRINGS: Dict = {
   "nav.logout": { zh: "登出", en: "Logout" },
   "nav.theme": { zh: "切换主题", en: "Toggle theme" },
   "nav.lang": { zh: "切换语言", en: "Switch language" },
+  "nav.section": { zh: "导航", en: "Navigation" },
   "role.admin": { zh: "管理员", en: "Admin" },
   "role.member": { zh: "成员", en: "Member" },
   // ---- common ----

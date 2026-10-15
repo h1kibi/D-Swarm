@@ -4,13 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRun, useRunList, useFolders, useBudgetSnapshot, useRuntimePools, useRunObservability, hasTargetDispatchMismatch, newRun, patchRun, deleteRun, retitleRun, uploadFiles, spawnWorker, killWorker, createFolder, renameFolder, deleteFolder, sendRunHitl, SavedFile, type RunSummary } from "@/lib/useRun";
 import { useLang, useT } from "@/lib/i18n";
 import { GraphNode, isRunActive } from "@/lib/events";
-import { I18nProvider } from "@/lib/i18n";
 import { Icon } from "@/components/Icon";
 import { ThreadRail } from "@/components/ThreadRail";
 import { StartupTestPanel } from "@/components/StartupTestPanel";
 import { Conversation } from "@/components/Conversation";
 import type { DispatchOpts } from "@/components/Conversation";
-import { LoginGate } from "@/components/LoginGate";
 import { CommandPalette } from "@/components/CommandPalette";
 import { BtwPanel } from "@/components/BtwPanel";
 import { ToastLane, useToasts } from "@/components/Toast";
@@ -83,13 +81,7 @@ const urlForRun = (id: string): string =>
   id && !isDraft(id) ? `/run/${encodeURIComponent(id)}` : "/";
 
 export default function Page() {
-  return (
-    <I18nProvider>
-      <LoginGate>
-        <Deck />
-      </LoginGate>
-    </I18nProvider>
-  );
+  return <Deck />;
 }
 
 function Deck() {

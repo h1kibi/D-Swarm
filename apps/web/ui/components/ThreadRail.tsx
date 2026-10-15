@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import type { CSSProperties, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from "react";
 import { RunSummary, RunStatus, Folder } from "@/lib/useRun";
 import { useLang, useT, type Lang } from "@/lib/i18n";
+import { useUser } from "@/lib/useUser";
 import { Icon, type IconName } from "@/components/Icon";
 import { clampRailWidth, railWidthMax, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN, RAIL_WIDTH_MAX } from "@/lib/railSizing";
 import {
@@ -49,6 +51,18 @@ type RailAction =
   | { kind: "renameFolder"; folderId: string; name: string }
   | { kind: "deleteFolder"; folderId: string };
 
+/** Global app navigation shown at the top of the rail (dashboard pages). */
+const RAIL_NAV: { href: string; key: string; admin?: boolean }[] = [
+  { href: "/", key: "nav.dashboard" },
+  { href: "/events", key: "nav.events" },
+  { href: "/targets", key: "nav.targets" },
+  { href: "/runs", key: "nav.runs" },
+  { href: "/analytics", key: "nav.analytics" },
+  { href: "/admin/accounts", key: "nav.accounts", admin: true },
+  { href: "/admin/audit", key: "nav.audit", admin: true },
+  { href: "/settings", key: "nav.settings" },
+];
+
 export function ThreadRail({
   collapsed,
   width,
@@ -86,6 +100,7 @@ export function ThreadRail({
 }) {
   const t = useT();
   const { lang } = useLang();
+  const { isAdmin } = useUser();
   const [showArchived, setShowArchived] = useState(false);
   // Fleet state (§5.2): status filter, within-section sort, compact density,
   // and the batch-selection mode. Compact persists across sessions.
@@ -339,6 +354,17 @@ export function ThreadRail({
           <button className="newsolve" onClick={onNew}>{t("rail.newSolve")}</button>
           <button className="newsolve" onClick={onStartupTest}>{t("rail.startupTest")}</button>
         </div>
+
+        <nav className="rail-nav" aria-label={t("nav.section")}>
+          <div className="rail-nav-label">{t("nav.section")}</div>
+          <div className="rail-nav-grid">
+            {RAIL_NAV.filter((item) => !item.admin || isAdmin).map((item) => (
+              <Link key={item.href} href={item.href} className="rail-nav-link">
+                {t(item.key)}
+              </Link>
+            ))}
+          </div>
+        </nav>
 
         <div className="rail-search">
           <span className="rail-search-ico" aria-hidden="true"><Icon name="search" size={14} /></span>

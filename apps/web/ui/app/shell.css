@@ -516,43 +516,49 @@
   font-size: 12px;
 }
 
-/* ── top navigation (deck-ified) ───────────────────────────────────────── */
+/* ── top navigation (deck TopBar spec) ─────────────────────────────────── */
 .ds-nav {
   position: sticky;
   top: 0;
   z-index: 60;
   display: flex;
   align-items: center;
-  gap: 3px;
-  height: 42px;
-  padding: 0 14px;
-  background: var(--rail);
-  border-bottom: 1px solid var(--line);
-  font-family: var(--font-mono);
-  font-size: 12.5px;
+  gap: 4px;
+  min-height: 44px;
+  padding: 6px 12px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  font-family: inherit; /* same stack as the deck TopBar (body font) */
+  font-size: 13px;
+  overflow-x: auto;
 }
 
 .ds-nav-brand {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-right: 12px;
-  font-weight: 700;
-  letter-spacing: 0.09em;
+  gap: 7px;
+  margin-right: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
   color: var(--bright);
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .ds-nav-link {
   padding: 5px 10px;
-  border-radius: var(--r-chip);
+  border-radius: var(--r-input);
   color: var(--muted);
   text-decoration: none;
   font-weight: 600;
+  white-space: nowrap;
   transition: color 0.15s, background 0.15s;
 }
 
-.ds-nav-link:hover { color: var(--text); background: var(--ink-wash); }
+.ds-nav-link:hover {
+  color: var(--text);
+  background: var(--panel);
+}
 
 .ds-nav-link--on {
   color: var(--accent);
@@ -568,25 +574,36 @@
   color: var(--muted);
 }
 
+.ds-nav-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-label);
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 .ds-nav-user {
   color: var(--text);
   font-weight: 600;
 }
 
 .ds-nav-btn {
-  font: 600 11.5px/1 var(--font-mono);
-  padding: 5px 9px;
-  border-radius: var(--r-chip);
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
+  padding: 4px 12px;
+  border-radius: var(--r-input);
+  border: 1px solid var(--border2);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
   cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+  transition: border-color 0.15s var(--ease-out-soft);
 }
 
 .ds-nav-btn:hover {
-  color: var(--text);
-  border-color: var(--line2);
+  border-color: var(--brand);
 }
 
 /* ── responsive ────────────────────────────────────────────────────────── */

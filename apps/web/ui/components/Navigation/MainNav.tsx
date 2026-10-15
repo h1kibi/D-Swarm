@@ -5,10 +5,17 @@ import { usePathname } from "next/navigation";
 import { useUser, logout } from "@/lib/useUser";
 import { useT, useLang } from "@/lib/i18n";
 import { useTheme } from "@/lib/theme";
+import { Icon } from "@/components/Icon";
+
+/**
+ * Top navigation for the management pages. Spec-matched to the deck's TopBar
+ * (44px, --bg2 ground, --border hairline, 800-weight "D-Swarm" lockup, the
+ * deck's own icon-btn/lang-btn toggles and theme/lang i18n keys) so navigating
+ * between the console and the deck reads as one bar with swapped content.
+ */
 
 const NAV: { href: string; key: string; admin?: boolean }[] = [
   { href: "/", key: "nav.dashboard" },
-  { href: "/deck", key: "nav.deck" },
   { href: "/events", key: "nav.events" },
   { href: "/targets", key: "nav.targets" },
   { href: "/runs", key: "nav.runs" },
@@ -33,11 +40,12 @@ export function MainNav() {
   const isActive = (path: string) =>
     path === "/" ? pathname === "/" : pathname === path || pathname?.startsWith(path + "/");
 
+  const online = Boolean(user?.id);
+
   return (
     <nav className="ds-nav">
       <Link href="/" className="ds-nav-brand">
-        <span className="ds-led ds-led--cyan" aria-hidden />
-        D-SWARM
+        <span>D-Swarm</span>
       </Link>
 
       {NAV.filter((item) => !item.admin || isAdmin).map((item) => (
@@ -53,23 +61,27 @@ export function MainNav() {
       <span className="ds-nav-spacer" />
 
       <span className="ds-nav-side">
+        <span className="ds-nav-status">
+          <span className={"ds-led " + (online ? "ds-led--green" : "ds-led--red")} aria-hidden />
+          {online ? t("dash.online") : t("dash.offline")}
+        </span>
         <button
           type="button"
-          className="ds-nav-btn"
+          className="icon-btn"
           onClick={toggleTheme}
-          title={t("nav.theme")}
-          aria-label={t("nav.theme")}
+          title={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}
+          aria-label={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}
         >
-          {theme === "dark" ? "◐ light" : "◑ dark"}
+          <Icon name={theme === "dark" ? "sun" : "moon"} />
         </button>
         <button
           type="button"
-          className="ds-nav-btn"
+          className="lang-btn"
           onClick={() => setLang(lang === "zh" ? "en" : "zh")}
-          title={t("nav.lang")}
-          aria-label={t("nav.lang")}
+          title={t("lang.toggleTitle")}
+          aria-label={t("lang.toggleTitle")}
         >
-          {lang === "zh" ? "EN" : "中"}
+          {t("lang.toggle")}
         </button>
         {user && (
           <>
