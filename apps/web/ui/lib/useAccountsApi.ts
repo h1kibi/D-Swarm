@@ -125,7 +125,7 @@ export async function toggleAccountActive(
   isActive: boolean
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await apiFetch(`/api/accounts/${id}/active`, {
+    const res = await apiFetch(`/api/accounts/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ is_active: isActive }),

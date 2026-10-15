@@ -14,7 +14,7 @@ interface EventDetailsProps {
 export function EventDetails({ eventId }: EventDetailsProps) {
   const { events, loading: eventsLoading } = useEvents();
   const { targets } = useTargets(eventId);
-  const { runs } = useRuns(eventId);
+  const { runs } = useRuns();
 
   const event = events.find((e) => e.id === eventId);
 
@@ -65,10 +65,12 @@ export function EventDetails({ eventId }: EventDetailsProps) {
     return <div className={styles.error}>Event not found</div>;
   }
 
-  const solvedTargets = targets.filter((t) => t.solved).length;
+  const eventTargetIds = new Set(targets.map((t) => t.id));
+  const eventRuns = runs.filter((r) => r.target_id && eventTargetIds.has(r.target_id));
+  const solvedTargets = targets.filter((t) => t.is_solved).length;
   const totalTargets = targets.length;
-  const activeRuns = runs.filter((r) => r.status === "running" || r.status === "pending").length;
-  const completedRuns = runs.filter((r) => r.status === "completed").length;
+  const activeRuns = eventRuns.filter((r) => r.status === "running").length;
+  const completedRuns = eventRuns.filter((r) => r.solved === true || r.finished === true).length;
 
   return (
     <div className={styles.container}>
@@ -193,7 +195,7 @@ export function EventDetails({ eventId }: EventDetailsProps) {
                 <div className={styles.targetName}>{target.name}</div>
                 <div className={styles.targetCategory}>{target.category}</div>
                 <div className={styles.targetStatus}>
-                  {target.solved ? "✓ Solved" : "Unsolved"}
+                  {target.is_solved ? "✓ Solved" : "Unsolved"}
                 </div>
               </div>
             ))}

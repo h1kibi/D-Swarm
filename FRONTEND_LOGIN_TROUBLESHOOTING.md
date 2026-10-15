@@ -1,5 +1,11 @@
 # 前端登录问题排查指南
 
+> **[2026-10-16 更新] 本文件已过时。** 文末描述的"mock 端点"方案是错误做法：它伪造空数据、
+> 遮蔽了真实的 `/api/runs`、`/api/targets` 等接口，并且绕过了真正的账户系统。该方案及其
+> 临时路由（`auth_direct.py`、`mock.py`）已被删除；登录现在走真实账户系统（`/api/auth/login`
+> → `/api/accounts` 的 DbAccountService，密码可选用户名）。当前状态与排障请以
+> `session-handoff.md` 为准。下文仅作历史记录保留。
+
 ## 问题现象
 
 输入密码 `TestPass123!` 后，登录界面闪烁一下，无法进入后台。

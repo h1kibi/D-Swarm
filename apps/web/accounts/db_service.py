@@ -8,7 +8,7 @@ import time
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 
-from passlib.context import CryptContext
+import bcrypt
 import jwt
 from sqlalchemy.orm import Session
 from cryptography.fernet import Fernet
@@ -17,8 +17,8 @@ from apps.web.db.models import AccountModel, AccountApiKeyModel, AccountRole
 from apps.web.accounts.models import Account, AccountApiKey
 
 
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Password hashing uses the bcrypt package directly: passlib 1.7.4 is
+# incompatible with bcrypt >= 4.1 (removed __about__, 72-byte wrap detection).
 
 
 class DbAccountService:
@@ -45,12 +45,17 @@ class DbAccountService:
     @staticmethod
     def hash_password(password: str) -> str:
         """Hash a password using bcrypt."""
-        return pwd_context.hash(password)
-    
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
     @staticmethod
     def verify_password(plain_password: str, hashed_password: str) -> bool:
-        """Verify a password against a hash."""
-        return pwd_context.verify(plain_password, hashed_password)
+        """Verify a password against a bcrypt hash."""
+        try:
+            return bcrypt.checkpw(
+                plain_password.encode("utf-8"), hashed_password.encode("utf-8")
+            )
+        except ValueError:
+            return False
     
     def create_account(
         self,
@@ -271,8 +276,10 @@ class DbAccountService:
             id=model.id,
             username=model.username,
             display_name=model.display_name,
-            role=model.role.value,
+            role=AccountRole(model.role.value),
+            password_hash=model.password_hash,
             is_active=model.is_active,
+            created_by=model.created_by,
             created_at=model.created_at.timestamp(),
             updated_at=model.updated_at.timestamp(),
             last_login=model.last_login.timestamp() if model.last_login else None

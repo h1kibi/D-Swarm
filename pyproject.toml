@@ -35,6 +35,10 @@ dependencies = [
     "r2pipe>=1.9.8",
     "lief>=0.17.6",
     "python-multipart>=0.0.9",
+    "bcrypt>=5.0.0",
+    "passlib>=1.7.4",
+    "cryptography>=50.0.2",
+    "sqlalchemy>=2.1.4",
 ]
 
 [project.optional-dependencies]

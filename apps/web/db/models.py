@@ -27,7 +27,11 @@ class AccountModel(Base):
     username = Column(String(255), unique=True, nullable=False, index=True)
     display_name = Column(String(255), nullable=False)
     password_hash = Column(String(255), nullable=False)
-    role = Column(SQLEnum(AccountRole), nullable=False, default=AccountRole.MEMBER)
+    role = Column(
+        SQLEnum(AccountRole, values_callable=lambda enum_cls: [m.value for m in enum_cls]),
+        nullable=False,
+        default=AccountRole.MEMBER,
+    )
     is_active = Column(Boolean, default=True, nullable=False)
     
     created_by = Column(String(36), ForeignKey("accounts.id"), nullable=True)
@@ -38,7 +42,12 @@ class AccountModel(Base):
     # Relationships
     api_keys = relationship("AccountApiKeyModel", back_populates="account", cascade="all, delete-orphan")
     events = relationship("EventModel", back_populates="created_by_account", cascade="all, delete-orphan")
-    targets = relationship("TargetModel", back_populates="created_by_account", cascade="all, delete-orphan")
+    targets = relationship(
+        "TargetModel",
+        foreign_keys="TargetModel.created_by",
+        back_populates="created_by_account",
+        cascade="all, delete-orphan",
+    )
     runs = relationship("RunModel", back_populates="created_by_account", cascade="all, delete-orphan")
     
     def __repr__(self):
@@ -114,7 +123,9 @@ class TargetModel(Base):
     
     # Relationships
     event = relationship("EventModel", back_populates="targets")
-    # created_by_account removed - use created_by_id instead (fixes relationship ambiguity)
+    created_by_account = relationship(
+        "AccountModel", back_populates="targets", foreign_keys=[created_by]
+    )
     runs = relationship("RunModel", back_populates="target", cascade="all, delete-orphan")
     snapshots = relationship("TargetSnapshotModel", back_populates="target", cascade="all, delete-orphan")
     

@@ -137,7 +137,6 @@ export function EventsList() {
             <p className={styles.description}>{event.description}</p>
 
             <div className={styles.meta}>
-              <span>{event.target_count} targets</span>
               <span>by {event.created_by}</span>
             </div>
 

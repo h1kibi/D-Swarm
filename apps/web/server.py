@@ -41,10 +41,9 @@ from apps.web.auth import (
 from apps.web.run_manager import RunManager
 from apps.web.startup_test import StartupTestController
 from apps.web.http_utils import _env_float
-from apps.web.routes.auth_direct import router as accounts_auth_router
-from apps.web.routes.mock import router as mock_router
-from apps.web.routes.accounts import accounts_router
+from apps.web.routes.accounts import router as accounts_auth_router, accounts_router
 from apps.web.routes.audit import router as audit_router
+from apps.web.routes.auth import router as p3_auth_router
 from apps.web.routes.events import router as events_router
 from apps.web.routes.runs_ctf import router as runs_ctf_router
 from apps.web.routes.blackboard import router as blackboard_router
@@ -59,7 +58,9 @@ from apps.web.routes.runtime_pools import router as runtime_pools_router
 from apps.web.routes.observability import router as observability_router
 from apps.web.routes.runs import router as runs_router
 from apps.web.routes.targets import router as targets_router
+from apps.web.routes.analytics import router as analytics_router
 from apps.web.routes.scheduler import router as scheduler_router
+from apps.web.routes.search import router as search_router
 from apps.web.routes.settings_identity import router as settings_identity_router
 from apps.web.routes.settings_workers import router as settings_workers_router
 from apps.web.routes.startup_test import router as startup_test_router
@@ -134,10 +135,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.state.engine_cache_ttl_s = 300.0
     app.state.engine_refresh_lock = asyncio.Lock()
     app.include_router(accounts_auth_router)
-    app.include_router(mock_router)
     app.include_router(accounts_router)
+    app.include_router(p3_auth_router)
     app.include_router(events_router)
-    app.include_router(runs_ctf_router)
     app.include_router(audit_router)
     app.include_router(blackboard_router)
     app.include_router(btw_router)
@@ -150,8 +150,11 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app.include_router(runtime_pools_router)
     app.include_router(observability_router)
     app.include_router(runs_router)
+    app.include_router(runs_ctf_router)
     app.include_router(targets_router)
     app.include_router(scheduler_router)
+    app.include_router(search_router)
+    app.include_router(analytics_router)
     app.include_router(settings_identity_router)
     app.include_router(settings_workers_router)
     app.include_router(startup_test_router)
@@ -208,6 +211,22 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             resp.headers["Vary"] = "Origin"
         return resp
 
+    def _account_token_valid(token: Optional[str]) -> bool:
+        """Multi-account JWTs (account system) are also valid credentials."""
+        if not token:
+            return False
+        try:
+            from apps.web.accounts.db_service import DbAccountService
+            from apps.web.db.session import SessionLocal
+
+            db = SessionLocal()
+            try:
+                return DbAccountService(db).verify_access_token(token, "access") is not None
+            finally:
+                db.close()
+        except Exception:
+            return False
+
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):
         cfg: AuthConfig = app.state.auth
@@ -225,7 +244,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         if path.endswith("/events"):
             return await call_next(request)
         token = bearer_from_header(request.headers.get("Authorization"))
-        if not verify_token(cfg, token):
+        if not verify_token(cfg, token) and not _account_token_valid(token):
             return _unauthorized(request)
         return await call_next(request)
 

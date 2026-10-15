@@ -706,7 +706,7 @@ def test_events_reducer_tracks_phase_and_budget_events():
 
 
 def test_dispatch_sends_per_run_budget_controls():
-    src = (UI_ROOT / "app" / "page.tsx").read_text()
+    src = (UI_ROOT / "app" / "deck.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
     i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
@@ -723,7 +723,7 @@ def test_dispatch_sends_per_run_budget_controls():
 
 
 def test_collect_mode_does_not_force_token_flag_format():
-    src = (UI_ROOT / "app" / "page.tsx").read_text()
+    src = (UI_ROOT / "app" / "deck.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
     i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
@@ -735,7 +735,7 @@ def test_collect_mode_does_not_force_token_flag_format():
 
 
 def test_dispatch_threads_custom_flag_wrapper():
-    src = (UI_ROOT / "app" / "page.tsx").read_text()
+    src = (UI_ROOT / "app" / "deck.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
     i18n = (UI_ROOT / "lib" / "strings.ts").read_text()
 
@@ -762,7 +762,7 @@ def test_advanced_flag_format_layout_is_not_cramped():
 
 
 def test_per_run_zero_budget_values_are_preserved():
-    src = (UI_ROOT / "app" / "page.tsx").read_text()
+    src = (UI_ROOT / "app" / "deck.tsx").read_text()
     convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
 
     assert "opts?.wallClockBudget != null" in src
@@ -1185,7 +1185,7 @@ def test_worker_lane_detail_defaults_collapsed():
 def test_settings_moved_to_rail_and_header_toggles_theme():
     rail = (UI_ROOT / "components" / "ThreadRail.tsx").read_text()
     topbar = (UI_ROOT / "components" / "TopBar.tsx").read_text()
-    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    page = (UI_ROOT / "app" / "deck.tsx").read_text()
     theme = (UI_ROOT / "lib" / "theme.ts").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
 
@@ -1205,7 +1205,7 @@ def test_detail_views_are_routes_not_a_drawer():
     """The deck is timeline-first: the 10 detail views are real routes
     (/run/<id>/<view>) opened from links — the in-page drawer that crammed a
     fourth column into the deck is gone."""
-    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    page = (UI_ROOT / "app" / "deck.tsx").read_text()
     detail = (UI_ROOT / "components" / "RunDetailPage.tsx").read_text()
     route = (UI_ROOT / "app" / "run" / "[id]" / "[view]" / "page.tsx").read_text()
     helper = (UI_ROOT / "lib" / "runRoute.ts").read_text()
@@ -1228,7 +1228,7 @@ def test_phase4_command_center_layout():
     Stage Rail, Run Fleet left, Decision Timeline center, Live Swarm Inspector
     right, persistent Operator Command Bar bottom. The conversation is demoted
     to the draft/launch surface + one timeline event class."""
-    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    page = (UI_ROOT / "app" / "deck.tsx").read_text()
     topbar = (UI_ROOT / "components" / "TopBar.tsx").read_text()
     timeline = (UI_ROOT / "components" / "DecisionTimeline.tsx").read_text()
     inspector = (UI_ROOT / "components" / "SwarmInspector.tsx").read_text()
@@ -1304,7 +1304,7 @@ def test_phase5_worker_evidence_pheromone_views():
     inspector = (UI_ROOT / "components" / "SwarmInspector.tsx").read_text()
     timeline = (UI_ROOT / "components" / "DecisionTimeline.tsx").read_text()
     artifact = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
-    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    page = (UI_ROOT / "app" / "deck.tsx").read_text()
     crosslink = (UI_ROOT / "lib" / "crosslink.ts").read_text()
     clock = (UI_ROOT / "lib" / "usePheromoneClock.ts").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()

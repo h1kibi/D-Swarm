@@ -65,17 +65,22 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   return res;
 }
 
-/** POST the operator password; on success store the returned session token. */
-export async function login(password: string): Promise<{ ok: boolean; authRequired: boolean }> {
+/** POST the operator password (optionally with username); store the token. */
+export async function login(password: string, username?: string): Promise<{ ok: boolean; authRequired: boolean }> {
   const res = await fetch(`${API}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
+    body: JSON.stringify(username ? { username, password } : { password }),
   });
   if (!res.ok) return { ok: false, authRequired: true };
-  const data = await res.json().catch(() => ({} as any));
-  if (data?.token) setToken(String(data.token));
-  return { ok: true, authRequired: Boolean(data?.auth_required) };
+  const data = (await res.json().catch(() => ({}))) as {
+    token?: string;
+    access_token?: string;
+    auth_required?: boolean;
+  };
+  const token = data.access_token || data.token;
+  if (token) setToken(String(token));
+  return { ok: true, authRequired: Boolean(data.auth_required) };
 }
 
 /** True if the current token is accepted (or auth is disabled). */

@@ -12,10 +12,10 @@ function MemberDashboard() {
   const { targets, loading: targetsLoading, error: targetsError } = useTargets();
   const { runs, loading: runsLoading, error: runsError } = useRuns();
 
-  const unsolvedTargets = targets.filter((t) => !t.solved);
-  const solvedTargets = targets.filter((t) => t.solved);
-  const activeRuns = runs.filter((r) => r.status === "running" || r.status === "pending");
-  const completedRuns = runs.filter((r) => r.status === "completed");
+  const unsolvedTargets = targets.filter((t) => !t.is_solved);
+  const solvedTargets = targets.filter((t) => t.is_solved);
+  const activeRuns = runs.filter((r) => r.status === "running");
+  const completedRuns = runs.filter((r) => r.solved === true || r.finished === true);
 
   return (
     <div className={styles.dashboard}>

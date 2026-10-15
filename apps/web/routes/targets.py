@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import Optional, List
 
@@ -84,10 +84,10 @@ router = APIRouter(prefix="/api/targets", tags=["targets"])
 
 
 def get_current_account(
-    authorization: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> AccountModel:
-    """Get current authenticated account."""
+    """Get current authenticated account (Authorization: Bearer <token>)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
     

@@ -10,7 +10,8 @@ export interface Event {
   status: "draft" | "active" | "archived";
   created_by: string;
   created_at: number;
-  target_count: number;
+  updated_at: number;
+  archived_at: number | null;
 }
 
 export interface EventsState {

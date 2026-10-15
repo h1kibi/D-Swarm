@@ -7,12 +7,10 @@ import styles from "./AuditLog.module.css";
 export function AuditLog() {
   const [filters, setFilters] = useState<AuditFilters>({
     limit: 50,
-    offset: 0,
+    skip: 0,
   });
   const { logs, total, loading, error, refresh } = useAudit(filters);
 
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
   const [actionFilter, setActionFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<"" | "success" | "failure">("");
   const [exporting, setExporting] = useState(false);
@@ -20,25 +18,21 @@ export function AuditLog() {
   const handleFilterApply = () => {
     const newFilters: AuditFilters = {
       limit: 50,
-      offset: 0,
+      skip: 0,
     };
 
-    if (startDate) newFilters.start_date = new Date(startDate).getTime() / 1000;
-    if (endDate) newFilters.end_date = new Date(endDate).getTime() / 1000;
     if (actionFilter) newFilters.action = actionFilter;
-    if (statusFilter) newFilters.status = statusFilter;
+    if (statusFilter) newFilters.status_filter = statusFilter;
 
     setFilters(newFilters);
     void refresh(newFilters);
   };
 
   const handleClearFilters = () => {
-    setStartDate("");
-    setEndDate("");
     setActionFilter("");
     setStatusFilter("");
-    setFilters({ limit: 50, offset: 0 });
-    void refresh({ limit: 50, offset: 0 });
+    setFilters({ limit: 50, skip: 0 });
+    void refresh({ limit: 50, skip: 0 });
   };
 
   const handleExport = async () => {
@@ -58,21 +52,25 @@ export function AuditLog() {
   };
 
   const handlePreviousPage = () => {
-    setFilters((prev) => ({
-      ...prev,
-      offset: Math.max(0, (prev.offset || 0) - (prev.limit || 50)),
-    }));
+    const next: AuditFilters = {
+      ...filters,
+      skip: Math.max(0, (filters.skip || 0) - (filters.limit || 50)),
+    };
+    setFilters(next);
+    void refresh(next);
   };
 
   const handleNextPage = () => {
-    setFilters((prev) => ({
-      ...prev,
-      offset: ((prev.offset || 0) + (prev.limit || 50)),
-    }));
+    const next: AuditFilters = {
+      ...filters,
+      skip: (filters.skip || 0) + (filters.limit || 50),
+    };
+    setFilters(next);
+    void refresh(next);
   };
 
-  const currentPage = Math.floor((filters.offset || 0) / (filters.limit || 50)) + 1;
-  const totalPages = Math.ceil(total / (filters.limit || 50));
+  const currentPage = Math.floor((filters.skip || 0) / (filters.limit || 50)) + 1;
+  const totalPages = Math.max(1, Math.ceil(total / (filters.limit || 50)));
 
   return (
     <div className={styles.container}>
@@ -84,26 +82,6 @@ export function AuditLog() {
       </div>
 
       <div className={styles.filters}>
-        <div className={styles.filterGroup}>
-          <label htmlFor="start-date">Start Date</label>
-          <input
-            id="start-date"
-            type="date"
-            value={startDate}
-            onChange={(e) => setStartDate(e.target.value)}
-          />
-        </div>
-
-        <div className={styles.filterGroup}>
-          <label htmlFor="end-date">End Date</label>
-          <input
-            id="end-date"
-            type="date"
-            value={endDate}
-            onChange={(e) => setEndDate(e.target.value)}
-          />
-        </div>
-
         <div className={styles.filterGroup}>
           <label htmlFor="action">Action</label>
           <select value={actionFilter} onChange={(e) => setActionFilter(e.target.value)}>
@@ -117,7 +95,10 @@ export function AuditLog() {
 
         <div className={styles.filterGroup}>
           <label htmlFor="status">Status</label>
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as any)}>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as "" | "success" | "failure")}
+          >
             <option value="">All</option>
             <option value="success">Success</option>
             <option value="failure">Failure</option>
@@ -160,7 +141,7 @@ export function AuditLog() {
               </span>
             </div>
             <div className={styles.col_actor}>
-              <code>{log.actor_username}</code>
+              <code>{log.actor}</code>
             </div>
             <div className={styles.col_resource}>
               <span className={styles.resource}>
@@ -186,7 +167,7 @@ export function AuditLog() {
         <span>
           Page {currentPage} of {totalPages} ({total} total)
         </span>
-        <button onClick={handleNextPage} disabled={currentPage === totalPages}>
+        <button onClick={handleNextPage} disabled={currentPage >= totalPages}>
           Next →
         </button>
       </div>

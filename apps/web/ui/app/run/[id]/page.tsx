@@ -4,4 +4,4 @@
 // (see app/page.tsx Deck), so this route renders the exact same shell — a refresh
 // or shared link to /run/<id> restores that conversation. Re-export keeps one
 // source of truth for the deck.
-export { default } from "../../page";
+export { default } from "../../deck";

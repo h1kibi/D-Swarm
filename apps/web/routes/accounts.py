@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from typing import Optional
 
 from apps.web.accounts.dependencies import (
@@ -10,11 +10,13 @@ from apps.web.accounts.dependencies import (
 )
 from apps.web.accounts.models import Account, AccountRole
 from apps.web.accounts.schemas import (
-    LoginRequest, LoginResponse, AccountResponse, CreateAccountRequest,
+    LoginRequest, AccountResponse, CreateAccountRequest,
     CreateAccountResponse, UpdateAccountRequest, ChangePasswordRequest,
-    CurrentUserResponse, AccountListResponse, ApiKeyResponse
+    AccountListResponse, ApiKeyResponse
 )
-from apps.web.accounts.service import AccountService
+from apps.web.accounts.db_service import DbAccountService
+from apps.web.auth import AuthConfig, check_password, issue_token, verify_token
+from dswarm.core.runtime_env import is_web_container
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 accounts_router = APIRouter(prefix="/api/accounts", tags=["accounts"])
@@ -24,33 +26,72 @@ accounts_router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 # Authentication endpoints
 # ═══════════════════════════════════════════════════════════════════
 
-@router.post("/login", response_model=LoginResponse)
+@router.post("/login")
 async def login(
     req: LoginRequest,
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
-    """Login with username and password.
-    
-    Returns access token and account information.
+    """Login: account credentials, or the operator password (P3 gate).
+
+    - no password at all: open-mode probe → 200 ``auth_required: false``
+    - account credentials (username optional; the password identifies the
+      account) → account JWT, returned as both ``access_token`` and ``token``
+    - operator password (DSWARM_WEB_PASSWORD, gate enabled) → P3 session token
     """
-    account = service.authenticate(req.username, req.password)
-    if not account:
+    cfg = AuthConfig.from_env()
+
+    if not req.password:
+        if not cfg.enabled:
+            return {"ok": True, "token": "", "auth_required": False}
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid password"
         )
-    
-    access_token, ttl = service.create_access_token(account.id, token_type="access")
-    refresh_token, _ = service.create_access_token(account.id, token_type="refresh")
-    
-    return LoginResponse(
-        access_token=access_token,
-        token_type="bearer",
-        expires_in=ttl,
-        account_id=account.id,
-        username=account.username,
-        display_name=account.display_name,
-        role=account.role.value
+
+    username = req.username
+    if not username:
+        # Password-only mode: match the password against active accounts and
+        # log in as the account it belongs to (solo-operator convenience).
+        candidates, _ = service.list_accounts(skip=0, limit=1000)
+        for candidate in candidates:
+            if candidate.is_active and service.verify_password(
+                req.password, candidate.password_hash
+            ):
+                username = candidate.username
+                break
+
+    if username:
+        account = service.authenticate(username, req.password)
+        if account:
+            access_token, ttl = service.create_access_token(account.id, token_type="access")
+            return {
+                "access_token": access_token,
+                "token": access_token,  # legacy deck field
+                "token_type": "bearer",
+                "expires_in": ttl,
+                "account_id": account.id,
+                "username": account.username,
+                "display_name": account.display_name,
+                "role": account.role.value,
+                "auth_required": cfg.enabled,
+                "ok": True,
+            }
+
+    # Operator-password fallback (P3 single-password gate).
+    if cfg.enabled and check_password(cfg, req.password):
+        token = issue_token(cfg)
+        return {
+            "token": token,
+            "access_token": token,
+            "token_type": "bearer",
+            "username": "operator",
+            "display_name": "Operator",
+            "role": "admin",
+            "auth_required": True,
+            "ok": True,
+        }
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password"
     )
 
 
@@ -62,18 +103,48 @@ async def logout(
     return {"status": "ok"}
 
 
-@router.get("/me", response_model=CurrentUserResponse)
+@router.get("/me")
 async def get_current_user(
-    current_account: Account = Depends(get_current_account)
+    authorization: Optional[str] = Header(None),
+    service: DbAccountService = Depends(get_account_service),
 ):
-    """Get current authenticated user information."""
-    return CurrentUserResponse(
-        id=current_account.id,
-        username=current_account.username,
-        display_name=current_account.display_name,
-        role=current_account.role.value,
-        is_active=current_account.is_active
-    )
+    """Current identity: the account user object, or the P3 gate status.
+
+    The dashboard pages need the account (id/role); the deck's LoginGate needs
+    ``auth_required``/``in_container``. One endpoint serves both.
+    """
+    cfg = AuthConfig.from_env()
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+
+    if token:
+        payload = service.verify_access_token(token, "access")
+        if payload:
+            account = service.get_account_by_id(payload["account_id"])
+            if account and account.is_active:
+                return {
+                    "id": account.id,
+                    "username": account.username,
+                    "display_name": account.display_name,
+                    "role": account.role.value,
+                    "is_active": account.is_active,
+                }
+        if verify_token(cfg, token):
+            return {
+                "authenticated": True,
+                "auth_required": cfg.enabled,
+                "in_container": is_web_container(),
+            }
+
+    if not cfg.enabled:
+        return {
+            "authenticated": True,
+            "auth_required": False,
+            "in_container": is_web_container(),
+        }
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -85,7 +156,7 @@ async def list_accounts(
     skip: int = 0,
     limit: int = 100,
     admin: Account = Depends(require_admin),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """List all accounts (Admin only)."""
     accounts, total = service.list_accounts(skip=skip, limit=limit)
@@ -101,7 +172,7 @@ async def list_accounts(
 async def create_account(
     req: CreateAccountRequest,
     admin: Account = Depends(require_admin),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """Create new account (Admin only)."""
     try:
@@ -129,7 +200,7 @@ async def create_account(
 async def get_account(
     account_id: str,
     admin: Account = Depends(require_admin),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """Get account information (Admin only)."""
     account = service.get_account_by_id(account_id)
@@ -144,7 +215,7 @@ async def update_account(
     account_id: str,
     req: UpdateAccountRequest,
     admin: Account = Depends(require_admin),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """Update account (Admin only)."""
     account = service.update_account(
@@ -163,7 +234,7 @@ async def update_account(
 async def delete_account(
     account_id: str,
     admin: Account = Depends(require_admin),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """Delete account (Admin only - soft delete by deactivating)."""
     account = service.get_account_by_id(account_id)
@@ -184,7 +255,7 @@ async def delete_account(
 async def change_password(
     req: ChangePasswordRequest,
     current_account: Account = Depends(get_current_account),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """Change password for current user."""
     if not service.change_password(
@@ -204,7 +275,7 @@ async def change_password(
 @accounts_router.post("/me/api-keys", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)
 async def generate_api_key(
     current_account: Account = Depends(get_current_account),
-    service: AccountService = Depends(get_account_service)
+    service: DbAccountService = Depends(get_account_service)
 ):
     """Generate new API key for external integrations.
     

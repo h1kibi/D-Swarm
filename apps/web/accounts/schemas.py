@@ -7,9 +7,14 @@ from typing import Optional, List
 
 
 class LoginRequest(BaseModel):
-    """Login request with username and password."""
-    username: str = Field(..., min_length=1, max_length=255)
-    password: str = Field(..., min_length=1)
+    """Login request.
+
+    Both fields are optional: an empty body is the open-mode probe the deck
+    sends to learn whether a password gate exists at all. ``username`` may be
+    omitted to let the password identify the account (or the operator gate).
+    """
+    username: Optional[str] = Field(None, max_length=255)
+    password: Optional[str] = None
 
 
 class LoginResponse(BaseModel):

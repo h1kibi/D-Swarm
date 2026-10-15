@@ -40,6 +40,11 @@ export function MainNav() {
             </Link>
           </li>
           <li>
+            <Link href="/deck" className={isActive("/deck") ? styles.active : ""}>
+              Deck
+            </Link>
+          </li>
+          <li>
             <Link href="/runs" className={isActive("/runs") ? styles.active : ""}>
               Runs
             </Link>

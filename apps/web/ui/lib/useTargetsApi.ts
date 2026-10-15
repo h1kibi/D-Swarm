@@ -5,16 +5,19 @@ import { apiFetch } from "./useRun";
 
 export interface Target {
   id: string;
+  event_id: string;
   name: string;
   description: string;
   category: string;
-  event_id: string;
+  target_address: string | null;
+  expected_flags: number;
+  is_solved: boolean;
+  solved_by: string | null;
+  flags: string[];
+  facts_count: number;
   created_by: string;
   created_at: number;
-  flag_count: number;
-  fact_count: number;
-  solved: boolean;
-  solved_by: string[];
+  updated_at: number;
 }
 
 export interface TargetsState {

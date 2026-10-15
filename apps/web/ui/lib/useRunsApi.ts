@@ -3,36 +3,43 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "./useRun";
 
-export interface RunInfo {
-  id: string;
-  target_id: string;
-  event_id: string;
-  created_by: string;
-  created_at: number;
-  status: "pending" | "running" | "completed" | "failed" | "stopped";
-  solved: boolean;
-  flags_found: string[];
-  facts_count: number;
-  token_usage: Record<string, number>;
+/**
+ * Deck run summary shape (from GET /api/runs, served by runs.py).
+ * Flag values are redacted for unauthenticated callers; `flag_count` stays.
+ */
+export interface RunSummary {
+  run_id: string;
+  name: string;
+  category?: string;
+  target_id?: string | null;
+  target_name?: string | null;
+  status: string;
+  started?: boolean;
+  finished?: boolean;
+  solved?: boolean;
+  flag_count?: number;
+  flags?: string[];
+  flags_redacted?: boolean;
+  archived?: boolean;
+  updated_at?: number;
 }
 
 export interface RunsState {
-  runs: RunInfo[];
+  runs: RunSummary[];
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
 }
 
-export function useRuns(eventId?: string): RunsState {
-  const [runs, setRuns] = useState<RunInfo[]>([]);
+export function useRuns(): RunsState {
+  const [runs, setRuns] = useState<RunSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
     setLoading(true);
     try {
-      const query = eventId ? `?event_id=${encodeURIComponent(eventId)}` : "";
-      const res = await apiFetch(`/api/runs${query}`);
+      const res = await apiFetch("/api/runs?archived=1");
       if (!res.ok) {
         setError(`HTTP ${res.status}`);
         setRuns([]);
@@ -42,7 +49,7 @@ export function useRuns(eventId?: string): RunsState {
       const body = (await res.json()) as unknown;
       const runsList =
         body && typeof body === "object" && "runs" in body
-          ? ((body as Record<string, unknown>).runs as RunInfo[])
+          ? ((body as Record<string, unknown>).runs as RunSummary[])
           : [];
       setRuns(runsList);
       setError(null);
@@ -52,7 +59,7 @@ export function useRuns(eventId?: string): RunsState {
     } finally {
       setLoading(false);
     }
-  }, [eventId]);
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -61,71 +68,41 @@ export function useRuns(eventId?: string): RunsState {
   return { runs, loading, error, refresh };
 }
 
-export async function startRun(data: {
-  target_id: string;
-  event_id: string;
-}): Promise<{ ok: boolean; run?: RunInfo; error?: string }> {
+/** Mint a fresh run id; dispatch happens in the deck (/run/<run_id>). */
+export async function startRun(): Promise<{ ok: boolean; runId?: string; error?: string }> {
   try {
-    const res = await apiFetch("/api/runs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-
+    const res = await apiFetch("/api/runs", { method: "POST" });
     if (!res.ok) {
-      const body = (await res.json()) as unknown;
-      const detail =
-        body && typeof body === "object" && "detail" in body
-          ? String((body as Record<string, unknown>).detail)
-          : "Failed to start run";
-      return { ok: false, error: detail };
+      return { ok: false, error: `HTTP ${res.status}` };
     }
-
-    const result = (await res.json()) as unknown;
-    const run =
-      result && typeof result === "object" && "run" in result
-        ? ((result as Record<string, unknown>).run as RunInfo)
+    const body = (await res.json()) as unknown;
+    const runId =
+      body && typeof body === "object" && "run_id" in body
+        ? String((body as Record<string, unknown>).run_id)
         : undefined;
-
-    return { ok: true, run };
+    return runId ? { ok: true, runId } : { ok: false, error: "No run id returned" };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "An error occurred" };
   }
 }
 
-export async function stopRun(id: string): Promise<{ ok: boolean; error?: string }> {
+export async function stopRun(runId: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await apiFetch(`/api/runs/${id}/stop`, { method: "POST" });
-
-    if (!res.ok) {
-      const body = (await res.json()) as unknown;
-      const detail =
-        body && typeof body === "object" && "detail" in body
-          ? String((body as Record<string, unknown>).detail)
-          : "Failed to stop run";
-      return { ok: false, error: detail };
-    }
-
-    return { ok: true };
+    const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/stop`, {
+      method: "POST",
+    });
+    return res.ok ? { ok: true } : { ok: false, error: `HTTP ${res.status}` };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "An error occurred" };
   }
 }
 
-export async function deleteRun(id: string): Promise<{ ok: boolean; error?: string }> {
+export async function deleteRun(runId: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await apiFetch(`/api/runs/${id}`, { method: "DELETE" });
-
-    if (!res.ok) {
-      const body = (await res.json()) as unknown;
-      const detail =
-        body && typeof body === "object" && "detail" in body
-          ? String((body as Record<string, unknown>).detail)
-          : "Failed to delete run";
-      return { ok: false, error: detail };
-    }
-
-    return { ok: true };
+    const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}`, {
+      method: "DELETE",
+    });
+    return res.ok ? { ok: true } : { ok: false, error: `HTTP ${res.status}` };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "An error occurred" };
   }

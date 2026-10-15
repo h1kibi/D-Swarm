@@ -20,6 +20,7 @@ import { useT } from "@/lib/i18n";
 export function LoginGate({ children }: { children: React.ReactNode }) {
   const t = useT();
   const [phase, setPhase] = useState<"checking" | "locked" | "open">("checking");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -59,7 +60,7 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
       setBusy(true);
       setError("");
       try {
-        const { ok } = await login(password);
+        const { ok } = await login(password, username.trim() || undefined);
         if (ok) {
           setPassword("");
           setPhase("open");
@@ -72,7 +73,7 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
         setBusy(false);
       }
     },
-    [password, t]
+    [password, username, t]
   );
 
   if (phase === "open") return <>{children}</>;
@@ -113,6 +114,23 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
               {t("login.subtitle")}
             </div>
           </div>
+          <input
+            type="text"
+            autoComplete="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="Username (optional)"
+            disabled={busy}
+            style={{
+              padding: "10px 12px",
+              fontSize: 14,
+              color: "var(--text)",
+              background: "var(--panel2)",
+              border: "1px solid var(--line2)",
+              borderRadius: 9,
+              outline: "none",
+            }}
+          />
           <input
             type="password"
             autoFocus

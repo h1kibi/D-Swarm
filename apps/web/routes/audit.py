@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 from typing import Optional
 
@@ -44,10 +44,10 @@ router = APIRouter(prefix="/api/audit", tags=["audit"])
 
 
 def get_current_account(
-    authorization: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> AccountModel:
-    """Get current authenticated account."""
+    """Get current authenticated account (Authorization: Bearer <token>)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
     
@@ -115,6 +115,58 @@ async def get_audit_logs(
         "skip": skip,
         "limit": limit
     }
+
+
+@router.get("/export")
+async def export_audit_logs(
+    action: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    admin: AccountModel = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Export audit logs as CSV (admin only)."""
+    import csv
+    import io
+
+    service = AuditService(db)
+    logs, _ = service.get_logs(
+        action=action,
+        actor_id=actor_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        status=status_filter,
+        skip=0,
+        limit=100000,
+    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["id", "action", "actor", "resource_type", "resource_id", "status", "timestamp", "ip_address", "details"]
+    )
+    for log in logs:
+        writer.writerow(
+            [
+                log.id,
+                log.action,
+                log.actor,
+                log.resource_type,
+                log.resource_id,
+                log.status,
+                log.timestamp.timestamp(),
+                log.ip_address,
+                log.details,
+            ]
+        )
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="audit-logs.csv"'},
+    )
 
 
 @router.get("/account/{account_id}/actions")

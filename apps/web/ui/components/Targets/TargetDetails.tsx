@@ -21,7 +21,6 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
     name: "",
     description: "",
     category: "",
-    solved: false,
   });
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,7 +32,6 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
         name: target.name,
         description: target.description,
         category: target.category,
-        solved: target.solved,
       });
     }
   }, [target]);
@@ -68,8 +66,8 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
   }
 
   const solvedRuns = targetRuns.filter((r) => r.solved).length;
-  const totalFlags = target.flag_count;
-  const totalFacts = target.fact_count;
+  const totalFlags = target.flags.length;
+  const totalFacts = target.facts_count;
 
   return (
     <div className={styles.container}>
@@ -115,17 +113,6 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
               />
             </div>
 
-            <div className={styles.checkbox}>
-              <input
-                id="solved"
-                type="checkbox"
-                checked={formData.solved}
-                onChange={(e) => setFormData({ ...formData, solved: e.target.checked })}
-                disabled={updating}
-              />
-              <label htmlFor="solved">Mark as solved</label>
-            </div>
-
             {error && <div className={styles.error}>{error}</div>}
             {success && <div className={styles.success}>Target updated successfully!</div>}
 
@@ -144,7 +131,7 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
             <div className={styles.meta}>
               <span className={styles.category}>{target.category}</span>
               <span>
-                {target.solved ? (
+                {target.is_solved ? (
                   <span className={styles.solved}>✓ Solved</span>
                 ) : (
                   <span className={styles.unsolved}>○ Unsolved</span>
@@ -199,15 +186,16 @@ export function TargetDetails({ targetId }: TargetDetailsProps) {
           <h2>Recent Runs</h2>
           <div className={styles.runsList}>
             {targetRuns.slice(0, 5).map((run) => (
-              <Link key={run.id} href={`/run/${run.id}`} className={styles.runItem}>
+              <Link key={run.run_id} href={`/run/${encodeURIComponent(run.run_id)}`} className={styles.runItem}>
                 <div className={styles.runStatus + " " + styles[`status_${run.status}`]}>
                   {run.status}
                 </div>
                 <div className={styles.runDate}>
-                  {new Date(run.created_at * 1000).toLocaleDateString()}
+                  {run.updated_at ? new Date(run.updated_at * 1000).toLocaleDateString() : "—"}
                 </div>
                 <div className={styles.runFlags}>
-                  {run.flags_found.length} flag{run.flags_found.length !== 1 ? "s" : ""}
+                  {run.flag_count ?? run.flags?.length ?? 0} flag
+                  {(run.flag_count ?? run.flags?.length ?? 0) !== 1 ? "s" : ""}
                 </div>
               </Link>
             ))}

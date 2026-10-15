@@ -1,63 +1,43 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useRuns, startRun, stopRun, deleteRun } from "@/lib/useRunsApi";
-import { useEvents } from "@/lib/useEventsApi";
-import { useTargets } from "@/lib/useTargetsApi";
 import Link from "next/link";
 import styles from "./RunsList.module.css";
 
 export function RunsList() {
-  const { events } = useEvents();
-  const [selectedEventId, setSelectedEventId] = useState<string>("");
-  const { targets } = useTargets(selectedEventId);
-  const { runs, loading, error, refresh } = useRuns(selectedEventId);
-
-  const [showLauncher, setShowLauncher] = useState(false);
-  const [launchData, setLaunchData] = useState({ event_id: "", target_id: "" });
+  const router = useRouter();
+  const { runs, loading, error, refresh } = useRuns();
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<"all" | "running" | "completed" | "failed">("all");
+  const [filter, setFilter] = useState<"all" | "running" | "finished" | "solved">("all");
 
   const filteredRuns =
     filter === "all"
       ? runs
-      : runs.filter((r) => {
-          if (filter === "running") return r.status === "running" || r.status === "pending";
-          if (filter === "completed") return r.status === "completed";
-          if (filter === "failed") return r.status === "failed" || r.status === "stopped";
+      : runs.filter((run) => {
+          if (filter === "running") return run.status === "running";
+          if (filter === "finished") return run.finished || run.solved;
+          if (filter === "solved") return run.solved === true;
           return false;
         });
 
-  const handleLaunch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!launchData.event_id || !launchData.target_id) {
-      setLaunchError("Please select both event and target");
-      return;
-    }
-
+  const handleLaunch = async () => {
     setLaunching(true);
     setLaunchError(null);
-
-    const result = await startRun({
-      event_id: launchData.event_id,
-      target_id: launchData.target_id,
-    });
-
-    if (result.ok) {
-      setLaunchData({ event_id: "", target_id: "" });
-      setShowLauncher(false);
-      void refresh();
-    } else {
-      setLaunchError(result.error || "Failed to start run");
+    const result = await startRun();
+    if (result.ok && result.runId) {
+      router.push(`/run/${encodeURIComponent(result.runId)}`);
+      return;
     }
+    setLaunchError(result.error || "Failed to create a run");
     setLaunching(false);
   };
 
-  const handleStop = async (id: string) => {
+  const handleStop = async (runId: string) => {
     if (!window.confirm("Stop this run?")) return;
-
-    const result = await stopRun(id);
+    const result = await stopRun(runId);
     if (result.ok) {
       void refresh();
     } else {
@@ -65,10 +45,9 @@ export function RunsList() {
     }
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (runId: string) => {
     if (!window.confirm("Delete this run?")) return;
-
-    const result = await deleteRun(id);
+    const result = await deleteRun(runId);
     if (result.ok) {
       void refresh();
     } else {
@@ -76,95 +55,27 @@ export function RunsList() {
     }
   };
 
-  const filteredTargets = selectedEventId
-    ? targets
-    : [];
+  const flagCountFor = (run: { flag_count?: number; flags?: string[] }): number =>
+    run.flag_count ?? run.flags?.length ?? 0;
 
   return (
     <div className={styles.container}>
       <div className={styles.header}>
         <h1>Runs</h1>
-        <button onClick={() => setShowLauncher(!showLauncher)} className={styles.launchBtn}>
-          🚀 Launch Run
+        <button onClick={handleLaunch} disabled={launching} className={styles.launchBtn}>
+          {launching ? "Opening..." : "🚀 Launch Run"}
         </button>
       </div>
 
-      <div className={styles.eventSelector}>
-        <label htmlFor="event-select">Filter by Event:</label>
-        <select
-          id="event-select"
-          value={selectedEventId}
-          onChange={(e) => {
-            setSelectedEventId(e.target.value);
-            setLaunchData({ ...launchData, event_id: e.target.value });
-          }}
-        >
-          <option value="">All Events</option>
-          {events.map((event) => (
-            <option key={event.id} value={event.id}>
-              {event.name}
-            </option>
-          ))}
-        </select>
-      </div>
+      <p className={styles.hint}>
+        Launching mints a new run and opens it in the Command Deck, where you pick
+        the Target and dispatch the prompt.
+      </p>
 
-      {showLauncher && (
-        <form onSubmit={handleLaunch} className={styles.launcher}>
-          <h3>Launch New Run</h3>
-
-          <div className={styles.formGroup}>
-            <label htmlFor="launch-event">Event *</label>
-            <select
-              id="launch-event"
-              value={launchData.event_id}
-              onChange={(e) => {
-                setLaunchData({ ...launchData, event_id: e.target.value });
-              }}
-              disabled={launching}
-              required
-            >
-              <option value="">Select an event</option>
-              {events.map((event) => (
-                <option key={event.id} value={event.id}>
-                  {event.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className={styles.formGroup}>
-            <label htmlFor="launch-target">Target *</label>
-            <select
-              id="launch-target"
-              value={launchData.target_id}
-              onChange={(e) => setLaunchData({ ...launchData, target_id: e.target.value })}
-              disabled={launching || !launchData.event_id}
-              required
-            >
-              <option value="">Select a target</option>
-              {filteredTargets.map((target) => (
-                <option key={target.id} value={target.id}>
-                  {target.name} {target.solved ? "✓" : ""}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {launchError && <div className={styles.error}>{launchError}</div>}
-
-          <div className={styles.actions}>
-            <button type="submit" disabled={launching}>
-              {launching ? "Launching..." : "Launch"}
-            </button>
-            <button type="button" onClick={() => setShowLauncher(false)} disabled={launching}>
-              Cancel
-            </button>
-          </div>
-        </form>
-      )}
+      {launchError && <div className={styles.error}>{launchError}</div>}
 
       <div className={styles.filters}>
-        {(["all", "running", "completed", "failed"] as const).map((f) => (
+        {(["all", "running", "finished", "solved"] as const).map((f) => (
           <button
             key={f}
             onClick={() => setFilter(f)}
@@ -178,27 +89,25 @@ export function RunsList() {
       {loading && <div className={styles.loading}>Loading runs...</div>}
       {error && <div className={styles.error}>Error: {error}</div>}
 
-      {!loading && filteredRuns.length === 0 && (
-        <div className={styles.empty}>No runs found</div>
-      )}
+      {!loading && filteredRuns.length === 0 && <div className={styles.empty}>No runs found</div>}
 
       <div className={styles.table}>
         <div className={styles.tableHeader}>
-          <div className={styles.col_id}>ID</div>
-          <div className={styles.col_target}>Target</div>
+          <div className={styles.col_id}>Run ID</div>
+          <div className={styles.col_target}>Name</div>
           <div className={styles.col_status}>Status</div>
           <div className={styles.col_flags}>Flags</div>
-          <div className={styles.col_time}>Created</div>
+          <div className={styles.col_time}>Solved</div>
           <div className={styles.col_actions}>Actions</div>
         </div>
 
         {filteredRuns.map((run) => (
-          <div key={run.id} className={styles.tableRow}>
+          <div key={run.run_id} className={styles.tableRow}>
             <div className={styles.col_id}>
-              <code>{run.id.substring(0, 8)}</code>
+              <code>{run.run_id.substring(0, 8)}</code>
             </div>
             <div className={styles.col_target}>
-              <span>{run.target_id.substring(0, 8)}</span>
+              <span>{run.name || run.run_id}</span>
             </div>
             <div className={styles.col_status}>
               <span className={styles.status + " " + styles[`status_${run.status}`]}>
@@ -206,23 +115,19 @@ export function RunsList() {
               </span>
             </div>
             <div className={styles.col_flags}>
-              <span className={run.solved ? styles.solved : ""}>
-                {run.flags_found.length}
-              </span>
+              <span className={run.solved ? styles.solved : ""}>{flagCountFor(run)}</span>
             </div>
-            <div className={styles.col_time}>
-              {new Date(run.created_at * 1000).toLocaleDateString()}
-            </div>
+            <div className={styles.col_time}>{run.solved ? "✓" : "—"}</div>
             <div className={styles.col_actions}>
-              <Link href={`/run/${run.id}`} className={styles.viewBtn}>
-                View
+              <Link href={`/run/${encodeURIComponent(run.run_id)}`} className={styles.viewBtn}>
+                Open
               </Link>
-              {(run.status === "running" || run.status === "pending") && (
-                <button onClick={() => handleStop(run.id)} className={styles.stopBtn}>
+              {run.status === "running" && (
+                <button onClick={() => handleStop(run.run_id)} className={styles.stopBtn}>
                   Stop
                 </button>
               )}
-              <button onClick={() => handleDelete(run.id)} className={styles.deleteBtn}>
+              <button onClick={() => handleDelete(run.run_id)} className={styles.deleteBtn}>
                 Delete
               </button>
             </div>

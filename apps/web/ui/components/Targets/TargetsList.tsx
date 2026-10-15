@@ -33,8 +33,8 @@ export function TargetsList() {
     filter === "all"
       ? targets
       : filter === "solved"
-        ? targets.filter((t) => t.solved)
-        : targets.filter((t) => !t.solved);
+        ? targets.filter((t) => t.is_solved)
+        : targets.filter((t) => !t.is_solved);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -201,8 +201,8 @@ export function TargetsList() {
           <div key={target.id} className={styles.card}>
             <div className={styles.cardHeader}>
               <h3>{target.name}</h3>
-              <span className={styles.status + " " + styles[target.solved ? "solved" : "unsolved"]}>
-                {target.solved ? "✓ Solved" : "Unsolved"}
+              <span className={styles.status + " " + styles[target.is_solved ? "solved" : "unsolved"]}>
+                {target.is_solved ? "✓ Solved" : "Unsolved"}
               </span>
             </div>
 
@@ -210,8 +210,8 @@ export function TargetsList() {
 
             <div className={styles.meta}>
               {target.category && <span className={styles.category}>{target.category}</span>}
-              <span>{target.flag_count} flags</span>
-              <span>{target.fact_count} facts</span>
+              <span>{target.flags.length} flags</span>
+              <span>{target.facts_count} facts</span>
             </div>
 
             <div className={styles.actions}>

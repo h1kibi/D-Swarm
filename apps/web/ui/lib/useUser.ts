@@ -7,9 +7,8 @@ export interface User {
   id: string;
   username: string;
   display_name: string;
-  role: "admin" | "member";
-  created_at: number;
-  auth_required: boolean;
+  role: string;
+  is_active: boolean;
 }
 
 export interface UserState {
@@ -43,12 +42,15 @@ export async function fetchCurrentUser(): Promise<User | null> {
   try {
     const res = await apiFetch("/api/auth/me");
     if (!res.ok) return null;
+    // GET /api/auth/me returns CurrentUserResponse directly (no wrapper).
     const body = (await res.json()) as unknown;
-    if (body && typeof body === "object" && "user" in body) {
-      const candidate = (body as Record<string, unknown>).user;
-      return typeof candidate === "object" && candidate !== null
-        ? (candidate as unknown as User)
-        : null;
+    if (
+      body &&
+      typeof body === "object" &&
+      typeof (body as Record<string, unknown>).id === "string" &&
+      typeof (body as Record<string, unknown>).role === "string"
+    ) {
+      return body as unknown as User;
     }
     return null;
   } catch {
@@ -118,8 +120,8 @@ export async function changePassword(
   newPassword: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await apiFetch("/api/auth/change-password", {
-      method: "POST",
+    const res = await apiFetch("/api/accounts/me/password", {
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
     });
