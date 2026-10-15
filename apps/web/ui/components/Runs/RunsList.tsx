@@ -1,10 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
-import { useRuns, startRun, stopRun, deleteRun } from "@/lib/useRunsApi";
+import { useRuns } from "@/lib/useRunsApi";
 import { useT } from "@/lib/i18n";
 import Link from "next/link";
+
+/** Read-only run overview: creation and management live in the deck's rail. */
 
 function statusTone(run: { status: string; solved?: boolean; finished?: boolean }): string {
   if (run.status === "running") return "ds-badge--cyan";
@@ -22,10 +23,7 @@ function statusLed(run: { status: string; solved?: boolean; finished?: boolean }
 
 export function RunsList() {
   const t = useT();
-  const router = useRouter();
-  const { runs, loading, error, refresh } = useRuns();
-  const [launching, setLaunching] = useState(false);
-  const [launchError, setLaunchError] = useState<string | null>(null);
+  const { runs, loading, error } = useRuns();
   const [filter, setFilter] = useState<"all" | "running" | "finished" | "solved">("all");
 
   const filteredRuns =
@@ -38,38 +36,6 @@ export function RunsList() {
           return false;
         });
 
-  const handleLaunch = async () => {
-    setLaunching(true);
-    setLaunchError(null);
-    const result = await startRun();
-    if (result.ok && result.runId) {
-      router.push(`/run/${encodeURIComponent(result.runId)}`);
-      return;
-    }
-    setLaunchError(result.error || t("runs.launchFailed"));
-    setLaunching(false);
-  };
-
-  const handleStop = async (runId: string) => {
-    if (!window.confirm(t("runs.stopConfirm"))) return;
-    const result = await stopRun(runId);
-    if (result.ok) {
-      void refresh();
-    } else {
-      alert(result.error || t("runs.stopFailed"));
-    }
-  };
-
-  const handleDelete = async (runId: string) => {
-    if (!window.confirm(t("runs.deleteConfirm"))) return;
-    const result = await deleteRun(runId);
-    if (result.ok) {
-      void refresh();
-    } else {
-      alert(result.error || t("runs.deleteFailed"));
-    }
-  };
-
   const flagCountFor = (run: { flag_count?: number; flags?: string[] }): number =>
     run.flag_count ?? run.flags?.length ?? 0;
 
@@ -80,15 +46,11 @@ export function RunsList() {
           <h1 className="ds-title">{t("runs.title")}</h1>
         </div>
         <div className="ds-actions">
-          <button type="button" onClick={handleLaunch} disabled={launching} className="ds-btn ds-btn--primary">
-            {launching ? t("runs.launching") : t("runs.launch")}
-          </button>
+          <Link href="/deck" className="ds-btn ds-btn--primary">{t("dash.openDeck")}</Link>
         </div>
       </div>
 
-      <p className="ds-hint">{t("runs.launchHint")}</p>
-
-      {launchError && <div className="ds-banner ds-banner--error">{launchError}</div>}
+      <p className="ds-hint">{t("runs.manageHint")}</p>
 
       <div className="ds-toolbar">
         {(["all", "running", "finished", "solved"] as const).map((option) => (
@@ -115,7 +77,7 @@ export function RunsList() {
       {!loading && filteredRuns.length === 0 && <div className="ds-empty">{t("runs.empty")}</div>}
 
       {filteredRuns.length > 0 && (
-        <div className="ds-table" style={{ "--cols": "110px 1fr 130px 80px 70px 220px" } as React.CSSProperties}>
+        <div className="ds-table" style={{ "--cols": "110px 1fr 130px 80px 70px 100px" } as React.CSSProperties}>
           <div className="ds-table-head">
             <span>{t("runs.colRun")}</span>
             <span>{t("runs.colName")}</span>
@@ -141,22 +103,6 @@ export function RunsList() {
                 <Link href={`/run/${encodeURIComponent(run.run_id)}`} className="ds-btn ds-btn--sm">
                   {t("common.open")}
                 </Link>
-                {run.status === "running" && (
-                  <button
-                    type="button"
-                    onClick={() => handleStop(run.run_id)}
-                    className="ds-btn ds-btn--sm"
-                  >
-                    {t("common.stop")}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => handleDelete(run.run_id)}
-                  className="ds-btn ds-btn--sm ds-btn--danger"
-                >
-                  {t("common.delete")}
-                </button>
               </span>
             </div>
           ))}

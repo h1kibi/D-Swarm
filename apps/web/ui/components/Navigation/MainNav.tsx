@@ -17,7 +17,6 @@ import { Icon } from "@/components/Icon";
 const NAV: { href: string; key: string; admin?: boolean }[] = [
   { href: "/", key: "nav.dashboard" },
   { href: "/events", key: "nav.events" },
-  { href: "/targets", key: "nav.targets" },
   { href: "/runs", key: "nav.runs" },
   { href: "/analytics", key: "nav.analytics" },
   { href: "/admin/accounts", key: "nav.accounts", admin: true },

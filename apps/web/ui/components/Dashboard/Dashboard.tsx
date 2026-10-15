@@ -2,20 +2,27 @@
 
 import { useUser } from "@/lib/useUser";
 import { useEvents } from "@/lib/useEventsApi";
-import { useTargets } from "@/lib/useTargetsApi";
+import { useTargets } from "@/lib/useTargets";
 import { useRuns } from "@/lib/useRunsApi";
 import { useT } from "@/lib/i18n";
 import Link from "next/link";
 
+/**
+ * The console dashboard is an overview + operator/admin surface. Target and Run
+ * CREATION/MANAGEMENT live in the Command Deck (its Target Library, run rail,
+ * and launch wizard) — nothing here duplicates those actions; cards summarize
+ * the same data sources and hand off to the deck.
+ */
+
 function MemberDashboard() {
   const t = useT();
   const { events, loading: eventsLoading } = useEvents();
-  const { targets } = useTargets();
+  const targets = useTargets();
   const { runs } = useRuns();
 
   const activeEvents = events.filter((event) => event.status === "active");
-  const unsolvedTargets = targets.filter((tgt) => !tgt.is_solved);
-  const solvedTargets = targets.filter((tgt) => tgt.is_solved);
+  const solvedTargets = targets.filter((target) => target.status === "solved");
+  const unsolvedTargets = targets.filter((target) => target.status !== "solved");
   const activeRuns = runs.filter((run) => run.status === "running");
   const completedRuns = runs.filter((run) => run.solved === true || run.finished === true);
 
@@ -25,6 +32,9 @@ function MemberDashboard() {
         <div>
           <h1 className="ds-title">{t("dash.title")}</h1>
           <p className="ds-sub">{t("dash.sub")}</p>
+        </div>
+        <div className="ds-actions">
+          <Link href="/deck" className="ds-btn ds-btn--primary">{t("dash.openDeck")}</Link>
         </div>
       </div>
 
@@ -59,7 +69,7 @@ function MemberDashboard() {
             </div>
           </div>
           <div className="ds-actions" style={{ justifyContent: "flex-start", marginTop: 14 }}>
-            <Link href="/targets" className="ds-btn ds-btn--sm">{t("dash.viewAll")}</Link>
+            <Link href="/deck" className="ds-btn ds-btn--sm">{t("dash.manageInDeck")}</Link>
           </div>
         </section>
 
@@ -83,9 +93,9 @@ function MemberDashboard() {
         <section className="ds-card">
           <h2 className="ds-card-title">{t("dash.quick")}</h2>
           <div className="ds-actions" style={{ flexDirection: "column", alignItems: "stretch" }}>
-            <Link href="/runs" className="ds-btn">{t("dash.startRun")}</Link>
-            <Link href="/targets" className="ds-btn">{t("dash.createTarget")}</Link>
+            <Link href="/deck" className="ds-btn">{t("dash.openDeck")}</Link>
             <Link href="/events" className="ds-btn">{t("dash.createEvent")}</Link>
+            <Link href="/analytics" className="ds-btn">{t("nav.analytics")}</Link>
           </div>
         </section>
       </div>
@@ -111,6 +121,9 @@ function AdminDashboard() {
         <div>
           <h1 className="ds-title">{t("dash.adminTitle")}</h1>
           <p className="ds-sub">{t("dash.adminSub")}</p>
+        </div>
+        <div className="ds-actions">
+          <Link href="/deck" className="ds-btn ds-btn--primary">{t("dash.openDeck")}</Link>
         </div>
       </div>
 
@@ -176,14 +189,6 @@ function AdminDashboard() {
               />{" "}
               {online ? t("dash.online") : t("dash.offline")}
             </span>
-          </div>
-        </section>
-
-        <section className="ds-card">
-          <h2 className="ds-card-title">{t("dash.quick")}</h2>
-          <div className="ds-actions" style={{ flexDirection: "column", alignItems: "stretch" }}>
-            <Link href="/events" className="ds-btn">{t("dash.createEvent")}</Link>
-            <Link href="/deck" className="ds-btn">{t("nav.deck")}</Link>
           </div>
         </section>
       </div>
